@@ -7,15 +7,20 @@ C_GREEN = '\033[92m'
 
 class ThinkTool(BaseTool):
     """A tool for internal reasoning and planning."""
-    def __init__(self, llm_client: LLMClient):
+    def __init__(self, llm_client: LLMClient, worker=None):
         super().__init__(
             name="think",
             description='Internal reasoning loop. Use to plan or analyze before acting. Params: `query` (str). Example: `{"tool_name": "think", "parameters": {"query": "Drafting plan to fix bug."}}`'
         )
         self.llm_client = llm_client
+        self.worker = worker
 
-    def execute(self, query: str, working_memory: str):
-        prompt = f"""Current Working Memory:
+    def execute(self, query: str):
+        working_memory = "No working memory available."
+        if self.worker:
+             working_memory = self.worker._format_open_files()
+        
+        prompt = f"""Current Working Memory (Open Files):
 ---
 {working_memory}
 ---

@@ -125,12 +125,17 @@ OPEN FILES (Short Term Memory):
 
 INSTRUCTIONS:
 1. Based on the Plan and Suggestion, formulate the exact JSON for the tool execution.
-2. Verify you are using valid tools.
-3. If you need to read a file, use open_file. If you need to write, use write_file.
+2. ACTION CHAINING (Dynamic): You may output a list of actions to be executed sequentially.
+   - **Dynamic Sizing**: You are free to determine the number of actions based on task complexity.
+   - **Simple/Deterministic Tasks**: You may chain up to **15 actions** (e.g. setting up git, creating config files, simple linear shell commands).
+   - **Complex/Uncertain Tasks**: Use **1-3 actions**. If you need to see the output of step A to decide step B, do NOT chain them. Stop and observe.
+   - The execution will stop automatically if any step fails, unless you add "allow_failure": true.
+3. Verify you are using valid tools.
+4. If you need to read a file, use open_file. If you need to write, use write_file.
 
 OUTPUT FORMAT:
-MUST be a single valid JSON object for the tool call.
-Example: {{"tool_name": "run_command", "parameters": {{"command": "ls -la"}}}}
+MUST be a single valid JSON object with an "actions" key containing a list of tool calls.
+Example: {{"actions": [{{"tool_name": "write_file", "parameters": {{"file_path": "test.py", "content": "..."}}}}, {{"tool_name": "run_command", "parameters": {{"command": "ls missing_file"}}, "allow_failure": true}}]}}
 
 IMPORTANT REMINDERS:
 {self.important_reminders}
