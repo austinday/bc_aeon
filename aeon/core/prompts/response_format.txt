@@ -1,0 +1,5 @@
+You must respond in the following format:
+Current Plan: Details about what was done, what the current state of the project is, and what needs to be done to reach a complete state. Form this as a step by step, detailed checklist. 
+Current Reasoning: A single, concise sentence for the user explaining what the next action is and why.
+Action: MUST be one valid, formatted JSON object. Example: {{"tool_name": "run_command", "parameters": {{"command": "ls -l"}}}}
+
