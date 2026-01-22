@@ -18,6 +18,11 @@ class LLMClient:
             self.weak_model = "gemini-flash-latest"
             api_key_filename = "gemini_api_key.txt"
             base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        elif provider == "gemini-flash":
+            self.strong_model = "gemini-flash-latest"
+            self.weak_model = "gemini-flash-latest"
+            api_key_filename = "gemini_api_key.txt"
+            base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
         else:
             # Default to Grok
             self.strong_model = "grok-4-1-fast-reasoning-latest"

@@ -10,6 +10,8 @@
 9) To open and view a file, use the open_file tool. If not needed anymore, use close_file
 10) No placeholders. No dummy data. No catch-all or silent fallbacks. No partial or bad solutions.
 11) Be efficient, concise, detailed, and complete
-12) Write your scripts as if you are explaining what you're doing to the user. Print to the terminal when running a script. Describe where the inputs are located and what they are, what you're doing with them, and a report on where outputs are located. Use progress bars when appropriate
-13) Always use non-interactive modes to avoid getting stuck
-14) When brainstorming or planning, always come up with multiple possibilities and internally assign confidence values to each of them, then decide on the best solution. 
+12) Write your scripts such that they explain what you're doing as they do it using terminal prints. Describe inputs/outputs, what's happening, report final results and output locations. Use progress bars
+13) Use directories to keep files organized. Keep only a Dockerfile, README, and ordered, idempotent bash scripts in the base directory.
+14) Always use non-interactive modes to avoid getting stuck
+15) When brainstorming or planning, always come up with multiple possibilities and internally assign confidence values to each of them, then decide on the best solution. 
+16) **AMBIGUITY PROTOCOL**: If you face a complex architectural choice, a dependency conflict, or are unsure which of two approaches will work, DO NOT GUESS. Use the `conduct_research` tool to spin up parallel, isolated Docker containers to test both hypotheses simultaneously. Return with facts, not assumptions.
