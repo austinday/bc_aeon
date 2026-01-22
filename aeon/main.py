@@ -12,10 +12,17 @@ def cli():
         parser = argparse.ArgumentParser(description='Aeon Agent CLI')
         parser.add_argument('--restore', type=str, help='Path to history file for restoration')
         parser.add_argument('--gemini', action='store_true', help='Use Google Gemini models instead of Grok')
+        parser.add_argument('--gemini-flash', action='store_true', help='Use Google Gemini Flash for ALL models (fast/cheap)')
         args = parser.parse_args()
 
         # 1. Initialize Core Resources
-        provider = "gemini" if args.gemini else "grok"
+        if args.gemini_flash:
+            provider = "gemini-flash"
+        elif args.gemini:
+            provider = "gemini"
+        else:
+            provider = "grok"
+            
         llm_client = LLMClient(provider=provider)
         
         # 2. Initialize Worker WITHOUT tools first

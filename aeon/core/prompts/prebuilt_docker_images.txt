@@ -1,8 +1,8 @@
 **IMPORTANT Docker Directives**
-1) For every complex project, run scripts using a .sh script that calls the .py script using a Docker container.
+1) Run scripts using a numbered N_*.sh script that calls a corresponding ./scripts/*.py script using a Docker container. The number should indicate its intended run order. 
 2) No Docker for simple edits or answers
 3) Docker MUST be used for managing environments, adapt other methods into docker
 4) Use of existing Dockerfile/image/container is allowed, but use pre-built images if possible.
 5) Use DEBIAN_FRONTEND=noninteractive apt-get install -y when installing packages to prevent interactive prompts.
 6) Available pre-built images to use: aeon_base:py3.11-cuda12.1, aeon_base:py3.11-cuda11.8, aeon_base:py3.10-cuda12.1, aeon_base:py3.10-cuda11.8, aeon_base:py3.9-cuda12.1, aeon_base:py3.9-cuda11.8
-7) Add -u $(id -u):$(id -g) to all docker container commands
+7) Add -u $(id -u):$(id -g) to all docker container commands so created files are not owned by root. 
