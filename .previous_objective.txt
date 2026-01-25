@@ -7,3 +7,12 @@ does your multi-action work? test it out by doing three things at once.
 [2026-01-19 21:37:27] OBJECTIVE UPDATE:
 test our your new ability to do multiple steps in a single iteration
 ----------------------------------------
+[2026-01-22 20:01:58] OBJECTIVE UPDATE:
+do you have a tool for making images? can you test it out? 
+----------------------------------------
+[2026-01-22 22:49:46] OBJECTIVE UPDATE:
+can you list out all the tools you can see/use? 
+----------------------------------------
+[2026-01-22 22:52:14] OBJECTIVE UPDATE:
+make me an image, test out the appropriate tool
+----------------------------------------

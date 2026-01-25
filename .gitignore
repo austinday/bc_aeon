@@ -2,30 +2,25 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-build/
-dist/
 
-# C extensions
-*.egg-info/
-
-# Logs and temp files
-*.log
-.codinator_*
-*.bak
-
-# OS generated files
-.DS_Store
-Thumbs.db
-
-# Jupyter notebooks
-.ipynb_checkpoints/
-
-# Environment variables (if any)
+# Virtual environments
+venv/
+env/
 .env
-.venv
 
-# Backups and session files
-workspace_backup_*.tar.gz
-revertChanges.txt
+# Agent Logs
+aeon.log
+
+# API Keys
+*_api_key.txt
+
+# User Data & Models
+aeon_models/
+data/
+
+# IDEs
+.vscode/
+.idea/
+
+# System
+.DS_Store
