@@ -9,13 +9,16 @@ aeon.egg-info/entry_points.txt
 aeon.egg-info/requires.txt
 aeon.egg-info/top_level.txt
 aeon/core/__init__.py
+aeon/core/directives.py
 aeon/core/llm.py
 aeon/core/logger.py
 aeon/core/system_info.py
 aeon/core/utils.py
 aeon/core/worker.py
+aeon/core/prompts/__init__.py
 aeon/scripts/__init__.py
 aeon/scripts/download_models.py
+aeon/scripts/fix_flux_download.py
 aeon/scripts/gen_img.py
 aeon/scripts/vision_analyze.py
 aeon/scripts/vision_inference.py

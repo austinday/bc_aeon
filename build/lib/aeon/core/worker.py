@@ -4,12 +4,13 @@ import time
 import sys
 from datetime import datetime
 from collections import deque
-from importlib import resources
+from pathlib import Path
 from typing import List, Any, Dict, Callable, Optional
 
 from .llm import LLMClient
 from .system_info import get_runtime_info
 from .logger import get_logger
+from .directives import CORE_DIRECTIVES, DOCKER_DIRECTIVES
 
 # Colors for terminal output
 C_RED = '\033[91m'
@@ -32,9 +33,9 @@ class Worker:
         self.recent_history = deque(maxlen=10) 
         self.last_observation = "None."
         
-        self.base_directives = ""
+        self.base_directives = CORE_DIRECTIVES
+        self.docker_directives = DOCKER_DIRECTIVES
         self.max_history_tokens = 25000
-        self._load_directives()
 
     def register_tools(self, tools_list: List[Any]):
         for tool in tools_list:
@@ -51,13 +52,6 @@ class Worker:
 
     def is_file_open(self, path: str) -> bool:
         return path in self.open_files
-
-    def _load_directives(self):
-        try:
-            txt = resources.files('aeon.core.prompts') / 'core_directives.txt'
-            self.base_directives = txt.read_text(encoding='utf-8')
-        except Exception:
-            self.base_directives = "Be helpful, efficient, and precise."
 
     def _get_tools_description(self) -> str:
         descs = []
@@ -148,11 +142,13 @@ class Worker:
                 # --- PREPARE CONTEXT ---
                 system_specs = get_runtime_info()
                 tool_list_str = self._get_tools_description()
+                # CLEANED CONTEXT: Removed redundant headers since directives include them.
                 system_context = f"""**System Info**
 {system_specs}
 
-**Core Directives**
 {self.base_directives}
+
+{self.docker_directives}
 
 **Available Tools**
 {tool_list_str}

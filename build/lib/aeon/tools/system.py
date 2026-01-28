@@ -17,11 +17,16 @@ class RunCommandTool(BaseTool):
         output_lines = []
         start_time = time.time()
         
+        # WRAPPER FIX: Source .bashrc to ensure environment (paths, aliases) matches interactive user session.
+        # We use /bin/bash explicitly because /bin/sh does not support 'source'.
+        wrapped_command = f"source ~/.bashrc 2>/dev/null; {command}"
+
         try:
             # Use Popen to stream output
             process = subprocess.Popen(
-                command,
+                wrapped_command,
                 shell=True,
+                executable="/bin/bash", # Required for 'source' to work
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, # Merge stderr into stdout
                 text=True,
