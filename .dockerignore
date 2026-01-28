@@ -1,0 +1,10 @@
+aeon_models/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+test_images/
+venv/
+.env

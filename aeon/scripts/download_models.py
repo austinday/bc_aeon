@@ -21,17 +21,16 @@ MODELS = {
     'vision_large': 'Qwen/Qwen2-VL-72B-Instruct'
 }
 
-def try_global_login():
+def get_token():
     token_path = Path.home() / 'huggingface_access_token.txt'
     if token_path.exists():
         try:
             with open(token_path, 'r') as f:
-                file_token = f.read().strip()
-            if file_token:
-                login(token=file_token, add_to_git_credential=True)
-                return True
+                token = f.read().strip()
+            if token:
+                return token
         except: pass
-    return False
+    return None
 
 def main():
     default_path = Path.home() / 'bc_aeon' / 'aeon_models'
@@ -40,7 +39,18 @@ def main():
     parser.add_argument('--model', type=str, help='Specific model key to download')
     args = parser.parse_args()
 
-    try_global_login()
+    token = get_token()
+    if token:
+        print(f"Authentication token found (len={len(token)}).")
+        # CRITICAL FIX: Set env var for underlying libraries to ensure gated access works
+        os.environ["HF_TOKEN"] = token
+        try:
+            login(token=token, add_to_git_credential=False)
+        except Exception as e:
+            print(f"Login warning (non-fatal): {e}")
+    else:
+        print("Warning: No Hugging Face token found. Gated models (Flux) will fail.")
+
     base_dir = Path(args.dir).resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
     
@@ -48,15 +58,23 @@ def main():
     
     targets = {args.model: MODELS[args.model]} if args.model in MODELS else MODELS
 
+    # Files to grab: weights (safetensors/bin), config (json), code (py), metadata (txt/md/model)
+    patterns = ["*.safetensors", "*.bin", "*.json", "*.txt", "*.py", "*.model", "*.md"]
+
     for key, repo_id in targets.items():
         print(f'Checking {key} ({repo_id})...')
         target_dir = base_dir / key
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=target_dir,
-            local_dir_use_symlinks=False,
-            resume_download=True
-        )
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                local_dir=target_dir,
+                local_dir_use_symlinks=False,
+                resume_download=True,
+                allow_patterns=patterns,
+                token=token
+            )
+        except Exception as e:
+            print(f"Failed {key}: {e}")
 
 if __name__ == '__main__':
     main()

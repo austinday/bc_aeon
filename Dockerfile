@@ -39,34 +39,31 @@ RUN apt-get update && apt-get install -y \
  && curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - \
  && apt-get update && apt-get install -y google-cloud-sdk
 
-# 6. SET UP PYTHON & INSTALL PIP
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR} 1 \
- && update-alternatives --install /usr/bin/pip pip /usr/local/bin/pip 1
+# 6. INSTALL UV (The pip replacement)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# 7. PYTHON CORE
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel twine poetry black flake8 isort mypy jupyter notebook ipykernel ipywidgets cython numba pybind11
+# 7. PYTHON CORE & SCIENTIFIC LIBS (Parallelized via uv)
+# Note: We use --system to install into the system python environment
+RUN uv pip install --system --no-cache-dir --upgrade pip setuptools wheel twine poetry black flake8 isort mypy jupyter notebook ipykernel ipywidgets cython numba pybind11 \
+    numpy scipy matplotlib pandas scikit-learn tqdm pydantic beautifulsoup4 lxml polars pyarrow zarr lmdb duckdb psycopg2-binary redis pillow opencv-python-headless \
+    pytest pytest-cov pytest-mock
 
-# 8. SCIENTIFIC LIBS
-RUN pip install --no-cache-dir numpy scipy matplotlib pandas scikit-learn tqdm pydantic beautifulsoup4 lxml polars pyarrow zarr lmdb duckdb psycopg2-binary redis pillow opencv-python-headless
-
-# 9. TESTING
-RUN pip install --no-cache-dir pytest pytest-cov pytest-mock
-
-# 10. DL & ML (UPDATED FOR QWEN2-VL)
-RUN pip install --no-cache-dir --ignore-installed blinker
-RUN pip install --no-cache-dir \
-    wandb deepspeed lightning[extra] \
+# 8. DL & ML (Resolves wheels better to avoid build failures)
+RUN uv pip install --system --no-cache-dir \
+    blinker wandb deepspeed lightning[extra] \
     "transformers>=4.46.0" "accelerate>=0.26.0" qwen-vl-utils \
     datasets huggingface_hub \
     xgboost lightgbm mlflow tensorboard timm
 
-# 11-17. OTHER LIBS (Condensed for brevity but preserved in build)
-RUN pip install --no-cache-dir biopython pysam pybedtools scikit-bio pyro-ppl pymc statsmodels sympy pysr qutip "ray[all]" "dask[complete]" dask-cuda pyspark google-cloud-storage google-cloud-bigquery google-cloud-aiplatform google-cloud-pubsub gcsfs seaborn plotly logomaker python-pptx WeasyPrint Jinja2 nbconvert fastapi uvicorn[standard] httpx streamlit gradio flask requests aiohttp
+# 9. OTHER LIBS
+RUN uv pip install --system --no-cache-dir \
+    biopython pysam pybedtools scikit-bio pyro-ppl pymc statsmodels sympy pysr qutip "ray[all]" "dask[complete]" dask-cuda pyspark \
+    google-cloud-storage google-cloud-bigquery google-cloud-aiplatform google-cloud-pubsub gcsfs \
+    seaborn plotly logomaker python-pptx WeasyPrint Jinja2 nbconvert fastapi uvicorn[standard] httpx streamlit gradio flask requests aiohttp
 
-# 18. PYTORCH
-RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_SUFFIX}
+# 10. PYTORCH
+RUN uv pip install --system --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_SUFFIX}
 
-# 19. CLEANUP
+# 11. CLEANUP
 WORKDIR /workspace
 CMD ["bash"]

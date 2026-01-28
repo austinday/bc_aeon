@@ -12,6 +12,7 @@ echo "Dir: ~/bc_aeon/aeon_models"
 
 # 2. Build Base Images (Project Environments)
 echo "\n[2/4] Building Project Base Images (Cpu/Cuda)..."
+# Check if image exists to avoid rebuilds if possible, but for now we force it to ensure deps
 docker build -t aeon_base:py3.10-cuda12.1 \
   --build-arg PYTHON_VERSION_MINOR=10 \
   --build-arg CUDA_VERSION=12.1.1 \
@@ -27,7 +28,8 @@ echo "\n[4/4] Downloading Image Gen Models..."
 echo "Targets: Flux (High VRAM), Pony (Creative), DreamShaper (Low VRAM)."
 echo "Note: Interactive auth required for Flux/Pony if token not found."
 pip install huggingface_hub
-python3 aeon/scripts/download_models.py
+# ADDED -u HERE TO FIX VISIBILITY
+python3 -u aeon/scripts/download_models.py
 
 echo "\n========================================"
 echo "       SETUP COMPLETE                   "
