@@ -8,7 +8,7 @@ class SearchWebTool(BaseTool):
     def __init__(self, llm_client: LLMClient):
         super().__init__(
             name="search_web",
-            description='Web search. Use for external info/docs, current information, or inspiration when stuck. Params: `query` (str). Example: `{"tool_name": "search_web", "parameters": {"query": "python singleton pattern"}}`'
+            description="""Web search. Use for external info/docs, current information, or inspiration when stuck. Params: `query` (str). Example: `{"tool_name": "search_web", "parameters": {"query": "python singleton pattern"}}`"""
         )
         self.llm_client = llm_client
         self.tavily_client = None
