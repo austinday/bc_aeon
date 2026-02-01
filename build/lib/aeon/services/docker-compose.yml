@@ -1,0 +1,62 @@
+services:
+  # GPU 0: The Planner (DeepSeek R1)
+  planner:
+    image: vllm/vllm-openai:latest
+    container_name: aeon_planner
+    runtime: nvidia
+    shm_size: '16gb'
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      # Internal Isolation: Process only sees GPU 0
+      - NVIDIA_VISIBLE_DEVICES=0
+    volumes:
+      - ~/bc_aeon/aeon_models:/models
+    ports:
+      - "8000:8000"
+    command: >
+      --model /models/planner
+      --served-model-name casperhansen/deepseek-r1-distill-llama-70b-awq
+      --quantization awq
+      --trust-remote-code
+      --gpu-memory-utilization 0.90
+      --port 8000
+      --max-model-len 32768
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Request ALL GPUs to bypass CDI selection bugs
+              count: all
+              capabilities: [gpu]
+
+  # GPU 1: The Executor (Qwen 2.5)
+  executor:
+    image: vllm/vllm-openai:latest
+    container_name: aeon_executor
+    runtime: nvidia
+    shm_size: '16gb'
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      # Internal Isolation: Process only sees GPU 1
+      - NVIDIA_VISIBLE_DEVICES=1
+    volumes:
+      - ~/bc_aeon/aeon_models:/models
+    ports:
+      - "8001:8000"
+    command: >
+      --model /models/executor
+      --served-model-name Qwen/Qwen2.5-72B-Instruct-GPTQ-Int4
+      --quantization gptq
+      --trust-remote-code
+      --gpu-memory-utilization 0.50
+      --port 8000
+      --max-model-len 32768
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Request ALL GPUs to bypass CDI selection bugs
+              count: all
+              capabilities: [gpu]

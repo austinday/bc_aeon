@@ -1,4 +1,6 @@
-openai>=1.12.0
-tavily-python
-psutil
+huggingface_hub
 nvidia-ml-py3
+openai>=1.12.0
+psutil
+requests
+tavily-python

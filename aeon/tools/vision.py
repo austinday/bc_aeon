@@ -8,10 +8,12 @@ class ImageViewerTool(BaseTool):
     def __init__(self):
         super().__init__(
             name='image_viewer',
-            description='Analyzes an image file using an AI vision model. You must provide a specific `prompt` describing what you want to extract or observe. Params: `image_path` (str), `prompt` (str). Example: `{"tool_name": "image_viewer", "parameters": {"image_path": "plot.png", "prompt": "What is the value of the highest bar?"}}`'
+            description='Analyzes an image file using an AI vision model. Params: `image_path` (str), `prompt` (str).'
         )
         self.models_base = Path.home() / 'bc_aeon' / 'aeon_models'
         self.scripts_dir = Path.home() / 'bc_aeon' / 'aeon' / 'scripts'
+        self.C_CYAN = '\033[96m'
+        self.C_RESET = '\033[0m'
 
     def execute(self, image_path: str, prompt: str):
         if not image_path or not prompt:
@@ -26,8 +28,11 @@ class ImageViewerTool(BaseTool):
 
         uid_gid = f'{os.getuid()}:{os.getgid()}'
         
+        # Use legacy runtime to avoid CDI errors on host
         cmd = [
-            'docker', 'run', '--rm', '--gpus', 'all',
+            'docker', 'run', '--rm',
+            '--runtime', "nvidia",
+            '-e', 'NVIDIA_VISIBLE_DEVICES=1',
             '-u', uid_gid,
             '-e', 'HF_HOME=/tmp/.cache',
             '-e', 'PYTHONPATH=/scripts',
@@ -42,7 +47,7 @@ class ImageViewerTool(BaseTool):
         ]
 
         try:
-            print(f'Aeon Vision: Running agent-provided query on {image_file}...')
+            print(f'Aeon Vision: Running query on {image_file} (GPU 1)...')
             result = subprocess.run(cmd, check=True, capture_output=True, text=True)
             
             output = result.stdout
@@ -51,7 +56,6 @@ class ImageViewerTool(BaseTool):
                 if len(parts) > 1:
                     output = parts[1].split('--- VISION ANALYSIS END ---')[0].strip()
             
-            # FIX: Print the result to the user's terminal for verbosity
             print(f'\n{self.C_CYAN}Vision Result:{self.C_RESET}\n{output}\n')
             
             return output

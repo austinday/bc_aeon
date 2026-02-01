@@ -1,0 +1,24 @@
+**IMPORTANT Docker Directives & Hierarchy**
+
+1) THE GOLDEN RULE: "EXTEND, DON'T HACK"
+   - Never run `pip install` or `apt-get install` inside a transient `run_command` string.
+   - Never install packages on the host machine.
+
+2) THE WORKFLOW:
+   STEP A: Identify the Base.
+     - Use `aeon_base:py3.10-cuda12.1` as your base image for general logic/ml.
+   STEP B: Check Dependencies.
+     - If the base image has what you need: Use it directly.
+     - If you need NEW packages: Create a `Dockerfile` that inherits from the base.
+       ```dockerfile
+       FROM aeon_base:py3.10-cuda12.1
+       RUN pip install pandas matplotlib
+       ```
+   STEP C: Build.
+     - `docker build -t project_specific_name .`
+   STEP D: Run.
+     - `docker run --rm -v $(pwd):/workspace -w /workspace -u $(id -u):$(id -g) project_specific_name python script.py`
+
+3) TRANSPARENCY NOTE:
+   - Tools like `image_viewer` or `conduct_research` manage their own containers internally. You do not need to manually wrap them.
+   - YOU are responsible for wrapping your own logic (scripts, file ops, analysis) in Docker containers using the workflow above.

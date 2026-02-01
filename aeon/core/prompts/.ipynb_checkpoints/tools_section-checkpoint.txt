@@ -1,0 +1,4 @@
+These are your available tools. ONLY use these tools for all actions.
+{tools}
+No other tools are available. NEVER use any other tools. 
+

@@ -9,11 +9,9 @@ except ImportError:
     print('Error: huggingface_hub not found.')
     sys.exit(1)
 
-# OPTIMIZED REGISTRY: Best-in-Class Models for Each Tier
-# vision_small: Qwen2-VL-2B-Instruct (SOTA for <8GB VRAM)
-# vision_med:   InternVL2-26B (SOTA for 24GB VRAM, requires 4-bit)
-# vision_large: Qwen2-VL-72B-Instruct (SOTA for 80GB+ VRAM, requires 4-bit/8-bit)
+# OPTIMIZED REGISTRY: Only Tool Models (Brain is now on Ollama)
 MODELS = {
+    # --- TOOLS ---
     'flux_schnell': 'black-forest-labs/FLUX.1-schnell',
     'dreamshaper_8': 'Lykon/dreamshaper-8',
     'vision_small': 'Qwen/Qwen2-VL-2B-Instruct',
@@ -42,24 +40,20 @@ def main():
     token = get_token()
     if token:
         print(f"Authentication token found (len={len(token)}).")
-        # CRITICAL FIX: Set env var for underlying libraries to ensure gated access works
         os.environ["HF_TOKEN"] = token
         try:
             login(token=token, add_to_git_credential=False)
         except Exception as e:
             print(f"Login warning (non-fatal): {e}")
-    else:
-        print("Warning: No Hugging Face token found. Gated models (Flux) will fail.")
 
     base_dir = Path(args.dir).resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f'Aeon Vision: Syncing models to {base_dir}...')
+    print(f'Aeon Infrastructure: Syncing tool models to {base_dir}...')
     
     targets = {args.model: MODELS[args.model]} if args.model in MODELS else MODELS
 
-    # Files to grab: weights (safetensors/bin), config (json), code (py), metadata (txt/md/model)
-    patterns = ["*.safetensors", "*.bin", "*.json", "*.txt", "*.py", "*.model", "*.md"]
+    patterns = ["*.safetensors", "*.bin", "*.json", "*.txt", "*.py", "*.model", "*.md", "*.pt"]
 
     for key, repo_id in targets.items():
         print(f'Checking {key} ({repo_id})...')

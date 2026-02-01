@@ -10,7 +10,7 @@ class GenerateImageTool(BaseTool):
     def __init__(self):
         super().__init__(
             name="generate_image",
-            description='Generates images from text prompts. Files are saved as `{output_dir}/{name}_{index}.png`. The system automatically selects the highest quality model compatible with your GPU VRAM. Params: `prompt` (str), `name` (str, filename prefix), `count` (int), `aspect_ratio` ("1:1", "16:9", "9:16", "4:3"), `output_dir` (str). For BATCH processing, use `requests` (list of objects with these keys).'
+            description='Generates images. Params: `prompt` (str), `name` (str), `count` (int), `aspect_ratio`. BATCH: `requests` list.'
         )
         self.models_base = Path.home() / "bc_aeon" / "aeon_models"
         self.scripts_dir = Path.home() / "bc_aeon" / "aeon" / "scripts"
@@ -34,8 +34,11 @@ class GenerateImageTool(BaseTool):
         except Exception as e:
             return f"Error writing request file: {e}"
 
+        # Use legacy runtime to avoid CDI errors on host
         cmd = [
-            "docker", "run", "--rm", "--gpus", "all",
+            "docker", "run", "--rm", 
+            "--runtime", "nvidia",
+            "-e", "NVIDIA_VISIBLE_DEVICES=1",
             "-v", f"{self.models_base}:/models",
             "-v", f"{abs_output_dir}:/output",
             "-v", f"{self.scripts_dir}:/scripts",
@@ -47,7 +50,7 @@ class GenerateImageTool(BaseTool):
         ]
 
         try:
-            print(f"Aeon Vision: Processing {len(requests)} image request(s)...")
+            print(f"Aeon Vision: Processing {len(requests)} image request(s) on GPU 1...")
             result = subprocess.run(cmd, check=True, capture_output=True, text=True)
             return f"Success. Images in {abs_output_dir}.\nLogs:\n{result.stderr}\n{result.stdout}"
         except subprocess.CalledProcessError as e:

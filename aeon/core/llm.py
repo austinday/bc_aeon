@@ -3,17 +3,47 @@ import openai
 import pathlib
 import sys
 import json
+import re
 from typing import Dict
 sys.setrecursionlimit(2000)
 from .system_info import get_runtime_info
 from .logger import get_logger
 
 class LLMClient:
-    """A client for interacting with a Large Language Model."""
-    def __init__(self, provider: str = "grok"):
+    """A client for interacting with Large Language Models (Cloud or Local)."""
+    def __init__(self, provider: str = "local"):
         self.provider = provider
+        self.logger = get_logger()
         
-        if provider == "gemini":
+        # Defaults
+        api_key = None
+        base_url = None
+        
+        # --- 1. LOCAL PROVIDER (The Brain) ---
+        if provider == "local":
+            self.logger.info("Initializing Local Brain (Ollama Backend)...")
+            # GPU 0: Planner (DeepSeek R1)
+            self.planner_client = openai.OpenAI(
+                base_url="http://localhost:8000/v1",
+                api_key="ollama" 
+            )
+            self.planner_model = "deepseek-r1:70b"
+            
+            # GPU 1: Executor (Qwen 2.5)
+            self.executor_client = openai.OpenAI(
+                base_url="http://localhost:8001/v1",
+                api_key="ollama"
+            )
+            self.executor_model = "qwen2.5:72b"
+            
+            self.summarizer_client = self.executor_client
+            self.summarizer_model = self.executor_model
+            
+            self._load_reminders()
+            return
+
+        # --- 2. CLOUD PROVIDERS ---
+        elif provider == "gemini":
             self.strong_model = "gemini-3-pro-preview"
             self.weak_model = "gemini-flash-latest"
             api_key_filename = "gemini_api_key.txt"
@@ -30,37 +60,62 @@ class LLMClient:
             api_key_filename = "grok_api_key.txt"
             base_url = "https://api.x.ai/v1"
         
-        # Load important reminders
-        self.important_reminders_path = pathlib.Path(__file__).parent / "prompts" / "important_reminders.txt"
-        self.important_reminders = ""
-        if self.important_reminders_path.is_file():
-            with open(self.important_reminders_path, 'r') as f:
-                self.important_reminders = f.read().strip()
-        
+        # Load API Key
         api_key_path = pathlib.Path.home() / api_key_filename
-        api_key = None
         if api_key_path.is_file():
             with open(api_key_path, 'r') as f:
                 api_key = f.readline().strip()
 
         if not api_key:
-            raise ValueError(f"{provider.capitalize()} API key not found in ~/{api_key_filename}. Please create this file and add your API key to it.")
+            raise ValueError(f"{provider.capitalize()} API key not found in ~/{api_key_filename}.")
         
-        self.client = openai.OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
-        self.logger = get_logger()
+        # For Cloud, clients are unified
+        self.planner_client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        self.executor_client = self.planner_client
+        self.summarizer_client = self.planner_client
+        
+        self.planner_model = self.strong_model
+        self.executor_model = self.strong_model
+        self.summarizer_model = self.weak_model
+        
+        self._load_reminders()
+
+    def _load_reminders(self):
+        self.important_reminders_path = pathlib.Path(__file__).parent / "prompts" / "important_reminders.txt"
+        self.important_reminders = ""
+        if self.important_reminders_path.is_file():
+            with open(self.important_reminders_path, 'r') as f:
+                self.important_reminders = f.read().strip()
 
     def _add_system_context(self, prompt: str) -> str:
-        """Adds real-time system context to the prompt."""
         runtime_info = get_runtime_info()
         return f"{runtime_info}\n\nUser Prompt:\n{prompt}"
 
-    # --- NEW STATE-BASED METHODS ---
+    def _clean_json_response(self, content: str) -> str:
+        """Extracts JSON from text, handling <think> blocks from R1. Only active for local."""
+        if not content: return ""
+        
+        # 1. Strip <think> blocks (DeepSeek R1 specific)
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        
+        # 2. Extract JSON block if wrapped in markdown
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[0].strip()
+            
+        # 3. Fallback: find first { and last }
+        start = content.find('{')
+        end = content.rfind('}') + 1
+        if start != -1 and end != -1:
+            return content[start:end]
+            
+        return content
+
+    # --- ROUTING LOGIC ---
 
     def get_plan(self, system_context: str, user_objective: str, history_str: str, current_plan: str, last_observation: str) -> str:
-        """Step 1: The Planner. Returns a strategic plan and a next step suggestion."""
+        """ROUTING: Uses the PLANNER (GPU 0 / Strong Model)."""
         prompt = f"""{system_context}
 
 OBJECTIVE: {user_objective}
@@ -78,37 +133,48 @@ INSTRUCTIONS:
 1. Review the Objective, Current Plan, Recent History, and Last Observation.
 2. Look at the meta, higher-level strategic view. 
 3. Determine if the project is progressing, stagnating, or looping.
-4. Review the Recent History for KEY ACCOMPLISHMENTS (e.g., "Docker image built", "Environment verified").
-5. If stagnating, repeating the same fixes (7+ times), or looping, PIVOT immediately. Create a new strategy.
+4. Review the Recent History for KEY ACCOMPLISHMENTS.
+5. If stagnating, repeating the same fixes (7+ times), or looping, PIVOT immediately.
 6. If progressing, refine the Current Plan.
-7. Maintain a section in your `updated_plan` called "## Verified Milestones" to track assets (like built images) that persist even if a specific test fails.
-8. Suggest the IMMEDIATE NEXT ACTION (single tool call suggestion) to move forward.
+7. Suggest the IMMEDIATE NEXT ACTION (single tool call suggestion).
 
 OUTPUT FORMAT:
 You must output a JSON object:
 {{
-  "thought_process": "Analysis of the situation... I have identified these key milestones: ...",
-  "updated_plan": "## Verified Milestones\n- Image built...\n\n## Next Steps\n1. Step one... 2. Step two...",
-  "next_step_suggestion": "Run command 'ls -la' to check files..."
+  "thought_process": "Analysis of the situation...",
+  "updated_plan": "## Verified Milestones\n...\n## Next Steps\n...",
+  "next_step_suggestion": "Run command 'ls -la'..."
 }}
 
 IMPORTANT REMINDERS:
 {self.important_reminders}
 """
-        self.logger.info(f'Full prompt for get_plan: {prompt}')
-        model = self.strong_model
+        self.logger.info(f'Planning with model: {self.planner_model}')
         try:
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=10000,
-                response_format={"type": "json_object"}
-            )
-            return response.choices[0].message.content
+            # STRICT SEPARATION: Cloud vs Local
+            if self.provider == "local":
+                # Local: No JSON enforcement (avoids R1 crash), use Cleaner
+                response = self.planner_client.chat.completions.create(
+                    model=self.planner_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=8192
+                )
+                raw_content = response.choices[0].message.content
+                return self._clean_json_response(raw_content)
+            else:
+                # Cloud: Use JSON enforcement, NO Cleaner (Preserve original behavior)
+                response = self.planner_client.chat.completions.create(
+                    model=self.planner_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=8192,
+                    response_format={"type": "json_object"}
+                )
+                return response.choices[0].message.content
+            
         except Exception as e:
             self.logger.error(f"Planner Error: {e}")
-            # Return a valid JSON structure so the worker doesn't crash
             return json.dumps({
                 "thought_process": f"Error in planning: {e}",
                 "updated_plan": current_plan,
@@ -116,7 +182,7 @@ IMPORTANT REMINDERS:
             })
 
     def get_action(self, system_context: str, plan: str, suggestion: str, open_files_context: str) -> str:
-        """Step 2: The Executor. Returns the specific tool call."""
+        """ROUTING: Uses the EXECUTOR (GPU 1 / Fast Model)."""
         prompt = f"""{system_context}
 
 CURRENT PLAN:
@@ -130,37 +196,37 @@ OPEN FILES (Short Term Memory):
 
 INSTRUCTIONS:
 1. Based on the Plan and Suggestion, formulate the exact JSON for the tool execution.
-2. ACTION CHAINING (Dynamic): You may output a list of actions to be executed sequentially.
-   - **Dynamic Sizing**: You are free to determine the number of actions based on task complexity.
-   - **Simple/Deterministic Tasks**: You may chain up to **15 actions** (e.g. setting up git, creating config files, simple linear shell commands).
-   - **Complex/Uncertain Tasks**: Use **1-3 actions**. If you need to see the output of step A to decide step B, do NOT chain them. Stop and observe.
-   - The execution will stop automatically if any step fails, unless you add "allow_failure": true.
+2. ACTION CHAINING: You may output a list of actions.
 3. Verify you are using valid tools.
-4. If you need to read a file, use open_file. If you need to write, use write_file.
 
 OUTPUT FORMAT:
-MUST be a single valid JSON object with an "actions" key containing a list of tool calls.
-Example: {{"actions": [{{"tool_name": "write_file", "parameters": {{"file_path": "test.py", "content": "..."}}}}, {{"tool_name": "run_command", "parameters": {{"command": "ls missing_file"}}, "allow_failure": true}}]}}
+MUST be a single valid JSON object with an "actions" key.
+Example: {{"actions": [{{"tool_name": "write_file", "parameters": {{"file_path": "test.py", "content": "..."}}}}]}}
 
 IMPORTANT REMINDERS:
 {self.important_reminders}
 """
-        self.logger.info(f'Full prompt for get_action: {prompt}')
-        model = self.strong_model
+        self.logger.info(f'Executing with model: {self.executor_model}')
         try:
-            response = self.client.chat.completions.create(
-                model=model,
+            response = self.executor_client.chat.completions.create(
+                model=self.executor_model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1, 
+                temperature=0.1,
                 max_tokens=4000
             )
-            return response.choices[0].message.content
+            raw_content = response.choices[0].message.content
+            
+            if self.provider == "local":
+                return self._clean_json_response(raw_content)
+            else:
+                return raw_content
+                
         except Exception as e:
             self.logger.error(f"Action Error: {e}")
             return ""
 
     def summarize_execution(self, command_context: str, raw_output: str) -> str:
-        """Step 4: The Observer. Summarizes the raw output."""
+        """ROUTING: Uses the EXECUTOR (GPU 1 / Fast Model)."""
         prompt = f"""You are an Objective Observer.
         
 COMMAND/ACTION RUN:
@@ -171,59 +237,36 @@ RAW OUTPUT/LOGS:
 
 INSTRUCTIONS:
 1. Objectively summarize the output.
-2. HIGHLIGHT ALL ERRORS, WARNINGS, and FAILURES. Do not gloss over them.
-3. Note what was successfully accomplished. Explicitly flag KEY ACCOMPLISHMENTS (e.g., "Docker image successfully built", "Script syntax valid").
-4. If it was a file read, summarize the content relevance.
-5. Be concise but COMPLETE. This summary will be the only record of this action.
-6. Helpful doesn't mean optimistic. It means catching problems early but acknowledging wins.
+2. HIGHLIGHT ALL ERRORS, WARNINGS, and FAILURES.
+3. Note what was successfully accomplished.
+4. Be concise but COMPLETE.
 
 OUTPUT:
 A text summary.
-
-IMPORTANT REMINDERS:
-{self.important_reminders}
 """
-        self.logger.info(f'Full prompt for summarize_execution: {prompt}')
-        model = self.strong_model 
         try:
-            response = self.client.chat.completions.create(
-                model=model,
+            response = self.executor_client.chat.completions.create(
+                model=self.executor_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=10000
+                max_tokens=4096
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"Error summarizing output: {e}. Raw output start: {raw_output[:500]}"
+            return f"Error summarizing output: {e}."
 
     def analyze_interruption(self, current_objective: str, user_input: str) -> Dict[str, str]:
-        """Analyzes user input during a pause to determine intent."""
-        prompt = f"""The user has interrupted the agent's execution loop.
+        """ROUTING: Uses the EXECUTOR (GPU 1 / Fast Model)."""
+        prompt = f"""USER INTERRUPTION ANALYSIS
 CURRENT OBJECTIVE: {current_objective}
 USER INPUT: {user_input}
 
-INSTRUCTIONS:
-Determine the user's intent. Choose exactly one of the following classifications:
-1. "NEW_TASK": The user wants to stop the current task completely and start something entirely new.
-2. "MODIFY_OBJECTIVE": The user wants to keep the current progress/files but slightly alter the goal or constraints.
-3. "ADVICE": The user is giving a hint, correcting a mistake, or providing data to help the agent continuously solve the CURRENT objective.
-
-OUTPUT FORMAT:
-Return a JSON object:
-{{
-  "classification": "NEW_TASK" | "MODIFY_OBJECTIVE" | "ADVICE",
-  "reasoning": "Brief explanation...",
-  "updated_text": "The text to use (e.g., the new objective or the formatted advice string)"
-}}
-
-IMPORTANT REMINDERS:
-{self.important_reminders}
+Determine intent: "NEW_TASK", "MODIFY_OBJECTIVE", or "ADVICE".
+Return JSON: {{ "classification": "...", "reasoning": "...", "updated_text": "..." }}
 """
-        self.logger.info(f'Full prompt for analyze_interruption: {prompt}')
-        model = self.strong_model
         try:
-            response = self.client.chat.completions.create(
-                model=model,
+            response = self.executor_client.chat.completions.create(
+                model=self.executor_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=1000,
@@ -237,31 +280,27 @@ IMPORTANT REMINDERS:
                 "updated_text": user_input
             }
 
-    # --- LEGACY METHODS (Kept for compatibility) ---
-
     def reason(self, prompt: str) -> str:
-        """Legacy reasoner."""
-        final_prompt = self._add_system_context(prompt) + f"\n\nIMPORTANT REMINDERS:\n{self.important_reminders}"
-        self.logger.info(f'Full prompt for reason: {final_prompt}')
+        """ROUTING: Uses the PLANNER (GPU 0 / Strong Model). Used by 'think' tool."""
+        final_prompt = self._add_system_context(prompt)
         try:
-            response = self.client.chat.completions.create(
-                model=self.strong_model,
+            # No forced json for reason tool
+            response = self.planner_client.chat.completions.create(
+                model=self.planner_model,
                 messages=[{"role": "user", "content": final_prompt}],
                 temperature=0.2,
-                max_tokens=30000,
+                max_tokens=8192,
             )
             return response.choices[0].message.content
         except Exception as e:
             return f"Error: {e}"
 
     def summarize_text(self, text_to_summarize: str, query: str) -> str:
-        """Summarizes text (used by search tool)."""
-        system_prompt = f"You are a helpful assistant that summarizes web search results. Provide a concise summary of the following content, focusing on what is most relevant to the user's query: '{query}'\n\nIMPORTANT REMINDERS:\n{self.important_reminders}"
-        full_prompt = f"System: {system_prompt}\nUser: {text_to_summarize}"
-        self.logger.info(f'Full prompt for summarize_text: {full_prompt}')
+        """ROUTING: Uses the SUMMARIZER (Weak Model for Cloud / Executor for Local). Used by 'search' tool."""
+        system_prompt = f"Summarize web search results relevant to: '{query}'"
         try:
-            response = self.client.chat.completions.create(
-                model=self.weak_model,
+            response = self.summarizer_client.chat.completions.create(
+                model=self.summarizer_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": text_to_summarize}
@@ -271,4 +310,4 @@ IMPORTANT REMINDERS:
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"Could not summarize the text due to an error: {e}"
+            return f"Could not summarize text: {e}"
