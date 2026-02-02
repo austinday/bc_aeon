@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y \
     python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR} \
     python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}-venv \
     python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}-dev \
+    python-is-python3 \
     git curl wget vim htop unzip jq build-essential pkg-config cmake \
     libgl1-mesa-glx libglib2.0-0 libpq-dev \
     libpango-1.0-0 libcairo2 libgdk-pixbuf2.0-0 \

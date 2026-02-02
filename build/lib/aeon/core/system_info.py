@@ -6,7 +6,8 @@ from collections import Counter
 from datetime import datetime
 
 # --- Configuration ---
-# Approx 100k tokens * 4 chars/token = 400,000 chars
+# Adjusted for 128k Context Window
+# We allow the tree to take up to 100k tokens, leaving ~28k for conversation/history.
 MAX_TREE_TOKENS = 100000 
 CHARS_PER_TOKEN = 4
 MAX_OUTPUT_CHARS = MAX_TREE_TOKENS * CHARS_PER_TOKEN
@@ -200,11 +201,9 @@ def get_directory_tree_str(startpath='.'):
         return output
 
     # 4. Critical Failure
-    raise RuntimeError(
-        f"CRITICAL: Working directory is too large to represent in context. "
-        f"Even with strict truncation, the tree exceeds {MAX_TREE_TOKENS} tokens. "
-        "Please reorganize your files or use a .gitignore to exclude data directories."
-    )
+    return (f"CRITICAL: Working directory is too large to represent in context. "
+            f"Even with strict truncation, the tree exceeds {MAX_TREE_TOKENS} tokens. "
+            "Please reorganize your files or use a .gitignore to exclude data directories.")
 
 
 def get_runtime_info():
