@@ -119,7 +119,7 @@ class Worker:
             try:
                 iteration += 1
                 
-                # Display max as '∞' if None
+                # Display max as '\u221e' if None
                 display_max = max_iterations if max_iterations is not None else 999
                 
                 if step_callback:
@@ -292,8 +292,46 @@ class Worker:
                 self.recent_history.append({"iteration": iteration, "action": f"Chain: {len(actions)} tools", "summary": summary})
 
             except KeyboardInterrupt:
-                self.print_func(f"\n{C_RED}PAUSED.{C_RESET}")
-                break
+                self.print_func(f"\n{C_RED}PAUSED (User Interrupt).{C_RESET}")
+                try:
+                    self.print_func(f"{C_YELLOW}Interruption Detected. Enter guidance to steer the agent, or press Enter to resume.{C_RESET}")
+                    self.print_func(f"{C_YELLOW}(Type 'exit' or press Ctrl+C again to abort task){C_RESET}")
+                    user_guidance = input(f"{C_BLUE}User Guidance > {C_RESET}")
+                    
+                    if not user_guidance.strip():
+                        self.print_func("Resuming...")
+                        continue
+                        
+                    if user_guidance.lower() in ['exit', 'quit']:
+                        self.print_func("Aborting task.")
+                        break
+
+                    self.print_func("Analyzing interruption...")
+                    analysis = self.llm_client.analyze_interruption(objective, user_guidance)
+                    
+                    intent = analysis.get("classification", "ADVICE")
+                    updated_text = analysis.get("updated_text", user_guidance)
+                    reasoning = analysis.get("reasoning", "")
+                    
+                    self.print_func(f"Interpretation: {intent} ({reasoning})")
+                    
+                    if intent == "NEW_TASK":
+                        self.print_func(f"{C_GREEN}Switching to NEW TASK: {updated_text}{C_RESET}")
+                        objective = updated_text
+                        self._reset_state(initial_observation=f"Task switched by user: {user_guidance}")
+                        self._save_objective(objective)
+                    elif intent == "MODIFY_OBJECTIVE":
+                        self.print_func(f"{C_GREEN}Updating OBJECTIVE: {updated_text}{C_RESET}")
+                        objective = updated_text
+                        self.last_observation = f"USER INTERRUPTION: {user_guidance} (Objective Updated)"
+                        self._save_objective(objective)
+                    else:
+                        self.print_func(f"{C_GREEN}Advice received.{C_RESET}")
+                        self.last_observation = f"USER ADVICE: {user_guidance}"
+                        
+                except (KeyboardInterrupt, EOFError):
+                    self.print_func(f"\n{C_RED}Forced Exit.{C_RESET}")
+                    break
 
     def estimate_tokens(self, text):
         return len(text) // 4

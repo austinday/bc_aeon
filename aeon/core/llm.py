@@ -8,6 +8,7 @@ from typing import Dict
 sys.setrecursionlimit(2000)
 from .system_info import get_runtime_info
 from .logger import get_logger
+from .utils import estimate_tokens
 
 class LLMClient:
     """A client for interacting with Large Language Models (Cloud or Local)."""
@@ -39,6 +40,9 @@ class LLMClient:
             self.summarizer_client = self.executor_client
             self.summarizer_model = self.executor_model
             
+            # Local Guardrail: 128k Limit (Hard Stop)
+            self.context_limit = 128000 
+            
             self._load_reminders()
             return
 
@@ -48,17 +52,20 @@ class LLMClient:
             self.weak_model = "gemini-flash-latest"
             api_key_filename = "gemini_api_key.txt"
             base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            self.context_limit = 1000000 # Gemini has huge context
         elif provider == "gemini-flash":
             self.strong_model = "gemini-flash-latest"
             self.weak_model = "gemini-flash-latest"
             api_key_filename = "gemini_api_key.txt"
             base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            self.context_limit = 1000000
         else:
             # Default to Grok
             self.strong_model = "grok-4-1-fast-reasoning-latest"
             self.weak_model = "grok-4-1-fast-non-reasoning-latest"
             api_key_filename = "grok_api_key.txt"
             base_url = "https://api.x.ai/v1"
+            self.context_limit = 128000
         
         # Load API Key
         api_key_path = pathlib.Path.home() / api_key_filename
@@ -90,6 +97,28 @@ class LLMClient:
     def _add_system_context(self, prompt: str) -> str:
         runtime_info = get_runtime_info()
         return f"{runtime_info}\n\nUser Prompt:\n{prompt}"
+
+    def _check_context_size(self, text: str, model_name: str):
+        """Guardrail: Hard stop if context overflows (Local Only)."""
+        count = estimate_tokens(text)
+        if count > self.context_limit:
+            if self.provider == "local":
+                # STRICT FAIL-FAST FOR LOCAL
+                msg = (f"CONTEXT OVERFLOW: Input size {count} exceeds limit {self.context_limit}. "
+                       "Aborting to prevent silent truncation. "
+                       "Reduce file tree size or history.")
+                # Standard ANSI Red
+                C_RED = '\033[91m'
+                C_RESET = '\033[0m'
+                print(f"\n{C_RED}!!! CRITICAL: {msg} !!!{C_RESET}\n")
+                raise ValueError(msg)
+            else:
+                # WARNING ONLY FOR CLOUD (Grok/Gemini)
+                C_YELLOW = '\033[93m'
+                C_RESET = '\033[0m'
+                print(f"\n{C_YELLOW}!!! WARNING: Context Overflow Detected !!!{C_RESET}")
+                print(f"{C_YELLOW}Sending {count} tokens to {model_name}, but limit is {self.context_limit}.{C_RESET}")
+                print(f"{C_YELLOW}The model will silently truncate the input. Expect amnesia.{C_RESET}\n")
 
     def _clean_json_response(self, content: str) -> str:
         """Extracts JSON from text, handling <think> blocks from R1. Only active for local."""
@@ -149,6 +178,7 @@ You must output a JSON object:
 IMPORTANT REMINDERS:
 {self.important_reminders}
 """
+        self._check_context_size(prompt, self.planner_model)
         self.logger.info(f'Planning with model: {self.planner_model}')
         try:
             # STRICT SEPARATION: Cloud vs Local
@@ -206,6 +236,7 @@ Example: {{"actions": [{{"tool_name": "write_file", "parameters": {{"file_path":
 IMPORTANT REMINDERS:
 {self.important_reminders}
 """
+        self._check_context_size(prompt, self.executor_model)
         self.logger.info(f'Executing with model: {self.executor_model}')
         try:
             response = self.executor_client.chat.completions.create(
@@ -244,6 +275,7 @@ INSTRUCTIONS:
 OUTPUT:
 A text summary.
 """
+        self._check_context_size(prompt, self.executor_model)
         try:
             response = self.executor_client.chat.completions.create(
                 model=self.executor_model,
@@ -283,6 +315,7 @@ Return JSON: {{ "classification": "...", "reasoning": "...", "updated_text": "..
     def reason(self, prompt: str) -> str:
         """ROUTING: Uses the PLANNER (GPU 0 / Strong Model). Used by 'think' tool."""
         final_prompt = self._add_system_context(prompt)
+        self._check_context_size(final_prompt, self.planner_model)
         try:
             # No forced json for reason tool
             response = self.planner_client.chat.completions.create(
@@ -298,6 +331,7 @@ Return JSON: {{ "classification": "...", "reasoning": "...", "updated_text": "..
     def summarize_text(self, text_to_summarize: str, query: str) -> str:
         """ROUTING: Uses the SUMMARIZER (Weak Model for Cloud / Executor for Local). Used by 'search' tool."""
         system_prompt = f"Summarize web search results relevant to: '{query}'"
+        self._check_context_size(text_to_summarize + system_prompt, self.summarizer_model)
         try:
             response = self.summarizer_client.chat.completions.create(
                 model=self.summarizer_model,
