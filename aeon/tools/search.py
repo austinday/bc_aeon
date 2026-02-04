@@ -26,7 +26,10 @@ class SearchWebTool(BaseTool):
         except ImportError:
             pass # tavily_client remains None
 
-    def execute(self, query: str):
+    def execute(self, query: str) -> str:
+        if not query:
+            return "Error: query parameter is required."
+            
         if not self.tavily_client:
             return "Error: Tavily API key not found in ~/tavily_api_key.txt or tavily-python is not installed. The search_web tool is not available."
         
@@ -41,8 +44,9 @@ class SearchWebTool(BaseTool):
             if not context:
                 return f"No search results found for the query: '{query}'"
 
-            summary = self.llm_client.summarize_text(text_to_summarize=context, query=query)
+            # Fixed: use correct parameter names (text, query) not (text_to_summarize, query)
+            summary = self.llm_client.summarize_text(text=context, query=query)
             return summary
 
         except Exception as e:
-            return f"An error occurred during the web search: {e}"
+            return f"An error occurred during the web search: {type(e).__name__}: {e}"

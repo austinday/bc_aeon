@@ -10,8 +10,10 @@ class ImageViewerTool(BaseTool):
             name='image_viewer',
             description='Analyzes an image file using an AI vision model. Params: `image_path` (str), `prompt` (str).'
         )
+        # Unified Model Lake Path
         self.models_base = Path.home() / 'bc_aeon' / 'aeon_models'
-        self.scripts_dir = Path.home() / 'bc_aeon' / 'aeon' / 'scripts'
+        # Dynamic path relative to this installed file
+        self.scripts_dir = Path(__file__).parent.parent / 'scripts'
         self.C_CYAN = '\033[96m'
         self.C_RESET = '\033[0m'
 
@@ -36,6 +38,7 @@ class ImageViewerTool(BaseTool):
             '-u', uid_gid,
             '-e', 'HF_HOME=/tmp/.cache',
             '-e', 'PYTHONPATH=/scripts',
+            # Mount the Unified Model Lake to /models
             '-v', f'{self.models_base}:/models',
             '-v', f'{image_dir}:/data',
             '-v', f'{self.scripts_dir}:/scripts',

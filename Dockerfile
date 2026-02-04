@@ -19,23 +19,23 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # 4. INSTALL SYSTEM-LEVEL DEPENDENCIES
 RUN apt-get update && apt-get install -y \
-    software-properties-common \
+ software-properties-common \
  && add-apt-repository ppa:deadsnakes/ppa \
  && apt-get update \
  && apt-get install -y \
-    python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR} \
-    python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}-venv \
-    python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}-dev \
-    python-is-python3 \
-    git curl wget vim htop unzip jq build-essential pkg-config cmake \
-    libgl1-mesa-glx libglib2.0-0 libpq-dev \
-    libpango-1.0-0 libcairo2 libgdk-pixbuf2.0-0 \
-    nvtop \
+ python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR} \
+ python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}-venv \
+ python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}-dev \
+ python-is-python3 \
+ git curl wget vim htop unzip jq build-essential pkg-config cmake \
+ libgl1-mesa-glx libglib2.0-0 libpq-dev \
+ libpango-1.0-0 libcairo2 libgdk-pixbuf2.0-0 \
+ nvtop \
  && rm -rf /var/lib/apt/lists/*
 
 # 5. INSTALL GOOGLE CLOUD SDK
 RUN apt-get update && apt-get install -y \
-    apt-transport-https ca-certificates gnupg \
+ apt-transport-https ca-certificates gnupg \
  && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list \
  && curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - \
  && apt-get update && apt-get install -y google-cloud-sdk
@@ -45,22 +45,22 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 # 7. PYTHON CORE & SCIENTIFIC LIBS (Parallelized via uv)
 # Note: We use --system to install into the system python environment
-RUN uv pip install --system --no-cache-dir --upgrade pip setuptools wheel twine poetry black flake8 isort mypy jupyter notebook ipykernel ipywidgets cython numba pybind11 \
-    numpy scipy matplotlib pandas scikit-learn tqdm pydantic beautifulsoup4 lxml polars pyarrow zarr lmdb duckdb psycopg2-binary redis pillow opencv-python-headless \
-    pytest pytest-cov pytest-mock
+RUN uv pip install --system --no-cache-dir --upgrade pip setuptools wheel twine poetry black flake8 isort mypy jupyter notebook ipykernel ipywidgets cython numba numba pybind11 numba numexpr numba \
+ numpy scipy matplotlib pandas scikit-learn tqdm pydantic beautifulsoup4 lxml polars pyarrow zarr lmdb duckdb psycopg2-binary redis pillow opencv-python-headless \
+ pytest pytest-cov pytest-mock
 
 # 8. DL & ML (Resolves wheels better to avoid build failures)
 RUN uv pip install --system --no-cache-dir \
-    blinker wandb deepspeed lightning[extra] \
-    "transformers>=4.46.0" "accelerate>=0.26.0" qwen-vl-utils \
-    datasets huggingface_hub \
-    xgboost lightgbm mlflow tensorboard timm
+ blinker wandb deepspeed lightning[extra] \
+ "transformers>=4.46.0" "accelerate>=0.26.0" \
+ datasets "huggingface_hub[cli]" \
+ xgboost lightgbm mlflow tensorboard timm
 
 # 9. OTHER LIBS
 RUN uv pip install --system --no-cache-dir \
-    biopython pysam pybedtools scikit-bio pyro-ppl pymc statsmodels sympy pysr qutip "ray[all]" "dask[complete]" dask-cuda pyspark \
-    google-cloud-storage google-cloud-bigquery google-cloud-aiplatform google-cloud-pubsub gcsfs \
-    seaborn plotly logomaker python-pptx WeasyPrint Jinja2 nbconvert fastapi uvicorn[standard] httpx streamlit gradio flask requests aiohttp
+ biopython pysam pybedtools scikit-bio pyro-ppl pymc statsmodels sympy pysr qutip "ray[all]" "dask[complete]" dask-cuda pyspark \
+ google-cloud-storage google-cloud-bigquery google-cloud-aiplatform google-cloud-pubsub gcsfs \
+ seaborn plotly logomaker python-pptx WeasyPrint Jinja2 nbconvert fastapi uvicorn[standard] httpx streamlit gradio flask aiohttp
 
 # 10. PYTORCH
 RUN uv pip install --system --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_SUFFIX}

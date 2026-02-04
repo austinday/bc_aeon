@@ -1,5 +1,6 @@
 import statistics
 from typing import Dict, Any, List
+from collections import deque
 
 # This is a forward declaration for type hinting to avoid circular import
 if False:
@@ -56,34 +57,41 @@ def summarize_unrecognized_text(analyzer: 'FileAnalyzer') -> Dict[str, Any]:
     return summary
 
 def summarize_log_file(analyzer: 'FileAnalyzer') -> Dict[str, Any]:
+    """Summarizes log files efficiently without loading entire file into memory."""
     try:
-        with open(analyzer.file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-        
-        line_count = len(lines)
-        head = [line.strip() for line in lines[:20]]
-        tail = [line.strip() for line in lines[-100:]] # Increased tail to 100 lines
-
         # Define keywords that indicate a problem, case-insensitively
         problem_keywords = {'error', 'warning', 'failed', 'exception', 'fatal', 'critical', 'traceback'}
         
-        # Use a set to store unique lines containing problem keywords
+        head_lines = []
+        tail_buffer = deque(maxlen=100)  # Keep last 100 lines in memory
         unique_error_lines = set()
-        for line in lines:
-            if any(keyword in line.lower() for keyword in problem_keywords):
-                unique_error_lines.add(line.strip())
-
-        # Convert set to a list for the final JSON
-        error_sample = list(unique_error_lines)
+        line_count = 0
+        
+        with open(analyzer.file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line_count += 1
+                stripped = line.strip()
+                
+                # Collect head
+                if line_count <= 20:
+                    head_lines.append(stripped)
+                
+                # Always add to tail buffer (deque auto-evicts old entries)
+                tail_buffer.append(stripped)
+                
+                # Check for error keywords
+                if any(keyword in line.lower() for keyword in problem_keywords):
+                    unique_error_lines.add(stripped)
 
         return {
             "summary_type": "log_file_summary", 
             "file_format": "log",
             "line_count": line_count,
-            "head_sample": "\n".join(head),
-            "tail_sample": "\n".join(tail),
-            "error_sample": "\n".join(error_sample), # Add the de-duplicated error lines
-            "description": "Log file summary showing the head, tail, and a de-duplicated sample of all lines containing error-related keywords."
+            "head_sample": "\n".join(head_lines),
+            "tail_sample": "\n".join(tail_buffer),
+            "error_sample": "\n".join(list(unique_error_lines)[:50]),  # Limit error samples
+            "unique_error_count": len(unique_error_lines),
+            "description": "Log file summary showing the head, tail, and a de-duplicated sample of lines containing error-related keywords."
         }
     except Exception as e:
         return {"summary_type": "error", "error_message": str(e)}

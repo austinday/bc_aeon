@@ -2,66 +2,66 @@
 set -e
 
 echo "=================================================="
-echo "    STARTING AEON LOCAL BRAIN (OLLAMA ENGINE)       "
+echo "    STARTING AEON LOCAL BRAIN (OLLAMA ENGINE)      "
 echo "=================================================="
 
-# 1. CLEANUP OLD CONTAINERS
-echo "[1/4] Cleaning up..."
-docker stop aeon_planner aeon_executor 2>/dev/null || true
-docker rm aeon_planner aeon_executor 2>/dev/null || true
+# Host Directory for Persistence (Unified Model Lake)
+HOST_OLLAMA_DIR="$HOME/bc_aeon/aeon_models/ollama_home"
 
-# 2. START PLANNER (GPU 0 - DeepSeek R1)
-# Added OLLAMA_KEEP_ALIVE=-1 to prevent unloading
-# Updated OLLAMA_NUM_CTX=131072 (128k) per user request
-echo "[2/4] Launching Planner (DeepSeek R1) on GPU 0..."
+if [ ! -d "$HOST_OLLAMA_DIR" ]; then
+    echo "Error: Model directory not found at $HOST_OLLAMA_DIR"
+    echo "Please run 'bash setup_environment.sh' first."
+    exit 1
+fi
+
+# --- 1. AGGRESSIVE PORT CLEANUP ---
+echo "[1/3] Checking for port conflicts..."
+
+kill_container_on_port() {
+  local PORT=$1
+  local CID=$(docker ps -q --filter "publish=$PORT")
+  if [ ! -z "$CID" ]; then
+    echo "   >> Found container $CID holding port $PORT. Killing..."
+    docker rm -f $CID >/dev/null
+  fi
+}
+
+kill_container_on_port 8000
+kill_container_on_port 8001
+
+# Cleanup names
+names=("aeon_strong_node" "aeon_weak_node")
+for name in "${names[@]}"; do
+  if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
+    echo "   >> Removing old container: $name"
+    docker rm -f $name >/dev/null
+  fi
+done
+
+# --- 2. START STRONG NODE (GPU 0 - Port 8000) ---
+echo "[2/3] Launching Strong Node (GPU 0 -> :8000)..."
+# Mounts the HOST directory directly. No internal volume needed.
 docker run -d \
-    --name aeon_planner \
+    --name aeon_strong_node \
     --gpus '"device=0"' \
-    -v aeon_ollama_planner:/root/.ollama \
+    -v "$HOST_OLLAMA_DIR:/root/.ollama" \
     -e OLLAMA_KEEP_ALIVE=-1 \
     -e OLLAMA_NUM_CTX=131072 \
     -p 8000:11434 \
     ollama/ollama:latest
 
-# 3. START EXECUTOR (GPU 1 - Qwen 2.5)
-# Added OLLAMA_KEEP_ALIVE=-1 to prevent unloading
-# Updated OLLAMA_NUM_CTX=131072 (128k) per user request
-echo "[3/4] Launching Executor (Qwen 2.5) on GPU 1..."
+# --- 3. START WEAK NODE (GPU 1 - Port 8001) ---
+echo "[3/3] Launching Weak Node (GPU 1 -> :8001)..."
+# Mounts the EXACT SAME host directory. Models are shared instantly.
 docker run -d \
-    --name aeon_executor \
+    --name aeon_weak_node \
     --gpus '"device=1"' \
-    -v aeon_ollama_executor:/root/.ollama \
+    -v "$HOST_OLLAMA_DIR:/root/.ollama" \
     -e OLLAMA_KEEP_ALIVE=-1 \
     -e OLLAMA_NUM_CTX=131072 \
     -p 8001:11434 \
     ollama/ollama:latest
 
-# 4. PRE-WARM MODELS (Force Load into VRAM)
-echo "[4/4] Pre-warming models..."
-
-# Wait for Planner API to be live
-echo -n "Waiting for Planner API..."
-until curl -s -f http://localhost:8000/api/tags > /dev/null; do
-    sleep 2
-    echo -n "."
-done
-echo " OK"
-
-# Wait for Executor API to be live
-echo -n "Waiting for Executor API..."
-until curl -s -f http://localhost:8001/api/tags > /dev/null; do
-    sleep 2
-    echo -n "."
-done
-echo " OK"
-
-echo " >> Triggering VRAM Hydration (Sending 'warmup' query)..."
-# We send a short prompt 'warmup' to force the engine to load weights.
-# We set keep_alive to -1 to lock it in memory.
-# We background (&) this so the script finishes, but the GPU will start filling up immediately.
-curl -s http://localhost:8000/api/generate -d '{"model": "deepseek-r1:70b", "prompt": "warmup", "keep_alive": -1}' > /dev/null &
-curl -s http://localhost:8001/api/generate -d '{"model": "qwen2.5:72b", "prompt": "warmup", "keep_alive": -1}' > /dev/null &
-
 echo "=================================================="
-echo "    BRAIN ONLINE. MODELS LOADING IN BACKGROUND.    "
+echo "    BRAIN ONLINE. READY FOR CONNECTIONS.           "
 echo "=================================================="
