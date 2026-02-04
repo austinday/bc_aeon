@@ -10,14 +10,16 @@ class GenerateImageTool(BaseTool):
     def __init__(self):
         super().__init__(
             name="generate_image",
-            description='Generates images. Params: `prompt` (str), `name` (str), `count` (int), `aspect_ratio`. BATCH: `requests` list.'
+            description='Generates images using Tencent HunyuanImage-3.0. Supports Text-to-Image and Image-to-Image. Params: `prompt` (str), `name` (str), `count` (int), `aspect_ratio`, `init_image_path` (optional str for Img2Img). BATCH: `requests` list.'
         )
+        # Anchored to home for persistence
         self.models_base = Path.home() / "bc_aeon" / "aeon_models"
-        self.scripts_dir = Path.home() / "bc_aeon" / "aeon" / "scripts"
+        # Dynamic path relative to this installed file
+        self.scripts_dir = Path(__file__).parent.parent / "scripts"
 
-    def execute(self, output_dir: str, requests: list = None, prompt: str = None, name: str = None, count: int = 1, aspect_ratio: str = "1:1"):
+    def execute(self, output_dir: str, requests: list = None, prompt: str = None, name: str = None, count: int = 1, aspect_ratio: str = "1:1", init_image_path: str = None):
         if requests is None and prompt is not None:
-            requests = [{"prompt": prompt, "name": name, "count": count, "aspect_ratio": aspect_ratio}]
+            requests = [{"prompt": prompt, "name": name, "count": count, "aspect_ratio": aspect_ratio, "init_image_path": init_image_path}]
         
         if not requests:
             return "Error: No prompts provided."
@@ -34,7 +36,6 @@ class GenerateImageTool(BaseTool):
         except Exception as e:
             return f"Error writing request file: {e}"
 
-        # Use legacy runtime to avoid CDI errors on host
         cmd = [
             "docker", "run", "--rm", 
             "--runtime", "nvidia",
@@ -48,6 +49,11 @@ class GenerateImageTool(BaseTool):
             "--requests_file", f"/output/{req_filename}",
             "--output_dir", "/output"
         ]
+
+        # Mount init image dir if needed
+        if init_image_path and os.path.exists(init_image_path):
+             init_dir = os.path.dirname(os.path.abspath(init_image_path))
+             cmd.extend(["-v", f"{init_dir}:/input_images"])
 
         try:
             print(f"Aeon Vision: Processing {len(requests)} image request(s) on GPU 1...")

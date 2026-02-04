@@ -18,19 +18,19 @@ class OpenFileTool(BaseTool):
 
     def execute(self, file_path: str) -> str:
         if not file_path:
-            raise ValueError("file_path parameter is required.")
+            return "Error: file_path parameter is required."
         
         abs_path = os.path.abspath(file_path)
         if not os.path.exists(abs_path):
             return f"Error: File not found: {file_path}"
         if os.path.isdir(abs_path):
-            return f"Error: {file_path} is a directory."
+            return f"Error: {file_path} is a directory. Use run_command with 'ls' to list contents."
         
         file_size = os.path.getsize(abs_path)
         if file_size > MAX_FILE_READ_SIZE:
              # Deterministic rejection of large files
-             return (f"File '{file_path}' is too large ({file_size} bytes) to open directly. "
-                     f"Limit is {MAX_FILE_READ_SIZE} bytes. Please use a script (python/bash) "
+             return (f"File '{file_path}' is too large ({file_size:,} bytes) to open directly. "
+                     f"Limit is {MAX_FILE_READ_SIZE:,} bytes. Please use a script (python/bash) "
                      "to analyze this file and print relevant details.")
 
         ext = os.path.splitext(abs_path)[1].lower()
@@ -52,12 +52,14 @@ class OpenFileTool(BaseTool):
                 with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
 
-            # Update Worker State
-            self.worker.update_open_file(file_path, content)
+            # Update Worker State with absolute path for consistency
+            self.worker.update_open_file(abs_path, content)
             return f"File '{file_path}' opened in Short Term Memory."
 
+        except UnicodeDecodeError as e:
+            return f"Error: File appears to be binary or has encoding issues: {e}"
         except Exception as e:
-            return f"Error opening file: {e}"
+            return f"Error opening file: {type(e).__name__}: {e}"
 
     def _truncate(self, text):
         s = str(text)
@@ -103,14 +105,14 @@ class OpenFileTool(BaseTool):
                     sample = {k: self._truncate(v) for k, v in sample.items()}
                 else:
                     sample = self._truncate(sample)
-                content = f"Schema: {schema}\nSample Item 0: {json.dumps(sample, indent=2)}"
+                content = f"Schema: {schema}\nLength: {len(data)} items\nSample Item 0: {json.dumps(sample, indent=2)}"
             else:
                 content = "Schema: Empty List"
         elif isinstance(data, dict):
             keys = list(data.keys())
             # Shallow truncated sample
             sample = {k: self._truncate(v) for k, v in data.items() if isinstance(v, (str, int, float, bool))}
-            content = f"Top-level Keys: {keys}\nShallow Sample: {json.dumps(sample, indent=2)}"
+            content = f"Top-level Keys ({len(keys)}): {keys[:20]}{'...' if len(keys) > 20 else ''}\nShallow Sample: {json.dumps(sample, indent=2)}"
         else:
             content = f"JSON Content: {self._truncate(data)}"
         
@@ -139,6 +141,8 @@ class CloseFileTool(BaseTool):
         self.worker = worker
 
     def execute(self, file_path: str) -> str:
+        if not file_path:
+            return "Error: file_path parameter is required."
         if self.worker.close_file(file_path):
             return f"File '{file_path}' closed."
         return f"File '{file_path}' was not open."
@@ -153,19 +157,24 @@ class WriteFileTool(BaseTool):
 
     def execute(self, file_path: str, content: str) -> str:
         if not file_path:
-            raise ValueError("file_path parameter is required.")
+            return "Error: file_path parameter is required."
         if content is None:
-            raise ValueError("content parameter is required.")
+            return "Error: content parameter is required (can be empty string)."
             
         if content.startswith("base64:"):
-            content_decoded = base64.b64decode(content[6:]).decode("utf-8")
+            try:
+                content_decoded = base64.b64decode(content[7:]).decode("utf-8")
+            except Exception as e:
+                return f"Error decoding base64 content: {e}"
         else:
             content_decoded = content
 
         abs_path = os.path.abspath(file_path)
         try:
-            # Ensure dir exists
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            # Ensure parent directory exists (handle files in current dir correctly)
+            parent_dir = os.path.dirname(abs_path)
+            if parent_dir:  # Only makedirs if there's actually a parent directory
+                os.makedirs(parent_dir, exist_ok=True)
             
             with open(abs_path, 'w', encoding='utf-8') as f:
                 f.write(content_decoded)
@@ -177,5 +186,7 @@ class WriteFileTool(BaseTool):
                 return f"Successfully wrote to {file_path}. (File closed from memory to ensure freshness)."
             
             return f"Successfully wrote to {file_path}."
+        except PermissionError:
+            return f"Error: Permission denied writing to {file_path}"
         except Exception as e:
-            return f"Error writing file: {e}"
+            return f"Error writing file: {type(e).__name__}: {e}"

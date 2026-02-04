@@ -12,7 +12,10 @@ class RunCommandTool(BaseTool):
             description='Executes shell commands. Returns FULL output for analysis. NEVER use run_command for opening files, use open_file instead. Params: `command` (str), optional `timeout` (int, default 300). Example: `{"tool_name": "run_command", "parameters": {"command": "ls -la"}}`'
         )
 
-    def execute(self, command: str, timeout: int = 300):
+    def execute(self, command: str, timeout: int = 300) -> str:
+        if not command:
+            return "Error: command parameter is required."
+            
         effective_timeout = timeout if timeout > 0 else None
         output_lines = []
         start_time = time.time()
@@ -39,6 +42,7 @@ class RunCommandTool(BaseTool):
                 # Check timeout (Note: readline may block if no output, delaying this check)
                 if effective_timeout and (time.time() - start_time > effective_timeout):
                     process.kill()
+                    process.wait()  # Ensure process is cleaned up
                     output = "".join(output_lines)
                     return f"Error: Command timed out after {timeout} seconds.\nPartial Output:\n{output}"
 
@@ -63,8 +67,10 @@ class RunCommandTool(BaseTool):
                 
             return f"COMMAND SUCCESS\n\nOUTPUT:\n{output}"
 
+        except FileNotFoundError:
+            return "Error: /bin/bash not found. Cannot execute shell commands."
         except Exception as e:
-            return f"An error occurred while running the command: {e}"
+            return f"An error occurred while running the command: {type(e).__name__}: {e}"
 
 class TaskCompleteTool(BaseTool):
     """A tool to signal that the task is complete."""
@@ -73,7 +79,7 @@ class TaskCompleteTool(BaseTool):
             name="task_complete",
             description='End task. Use when objective is met. Params: `reason` (str). Example: `{"tool_name": "task_complete", "parameters": {"reason": "All tests passed."}}`'
         )
-    def execute(self, reason: str):
+    def execute(self, reason: str = "Task completed.") -> str:
         return f"Task marked as complete with reason: {reason}"
 
 class GetUserInputTool(BaseTool):
@@ -83,5 +89,5 @@ class GetUserInputTool(BaseTool):
             name="get_user_input",
             description='Ask user for input. Use to pause for clarification. Params: `prompt` (str). Example: `{\"tool_name\": \"get_user_input\", \"parameters\": {\"prompt\": \"Confirm deletion?\"}}`'
         )
-    def execute(self, prompt: str):
+    def execute(self, prompt: str = "Please provide input:") -> str:
         return f"Awaiting user input with prompt: {prompt}"
