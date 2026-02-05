@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import time
+import signal
 from .base import BaseTool
 
 class RunCommandTool(BaseTool):
@@ -9,7 +10,7 @@ class RunCommandTool(BaseTool):
     def __init__(self):
         super().__init__(
             name="run_command",
-            description='Executes shell commands. Returns FULL output for analysis. NEVER use run_command for opening files, use open_file instead. Params: `command` (str), optional `timeout` (int, default 300). Example: `{"tool_name": "run_command", "parameters": {"command": "ls -la"}}`'
+            description='Executes shell commands on the HOST machine. Params: `command` (str), `timeout` (int).'
         )
 
     def execute(self, command: str, timeout: int = 300) -> str:
@@ -20,31 +21,26 @@ class RunCommandTool(BaseTool):
         output_lines = []
         start_time = time.time()
         
-        # WRAPPER FIX: Source .bashrc to ensure environment (paths, aliases) matches interactive user session.
-        # We use /bin/bash explicitly because /bin/sh does not support 'source'.
         wrapped_command = f"source ~/.bashrc 2>/dev/null; {command}"
 
+        process = None
         try:
-            # Use Popen to stream output
             process = subprocess.Popen(
                 wrapped_command,
                 shell=True,
-                executable="/bin/bash", # Required for 'source' to work
+                executable="/bin/bash",
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, # Merge stderr into stdout
+                stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                bufsize=1 # Line buffered
+                bufsize=1
             )
             
             while True:
-                # Check timeout (Note: readline may block if no output, delaying this check)
                 if effective_timeout and (time.time() - start_time > effective_timeout):
                     process.kill()
-                    process.wait()  # Ensure process is cleaned up
-                    output = "".join(output_lines)
-                    return f"Error: Command timed out after {timeout} seconds.\nPartial Output:\n{output}"
+                    return f"Error: Command timed out after {timeout} seconds.\nPartial Output:\n{''.join(output_lines)}"
 
                 line = process.stdout.readline()
                 
@@ -52,7 +48,6 @@ class RunCommandTool(BaseTool):
                     break
                 
                 if line:
-                    # Print to real terminal for user visibility
                     print(line, end='', flush=True)
                     output_lines.append(line)
             
@@ -67,27 +62,29 @@ class RunCommandTool(BaseTool):
                 
             return f"COMMAND SUCCESS\n\nOUTPUT:\n{output}"
 
-        except FileNotFoundError:
-            return "Error: /bin/bash not found. Cannot execute shell commands."
+        except KeyboardInterrupt:
+            # Kill the subprocess but let the exception propagate to worker loop
+            # The worker loop has an interactive dialog for user guidance
+            print("\n[RunCommand] Interrupted! Stopping subprocess...", flush=True)
+            if process:
+                try:
+                    process.kill()  # Send SIGKILL (cannot be ignored)
+                    process.wait(timeout=1)  # Briefly wait to reap zombie
+                except: pass
+            # Re-raise to worker loop which handles user interaction
+            raise
+
         except Exception as e:
             return f"An error occurred while running the command: {type(e).__name__}: {e}"
 
 class TaskCompleteTool(BaseTool):
-    """A tool to signal that the task is complete."""
     def __init__(self):
-        super().__init__(
-            name="task_complete",
-            description='End task. Use when objective is met. Params: `reason` (str). Example: `{"tool_name": "task_complete", "parameters": {"reason": "All tests passed."}}`'
-        )
+        super().__init__(name="task_complete", description='End task. Params: `reason` (str).')
     def execute(self, reason: str = "Task completed.") -> str:
         return f"Task marked as complete with reason: {reason}"
 
 class GetUserInputTool(BaseTool):
-    """A tool to signal a request for user input."""
     def __init__(self):
-        super().__init__(
-            name="get_user_input",
-            description='Ask user for input. Use to pause for clarification. Params: `prompt` (str). Example: `{\"tool_name\": \"get_user_input\", \"parameters\": {\"prompt\": \"Confirm deletion?\"}}`'
-        )
+        super().__init__(name="get_user_input", description='Ask user for input. Params: `prompt` (str).')
     def execute(self, prompt: str = "Please provide input:") -> str:
         return f"Awaiting user input with prompt: {prompt}"

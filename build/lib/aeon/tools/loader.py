@@ -5,6 +5,10 @@ import os
 from typing import List, Dict, Any
 from aeon.tools.base import BaseTool
 
+# ANSI Colors for loud failures
+C_RED = '\033[91m'
+C_RESET = '\033[0m'
+
 def load_tools_from_directory(
     package_name: str = "aeon.tools", 
     dependencies: Dict[str, Any] = None,
@@ -16,7 +20,8 @@ def load_tools_from_directory(
     try:
         package = importlib.import_module(package_name)
     except ImportError as e:
-        if verbose: print(f"Error importing package {package_name}: {e}")
+        if verbose: 
+            print(f"{C_RED}CRITICAL ERROR: Could not import tool package {package_name}: {e}{C_RESET}")
         return []
 
     for _, module_name, _ in pkgutil.iter_modules(package.__path__):
@@ -51,7 +56,9 @@ def load_tools_from_directory(
                                 found_tools.append(tool_instance)
                                 if verbose: print(f"Loaded tool: {tool_instance.name}")
                         except Exception as e:
-                            if verbose: print(f"Failed to load {name}: {e}")
+                            if verbose: 
+                                print(f"{C_RED}FAILED to initialize tool {name}: {e}{C_RESET}")
         except Exception as e:
-            if verbose: print(f"Error in module {module_name}: {e}")
+            if verbose: 
+                print(f"{C_RED}ERROR loading module {module_name}: {e}{C_RESET}")
     return found_tools

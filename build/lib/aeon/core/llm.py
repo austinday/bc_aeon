@@ -21,9 +21,10 @@ class LLMClient:
         
         # --- 1. LOCAL PROVIDER ---
         if provider == "local":
+            # Single Brain Node on Port 8000 handles both models
             self.planner_client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="ollama")
             self.planner_model = local_strong or "deepseek-r1:70b"
-            self.executor_client = openai.OpenAI(base_url="http://localhost:8001/v1", api_key="ollama")
+            self.executor_client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="ollama")
             self.executor_model = local_weak or "qwen2.5:72b"
             self.summarizer_client = self.executor_client
             self.summarizer_model = self.executor_model
@@ -67,53 +68,137 @@ class LLMClient:
             self.logger.warning(f"Failed to write to debug log: {e}")
 
     def _clean_json_response(self, content: str) -> str:
-        """Clean LLM response to extract JSON, removing think tags and markdown fences."""
+        """Clean LLM response to extract JSON, handling common LLM formatting quirks."""
         if not content:
             return "{}"
         
-        # Remove <think> tags and their content
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        # Remove <think> tags and their content (including orphaned closing tags)
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+        content = re.sub(r'</think>', '', content)
+        content = re.sub(r'<think>', '', content)
         
-        # Try to find JSON object
+        # Remove markdown code fences
+        content = re.sub(r'```json\s*', '', content)
+        content = re.sub(r'```\s*', '', content)
+        
+        content = content.strip()
+        
+        # Use brace matching to find the first complete JSON object
+        # This handles text before/after the JSON
+        brace_count = 0
+        json_start = -1
+        json_end = -1
+        in_string = False
+        escape_next = False
+        
+        for i, char in enumerate(content):
+            if escape_next:
+                escape_next = False
+                continue
+            if char == '\\':
+                escape_next = True
+                continue
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == '{':
+                if json_start == -1:
+                    json_start = i
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and json_start != -1:
+                    json_end = i + 1
+                    break
+        
+        if json_start != -1 and json_end != -1:
+            return content[json_start:json_end]
+        
+        # Fallback: try simple regex
         match = re.search(r'\{.*\}', content, re.DOTALL)
         if match:
             return match.group(0)
         
-        # If no JSON found, return empty object to avoid parse errors
         self.logger.warning(f"No JSON object found in response: {content[:200]}...")
         return "{}"
 
-    def get_plan(self, prompt: str) -> str:
-        """Get plan from planner LLM. Single prompt argument for simplicity."""
-        try:
-            resp = self.planner_client.chat.completions.create(
-                model=self.planner_model, 
-                messages=[{"role": "user", "content": prompt}], 
-                temperature=0.3
-            )
-            raw = resp.choices[0].message.content
-            self._log_to_debug("PLANNER", self.planner_model, prompt, raw)
-            return self._clean_json_response(raw)
-        except Exception as e:
-            self._log_to_debug("PLANNER_ERR", self.planner_model, prompt, str(e))
-            self.logger.error(f"Planner LLM call failed: {e}")
-            raise
+    def get_plan(self, prompt: str, max_retries: int = 3) -> str:
+        """Get plan from planner LLM with retry logic for JSON parsing errors."""
+        current_prompt = prompt
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                resp = self.planner_client.chat.completions.create(
+                    model=self.planner_model, 
+                    messages=[{"role": "user", "content": current_prompt}], 
+                    temperature=0.3
+                )
+                raw = resp.choices[0].message.content
+                self._log_to_debug("PLANNER", self.planner_model, current_prompt, raw)
+                
+                cleaned = self._clean_json_response(raw)
+                
+                # Validate JSON parsing
+                try:
+                    json.loads(cleaned)
+                    return cleaned
+                except json.JSONDecodeError as e:
+                    last_error = f"JSON parse error: {str(e)}"
+                    self.logger.warning(f"Planner attempt {attempt + 1}/{max_retries} failed: {last_error}")
+                    
+                    if attempt < max_retries - 1:
+                        # Add error feedback to prompt for retry
+                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE HAD INVALID JSON **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output ONLY a valid JSON object. No text before {{ or after }}. Use double quotes only."
+                    
+            except Exception as e:
+                self._log_to_debug("PLANNER_ERR", self.planner_model, current_prompt, str(e))
+                self.logger.error(f"Planner LLM call failed: {e}")
+                raise
+        
+        # All retries exhausted, return empty but valid JSON
+        self.logger.error(f"Planner failed after {max_retries} attempts. Last error: {last_error}")
+        return '{}'
 
-    def get_action(self, prompt: str) -> str:
-        """Get action from executor LLM. Single prompt argument for simplicity."""
-        try:
-            resp = self.executor_client.chat.completions.create(
-                model=self.executor_model, 
-                messages=[{"role": "user", "content": prompt}], 
-                temperature=0.1
-            )
-            raw = resp.choices[0].message.content
-            self._log_to_debug("EXECUTOR", self.executor_model, prompt, raw)
-            return self._clean_json_response(raw)
-        except Exception as e:
-            self._log_to_debug("EXEC_ERR", self.executor_model, prompt, str(e))
-            self.logger.error(f"Executor LLM call failed: {e}")
-            raise
+    def get_action(self, prompt: str, max_retries: int = 3) -> str:
+        """Get action from executor LLM with retry logic for JSON parsing errors."""
+        current_prompt = prompt
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                resp = self.executor_client.chat.completions.create(
+                    model=self.executor_model, 
+                    messages=[{"role": "user", "content": current_prompt}], 
+                    temperature=0.1
+                )
+                raw = resp.choices[0].message.content
+                self._log_to_debug("EXECUTOR", self.executor_model, current_prompt, raw)
+                
+                cleaned = self._clean_json_response(raw)
+                
+                # Validate JSON parsing
+                try:
+                    json.loads(cleaned)
+                    return cleaned
+                except json.JSONDecodeError as e:
+                    last_error = f"JSON parse error: {str(e)}"
+                    self.logger.warning(f"Executor attempt {attempt + 1}/{max_retries} failed: {last_error}")
+                    
+                    if attempt < max_retries - 1:
+                        # Add error feedback to prompt for retry
+                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE HAD INVALID JSON **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output ONLY a valid JSON object. No text before {{ or after }}. Use double quotes only."
+                    
+            except Exception as e:
+                self._log_to_debug("EXEC_ERR", self.executor_model, current_prompt, str(e))
+                self.logger.error(f"Executor LLM call failed: {e}")
+                raise
+        
+        # All retries exhausted, return empty but valid JSON
+        self.logger.error(f"Executor failed after {max_retries} attempts. Last error: {last_error}")
+        return '{"actions": []}'
 
     def analyze_milestones(self, analysis_context: str) -> Dict:
         """Analyze iteration results to identify completed milestones.
@@ -140,9 +225,19 @@ class LLMClient:
             self.logger.warning(f"Milestone analysis failed: {e}")
             return {}
 
+    def _truncate_with_tail(self, text: str, head_len: int = 500, tail_len: int = 1000) -> str:
+        """Truncate text keeping both head (context) and tail (errors)."""
+        if len(text) <= (head_len + tail_len):
+            return text
+        return text[:head_len] + f"\n... [TRUNCATED {len(text) - (head_len + tail_len)} CHARS] ...\n" + text[-tail_len:]
+
     def summarize_execution(self, ctx, raw_out) -> str:
         """Summarize execution output for history."""
-        prompt = f"Summarize this execution result concisely:\nContext: {ctx}\nOutput: {raw_out}"
+        # Smart truncate before sending to LLM to prevent context overflow
+        # Use a generous 20k window for the LLM context, biasing towards tail (error logs)
+        safe_out = self._truncate_with_tail(raw_out, head_len=4000, tail_len=16000)
+        
+        prompt = f"Summarize this execution result. IF THE OUTPUT CONTAINS ERRORS, FAILURES, OR EXIT CODE 1, YOU MUST STATE THIS CLEARLY AT THE START. Context: {ctx}\nOutput: {safe_out}"
         try:
             resp = self.summarizer_client.chat.completions.create(
                 model=self.summarizer_model, 
@@ -151,8 +246,12 @@ class LLMClient:
             return resp.choices[0].message.content
         except Exception as e:
             self.logger.warning(f"Summarize execution failed: {e}")
-            # Fallback: truncate raw output
-            return raw_out[:500] + "..." if len(raw_out) > 500 else raw_out
+            # LOUD FAILURE: Explicitly report the crash to the agent
+            tail_sample = raw_out[-1000:] if len(raw_out) > 1000 else raw_out
+            return (f"!! SYSTEM ERROR: SUMMARIZATION FAILED !!\n"
+                    f"Reason: {str(e)}\n"
+                    f"Output Length: {len(raw_out)}\n"
+                    f"--- RAW TAIL (Last 1000 chars) ---\n{tail_sample}")
 
     def analyze_interruption(self, obj, inp) -> Dict:
         """Analyze user interruption to classify intent."""

@@ -22,19 +22,10 @@ C_RESET = '\033[0m'
 C_BLUE = '\033[94m'
 
 # Planner prompt sections
-PLANNER_INSTRUCTIONS = """You are the Planning Agent. Your task is to analyze the full context (objective, history, observations, milestones, system state) and create a strategic plan.
+PLANNER_INSTRUCTIONS = """CRITICAL: Your response must be ONLY a valid JSON object. No text before the opening {. No text after the closing }. Use double quotes (") only, never single quotes ('). No markdown formatting or code fences.
 
-**Your Responsibilities:**
-1. Assess current progress toward the objective
-2. Identify what has been completed vs what remains
-3. Plan multiple steps ahead when the path is clear
-4. Suggest concrete next actions with tool names and key parameters
-5. Flag risks or uncertainties that require caution
-
-**Planning Strategy:**
-- For simple/conversational/boilerplate tasks: suggest multiple actions per iteration
-- For complex/risky/uncertain tasks: suggest one action at a time for tighter feedback loops
-- If objective is trivially satisfied (e.g., user just said 'hi'): plan to respond and conclude
+**Instructions**
+You are a high level planning agent. You will analyze the full context given (objectives, history, observations, milestones, system state, etc...) and create a strategic plan for how to achieve and validate the successful implementation of the objective from the current project state. Asses the current state of the project, what has been completed and what is still needed. Plan multiple steps ahead when the path is clear or conversational, if conversational, respond and conclude. Plan one step ahead if the next step is unclear, high risk, or complex. Internally, plan ahead step by step and consider multiple paths and solutions to get to the objective. For very complex tasks, consider using the conduct_research tool. Consider the probabilities of all the possible paths, then suggest the most probable solution, but consider alternative paths as suggestions or risks to be aware of. You will be responsible for outputting an analysis of the current state and progress, the updated plan for how to achieve the objective from the current state, the next actions with suggestions for actual tool calls, at a high level, the iteration strategy, and the risks. Adhere strictly to the output format.
 
 **Output Format:**
 You must output a JSON object:
@@ -47,10 +38,24 @@ You must output a JSON object:
   ],
   "iteration_strategy": "single_step" | "multi_step",
   "risk_notes": "Any concerns or things to watch for"
-}"""
+}
+
+WRONG (will cause errors):
+- {'analysis': ...}  <- Single quotes are invalid JSON
+- ```json {...} ```  <- Markdown fences break parsing
+- Let me think... {...}  <- Text before JSON
+- {...} I'll explain...  <- Text after JSON
+- {...},  <- Trailing comma
+
+CORRECT:
+{"analysis": "...", "updated_plan": "...", "next_actions": [...], "iteration_strategy": "...", "risk_notes": "..."}
+
+Output ONLY the JSON object now:"""
 
 # Executor prompt sections  
-EXECUTOR_INSTRUCTIONS = """You are the Execution Agent. Your task is to translate the plan into concrete tool calls.
+EXECUTOR_INSTRUCTIONS = """CRITICAL: Your response must be ONLY a valid JSON object. No text before the opening {. No text after the closing }. Use double quotes (") only, never single quotes ('). No markdown formatting or code fences.
+
+You are the Execution Agent. Your task is to translate the plan into concrete tool calls.
 
 **Your Responsibilities:**
 1. Read the current plan and suggested next actions
@@ -69,7 +74,19 @@ You MUST output a JSON object with an "actions" list:
 {"actions": [{"tool_name": "say_to_user", "parameters": {"message": "Hello!"}}, {"tool_name": "task_complete", "parameters": {"reason": "Greeted user as requested."}}]}
 
 Another example with allow_failure:
-{"actions": [{"tool_name": "run_command", "parameters": {"command": "ls -la"}, "allow_failure": true}]}"""
+{"actions": [{"tool_name": "run_command", "parameters": {"command": "ls -la"}, "allow_failure": true}]}
+
+WRONG (will cause errors):
+- {'actions': [...]}  <- Single quotes are invalid JSON
+- ```json {...} ```  <- Markdown fences break parsing
+- Let me analyze... {...}  <- Text before JSON
+- {...} Now I'll explain...  <- Text after JSON
+- {"actions": [...],}  <- Trailing comma
+
+CORRECT:
+{"actions": [{"tool_name": "run_command", "parameters": {"command": "ls"}}]}
+
+Output ONLY the JSON object now:"""
 
 MILESTONE_ANALYZER_INSTRUCTIONS = """**Instructions**
 You are analyzing the results of the most recent agent iteration to determine if any significant MILESTONES were achieved.
@@ -199,7 +216,7 @@ class Worker:
             self.logger.error(f"Failed to save objective to file: {e}")
 
     def _build_planner_context(self, tool_list_str: str, system_specs: str, 
-                                milestones_str: str, objective: str, history_str: str) -> str:
+                                milestones_str: str, objective: str, history_str: str, open_files_str: str) -> str:
         """Build the complete planner prompt with instructions at the end."""
         return f"""{self.base_directives}
 
@@ -215,6 +232,9 @@ class Worker:
 
 **Completed Milestones (Foundational Progress)**
 {milestones_str}
+
+**Open Files (Working Memory)**
+{open_files_str}
 
 **Objective**
 {objective}
@@ -371,10 +391,11 @@ Result:
                 tool_list_str = self._get_tools_description()
                 milestones_str = self._format_milestones()
                 history_str = self._format_history()
+                open_files_str = self._format_open_files()
                 
                 # Build planner prompt (instructions at end for emphasis)
                 planner_prompt = self._build_planner_context(
-                    tool_list_str, system_specs, milestones_str, objective, history_str
+                    tool_list_str, system_specs, milestones_str, objective, history_str, open_files_str
                 )
 
                 # --- PLANNER ---
@@ -419,7 +440,7 @@ Result:
                 if step_callback:
                     step_callback(iteration, display_max, "Executing")
 
-                open_files_str = self._format_open_files()
+                # open_files_str is already generated above for the planner
                 
                 # Build executor prompt (separate from planner, instructions at end)
                 executor_prompt = self._build_executor_context(

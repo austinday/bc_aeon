@@ -1,24 +1,11 @@
-**IMPORTANT Docker Directives & Hierarchy**
-
-1) THE GOLDEN RULE: "EXTEND, DON'T HACK"
-   - Never run `pip install` or `apt-get install` inside a transient `run_command` string.
-   - Never install packages on the host machine.
-
-2) THE WORKFLOW:
-   STEP A: Identify the Base.
-     - Use `aeon_base:py3.10-cuda12.1` as your base image for general logic/ml.
-   STEP B: Check Dependencies.
-     - If the base image has what you need: Use it directly.
-     - If you need NEW packages: Create a `Dockerfile` that inherits from the base.
-       ```dockerfile
-       FROM aeon_base:py3.10-cuda12.1
-       RUN pip install pandas matplotlib
-       ```
-   STEP C: Build.
-     - `docker build -t project_specific_name .`
-   STEP D: Run.
-     - `docker run --rm -v $(pwd):/workspace -w /workspace -u $(id -u):$(id -g) project_specific_name python script.py`
-
-3) TRANSPARENCY NOTE:
-   - Tools like `image_viewer` or `conduct_research` manage their own containers internally. You do not need to manually wrap them.
-   - YOU are responsible for wrapping your own logic (scripts, file ops, analysis) in Docker containers using the workflow above.
+**IMPORTANT Docker Directives**
+1) For every complex project, run scripts using a .sh script that calls the .py script using a Docker container.
+2) No Docker for simple edits or answers
+3) Docker MUST be used for managing environments, adapt other methods into docker
+4) Use of existing Dockerfile/image/container is allowed, but use pre-built images if possible.
+5) Use DEBIAN_FRONTEND=noninteractive apt-get install -y when installing packages to prevent interactive prompts.
+6) Available pre-built images to use: aeon_base:py3.10-cuda12.1
+7) Add -u $(id -u):$(id -g) to all docker container commands
+8) GPU ACCESS: ALWAYS add `--gpus all` to docker run commands when GPU/CUDA is needed. Without this flag, the container has NO GPU access even if the host has GPUs.
+9) TWO WORLDS DOCTRINE: The Host (World A) orchestrates Docker; the Container (World B) runs code. Host files are invisible to the Container unless you explicitly COPY them during build or mount (-v) them at runtime.
+10) VOLUME MOUNTING: To give the container access to host files at runtime, use `-v /host/path:/container/path`. Example: `-v $(pwd):/workspace -v ~/huggingface_access_token.txt:/root/.cache/huggingface/token`

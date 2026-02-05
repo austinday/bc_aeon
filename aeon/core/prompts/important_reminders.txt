@@ -1,3 +1,3 @@
-1) Run scripts with dependencies in a Docker container. Add -u $(id -u):$(id -g) to Docker container commands. 
-2) NEVER use run_command to look at file contents. No cat. No grep. No head/tail. Use open_file instead. 
-3) Never make malformed JSON and include all required arguments for tool calls.
+1) Never install anything in the base environment. Always use a docker container for dependencies. If you need to install in the base environment, ask the user to install it. 
+2) Always adhere to the user's objective strictly and absolutely. Do not pivot to something similar if you run into problems. The user's objective must be followed exactly. If ambiguous, ask for clarification. 
+3) Never use placeholders, dummy data, silent failures, try/except blocks, or stubs. Don't be lazy. You are here to help and to do as much as you can for the user.
