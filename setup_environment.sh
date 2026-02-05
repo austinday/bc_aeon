@@ -23,6 +23,9 @@ OLLAMA_MODELS=(
  "gemma3:27b"
  "phi4:14b"
  "deepcoder:14b"
+ "hf.co/TeichAI/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-GGUF:Q4_K_M"
+ "hf.co/TeichAI/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-GGUF:Q8_0"
+ "hf.co/TeichAI/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-GGUF:F16"
 )
 
 # Tool Models (Hugging Face Registry)
@@ -64,7 +67,7 @@ log_step "Creating Unified Model Lake at: $MODELS_DIR"
 mkdir -p "$OLLAMA_DIR"
 
 log_step "Stopping any existing Aeon containers..."
-docker stop aeon_strong_node aeon_weak_node aeon_vllm aeon_setup_provisioner >/dev/null 2>&1 || true
+docker stop aeon_brain_node aeon_strong_node aeon_weak_node aeon_vllm aeon_setup_provisioner >/dev/null 2>&1 || true
 docker rm -f aeon_setup_provisioner >/dev/null 2>&1 || true
 
 # =================================================================================================
@@ -78,6 +81,9 @@ docker build -t aeon_base:py3.10-cuda12.1 \
  --build-arg CUDA_VERSION=12.1.1 \
  --build-arg PYTORCH_CUDA_SUFFIX=cu121 \
  .
+
+log_step "Tagging 'aeon_base:latest'..."
+docker tag aeon_base:py3.10-cuda12.1 aeon_base:latest
 
 log_step "Tagging 'aeon_vision' (Aliasing Base)..."
 # Vision alias removed

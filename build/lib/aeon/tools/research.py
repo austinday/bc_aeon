@@ -114,7 +114,10 @@ class ConductResearchTool(BaseTool):
                 check=True, capture_output=True
             )
         except subprocess.CalledProcessError as e:
-            return {"error": f"Failed to start container: {e}"}
+            return {
+                "hypothesis": h_name,
+                "findings": {"summary": "Startup Failed", "details": f"Failed to start Docker container: {e.stderr.decode('utf-8', errors='replace')}"}
+            }
 
         # 2. Setup Tools
         submit_tool = SubmitFindingsTool()
@@ -148,19 +151,33 @@ Your goal is to prove or disprove this hypothesis experimentally.
 4. Use 'submit_findings' to report your conclusion.
 """
         
+        crash_error = None
+        
         # 4. Run
         try:
             # We treat 'submit_findings' as the terminal tool
             sub_worker.run(objective, max_iterations=iterations, terminal_tools=['submit_findings'])
         except Exception as e:
+            crash_error = str(e)
             print(f"[Agent {idx}] Crashed: {e}")
         finally:
             # 5. Cleanup
             subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
+        # Construct findings safely
+        if submit_tool.findings:
+            return {"hypothesis": h_name, "findings": submit_tool.findings}
+        
+        # Fallback if no findings were submitted
+        fail_reason = "Agent timed out or failed to report."
+        fail_details = "No data returned."
+        if crash_error:
+            fail_reason = "Agent Crashed"
+            fail_details = f"Exception encountered: {crash_error}"
+            
         return {
             "hypothesis": h_name,
-            "findings": submit_tool.findings or {"summary": "Agent timed out or failed to report.", "details": "No data."}
+            "findings": {"summary": fail_reason, "details": fail_details}
         }
 
     def execute(self, topic: str, hypotheses: List[Dict[str, str]], image_tag: str = "aeon_base:py3.10-cuda12.1", iterations: int = 15):

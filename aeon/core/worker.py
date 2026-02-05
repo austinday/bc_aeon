@@ -22,35 +22,39 @@ C_RESET = '\033[0m'
 C_BLUE = '\033[94m'
 
 # Planner prompt sections
-PLANNER_INSTRUCTIONS = """You are the Planning Agent. Your task is to analyze the full context (objective, history, observations, milestones, system state) and create a strategic plan.
+PLANNER_INSTRUCTIONS = """CRITICAL: Your response must be ONLY a valid JSON object. No text before the opening {. No text after the closing }. Use double quotes (") only, never single quotes ('). No markdown formatting or code fences.
 
-**Your Responsibilities:**
-1. Assess current progress toward the objective
-2. Identify what has been completed vs what remains
-3. Plan multiple steps ahead when the path is clear
-4. Suggest concrete next actions with tool names and key parameters
-5. Flag risks or uncertainties that require caution
+**Instructions**
+You are a high level planning agent. You will analyze the full context given (objectives, history, observations, milestones, system state, etc...) and create a strategic plan for how to achieve and validate the successful implementation of the objective from the current project state. Asses the current state of the project, what has been completed and what is still needed. Plan multiple steps ahead when the path is clear or conversational, if conversational, respond and conclude. Plan one step ahead if the next step is unclear, high risk, or complex. Internally, plan ahead step by step and consider multiple paths and solutions to get to the objective. For very complex tasks, consider using the conduct_research tool. Consider the probabilities of all the possible paths, then suggest the most probable solution, but consider alternative paths as suggestions or risks to be aware of.
 
-**Planning Strategy:**
-- For simple/conversational/boilerplate tasks: suggest multiple actions per iteration
-- For complex/risky/uncertain tasks: suggest one action at a time for tighter feedback loops
-- If objective is trivially satisfied (e.g., user just said 'hi'): plan to respond and conclude
+**Your job is HIGH-LEVEL THINKING, not crafting tool calls.** Write your next_actions as free-form natural language descriptions of what should be done next. The Executor will translate your ideas into actual tool calls. Do NOT write JSON or structured parameters - just describe the intent.
 
 **Output Format:**
 You must output a JSON object:
 {
   "analysis": "Brief assessment of current state and progress...",
   "updated_plan": "## Remaining Steps\n- [ ] Step 1...\n- [ ] Step 2...",
-  "next_actions": [
-    {"tool": "tool_name", "purpose": "why this action", "key_params": "important parameters"},
-    {"tool": "another_tool", "purpose": "why", "key_params": "params"}
-  ],
+  "next_actions": "Free-form description of what to do next. Example: First, search the web for information about X. Then, write a Dockerfile that includes Y. Finally, run the container to test.",
   "iteration_strategy": "single_step" | "multi_step",
   "risk_notes": "Any concerns or things to watch for"
-}"""
+}
+
+WRONG (will cause errors):
+- {'analysis': ...}  <- Single quotes are invalid JSON
+- ```json {...} ```  <- Markdown fences break parsing
+- Let me think... {...}  <- Text before JSON
+- {...} I'll explain...  <- Text after JSON
+- {...},  <- Trailing comma
+
+CORRECT:
+{"analysis": "...", "updated_plan": "...", "next_actions": [...], "iteration_strategy": "...", "risk_notes": "..."}
+
+Output ONLY the JSON object now:"""
 
 # Executor prompt sections  
-EXECUTOR_INSTRUCTIONS = """You are the Execution Agent. Your task is to translate the plan into concrete tool calls.
+EXECUTOR_INSTRUCTIONS = """CRITICAL: Your response must be ONLY a valid JSON object. No text before the opening {. No text after the closing }. Use double quotes (") only, never single quotes ('). No markdown formatting or code fences.
+
+You are the Execution Agent. Your task is to translate the plan into concrete tool calls.
 
 **Your Responsibilities:**
 1. Read the current plan and suggested next actions
@@ -59,6 +63,7 @@ EXECUTOR_INSTRUCTIONS = """You are the Execution Agent. Your task is to translat
 4. For conversations: respond to user AND use terminal tools (task_complete/get_user_input) to properly end or continue
 
 **Critical Rules:**
+- NEVER return empty actions. You MUST always output at least one tool call.
 - If the objective is conversational (greeting, question, simple request): use say_to_user THEN task_complete or get_user_input
 - Never leave a conversation hanging - always conclude with a terminal action when appropriate
 - Include ALL required parameters for each tool call
@@ -69,7 +74,19 @@ You MUST output a JSON object with an "actions" list:
 {"actions": [{"tool_name": "say_to_user", "parameters": {"message": "Hello!"}}, {"tool_name": "task_complete", "parameters": {"reason": "Greeted user as requested."}}]}
 
 Another example with allow_failure:
-{"actions": [{"tool_name": "run_command", "parameters": {"command": "ls -la"}, "allow_failure": true}]}"""
+{"actions": [{"tool_name": "run_command", "parameters": {"command": "ls -la"}, "allow_failure": true}]}
+
+WRONG (will cause errors):
+- {'actions': [...]}  <- Single quotes are invalid JSON
+- ```json {...} ```  <- Markdown fences break parsing
+- Let me analyze... {...}  <- Text before JSON
+- {...} Now I'll explain...  <- Text after JSON
+- {"actions": [...],}  <- Trailing comma
+
+CORRECT:
+{"actions": [{"tool_name": "run_command", "parameters": {"command": "ls"}}]}
+
+Output ONLY the JSON object now:"""
 
 MILESTONE_ANALYZER_INSTRUCTIONS = """**Instructions**
 You are analyzing the results of the most recent agent iteration to determine if any significant MILESTONES were achieved.
@@ -199,7 +216,7 @@ class Worker:
             self.logger.error(f"Failed to save objective to file: {e}")
 
     def _build_planner_context(self, tool_list_str: str, system_specs: str, 
-                                milestones_str: str, objective: str, history_str: str) -> str:
+                                milestones_str: str, objective: str, history_str: str, open_files_str: str) -> str:
         """Build the complete planner prompt with instructions at the end."""
         return f"""{self.base_directives}
 
@@ -215,6 +232,9 @@ class Worker:
 
 **Completed Milestones (Foundational Progress)**
 {milestones_str}
+
+**Open Files (Working Memory)**
+{open_files_str}
 
 **Objective**
 {objective}
@@ -371,10 +391,11 @@ Result:
                 tool_list_str = self._get_tools_description()
                 milestones_str = self._format_milestones()
                 history_str = self._format_history()
+                open_files_str = self._format_open_files()
                 
                 # Build planner prompt (instructions at end for emphasis)
                 planner_prompt = self._build_planner_context(
-                    tool_list_str, system_specs, milestones_str, objective, history_str
+                    tool_list_str, system_specs, milestones_str, objective, history_str, open_files_str
                 )
 
                 # --- PLANNER ---
@@ -387,13 +408,22 @@ Result:
                     plan_data = json.loads(plan_response_str)
                     self.current_plan = plan_data.get("updated_plan", self.current_plan)
                     
-                    # Format suggested actions for executor
-                    next_actions = plan_data.get("next_actions", [])
+                    # Format suggested actions for executor (now free-form text from planner)
+                    next_actions = plan_data.get("next_actions", "")
                     if next_actions:
-                        action_lines = []
-                        for act in next_actions:
-                            action_lines.append(f"- Tool: {act.get('tool', 'unknown')}, Purpose: {act.get('purpose', 'N/A')}, Params: {act.get('key_params', 'N/A')}")
-                        suggested_actions_str = "\n".join(action_lines)
+                        if isinstance(next_actions, str):
+                            suggested_actions_str = next_actions
+                        elif isinstance(next_actions, list):
+                            # Backwards compatibility if planner still outputs list
+                            action_lines = []
+                            for act in next_actions:
+                                if isinstance(act, dict):
+                                    action_lines.append(f"- {act.get('tool', 'unknown')}: {act.get('purpose', 'N/A')}")
+                                else:
+                                    action_lines.append(f"- {act}")
+                            suggested_actions_str = "\n".join(action_lines)
+                        else:
+                            suggested_actions_str = str(next_actions)
                     
                     analysis = plan_data.get("analysis", "")
                     iteration_strategy = plan_data.get("iteration_strategy", "single_step")
@@ -419,7 +449,7 @@ Result:
                 if step_callback:
                     step_callback(iteration, display_max, "Executing")
 
-                open_files_str = self._format_open_files()
+                # open_files_str is already generated above for the planner
                 
                 # Build executor prompt (separate from planner, instructions at end)
                 executor_prompt = self._build_executor_context(
