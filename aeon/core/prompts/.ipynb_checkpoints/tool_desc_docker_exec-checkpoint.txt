@@ -1,0 +1,1 @@
+Executes shell commands INSIDE the isolated research container. Params: `command` (str).

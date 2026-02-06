@@ -1,0 +1,1 @@
+Sends message to user. General communication. Use to be conversational, brainstorm, provide answers, updates, or ask questions to the user. Params: `message` (str). Example: `{"tool_name": "say_to_user", "parameters": {"message": "Analysis complete."}}`

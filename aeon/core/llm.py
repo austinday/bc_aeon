@@ -10,6 +10,11 @@ sys.setrecursionlimit(2000)
 from .system_info import get_runtime_info
 from .logger import get_logger
 from .utils import estimate_tokens
+from .prompts import (
+    SUMMARIZE_EXECUTION_PROMPT,
+    ANALYZE_INTERRUPTION_PROMPT,
+    SUMMARIZE_TEXT_PROMPT,
+)
 
 class LLMClient:
     """A client for interacting with Large Language Models (Cloud or Local)."""
@@ -237,7 +242,7 @@ class LLMClient:
         # Use a generous 20k window for the LLM context, biasing towards tail (error logs)
         safe_out = self._truncate_with_tail(raw_out, head_len=4000, tail_len=16000)
         
-        prompt = f"Summarize this execution result. IF THE OUTPUT CONTAINS ERRORS, FAILURES, OR EXIT CODE 1, YOU MUST STATE THIS CLEARLY AT THE START. Context: {ctx}\nOutput: {safe_out}"
+        prompt = SUMMARIZE_EXECUTION_PROMPT.format(ctx=ctx, safe_out=safe_out)
         try:
             resp = self.summarizer_client.chat.completions.create(
                 model=self.summarizer_model, 
@@ -255,11 +260,7 @@ class LLMClient:
 
     def analyze_interruption(self, obj, inp) -> Dict:
         """Analyze user interruption to classify intent."""
-        prompt = f"""Analyze this user interruption and classify their intent.
-Current objective: {obj}
-User input: {inp}
-
-Respond with JSON: {{"classification": "NEW_TASK" | "MODIFY_OBJECTIVE" | "ADVICE", "updated_text": "...", "reasoning": "..."}}"""
+        prompt = ANALYZE_INTERRUPTION_PROMPT.format(obj=obj, inp=inp)
         try:
             resp = self.executor_client.chat.completions.create(
                 model=self.executor_model, 
@@ -285,7 +286,7 @@ Respond with JSON: {{"classification": "NEW_TASK" | "MODIFY_OBJECTIVE" | "ADVICE
 
     def summarize_text(self, text: str, query: str) -> str:
         """Summarize text in context of a query."""
-        prompt = f"Query: {query}\nText: {text}\n\nProvide a concise summary relevant to the query."
+        prompt = SUMMARIZE_TEXT_PROMPT.format(query=query, text=text)
         try:
             resp = self.summarizer_client.chat.completions.create(
                 model=self.summarizer_model, 

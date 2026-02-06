@@ -2,6 +2,11 @@ from .base import BaseTool
 import os
 import base64
 import json
+from ..core.prompts import (
+    TOOL_DESC_OPEN_FILE,
+    TOOL_DESC_CLOSE_FILE,
+    TOOL_DESC_WRITE_FILE,
+)
 
 # Max characters before forcing script usage
 MAX_FILE_READ_SIZE = 250000 
@@ -12,7 +17,7 @@ class OpenFileTool(BaseTool):
     def __init__(self, worker):
         super().__init__(
             name="open_file",
-            description='Opens a file into Short Term Memory tabs. Smartly summarizes data files (CSV, JSON, FASTA) to save tokens. This tool MUST be used to read ANY file. Params: `file_path` (str). Example: `{"tool_name": "open_file", "parameters": {"file_path": "data.csv"}}`'
+            description=TOOL_DESC_OPEN_FILE
         )
         self.worker = worker
 
@@ -136,7 +141,7 @@ class CloseFileTool(BaseTool):
     def __init__(self, worker):
         super().__init__(
             name="close_file",
-            description='Closes a file, removing it from Short Term Memory. Use this when file information is no longer needed. Params: `file_path` (str). Example: `{"tool_name": "close_file", "parameters": {"file_path": "data.csv"}}`'
+            description=TOOL_DESC_CLOSE_FILE
         )
         self.worker = worker
 
@@ -151,7 +156,7 @@ class WriteFileTool(BaseTool):
     def __init__(self, worker):
         super().__init__(
             name="write_file",
-            description='Writes/Overwrites file. Params: `file_path` (str), `content` (str). Example: `{"tool_name": "write_file", "parameters": {"file_path": "test.py", "content": "print(\'hello\')"}}`'
+            description=TOOL_DESC_WRITE_FILE
         )
         self.worker = worker
 

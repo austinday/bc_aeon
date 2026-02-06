@@ -1,0 +1,1 @@
+Executes shell commands on the HOST machine. Params: `command` (str), `timeout` (int).

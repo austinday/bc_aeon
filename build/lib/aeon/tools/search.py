@@ -2,13 +2,14 @@ import os
 import pathlib
 from .base import BaseTool
 from ..core.llm import LLMClient
+from ..core.prompts import TOOL_DESC_SEARCH_WEB
 
 class SearchWebTool(BaseTool):
     """A tool to search the web for up-to-date information."""
     def __init__(self, llm_client: LLMClient):
         super().__init__(
             name="search_web",
-            description="""Web search. Use for external info/docs, current information, or inspiration when stuck. Params: `query` (str). Example: `{"tool_name": "search_web", "parameters": {"query": "python singleton pattern"}}`"""
+            description=TOOL_DESC_SEARCH_WEB
         )
         self.llm_client = llm_client
         self.tavily_client = None

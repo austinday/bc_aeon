@@ -1,0 +1,13 @@
+**VERY IMPORTANT Docker Directives**
+1) Docker is your only way to create an environment with dependencies. No venv, no conda. Use `FROM aeon_base:py3.10-cuda12.1` in Dockerfiles to inherit pre-installed libraries (PyTorch, CUDA 12.1, numpy, pandas, transformers, etc.) and only add project-specific dependencies.
+2) For complex tasks, organize code with a Dockerfile and sequentially numbered shell scripts (e.g., `1_build.sh`, `2_run.sh`). Each .sh script should be a complete example of calling the appropriate .py script with full arguments using the docker container. No other code in these scripts.
+3) Required flags for ALL `docker run` commands:
+   - `-u $(id -u):$(id -g)` — prevents root-owned files on mounted volumes 
+   - `--gpus all` — required when GPU/CUDA is needed (container has ZERO GPU access without this)
+4) Use `DEBIAN_FRONTEND=noninteractive apt-get install -y` in Dockerfiles to prevent interactive prompts.
+
+**TWO WORLDS MODEL (Critical)**
+HOST (World A) and CONTAINER (World B) have separate filesystems.
+- Host path `/home/user/project` mounted via `-v /home/user/project:/workspace` becomes `/workspace` inside the container. The container has no `~` or `/home/user`.
+- Scripts that run inside Docker must use CONTAINER paths, not host paths.
+- Never install dependencies on the host. The Dockerfile is the source of truth; the container is disposable.

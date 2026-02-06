@@ -9,6 +9,14 @@ from typing import List, Dict, Any
 from .base import BaseTool
 from ..core.worker import Worker
 from ..core.llm import LLMClient
+from ..core.prompts import (
+    TOOL_DESC_DOCKER_EXEC,
+    TOOL_DESC_DOCKER_WRITE_FILE,
+    TOOL_DESC_DOCKER_READ_FILE,
+    TOOL_DESC_SUBMIT_FINDINGS,
+    TOOL_DESC_CONDUCT_RESEARCH,
+    RESEARCH_OBJECTIVE_TEMPLATE,
+)
 
 # --- Docker Tools for Sub-Agents ---
 
@@ -16,7 +24,7 @@ class DockerExecTool(BaseTool):
     def __init__(self, container_name: str):
         super().__init__(
             name="run_command",
-            description='Executes shell commands INSIDE the isolated research container. Params: `command` (str). '
+            description=TOOL_DESC_DOCKER_EXEC
         )
         self.container_name = container_name
         self.is_internal = True
@@ -43,7 +51,7 @@ class DockerWriteFileTool(BaseTool):
     def __init__(self, container_name: str):
         super().__init__(
             name="write_file",
-            description='Writes a file inside the container. Params: `file_path`, `content`.'
+            description=TOOL_DESC_DOCKER_WRITE_FILE
         )
         self.container_name = container_name
         self.is_internal = True
@@ -61,7 +69,7 @@ class DockerReadFileTool(BaseTool):
     def __init__(self, container_name: str):
         super().__init__(
             name="open_file",
-            description='Reads a file from the container. Params: `file_path`.'
+            description=TOOL_DESC_DOCKER_READ_FILE
         )
         self.container_name = container_name
         self.is_internal = True
@@ -80,7 +88,7 @@ class SubmitFindingsTool(BaseTool):
     def __init__(self):
         super().__init__(
             name="submit_findings",
-            description='Submit your final research findings and EXIT. Params: `summary` (str), `details` (str).'
+            description=TOOL_DESC_SUBMIT_FINDINGS
         )
         self.is_internal = True
         self.findings = None
@@ -95,10 +103,11 @@ class ConductResearchTool(BaseTool):
     def __init__(self, llm_client: LLMClient, worker: Worker):
         super().__init__(
             name="conduct_research",
-            description='Spawns parallel research agents in isolated Docker containers. Params: `topic` (str), `hypotheses` (List[Dict{"name": str, "description": str}]).'
+            description=TOOL_DESC_CONDUCT_RESEARCH
         )
+        self.is_internal = True  # DISABLED: Sub-agents need Docker directive improvements
         self.llm_client = llm_client
-        self.main_worker = worker # Parent worker context
+        self.main_worker = worker  # Parent worker context
 
     def _run_researcher(self, idx: int, topic: str, hypothesis: Dict, image_tag: str, iterations: int) -> Dict:
         container_name = f"aeon_research_{uuid.uuid4().hex[:8]}"
@@ -139,17 +148,7 @@ class ConductResearchTool(BaseTool):
 
         sub_worker = Worker(self.llm_client, tools=tools, print_func=prefix_print)
         
-        objective = f"""
-RESEARCH ASSIGNMENT: {topic}
-HYPOTHESIS TO TEST: {h_name}
-DETAILS: {h_desc}
-
-Your goal is to prove or disprove this hypothesis experimentally.
-1. Write scripts/tests to verify the hypothesis.
-2. Execute them in the environment.
-3. Analyze the output.
-4. Use 'submit_findings' to report your conclusion.
-"""
+        objective = RESEARCH_OBJECTIVE_TEMPLATE.format(topic=topic, h_name=h_name, h_desc=h_desc)
         
         crash_error = None
         

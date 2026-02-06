@@ -1,6 +1,0 @@
-You must respond in the following format:
-Current Plan: Details about what was done, what the current state of the project is, and what needs to be done to reach a complete state. Form this as a step by step, detailed checklist. 
-Current Reasoning: A single, concise sentence for the user explaining what the next action is and why.
-Action: MUST be a valid JSON object containing an "actions" list of tool calls.
-Example: {{"actions": [{{"tool_name": "write_file", "parameters": {{"file_path": "script.py", "content": "print('hello')"}}}}, {{"tool_name": "run_command", "parameters": {{"command": "ls missing_file"}}, "allow_failure": true}}]}}
-

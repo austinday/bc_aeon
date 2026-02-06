@@ -4,13 +4,18 @@ import sys
 import time
 import signal
 from .base import BaseTool
+from ..core.prompts import (
+    TOOL_DESC_RUN_COMMAND,
+    TOOL_DESC_TASK_COMPLETE,
+    TOOL_DESC_GET_USER_INPUT,
+)
 
 class RunCommandTool(BaseTool):
     """A tool to execute a command on the command line."""
     def __init__(self):
         super().__init__(
             name="run_command",
-            description='Executes shell commands on the HOST machine. Params: `command` (str), `timeout` (int).'
+            description=TOOL_DESC_RUN_COMMAND
         )
 
     def execute(self, command: str, timeout: int = 300) -> str:
@@ -79,12 +84,12 @@ class RunCommandTool(BaseTool):
 
 class TaskCompleteTool(BaseTool):
     def __init__(self):
-        super().__init__(name="task_complete", description='End task. Params: `reason` (str).')
+        super().__init__(name="task_complete", description=TOOL_DESC_TASK_COMPLETE)
     def execute(self, reason: str = "Task completed.") -> str:
         return f"Task marked as complete with reason: {reason}"
 
 class GetUserInputTool(BaseTool):
     def __init__(self):
-        super().__init__(name="get_user_input", description='Ask user for input. Params: `prompt` (str).')
+        super().__init__(name="get_user_input", description=TOOL_DESC_GET_USER_INPUT)
     def execute(self, prompt: str = "Please provide input:") -> str:
         return f"Awaiting user input with prompt: {prompt}"

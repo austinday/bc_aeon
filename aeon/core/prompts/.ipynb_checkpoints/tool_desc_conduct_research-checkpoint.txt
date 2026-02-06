@@ -1,0 +1,1 @@
+Spawns parallel research agents in isolated Docker containers. Params: `topic` (str), `hypotheses` (List[Dict{"name": str, "description": str}]).

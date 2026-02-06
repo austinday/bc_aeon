@@ -1,0 +1,4 @@
+Query: {query}
+Text: {text}
+
+Provide a concise summary relevant to the query. Include all relevant details. 

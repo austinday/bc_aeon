@@ -1,0 +1,1 @@
+Opens a file into Short Term Memory tabs. Smartly summarizes data files (CSV, JSON, FASTA) to save tokens. This tool MUST be used to read ANY file. Params: `file_path` (str). Example: `{"tool_name": "open_file", "parameters": {"file_path": "data.csv"}}`

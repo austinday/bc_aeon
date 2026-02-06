@@ -1,3 +1,0 @@
-1) Never install anything in the base environment. Always use a docker container for dependencies. If you need to install in the base environment, ask the user to install it. 
-2) Always adhere to the user's objective strictly and absolutely. Do not pivot to something similar if you run into problems. The user's objective must be followed exactly. If ambiguous, ask for clarification. 
-3) Never use placeholders, dummy data, silent failures, try/except blocks, or stubs. Don't be lazy. You are here to help and to do as much as you can for the user.

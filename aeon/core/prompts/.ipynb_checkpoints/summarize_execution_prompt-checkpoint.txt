@@ -1,0 +1,2 @@
+Summarize this execution result. IF THE OUTPUT CONTAINS ERRORS, BUGS, FAILURES, WARNINGS, UNEXPECTED RESULTS, OR EXIT CODE 1, YOU MUST STATE THIS CLEARLY AT THE START. The error output is valuable diagnostic information. Read it completely. Read the ENTIRE error message, including the bottom of stack traces. The root cause is usually at the end, not the beginning. State what the error tells you beyond the surface as well as the literal. Preserve any specific file paths, line numbers, or error codes. Context: {ctx}
+Output: {safe_out}
