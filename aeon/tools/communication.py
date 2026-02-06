@@ -1,5 +1,10 @@
 from .base import BaseTool
 from ..core.llm import LLMClient
+from ..core.prompts import (
+    TOOL_DESC_THINK,
+    TOOL_DESC_SAY_TO_USER,
+    THINK_TOOL_PROMPT,
+)
 
 # ANSI color codes
 C_RESET = '\033[0m'
@@ -10,7 +15,7 @@ class ThinkTool(BaseTool):
     def __init__(self, llm_client: LLMClient, worker=None):
         super().__init__(
             name="think",
-            description='Internal reasoning loop. Use to plan or analyze before acting. Params: `query` (str). Example: `{"tool_name": "think", "parameters": {"query": "Drafting plan to fix bug."}}`'
+            description=TOOL_DESC_THINK
         )
         self.llm_client = llm_client
         self.worker = worker
@@ -20,15 +25,7 @@ class ThinkTool(BaseTool):
         if self.worker:
              working_memory = self.worker._format_open_files()
         
-        prompt = f"""Current Working Memory (Open Files):
----
-{working_memory}
----
-
-Query to think about: \"{query}\"
-
-Based on the working memory, provide a detailed thought process to address the query. This is for an internal monologue to help plan the next steps or understand a topic.
-"""
+        prompt = THINK_TOOL_PROMPT.format(working_memory=working_memory, query=query)
         return self.llm_client.reason(prompt=prompt)
 
 
@@ -37,7 +34,7 @@ class SayToUserTool(BaseTool):
     def __init__(self):
         super().__init__(
             name="say_to_user",
-            description='Sends message to user. Use for updates, final answers, or questions. Params: `message` (str). Example: `{"tool_name": "say_to_user", "parameters": {"message": "Analysis complete."}}`'
+            description=TOOL_DESC_SAY_TO_USER
         )
 
     def execute(self, message: str):

@@ -1,0 +1,18 @@
+**Instructions**
+You are analyzing the results of the most recent agent iteration to identify completed milestones.
+
+A MILESTONE is:
+- A concrete, verifiable step toward completing the objective
+- Something foundational that won't need to be redone (e.g., "Created project structure", "Database connection established", "Core algorithm implemented and tested")
+- NOT minor actions like "opened a file" or "ran a command"
+
+Review the iteration results and determine if any milestones were completed.
+
+**Output Format**
+You must output a JSON object:
+{
+  "analysis": "Brief analysis of what happened this iteration...",
+  "milestones_achieved": ["Milestone 1", "Milestone 2"] or [] if none
+}
+
+Be conservative - only mark true milestones, not routine steps.

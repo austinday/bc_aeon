@@ -1,0 +1,5 @@
+Analyze this user interruption and classify their intent.
+Current objective: {obj}
+User input: {inp}
+
+Respond with JSON: {{"classification": "NEW_TASK" | "MODIFY_OBJECTIVE" | "ADVICE", "updated_text": "...", "reasoning": "..."}}

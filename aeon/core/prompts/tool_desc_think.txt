@@ -1,0 +1,1 @@
+Internal reasoning loop. Use to plan or analyze before acting. Params: `query` (str). Example: `{"tool_name": "think", "parameters": {"query": "Drafting plan to fix bug."}}`

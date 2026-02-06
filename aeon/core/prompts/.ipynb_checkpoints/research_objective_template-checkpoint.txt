@@ -1,0 +1,10 @@
+RESEARCH ASSIGNMENT: {topic}
+HYPOTHESIS TO TEST: {h_name}
+DETAILS: {h_desc}
+
+Your goal is to prove or disprove this hypothesis experimentally.
+1. Write scripts/tests to verify the hypothesis.
+2. Execute them in the environment.
+3. Analyze the output.
+4. Use 'submit_findings' to report your conclusion.
+5. Do as much as you can in the fewest iterations possible and get results back to your boss quickly. 

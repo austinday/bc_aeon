@@ -1,0 +1,8 @@
+Current Working Memory (Open Files):
+---
+{working_memory}
+---
+
+Query to think about: "{query}"
+
+Based on the working memory, provide a detailed thought process to address the query. This is for an internal monologue to help plan the next steps or understand a topic.

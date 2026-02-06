@@ -1,1 +1,1 @@
-Your current objective is: {objective}
+Stay on task. Your overall objective is: {objective}

@@ -1,0 +1,1 @@
+End the current task. Marking it as complete. Params: `reason` (str).

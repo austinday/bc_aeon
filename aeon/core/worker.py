@@ -11,7 +11,14 @@ from typing import List, Any, Dict, Callable, Optional
 from .llm import LLMClient
 from .system_info import get_runtime_info
 from .logger import get_logger
-from .directives import CORE_DIRECTIVES, DOCKER_DIRECTIVES
+from .prompts import (
+    CORE_DIRECTIVES,
+    DOCKER_DIRECTIVES,
+    IMPORTANT_REMINDERS,
+    PLANNER_INSTRUCTIONS,
+    EXECUTOR_INSTRUCTIONS,
+    MILESTONE_ANALYZER_INSTRUCTIONS,
+)
 
 # Colors for terminal output
 C_RED = '\033[91m'
@@ -21,91 +28,6 @@ C_GREEN = '\033[92m'
 C_RESET = '\033[0m'
 C_BLUE = '\033[94m'
 
-# Planner prompt sections
-PLANNER_INSTRUCTIONS = """CRITICAL: Your response must be ONLY a valid JSON object. No text before the opening {. No text after the closing }. Use double quotes (") only, never single quotes ('). No markdown formatting or code fences.
-
-**Instructions**
-You are a high level planning agent. You will analyze the full context given (objectives, history, observations, milestones, system state, etc...) and create a strategic plan for how to achieve and validate the successful implementation of the objective from the current project state. Asses the current state of the project, what has been completed and what is still needed. Plan multiple steps ahead when the path is clear or conversational, if conversational, respond and conclude. Plan one step ahead if the next step is unclear, high risk, or complex. Internally, plan ahead step by step and consider multiple paths and solutions to get to the objective. For very complex tasks, consider using the conduct_research tool. Consider the probabilities of all the possible paths, then suggest the most probable solution, but consider alternative paths as suggestions or risks to be aware of.
-
-**Your job is HIGH-LEVEL THINKING, not crafting tool calls.** Write your next_actions as free-form natural language descriptions of what should be done next. The Executor will translate your ideas into actual tool calls. Do NOT write JSON or structured parameters - just describe the intent.
-
-**Output Format:**
-You must output a JSON object:
-{
-  "analysis": "Brief assessment of current state and progress...",
-  "updated_plan": "## Remaining Steps\n- [ ] Step 1...\n- [ ] Step 2...",
-  "next_actions": "Free-form description of what to do next. Example: First, search the web for information about X. Then, write a Dockerfile that includes Y. Finally, run the container to test.",
-  "iteration_strategy": "single_step" | "multi_step",
-  "risk_notes": "Any concerns or things to watch for"
-}
-
-WRONG (will cause errors):
-- {'analysis': ...}  <- Single quotes are invalid JSON
-- ```json {...} ```  <- Markdown fences break parsing
-- Let me think... {...}  <- Text before JSON
-- {...} I'll explain...  <- Text after JSON
-- {...},  <- Trailing comma
-
-CORRECT:
-{"analysis": "...", "updated_plan": "...", "next_actions": [...], "iteration_strategy": "...", "risk_notes": "..."}
-
-Output ONLY the JSON object now:"""
-
-# Executor prompt sections  
-EXECUTOR_INSTRUCTIONS = """CRITICAL: Your response must be ONLY a valid JSON object. No text before the opening {. No text after the closing }. Use double quotes (") only, never single quotes ('). No markdown formatting or code fences.
-
-You are the Execution Agent. Your task is to translate the plan into concrete tool calls.
-
-**Your Responsibilities:**
-1. Read the current plan and suggested next actions
-2. Formulate precise tool calls with exact parameters
-3. Execute the suggested actions faithfully
-4. For conversations: respond to user AND use terminal tools (task_complete/get_user_input) to properly end or continue
-
-**Critical Rules:**
-- NEVER return empty actions. You MUST always output at least one tool call.
-- If the objective is conversational (greeting, question, simple request): use say_to_user THEN task_complete or get_user_input
-- Never leave a conversation hanging - always conclude with a terminal action when appropriate
-- Include ALL required parameters for each tool call
-- If multiple actions are suggested and safe, execute them all in one iteration
-
-**Output Format:**
-You MUST output a JSON object with an "actions" list:
-{"actions": [{"tool_name": "say_to_user", "parameters": {"message": "Hello!"}}, {"tool_name": "task_complete", "parameters": {"reason": "Greeted user as requested."}}]}
-
-Another example with allow_failure:
-{"actions": [{"tool_name": "run_command", "parameters": {"command": "ls -la"}, "allow_failure": true}]}
-
-WRONG (will cause errors):
-- {'actions': [...]}  <- Single quotes are invalid JSON
-- ```json {...} ```  <- Markdown fences break parsing
-- Let me analyze... {...}  <- Text before JSON
-- {...} Now I'll explain...  <- Text after JSON
-- {"actions": [...],}  <- Trailing comma
-
-CORRECT:
-{"actions": [{"tool_name": "run_command", "parameters": {"command": "ls"}}]}
-
-Output ONLY the JSON object now:"""
-
-MILESTONE_ANALYZER_INSTRUCTIONS = """**Instructions**
-You are analyzing the results of the most recent agent iteration to determine if any significant MILESTONES were achieved.
-
-A MILESTONE is:
-- A concrete, verifiable step toward completing the objective
-- Something foundational that won't need to be redone (e.g., "Created project structure", "Database connection established", "Core algorithm implemented and tested")
-- NOT minor actions like "opened a file" or "ran a command"
-
-Review the iteration results and determine if any milestones were completed.
-
-**Output Format**
-You must output a JSON object:
-{
-  "analysis": "Brief analysis of what happened this iteration...",
-  "milestones_achieved": ["Milestone 1", "Milestone 2"] or [] if none
-}
-
-Be conservative - only mark true milestones, not routine steps."""
 
 class Worker:
     def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False):
@@ -127,12 +49,11 @@ class Worker:
         self.completed_milestones = []  # Foundational progress markers, append-only
         self.last_observation = "None."
         
+        # Load directives from central prompts module
         self.base_directives = CORE_DIRECTIVES
         self.docker_directives = DOCKER_DIRECTIVES
+        self.important_reminders = IMPORTANT_REMINDERS
         self.max_history_tokens = 25000
-        
-        # Load important reminders
-        self._load_reminders()
 
     def _init_debug_logging(self):
         """Initialize debug logging once per worker instance."""
@@ -143,10 +64,6 @@ class Worker:
         self.llm_client.set_debug_path(debug_path)
         self.print_func(f"{C_YELLOW}Debug logging enabled: {debug_path}{C_RESET}")
         self._debug_initialized = True
-
-    def _load_reminders(self):
-        path = Path(__file__).parent / "prompts" / "important_reminders.txt"
-        self.important_reminders = path.read_text().strip() if path.exists() else ""
 
     def register_tools(self, tools_list: List[Any]):
         for tool in tools_list:
