@@ -1,1 +1,4 @@
-Sends message to user. General communication. Use to be conversational, brainstorm, provide answers, updates, or ask questions to the user. Params: `message` (str). Example: `{"tool_name": "say_to_user", "parameters": {"message": "Analysis complete."}}`
+Sends a message to the user. Use for conversational responses, progress updates, asking clarifying questions, reporting results, or brainstorming.
+Schema:
+  message (str, required): The message text to display to the user.
+Example: {"tool_name": "say_to_user", "parameters": {"message": "Analysis complete. Found 3 issues."}}

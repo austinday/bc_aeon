@@ -1,0 +1,6 @@
+Makes a targeted edit to an existing file by replacing ONE unique occurrence of a string. Fails if old_str is not found or appears more than once. Prefer this over write_file for small changes to large files.
+Schema:
+  file_path (str, required): Path to the file to edit.
+  old_str (str, required): The exact text to find. Must appear exactly once in the file. Include enough surrounding context (nearby lines, indentation) to guarantee uniqueness.
+  new_str (str, optional, default=""): The replacement text. Empty string deletes old_str.
+Example: {"tool_name": "edit_file", "parameters": {"file_path": "main.py", "old_str": "def old_func():\n    pass", "new_str": "def old_func():\n    return 42"}}

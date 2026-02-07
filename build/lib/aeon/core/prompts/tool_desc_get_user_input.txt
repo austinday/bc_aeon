@@ -1,1 +1,4 @@
-Ask user for input. Params: `prompt` (str).
+Pauses execution and prompts the user for input. Use when you need clarification, a decision, credentials, or confirmation before proceeding.
+Schema:
+  prompt (str, optional, default="Please provide input:"): The question or prompt to display to the user.
+Example: {"tool_name": "get_user_input", "parameters": {"prompt": "Which database should I connect to: postgres or sqlite?"}}

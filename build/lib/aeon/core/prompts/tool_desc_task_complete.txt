@@ -1,1 +1,4 @@
-End the current task. Marking it as complete. Params: `reason` (str).
+Marks the current task as complete and terminates the agent loop. Use ONLY after validating that the objective has been fully achieved.
+Schema:
+  reason (str, optional, default="Task completed."): A brief summary of what was accomplished and how it was verified.
+Example: {"tool_name": "task_complete", "parameters": {"reason": "Built Docker image, ran tests, all 12 tests passed."}}

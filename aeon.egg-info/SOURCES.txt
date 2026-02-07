@@ -34,6 +34,7 @@ aeon/core/prompts/tool_desc_conduct_research.txt
 aeon/core/prompts/tool_desc_docker_exec.txt
 aeon/core/prompts/tool_desc_docker_read_file.txt
 aeon/core/prompts/tool_desc_docker_write_file.txt
+aeon/core/prompts/tool_desc_edit_file.txt
 aeon/core/prompts/tool_desc_get_user_input.txt
 aeon/core/prompts/tool_desc_open_file.txt
 aeon/core/prompts/tool_desc_run_command.txt

@@ -1,1 +1,4 @@
-Executes shell commands INSIDE the isolated research container. Params: `command` (str).
+Executes a shell command INSIDE the isolated research container. Working directory is /workspace. Use for running scripts, installing packages, and inspecting results within the container.
+Schema:
+  command (str, required): The shell command to execute inside the container via bash.
+Example: {"tool_name": "run_command", "parameters": {"command": "python /workspace/experiment.py --lr 0.001"}}

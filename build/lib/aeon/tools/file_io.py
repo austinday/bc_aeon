@@ -6,6 +6,7 @@ from ..core.prompts import (
     TOOL_DESC_OPEN_FILE,
     TOOL_DESC_CLOSE_FILE,
     TOOL_DESC_WRITE_FILE,
+    TOOL_DESC_EDIT_FILE,
 )
 
 # Max characters before forcing script usage
@@ -136,6 +137,79 @@ class OpenFileTool(BaseTool):
                 else:
                     summary.append(self._truncate(line))
         return "\n".join(summary) + "\n[...File Truncated for View...]"
+
+class EditFileTool(BaseTool):
+    """A tool to make targeted edits to a file via unique string replacement."""
+    def __init__(self, worker):
+        super().__init__(
+            name='edit_file',
+            description=TOOL_DESC_EDIT_FILE
+        )
+        self.worker = worker
+
+    def execute(self, file_path: str, old_str: str, new_str: str = '') -> str:
+        if not file_path:
+            return 'Error: file_path parameter is required.'
+        if not old_str:
+            return 'Error: old_str parameter is required and cannot be empty.'
+        if new_str is None:
+            new_str = ''
+
+        abs_path = os.path.abspath(file_path)
+        if not os.path.exists(abs_path):
+            return f'Error: File not found: {file_path}'
+        if os.path.isdir(abs_path):
+            return f'Error: {file_path} is a directory, not a file.'
+
+        try:
+            with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            return f'Error reading file: {type(e).__name__}: {e}'
+
+        # Count occurrences to enforce uniqueness
+        count = content.count(old_str)
+
+        if count == 0:
+            # Provide a helpful snippet of the file so the executor can orient
+            preview_lines = content.splitlines()[:20]
+            preview = '\n'.join(preview_lines)
+            return (
+                f'Error: old_str not found in {file_path}. '
+                f'The string to replace does not exist in the file. '
+                f'Double-check exact whitespace, indentation, and spelling.\n'
+                f'--- First 20 lines of file ---\n{preview}'
+            )
+
+        if count > 1:
+            return (
+                f'Error: old_str is not unique in {file_path} '
+                f'(found {count} occurrences). '
+                f'Include more surrounding context in old_str to make it unique.'
+            )
+
+        # Exactly one occurrence - perform the replacement
+        new_content = content.replace(old_str, new_str, 1)
+
+        try:
+            with open(abs_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+        except PermissionError:
+            return f'Error: Permission denied writing to {file_path}'
+        except Exception as e:
+            return f'Error writing file: {type(e).__name__}: {e}'
+
+        # If the file is open in working memory, update the cached content
+        if self.worker.is_file_open(file_path) or self.worker.is_file_open(abs_path):
+            self.worker.update_open_file(abs_path, new_content)
+
+        lines_removed = old_str.count('\n') + 1
+        lines_added = new_str.count('\n') + 1
+        return (
+            f'Successfully edited {file_path}. '
+            f'Replaced {lines_removed} line(s) with {lines_added} line(s).'
+        )
+
 
 class CloseFileTool(BaseTool):
     def __init__(self, worker):
