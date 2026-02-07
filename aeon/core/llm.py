@@ -139,7 +139,8 @@ class LLMClient:
                 resp = self.planner_client.chat.completions.create(
                     model=self.planner_model, 
                     messages=[{"role": "user", "content": current_prompt}], 
-                    temperature=0.3
+                    temperature=0.3,
+                    response_format={"type": "json_object"}
                 )
                 raw = resp.choices[0].message.content
                 self._log_to_debug("PLANNER", self.planner_model, current_prompt, raw)
@@ -177,7 +178,8 @@ class LLMClient:
                 resp = self.executor_client.chat.completions.create(
                     model=self.executor_model, 
                     messages=[{"role": "user", "content": current_prompt}], 
-                    temperature=0.1
+                    temperature=0.1,
+                    response_format={"type": "json_object"}
                 )
                 raw = resp.choices[0].message.content
                 self._log_to_debug("EXECUTOR", self.executor_model, current_prompt, raw)
@@ -213,7 +215,8 @@ class LLMClient:
             resp = self.summarizer_client.chat.completions.create(
                 model=self.summarizer_model,
                 messages=[{"role": "user", "content": analysis_context}],
-                temperature=0.1
+                temperature=0.1,
+                response_format={"type": "json_object"}
             )
             raw = resp.choices[0].message.content
             self._log_to_debug("MILESTONE_ANALYZER", self.summarizer_model, analysis_context, raw)
