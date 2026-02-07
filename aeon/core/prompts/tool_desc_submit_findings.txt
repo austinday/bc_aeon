@@ -1,1 +1,5 @@
-Submit your final research findings and EXIT. Params: `summary` (str), `details` (str).
+Submits your final research findings and terminates the sub-agent. This is the ONLY way to exit a research task. You MUST call this before your iterations run out.
+Schema:
+  summary (str, required): One-paragraph summary of the conclusion (proven/disproven/inconclusive and why).
+  details (str, required): Full details including methodology, raw numbers, observations, and any caveats.
+Example: {"tool_name": "submit_findings", "parameters": {"summary": "Hypothesis confirmed: batch size 256 with linear LR scaling achieves 2.1% higher accuracy.", "details": "Ran 5 trials each for batch sizes 32, 128, 256, 512..."}}

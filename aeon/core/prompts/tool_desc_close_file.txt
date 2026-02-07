@@ -1,1 +1,4 @@
-Closes a file, removing it from Short Term Memory. Use this when file information is no longer needed. Params: `file_path` (str). Example: `{"tool_name": "close_file", "parameters": {"file_path": "data.csv"}}`
+Closes a file, removing it from Short Term Memory. Use when file information is no longer needed to free up context space.
+Schema:
+  file_path (str, required): Path of the file to close (must match the path used to open it).
+Example: {"tool_name": "close_file", "parameters": {"file_path": "src/main.py"}}

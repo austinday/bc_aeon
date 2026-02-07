@@ -1,1 +1,4 @@
-Reads a file from the container. Params: `file_path`.
+Reads a file from the research container and returns its contents. Use to inspect output files, logs, or results generated inside the container.
+Schema:
+  file_path (str, required): Path to the file inside the container.
+Example: {"tool_name": "open_file", "parameters": {"file_path": "/workspace/results.json"}}

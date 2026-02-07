@@ -1,1 +1,5 @@
-Writes/Overwrites a file. Use this to make changes to a file. Params: `file_path` (str), `content` (str). Example: `{"tool_name": "write_file", "parameters": {"file_path": "test.py", "content": "print('hello')"}}`
+Writes or overwrites an entire file. Creates parent directories if needed. Use when creating new files or when changes are too extensive for edit_file. For small targeted edits, prefer edit_file instead.
+Schema:
+  file_path (str, required): Path to the file to write. Created if it does not exist; overwritten if it does.
+  content (str, required): The complete file content. Prefix with "base64:" for base64-encoded content.
+Example: {"tool_name": "write_file", "parameters": {"file_path": "test.py", "content": "import sys\nprint(sys.version)"}}

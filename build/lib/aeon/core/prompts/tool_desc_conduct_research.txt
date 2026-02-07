@@ -1,1 +1,9 @@
-Spawns parallel research agents in isolated Docker containers. Params: `topic` (str), `hypotheses` (List[Dict{"name": str, "description": str}]).
+Spawns parallel research sub-agents in isolated Docker containers. Each agent tests one hypothesis independently and reports findings. Use for exploratory tasks that benefit from parallel investigation.
+Schema:
+  topic (str, required): The overall research topic or question.
+  hypotheses (list, required): A list of hypothesis objects to test in parallel. Each object has:
+    - name (str, required): Short label for the hypothesis.
+    - description (str, required): Detailed description of what to test and how.
+  image_tag (str, optional, default="aeon_base:py3.10-cuda12.1"): Docker image for the research containers.
+  iterations (int, optional, default=15): Max iterations each sub-agent is allowed.
+Example: {"tool_name": "conduct_research", "parameters": {"topic": "Optimal batch size for training", "hypotheses": [{"name": "Small batches", "description": "Test batch sizes 8-32 on the validation set"}, {"name": "Large batches", "description": "Test batch sizes 128-512 with learning rate scaling"}]}}

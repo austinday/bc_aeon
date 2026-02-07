@@ -1,1 +1,5 @@
-Executes shell commands on the HOST machine. Params: `command` (str), `timeout` (int).
+Executes a shell command on the HOST machine. Output streams in real time. Use for docker commands, file operations, git, and other host-level tasks. NEVER use for pip install or apt-get on the host; use Docker instead.
+Schema:
+  command (str, required): The shell command to execute (run via bash).
+  timeout (int, optional, default=300): Max seconds before the command is killed. Use 0 for no timeout (dangerous; avoid for network/build commands).
+Example: {"tool_name": "run_command", "parameters": {"command": "docker build -t myapp .", "timeout": 600}}

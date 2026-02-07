@@ -45,7 +45,7 @@ class Worker:
         # --- STATE MODEL ---
         self.current_plan = "No plan formulated yet."
         self.open_files = {} 
-        self.recent_history = deque(maxlen=10) 
+        self.recent_history = deque(maxlen=50) 
         self.completed_milestones = []  # Foundational progress markers, append-only
         self.last_observation = "None."
         
@@ -95,6 +95,16 @@ class Worker:
             descs.append(f"- {name}: {tool.description}")
         return "\n".join(descs)
 
+    def _get_preflight_tools_description(self) -> str:
+        """Get tool descriptions for only file management tools (pre-flight phase)."""
+        preflight_tools = ['open_file', 'close_file']
+        descs = []
+        for name in preflight_tools:
+            if name in self.tools:
+                tool = self.tools[name]
+                descs.append(f"- {name}: {tool.description}")
+        return "\n".join(descs)
+
     def _format_open_files(self) -> str:
         if not self.open_files:
             return "No files currently open."
@@ -103,13 +113,118 @@ class Worker:
             out.append(f"--- FILE: {path} ---\n{content}\n--- END FILE ---")
         return "\n\n".join(out)
 
+    def _format_open_files_list(self) -> str:
+        """Return just a list of currently open file paths (no content).
+        Used for pre-flight executor context."""
+        if not self.open_files:
+            return "No files currently open."
+        paths = list(self.open_files.keys())
+        return "\n".join([f"  - {path}" for path in paths])
+
+    def _format_open_files_compact(self) -> str:
+        """Compact file manifest for the planner: names, sizes, and a brief peek.
+        The planner needs to know WHAT is open, not read every line."""
+        if not self.open_files:
+            return "No files currently open."
+        out = []
+        for path, content in self.open_files.items():
+            lines = content.splitlines()
+            line_count = len(lines)
+            head = lines[:8]
+            tail = lines[-4:] if line_count > 12 else []
+            peek = '\n'.join(head)
+            if tail:
+                peek += f'\n  ... ({line_count - 12} lines omitted) ...\n' + '\n'.join(tail)
+            out.append(f"--- FILE: {path} ({line_count} lines) ---\n{peek}\n--- END ---")
+        return "\n\n".join(out)
+
+    def _format_open_files_for_executor(self, suggested_actions: str) -> str:
+        """Show full content only for files referenced in the suggested actions.
+        Other open files get a one-line stub so the executor knows they exist
+        but isn't distracted by their content."""
+        if not self.open_files:
+            return "No files currently open."
+        # Build a lowercase search corpus from the suggested actions
+        actions_lower = suggested_actions.lower()
+        out_relevant = []
+        out_background = []
+        for path, content in self.open_files.items():
+            basename = os.path.basename(path).lower()
+            # Match on basename or full path appearing in the actions text
+            if basename in actions_lower or path.lower() in actions_lower:
+                out_relevant.append(f"--- FILE: {path} ---\n{content}\n--- END FILE ---")
+            else:
+                line_count = content.count('\n') + 1
+                out_background.append(f"  {path} ({line_count} lines) — not referenced in current actions, use open_file to view")
+        parts = []
+        if out_relevant:
+            parts.append("\n\n".join(out_relevant))
+        if out_background:
+            parts.append("Other open files (content hidden):\n" + "\n".join(out_background))
+        # Fallback: if nothing matched, show everything (safe default)
+        if not out_relevant and self.open_files:
+            return self._format_open_files()
+        return "\n\n".join(parts)
+
     def _format_history(self) -> str:
+        """Format history with tiered detail levels and token budgeting.
+
+        Tiers (counting from most recent):
+          - FULL   (last 3):  Complete action + full summary
+          - BRIEF  (next 7):  Action + first 2 sentences of summary
+          - MINIMAL (older):  One-line action label with OK/FAIL tag
+
+        Fills newest-first until max_history_tokens budget is exhausted.
+        Zero extra LLM calls - purely algorithmic compression.
+        """
         if not self.recent_history:
             return "No recent history."
-        out = []
-        for step in self.recent_history:
-            out.append(f"STEP {step['iteration']}:\nAction: {step['action']}\nResult Summary: {step['summary']}\n")
-        return "\n".join(out)
+
+        items = list(self.recent_history)  # oldest-first from deque
+        total = len(items)
+        budget_chars = self.max_history_tokens * 4  # rough chars-per-token
+        used_chars = 0
+        formatted = []  # collects entries newest-first
+
+        for idx_from_end, step in enumerate(reversed(items)):
+            iteration = step['iteration']
+            action = step['action']
+            summary = step.get('summary', '')
+
+            if idx_from_end < 3:
+                # FULL tier - complete context for most recent work
+                entry = f"STEP {iteration} [FULL]:\nAction: {action}\nResult Summary: {summary}\n"
+            elif idx_from_end < 10:
+                # BRIEF tier - action + first 2 sentences
+                brief = self._first_n_sentences(summary, 2)
+                entry = f"STEP {iteration} [BRIEF]:\nAction: {action}\nResult: {brief}\n"
+            else:
+                # MINIMAL tier - one-line label with pass/fail
+                status = 'FAIL' if any(kw in summary.upper() for kw in ('FAILED', 'ERROR', 'STUCK')) else 'OK'
+                entry = f"STEP {iteration}: {action} [{status}]\n"
+
+            entry_chars = len(entry)
+            if used_chars + entry_chars > budget_chars:
+                remaining = total - len(formatted)
+                formatted.append(f"... [{remaining} older steps omitted due to context budget] ...")
+                break
+            formatted.append(entry)
+            used_chars += entry_chars
+
+        # Reverse back to chronological order for readability
+        formatted.reverse()
+        return "\n".join(formatted)
+
+    @staticmethod
+    def _first_n_sentences(text: str, n: int) -> str:
+        """Extract roughly the first n sentences from text."""
+        if not text:
+            return ''
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        result = ' '.join(sentences[:n])
+        if len(sentences) > n:
+            result += ' [...]'
+        return result
         
     def _format_milestones(self) -> str:
         if not self.completed_milestones:
@@ -167,9 +282,53 @@ class Worker:
 
 {PLANNER_INSTRUCTIONS}"""
 
+    def _build_preflight_executor_context(self, tool_list_str: str, system_specs: str,
+                                            suggested_actions: str, open_files_list: str) -> str:
+        """Build the pre-flight executor prompt for context gathering phase."""
+        return f"""{self.base_directives}
+
+{self.docker_directives}
+
+**Available Tools (Pre-flight Phase - File Management Only)**
+{tool_list_str}
+
+**Important Reminders**
+{self.important_reminders}
+
+{system_specs}
+
+**Currently Open Files (Paths Only)**
+{open_files_list}
+
+**Planner's Suggested Actions**
+{suggested_actions}
+
+**Pre-flight Instructions**
+You are in the PRE-FLIGHT CONTEXT GATHERING phase. Your ONLY job is to ensure the right files are open before the main execution phase begins.
+
+Analyze the planner's suggested actions and determine which files will need to be read or modified to complete those actions. Then craft a list of file management actions:
+
+1. Use 'open_file' to open any files that are mentioned in the suggested actions but are NOT currently open
+2. Use 'close_file' to close any files that ARE currently open but are NOT needed for the suggested actions
+3. Return an empty actions list if the current open file state is already optimal
+
+You can ONLY use open_file and close_file tools. No other actions are allowed in pre-flight.
+
+Your response must be ONLY a valid JSON object. No text before {{. No text after }}. Use double quotes (") only. No markdown fences.
+
+Correct format:
+{{"actions": [{{"tool_name": "open_file", "parameters": {{"file_path": "path/to/file"}}}}, {{"tool_name": "close_file", "parameters": {{"file_path": "other/file"}}}}]}}
+
+Or if no changes needed:
+{{"actions": []}}
+"""
+
     def _build_executor_context(self, tool_list_str: str, milestones_str: str,
-                                 plan: str, suggested_actions: str, open_files_str: str) -> str:
-        """Build the complete executor prompt with instructions at the end."""
+                                 suggested_actions: str, open_files_str: str) -> str:
+        """Build the complete executor prompt with instructions at the end.
+        Note: The full plan is intentionally omitted. The executor receives the
+        distilled suggested_actions from the planner which contains everything
+        it needs. Sending the full plan wastes context and confuses weaker models."""
         return f"""{self.base_directives}
 
 {self.docker_directives}
@@ -183,10 +342,7 @@ class Worker:
 **Completed Milestones (Foundational Progress)**
 {milestones_str}
 
-**Current Plan**
-{plan}
-
-**Suggested Next Actions (from Planner)**
+**Your Task (from Planner)**
 {suggested_actions}
 
 **Open Files (Working Memory)**
@@ -205,27 +361,22 @@ class Worker:
 """
 
     def _analyze_milestones(self, objective: str, iteration: int, 
-                            actions_taken: List[str], iteration_result: str,
-                            base_context: str) -> None:
+                            actions_taken: List[str], iteration_result: str) -> None:
         """Analyze the iteration results to identify any completed milestones.
         Milestones are foundational progress markers that won't need to be redone.
+        Uses a minimal prompt - the analyzer only needs the objective, existing
+        milestones, and this iteration's results. No tools/directives/history needed.
         """
         try:
             milestones_str = self._format_milestones()
-            history_str = self._format_history()
             
-            analysis_context = f"""{base_context}
-
-{MILESTONE_ANALYZER_INSTRUCTIONS}
+            analysis_context = f"""{MILESTONE_ANALYZER_INSTRUCTIONS}
 
 **Objective**
 {objective}
 
 **Already Completed Milestones**
 {milestones_str}
-
-**Recent History**
-{history_str}
 
 **This Iteration (#{iteration})**
 Actions Taken: {', '.join(actions_taken)}
@@ -311,8 +462,10 @@ Result:
                 open_files_str = self._format_open_files()
                 
                 # Build planner prompt (instructions at end for emphasis)
+                # Planner gets compact file manifest; executor gets full content
+                compact_files_str = self._format_open_files_compact()
                 planner_prompt = self._build_planner_context(
-                    tool_list_str, system_specs, milestones_str, objective, history_str, open_files_str
+                    tool_list_str, system_specs, milestones_str, objective, history_str, compact_files_str
                 )
 
                 # --- PLANNER ---
@@ -323,10 +476,10 @@ Result:
                 suggested_actions_str = "No specific actions suggested."
                 try:
                     plan_data = json.loads(plan_response_str)
-                    self.current_plan = plan_data.get("updated_plan", self.current_plan)
+                    self.current_plan = plan_data.get("updated_plan") or self.current_plan
                     
                     # Format suggested actions for executor (now free-form text from planner)
-                    next_actions = plan_data.get("next_actions", "")
+                    next_actions = plan_data.get("next_actions") or ""
                     if next_actions:
                         if isinstance(next_actions, str):
                             suggested_actions_str = next_actions
@@ -362,133 +515,255 @@ Result:
                     self.logger.warning(f"Failed to parse planner response as JSON: {e}")
                     suggested_actions_str = "Planner output was not valid JSON. Analyze previous state and proceed."
 
-                # --- EXECUTOR ---
+                # --- PRE-FLIGHT EXECUTOR (Context Gathering Phase) ---
+                if step_callback:
+                    step_callback(iteration, display_max, "Pre-flight")
+
+                self.print_func("Pre-flight: Gathering file context...")
+                
+                preflight_tool_list = self._get_preflight_tools_description()
+                open_files_list = self._format_open_files_list()
+                preflight_prompt = self._build_preflight_executor_context(
+                    preflight_tool_list, system_specs,
+                    suggested_actions_str, open_files_list
+                )
+
+                try:
+                    preflight_json = self.llm_client.get_action(prompt=preflight_prompt)
+                    preflight_data = json.loads(self._clean_action_json(preflight_json))
+                    preflight_actions = preflight_data.get("actions", [])
+                    
+                    if not preflight_actions:
+                        self.print_func("Pre-flight: File context already optimal.")
+                    else:
+                        # Execute pre-flight actions (simple - just open/close files)
+                        for action in preflight_actions:
+                            tool_name = action.get("tool_name")
+                            params = action.get("parameters", {})
+                            
+                            if tool_name not in ["open_file", "close_file"]:
+                                self.logger.warning(f"Pre-flight: Ignoring invalid tool '{tool_name}'")
+                                continue
+                                
+                            if tool_name not in self.tools:
+                                self.logger.warning(f"Pre-flight: Tool '{tool_name}' not found")
+                                continue
+                            
+                            try:
+                                result = self.tools[tool_name].execute(**params)
+                                self.print_func(f"Pre-flight: {tool_name} {params.get('file_path', '?')}")
+                            except Exception as e:
+                                self.logger.warning(f"Pre-flight {tool_name} failed: {e}")
+                                # Continue - main executor can retry if needed
+                except Exception as e:
+                    self.logger.warning(f"Pre-flight phase failed: {e}. Proceeding to main execution.")
+                    # Continue anyway - main executor has open_file if needed
+
+                # --- MAIN EXECUTOR (with retry loop) ---
                 if step_callback:
                     step_callback(iteration, display_max, "Executing")
 
-                # open_files_str is already generated above for the planner
-                
-                # Build executor prompt (separate from planner, instructions at end)
+                # Now format files with full content for main executor
+                executor_files_str = self._format_open_files()
                 executor_prompt = self._build_executor_context(
-                    tool_list_str, milestones_str, self.current_plan, 
-                    suggested_actions_str, open_files_str
+                    tool_list_str, milestones_str,
+                    suggested_actions_str, executor_files_str
                 )
-                
-                action_json_str = self.llm_client.get_action(prompt=executor_prompt)
 
-                actions = []
-                try:
-                    clean_json = self._clean_action_json(action_json_str)
-                    parsed = json.loads(clean_json)
-                    
-                    if isinstance(parsed, list): 
-                        actions = parsed
-                    elif isinstance(parsed, dict):
-                        if "actions" in parsed and isinstance(parsed["actions"], list):
-                            actions = parsed["actions"]
-                        elif "tool_name" in parsed:
-                            actions = [parsed]
-                except json.JSONDecodeError as e:
-                    self.last_observation = f"Error parsing action JSON: {e}. Raw response: {action_json_str[:200]}..."
-                    self.logger.error(f"JSON parse error: {e}")
-                    self.recent_history.append({"iteration": iteration, "action": "Parse Error", "summary": self.last_observation})
-                    continue
-                except Exception as e:
-                    self.last_observation = f"Unexpected error parsing action: {e}"
-                    self.logger.error(f"Action parse error: {e}")
-                    self.recent_history.append({"iteration": iteration, "action": "Parse Error", "summary": self.last_observation})
-                    continue
+                max_exec_retries = 3
+                last_fail_step = -1
+                stuck_count = 0
+                exec_error_feedback = ""
+                final_summary = "No actions executed."
+                final_actions_taken = []
 
-                if not actions:
-                    self.last_observation = "No actions parsed from executor response."
-                    self.recent_history.append({"iteration": iteration, "action": "No Actions", "summary": self.last_observation})
-                    continue
+                for exec_attempt in range(max_exec_retries + 1):
+                    # On retries, augment prompt with error feedback and refreshed file state
+                    if exec_attempt > 0:
+                        self.print_func(f"{C_YELLOW}Executor self-correcting (retry {exec_attempt}/{max_exec_retries})...{C_RESET}")
+                        refreshed_files = self._format_open_files()
+                        retry_addendum = (
+                            f"\n\n**EXECUTION ERROR FEEDBACK (Retry {exec_attempt}/{max_exec_retries})**\n"
+                            f"Your previous set of actions failed during execution. Here is what happened:\n"
+                            f"{exec_error_feedback}\n\n"
+                            f"**Updated Open Files (may reflect changes from successful steps)**\n"
+                            f"{refreshed_files}\n\n"
+                            f"Revise your actions to fix the error. Do NOT repeat the exact same failing action unchanged."
+                        )
+                        current_prompt = executor_prompt + retry_addendum
+                    else:
+                        current_prompt = executor_prompt
 
-                combined_summary_parts = []
-                actions_taken_str = []
-                restart_main_loop = False 
-                
-                if len(actions) > 15: 
-                    actions = actions[:15]
-                    self.logger.warning(f"Truncated actions from {len(actions)} to 15")
+                    action_json_str = self.llm_client.get_action(prompt=current_prompt)
 
-                for idx, action_data in enumerate(actions):
-                    if restart_main_loop: break
+                    # --- Parse actions ---
+                    actions = []
+                    parse_failed = False
+                    try:
+                        clean_json = self._clean_action_json(action_json_str)
+                        parsed = json.loads(clean_json)
+                        if isinstance(parsed, list):
+                            actions = parsed
+                        elif isinstance(parsed, dict):
+                            if "actions" in parsed and isinstance(parsed["actions"], list):
+                                actions = parsed["actions"]
+                            elif "tool_name" in parsed:
+                                actions = [parsed]
+                    except json.JSONDecodeError as e:
+                        exec_error_feedback = f"Your response was not valid JSON. Parse error: {e}. Raw start: {action_json_str[:300]}..."
+                        self.logger.error(f"JSON parse error (exec attempt {exec_attempt}): {e}")
+                        parse_failed = True
+                    except Exception as e:
+                        exec_error_feedback = f"Unexpected parse error: {e}"
+                        self.logger.error(f"Action parse error (exec attempt {exec_attempt}): {e}")
+                        parse_failed = True
 
-                    tool_name = action_data.get("tool_name")
-                    params = action_data.get("parameters", {})
-                    allow_failure = action_data.get("allow_failure", False)
-                    
-                    if not tool_name:
-                        combined_summary_parts.append(f"Action {idx+1}: Missing tool_name in action data.")
-                        break
-                    
-                    if tool_name not in self.tools:
-                        combined_summary_parts.append(f"Action {idx+1}: Tool '{tool_name}' not found. Available: {list(self.tools.keys())}")
-                        break
+                    if parse_failed:
+                        if exec_attempt == max_exec_retries:
+                            final_summary = f"Failed to parse executor response after {max_exec_retries + 1} attempts. Last error: {exec_error_feedback}"
+                        continue
 
-                    self.print_func(f"{C_YELLOW}Executing (Step {idx+1}):{C_RESET} {tool_name} {params}")
-                    actions_taken_str.append(f"{tool_name}")
+                    if not actions:
+                        exec_error_feedback = "No actions were parsed from your response. You MUST return at least one action."
+                        if exec_attempt == max_exec_retries:
+                            final_summary = "No actions parsed from executor after all retries."
+                        continue
 
-                    if tool_name in terminal_tools:
-                        try:
-                            tool = self.tools[tool_name]
-                            result_str = str(tool.execute(**params))
-                        except Exception as e:
-                            result_str = f"Error executing terminal tool {tool_name}: {e}"
-                        
-                        self.print_func(f"\n{C_GREEN}{result_str}{C_RESET}")
-                        self.recent_history.append({"iteration": iteration, "action": tool_name, "summary": result_str})
-                        if step_callback: step_callback(iteration, display_max, "Complete")
-                        return 
+                    # --- Execute actions ---
+                    combined_summary_parts = []
+                    actions_taken_str = []
+                    error_at_step = -1
+                    hit_early_exit = False
 
-                    elif tool_name == "get_user_input":
-                        try:
-                            self.print_func(f"{C_YELLOW}Agent Request: {params.get('prompt')}\n> {C_RESET}")
-                            user_in = input()
-                            combined_summary_parts.append(f"User Input: {user_in}")
-                        except EOFError:
+                    if len(actions) > 15:
+                        actions = actions[:15]
+                        self.logger.warning("Truncated actions to 15")
+
+                    for idx, action_data in enumerate(actions):
+                        tool_name = action_data.get("tool_name")
+                        params = action_data.get("parameters", {})
+                        allow_failure = action_data.get("allow_failure", False)
+
+                        if not tool_name:
+                            combined_summary_parts.append(f"Action {idx+1}: Missing tool_name in action data.")
+                            error_at_step = idx
+                            break
+
+                        if tool_name not in self.tools:
+                            combined_summary_parts.append(f"Action {idx+1}: Tool '{tool_name}' not found. Available: {list(self.tools.keys())}")
+                            error_at_step = idx
+                            break
+
+                        self.print_func(f"{C_YELLOW}Executing (Step {idx+1}):{C_RESET} {tool_name} {params}")
+                        actions_taken_str.append(tool_name)
+
+                        if tool_name in terminal_tools:
+                            try:
+                                tool = self.tools[tool_name]
+                                result_str = str(tool.execute(**params))
+                            except Exception as e:
+                                result_str = f"Error executing terminal tool {tool_name}: {e}"
+                            self.print_func(f"\n{C_GREEN}{result_str}{C_RESET}")
+                            self.recent_history.append({"iteration": iteration, "action": tool_name, "summary": result_str})
+                            if step_callback: step_callback(iteration, display_max, "Complete")
                             return
+
+                        elif tool_name == "get_user_input":
+                            try:
+                                self.print_func(f"{C_YELLOW}Agent Request: {params.get('prompt')}\n> {C_RESET}")
+                                user_in = input()
+                                combined_summary_parts.append(f"User Input: {user_in}")
+                            except EOFError:
+                                return
+                            hit_early_exit = True
+                            break
+
+                        else:
+                            try:
+                                tool = self.tools[tool_name]
+                                raw_result = tool.execute(**params)
+                            except TypeError as e:
+                                raw_result = f"Tool Parameter Error: {e}. Check required parameters for '{tool_name}'."
+                            except Exception as e:
+                                raw_result = f"Tool Execution Error: {type(e).__name__}: {e}"
+
+                            result_str = str(raw_result)
+                            combined_summary_parts.append(f"Action {idx+1} ({tool_name}):\n{result_str}")
+
+                            if "COMMAND FAILED" in result_str or result_str.strip().startswith("Error:"):
+                                if not allow_failure:
+                                    error_at_step = idx
+                                    break
+
+                    # --- Summarize this attempt ---
+                    if not combined_summary_parts:
+                        attempt_summary = "No actions executed."
+                    else:
+                        full_raw_output = "\n\n".join(combined_summary_parts)
+                        if len(full_raw_output) < 200 and len(actions) == 1 and actions[0].get("tool_name") != "run_command":
+                            attempt_summary = full_raw_output
+                        else:
+                            command_context = f"Chain: {', '.join(actions_taken_str)}"
+                            attempt_summary = self.llm_client.summarize_execution(command_context, full_raw_output)
+
+                    # --- Decide: success, retry, or escalate ---
+                    if error_at_step == -1 or hit_early_exit:
+                        # All actions succeeded (or user input was requested)
+                        final_summary = attempt_summary
+                        final_actions_taken = actions_taken_str
                         break
-                    
+
+                    # Error occurred — check if we're making forward progress
+                    if error_at_step <= last_fail_step:
+                        stuck_count += 1
                     else:
-                        try:
-                            tool = self.tools[tool_name]
-                            raw_result = tool.execute(**params)
-                        except TypeError as e:
-                            raw_result = f"Tool Parameter Error: {e}. Check required parameters for '{tool_name}'."
-                        except Exception as e:
-                            raw_result = f"Tool Execution Error: {type(e).__name__}: {e}"
+                        # Failing later in the chain means earlier steps got fixed
+                        stuck_count = 0
+                    last_fail_step = error_at_step
 
-                        result_str = str(raw_result)
-                        combined_summary_parts.append(f"Action {idx+1} ({tool_name}):\n{result_str}")
-                        
-                        if "COMMAND FAILED" in result_str or result_str.strip().startswith("Error:"):
-                            if not allow_failure:
-                                break
+                    # Stuck on same (or earlier) step too many times -> escalate to planner
+                    if stuck_count >= 2:
+                        self.print_func(f"{C_RED}Executor stuck at step {error_at_step + 1} after {exec_attempt + 1} attempts. Escalating to planner.{C_RESET}")
+                        final_summary = (
+                            f"EXECUTOR STUCK at step {error_at_step + 1} across {exec_attempt + 1} retries. "
+                            f"Needs planner intervention.\n{attempt_summary}"
+                        )
+                        final_actions_taken = actions_taken_str
+                        break
 
-                if not combined_summary_parts:
-                    summary = "No actions executed."
-                else:
-                    full_raw_output = "\n\n".join(combined_summary_parts)
-                    if len(full_raw_output) < 200 and len(actions) == 1 and actions[0].get('tool_name') != "run_command":
-                        summary = full_raw_output
+                    # Still have retries left — build detailed feedback for the executor
+                    if exec_attempt < max_exec_retries:
+                        success_lines = [f"  Step {i+1} ({actions_taken_str[i]}): OK" for i in range(error_at_step)]
+                        fail_tool = actions_taken_str[error_at_step] if error_at_step < len(actions_taken_str) else "unknown"
+                        fail_line = f"  Step {error_at_step + 1} ({fail_tool}): FAILED"
+                        exec_error_feedback = (
+                            f"Executed {len(actions_taken_str)} action(s). Failed at step {error_at_step + 1}.\n"
+                            + ("\n".join(success_lines) + "\n" if success_lines else "")
+                            + fail_line + "\n"
+                            + f"Error details:\n{attempt_summary}"
+                        )
+                        self.print_func(
+                            f"{C_YELLOW}Error at step {error_at_step + 1}. "
+                            f"Retrying executor ({exec_attempt + 1}/{max_exec_retries})...{C_RESET}"
+                        )
                     else:
-                        command_context = f"Chain: {', '.join(actions_taken_str)}"
-                        summary = self.llm_client.summarize_execution(command_context, full_raw_output)
+                        # Out of retries entirely
+                        final_summary = (
+                            f"EXECUTOR FAILED after {max_exec_retries + 1} attempts. "
+                            f"Last error at step {error_at_step + 1}.\n{attempt_summary}"
+                        )
+                        final_actions_taken = actions_taken_str
 
-                self.last_observation = summary
-                self.recent_history.append({"iteration": iteration, "action": f"Chain: {len(actions)} tools", "summary": summary})
+                self.last_observation = final_summary
+                self.recent_history.append({"iteration": iteration, "action": f"Chain: {len(final_actions_taken)} tools", "summary": final_summary})
 
                 # --- MILESTONE ANALYSIS (after iteration completes) ---
                 # Analyze if any foundational milestones were achieved this iteration
-                base_context = self._build_base_context(tool_list_str)
                 self._analyze_milestones(
                     objective=objective,
                     iteration=iteration,
-                    actions_taken=actions_taken_str,
-                    iteration_result=summary,
-                    base_context=base_context
+                    actions_taken=final_actions_taken,
+                    iteration_result=final_summary,
                 )
 
             except KeyboardInterrupt:

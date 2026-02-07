@@ -1,1 +1,4 @@
-Internal reasoning loop. Use to plan or analyze before acting. Params: `query` (str). Example: `{"tool_name": "think", "parameters": {"query": "Drafting plan to fix bug."}}`
+Internal reasoning loop. Use to plan, analyze, or reflect before acting. Helps avoid costly mistakes by thinking through an approach first.
+Schema:
+  query (str, required): The question or topic to reason about.
+Example: {"tool_name": "think", "parameters": {"query": "What are the possible root causes of this import error?"}}

@@ -1,1 +1,5 @@
-Writes a file inside the container. Params: `file_path`, `content`.
+Writes a file inside the research container. Use to create scripts, configs, or data files within the container filesystem.
+Schema:
+  file_path (str, required): Path inside the container (relative to /workspace or absolute).
+  content (str, required): The complete file content to write.
+Example: {"tool_name": "write_file", "parameters": {"file_path": "experiment.py", "content": "import torch\nprint(torch.cuda.is_available())"}}

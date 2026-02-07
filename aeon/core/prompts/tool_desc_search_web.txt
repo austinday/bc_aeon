@@ -1,1 +1,4 @@
-Web search. Use for external info/docs, current information, or inspiration when stuck. Params: `query` (str). Example: `{"tool_name": "search_web", "parameters": {"query": "python singleton pattern"}}`
+Searches the web and returns a summarized result. Use for external documentation, current information, API references, or inspiration when stuck on a problem.
+Schema:
+  query (str, required): The search query. Be specific and concise for best results.
+Example: {"tool_name": "search_web", "parameters": {"query": "python asyncio gather exception handling"}}

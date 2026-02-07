@@ -1,1 +1,4 @@
-Opens a file into Short Term Memory tabs. Smartly summarizes data files (CSV, JSON, FASTA) to save tokens. This tool MUST be used to read ANY file. Params: `file_path` (str). Example: `{"tool_name": "open_file", "parameters": {"file_path": "data.csv"}}`
+Opens a file into Short Term Memory (working memory tabs). This is the ONLY way to read file contents. Smartly summarizes large data files (CSV, JSON, FASTA) to save tokens. Use before modifying any file.
+Schema:
+  file_path (str, required): Path to the file to open. Relative or absolute.
+Example: {"tool_name": "open_file", "parameters": {"file_path": "src/main.py"}}
