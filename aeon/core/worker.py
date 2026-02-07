@@ -275,8 +275,8 @@ Result:
         # This prevents multiple debug files per worker instance
 
         iteration = 0
-        if self.last_observation == "None.":
-            self.last_observation = "Project started."
+        # Prime the observation with the objective to ensure the Planner registers it immediately
+        self.last_observation = f"User input received: {objective}"
 
         self.print_func(f"{C_GREEN}Objective: {objective}{C_RESET}\n")
 

@@ -106,3 +106,24 @@ hi, only respond in text, don't do any coding or commands
 [2026-02-05 12:54:33] OBJECTIVE UPDATE:
 hi
 ----------------------------------------
+[2026-02-06 10:19:27] OBJECTIVE UPDATE:
+I want you to add support for ollama model qwen3-coder-next:q8_0, add it to the setup environment script so it downloads and sets it up like all the others, then make sure the aeon command supports selecting it from the menu. 
+----------------------------------------
+[2026-02-06 15:45:38] OBJECTIVE UPDATE:
+add support in the setup environment script and in the aeon agent for the ollama model qwen3-coder-next:q8_0
+----------------------------------------
+[2026-02-06 15:47:08] OBJECTIVE UPDATE:
+add support in the setup environment script and in the aeon agent for the ollama model qwen3-coder-next:q8_0, for this task only, you do not need to validate it by running it, just do the best you can to modify the code so that you think it would work correctly
+----------------------------------------
+[2026-02-06 16:00:48] OBJECTIVE UPDATE:
+modify setup_environment.sh so that it supports qwen3-coder-next:q8_0, make sure the aeon agent can use it
+----------------------------------------
+[2026-02-06 16:01:34] OBJECTIVE UPDATE:
+do the task
+----------------------------------------
+[2026-02-06 16:03:11] OBJECTIVE UPDATE:
+add support to aeon for qwen3-coder-next:q8_0
+----------------------------------------
+[2026-02-06 16:28:03] OBJECTIVE UPDATE:
+hi
+----------------------------------------
