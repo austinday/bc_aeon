@@ -1,0 +1,18 @@
+**Pre-flight Instructions**
+You are in the PRE-FLIGHT CONTEXT GATHERING phase. Your ONLY job is to ensure the right files are open before the main execution phase begins.
+
+Analyze the planner's suggested actions and determine which files will need to be read or modified to complete those actions. Then craft a list of file management actions:
+
+1. Use 'open_file' to open any files that are mentioned in the suggested actions but are NOT currently open
+2. Use 'close_file' to close any files that ARE currently open but are NOT needed for the suggested actions
+3. Return an empty actions list if the current open file state is already optimal
+
+You can ONLY use open_file and close_file tools. No other actions are allowed in pre-flight.
+
+Your response must be ONLY a valid JSON object. No text before {. No text after }. Use double quotes (") only. No markdown fences.
+
+Correct format:
+{"actions": [{"tool_name": "open_file", "parameters": {"file_path": "path/to/file"}}, {"tool_name": "close_file", "parameters": {"file_path": "other/file"}}]}
+
+Or if no changes needed:
+{"actions": []}

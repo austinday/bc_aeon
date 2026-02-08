@@ -17,6 +17,7 @@ from .prompts import (
     IMPORTANT_REMINDERS,
     PLANNER_INSTRUCTIONS,
     EXECUTOR_INSTRUCTIONS,
+    PREFLIGHT_INSTRUCTIONS,
     MILESTONE_ANALYZER_INSTRUCTIONS,
 )
 
@@ -248,8 +249,10 @@ class Worker:
             self.logger.error(f"Failed to save objective to file: {e}")
 
     def _build_planner_context(self, tool_list_str: str, system_specs: str, 
-                                milestones_str: str, objective: str, history_str: str, open_files_str: str) -> str:
+                               milestones_str: str, objective: str, history_str: str, open_files_str: str) -> str:
         """Build the complete planner prompt with instructions at the end."""
+        reminders_section = f"**Important Reminders**\n{self.important_reminders}\n" if self.important_reminders.strip() else ""
+        
         return f"""{self.base_directives}
 
 {self.docker_directives}
@@ -257,8 +260,7 @@ class Worker:
 **Available Tools**
 {tool_list_str}
 
-**Important Reminders**
-{self.important_reminders}
+{reminders_section}
 
 {system_specs}
 
@@ -283,8 +285,10 @@ class Worker:
 {PLANNER_INSTRUCTIONS}"""
 
     def _build_preflight_executor_context(self, tool_list_str: str, system_specs: str,
-                                            suggested_actions: str, open_files_list: str) -> str:
+                                          suggested_actions: str, open_files_list: str) -> str:
         """Build the pre-flight executor prompt for context gathering phase."""
+        reminders_section = f"**Important Reminders**\n{self.important_reminders}\n" if self.important_reminders.strip() else ""
+
         return f"""{self.base_directives}
 
 {self.docker_directives}
@@ -292,8 +296,7 @@ class Worker:
 **Available Tools (Pre-flight Phase - File Management Only)**
 {tool_list_str}
 
-**Important Reminders**
-{self.important_reminders}
+{reminders_section}
 
 {system_specs}
 
@@ -303,32 +306,17 @@ class Worker:
 **Planner's Suggested Actions**
 {suggested_actions}
 
-**Pre-flight Instructions**
-You are in the PRE-FLIGHT CONTEXT GATHERING phase. Your ONLY job is to ensure the right files are open before the main execution phase begins.
-
-Analyze the planner's suggested actions and determine which files will need to be read or modified to complete those actions. Then craft a list of file management actions:
-
-1. Use 'open_file' to open any files that are mentioned in the suggested actions but are NOT currently open
-2. Use 'close_file' to close any files that ARE currently open but are NOT needed for the suggested actions
-3. Return an empty actions list if the current open file state is already optimal
-
-You can ONLY use open_file and close_file tools. No other actions are allowed in pre-flight.
-
-Your response must be ONLY a valid JSON object. No text before {{. No text after }}. Use double quotes (") only. No markdown fences.
-
-Correct format:
-{{"actions": [{{"tool_name": "open_file", "parameters": {{"file_path": "path/to/file"}}}}, {{"tool_name": "close_file", "parameters": {{"file_path": "other/file"}}}}]}}
-
-Or if no changes needed:
-{{"actions": []}}
-"""
+{PREFLIGHT_INSTRUCTIONS}"""
 
     def _build_executor_context(self, tool_list_str: str, milestones_str: str,
-                                 suggested_actions: str, open_files_str: str) -> str:
+                                objective: str,
+                                suggested_actions: str, open_files_str: str) -> str:
         """Build the complete executor prompt with instructions at the end.
         Note: The full plan is intentionally omitted. The executor receives the
         distilled suggested_actions from the planner which contains everything
         it needs. Sending the full plan wastes context and confuses weaker models."""
+        reminders_section = f"**Important Reminders**\n{self.important_reminders}\n" if self.important_reminders.strip() else ""
+
         return f"""{self.base_directives}
 
 {self.docker_directives}
@@ -336,11 +324,13 @@ Or if no changes needed:
 **Available Tools**
 {tool_list_str}
 
-**Important Reminders**
-{self.important_reminders}
+{reminders_section}
 
 **Completed Milestones (Foundational Progress)**
 {milestones_str}
+
+**Objective**
+{objective}
 
 **Your Task (from Planner)**
 {suggested_actions}
@@ -471,49 +461,53 @@ Result:
                 # --- PLANNER ---
                 self.print_func("Thinking (Planning)...")
                 
-                plan_response_str = self.llm_client.get_plan(prompt=planner_prompt)
-                
-                suggested_actions_str = "No specific actions suggested."
                 try:
+                    plan_response_str = self.llm_client.get_plan(prompt=planner_prompt)
+                    if self.debug_mode:
+                        self.print_func(f"{C_YELLOW}[DEBUG] Planner Raw Output:\n{plan_response_str}{C_RESET}")
+                    
+                    suggested_actions_str = "No specific actions suggested."
+                    
+                    # PARSE PLANNER RESPONSE
                     plan_data = json.loads(plan_response_str)
                     self.current_plan = plan_data.get("updated_plan") or self.current_plan
-                    
-                    # Format suggested actions for executor (now free-form text from planner)
-                    next_actions = plan_data.get("next_actions") or ""
-                    if next_actions:
-                        if isinstance(next_actions, str):
-                            suggested_actions_str = next_actions
-                        elif isinstance(next_actions, list):
-                            # Backwards compatibility if planner still outputs list
-                            action_lines = []
-                            for act in next_actions:
-                                if isinstance(act, dict):
-                                    action_lines.append(f"- {act.get('tool', 'unknown')}: {act.get('purpose', 'N/A')}")
-                                else:
-                                    action_lines.append(f"- {act}")
-                            suggested_actions_str = "\n".join(action_lines)
-                        else:
-                            suggested_actions_str = str(next_actions)
-                    
-                    analysis = plan_data.get("analysis", "")
-                    iteration_strategy = plan_data.get("iteration_strategy", "single_step")
-                    risk_notes = plan_data.get("risk_notes", "")
-
-                    self.print_func(f"{C_CYAN}Analysis:{C_RESET} {analysis}")
-                    self.print_func(f"{C_CYAN}Strategy:{C_RESET} {iteration_strategy}")
-                    if risk_notes:
-                        self.print_func(f"{C_YELLOW}Risks:{C_RESET} {risk_notes}")
-                    
-                    plan_lines = self.current_plan.split('\n')
-                    if len(plan_lines) > 8:
-                        preview = '\n'.join(plan_lines[:4]) + f'\n{C_YELLOW}... [plan truncated] ...{C_RESET}\n' + '\n'.join(plan_lines[-4:])
+                except Exception as e:
+                    self.print_func(f"{C_RED}PLANNER CRASHED: {e}{C_RESET}")
+                    plan_data = {}
+                
+                # Format suggested actions for executor (now free-form text from planner)
+                next_actions = plan_data.get("next_actions") or ""
+                if next_actions:
+                    if isinstance(next_actions, str):
+                        suggested_actions_str = next_actions
+                    elif isinstance(next_actions, list):
+                        # Backwards compatibility if planner still outputs list
+                        action_lines = []
+                        for act in next_actions:
+                            if isinstance(act, dict):
+                                action_lines.append(f"- {act.get('tool', 'unknown')}: {act.get('purpose', 'N/A')}")
+                            else:
+                                action_lines.append(f"- {act}")
+                        suggested_actions_str = "\n".join(action_lines)
                     else:
-                        preview = self.current_plan
-                    self.print_func(f"{C_CYAN}Plan Update:{C_RESET}\n{preview}")
+                        suggested_actions_str = str(next_actions)
+                
+                analysis = plan_data.get("analysis", "")
+                iteration_strategy = plan_data.get("iteration_strategy", "single_step")
+                risk_notes = plan_data.get("risk_notes", "")
+
+                self.print_func(f"{C_CYAN}Analysis:{C_RESET} {analysis}")
+                self.print_func(f"{C_CYAN}Strategy:{C_RESET} {iteration_strategy}")
+                if risk_notes:
+                    self.print_func(f"{C_YELLOW}Risks:{C_RESET} {risk_notes}")
+                
+                plan_lines = self.current_plan.split('\n')
+                if len(plan_lines) > 8:
+                    preview = '\n'.join(plan_lines[:4]) + f'\n{C_YELLOW}... [plan truncated] ...{C_RESET}\n' + '\n'.join(plan_lines[-4:])
+                else:
+                    preview = self.current_plan
+                self.print_func(f"{C_CYAN}Plan Update:{C_RESET}\n{preview}")
                     
-                except json.JSONDecodeError as e:
-                    self.logger.warning(f"Failed to parse planner response as JSON: {e}")
-                    suggested_actions_str = "Planner output was not valid JSON. Analyze previous state and proceed."
 
                 # --- PRE-FLIGHT EXECUTOR (Context Gathering Phase) ---
                 if step_callback:
@@ -567,6 +561,7 @@ Result:
                 executor_files_str = self._format_open_files()
                 executor_prompt = self._build_executor_context(
                     tool_list_str, milestones_str,
+                    objective,
                     suggested_actions_str, executor_files_str
                 )
 
@@ -595,6 +590,8 @@ Result:
                         current_prompt = executor_prompt
 
                     action_json_str = self.llm_client.get_action(prompt=current_prompt)
+                    if self.debug_mode:
+                        self.print_func(f"{C_YELLOW}[DEBUG] Executor Raw Output:\n{action_json_str}{C_RESET}")
 
                     # --- Parse actions ---
                     actions = []
@@ -611,11 +608,11 @@ Result:
                                 actions = [parsed]
                     except json.JSONDecodeError as e:
                         exec_error_feedback = f"Your response was not valid JSON. Parse error: {e}. Raw start: {action_json_str[:300]}..."
-                        self.logger.error(f"JSON parse error (exec attempt {exec_attempt}): {e}")
+                        self.print_func(f"{C_RED}JSON Parse Failed: {e}{C_RESET}")
                         parse_failed = True
                     except Exception as e:
                         exec_error_feedback = f"Unexpected parse error: {e}"
-                        self.logger.error(f"Action parse error (exec attempt {exec_attempt}): {e}")
+                        self.print_func(f"{C_RED}Action Parse Failed: {e}{C_RESET}")
                         parse_failed = True
 
                     if parse_failed:

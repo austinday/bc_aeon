@@ -151,3 +151,18 @@ you working?
 [2026-02-07 12:19:47] OBJECTIVE UPDATE:
 you working? 
 ----------------------------------------
+[2026-02-07 13:57:09] OBJECTIVE UPDATE:
+hi
+----------------------------------------
+[2026-02-07 14:03:17] OBJECTIVE UPDATE:
+your current workspace has code for an agent framework. This framework is the one that you are currently the llm for. The current task is to adjust the setup script and aeon agent so that we remove some local models and add some local models. Specifically, I want to add support for qwen3-coder-next:q8_0 which is available on ollama. I want to remove deepcoder:14b phi4:14b nemotron-3-nano:30b all the GLM-4.7-Flash models, qwen3-coder:30b qwen3:32b deepseek-r1:70b llama4:16x17b qwen3-next:80b make sure you don't touch any other parts of the code, only the setup files and whatever is necessary to make sure the aeon command in the agent code recognizes the changes. 
+----------------------------------------
+[2026-02-07 14:05:12] OBJECTIVE UPDATE:
+your current workspace has code for an agent framework. This framework is the one that you are currently the llm for. The current task is to adjust the setup script and aeon agent so that we remove some local models and add some local models. Specifically, I want to add support for qwen3-coder-next:q8_0 which is available on ollama. I want to remove deepcoder:14b phi4:14b nemotron-3-nano:30b all the GLM-4.7-Flash models, qwen3-coder:30b qwen3:32b deepseek-r1:70b llama4:16x17b qwen3-next:80b make sure you don't touch any other parts of the code, only the setup files and whatever is necessary to make sure the aeon command in the agent code recognizes the changes.
+----------------------------------------
+[2026-02-07 14:16:55] OBJECTIVE UPDATE:
+your current workspace has code for an agent framework. This framework is the one that you are currently the llm for. The current task is to adjust the setup script and aeon agent so that we remove some local models and add some local models. Specifically, I want to add support for qwen3-coder-next:q8_0 which is available on ollama. I want to remove deepcoder:14b phi4:14b nemotron-3-nano:30b all the GLM-4.7-Flash models, qwen3-coder:30b qwen3:32b deepseek-r1:70b llama4:16x17b qwen3-next:80b make sure you don't touch any other parts of the code, only the setup files and whatever is necessary to make sure the aeon command in the agent code recognizes the changes.
+----------------------------------------
+[2026-02-07 14:21:33] OBJECTIVE UPDATE:
+your current workspace has code for an agent framework. This framework is the one that you are currently the llm for. The current task is to adjust the setup script and aeon agent so that we remove some local models and add some local models. Specifically, I want to add support for qwen3-coder-next:q8_0 which is available on ollama. I want to remove deepcoder:14b phi4:14b nemotron-3-nano:30b all the GLM-4.7-Flash models, qwen3-coder:30b qwen3:32b deepseek-r1:70b llama4:16x17b qwen3-next:80b make sure you don't touch any other parts of the code, only the setup files and whatever is necessary to make sure the aeon command in the agent code recognizes the changes.
+----------------------------------------

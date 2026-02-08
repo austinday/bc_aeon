@@ -16,6 +16,10 @@ from .prompts import (
     SUMMARIZE_TEXT_PROMPT,
 )
 
+# ANSI Colors for debug printing
+C_YELLOW = '\033[93m'
+C_RESET = '\033[0m'
+
 class LLMClient:
     """A client for interacting with Large Language Models (Cloud or Local)."""
     def __init__(self, provider: str = "local", local_strong: str = None, local_weak: str = None):
@@ -143,30 +147,38 @@ class LLMClient:
                     response_format={"type": "json_object"}
                 )
                 raw = resp.choices[0].message.content
+                
+                # DEBUG PRINT TO CONSOLE
+                if self.debug_path:
+                    print(f"{C_YELLOW}[LLM RAW - PLANNER]\n{raw}{C_RESET}")
+                
                 self._log_to_debug("PLANNER", self.planner_model, current_prompt, raw)
                 
                 cleaned = self._clean_json_response(raw)
                 
                 # Validate JSON parsing
                 try:
-                    json.loads(cleaned)
+                    parsed = json.loads(cleaned)
+                    if not parsed:
+                        raise ValueError("Empty JSON object returned.")
                     return cleaned
-                except json.JSONDecodeError as e:
-                    last_error = f"JSON parse error: {str(e)}"
+                except (json.JSONDecodeError, ValueError) as e:
+                    last_error = f"JSON validation error: {str(e)}"
                     self.logger.warning(f"Planner attempt {attempt + 1}/{max_retries} failed: {last_error}")
                     
                     if attempt < max_retries - 1:
                         # Add error feedback to prompt for retry
-                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE HAD INVALID JSON **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output ONLY a valid JSON object. No text before {{ or after }}. Use double quotes only."
+                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output ONLY a valid, non-empty JSON object. No text before {{ or after }}. Use double quotes only."
                     
             except Exception as e:
                 self._log_to_debug("PLANNER_ERR", self.planner_model, current_prompt, str(e))
                 self.logger.error(f"Planner LLM call failed: {e}")
                 raise
         
-        # All retries exhausted, return empty but valid JSON
-        self.logger.error(f"Planner failed after {max_retries} attempts. Last error: {last_error}")
-        return '{}'
+        # All retries exhausted, raise explicit error to avoid silent failure
+        error_msg = f"Planner failed after {max_retries} attempts. Last error: {last_error}"
+        self.logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
     def get_action(self, prompt: str, max_retries: int = 3) -> str:
         """Get action from executor LLM with retry logic for JSON parsing errors."""
@@ -182,30 +194,42 @@ class LLMClient:
                     response_format={"type": "json_object"}
                 )
                 raw = resp.choices[0].message.content
+                
+                # DEBUG PRINT TO CONSOLE
+                if self.debug_path:
+                    print(f"{C_YELLOW}[LLM RAW - EXECUTOR]\n{raw}{C_RESET}")
+                
                 self._log_to_debug("EXECUTOR", self.executor_model, current_prompt, raw)
                 
                 cleaned = self._clean_json_response(raw)
                 
                 # Validate JSON parsing
                 try:
-                    json.loads(cleaned)
+                    parsed = json.loads(cleaned)
+                    # Executor MUST return actions
+                    if not parsed:
+                        raise ValueError("Empty JSON object returned.")
+                    if "actions" in parsed and not parsed["actions"]:
+                        raise ValueError("Actions list is empty.")
+                        
                     return cleaned
-                except json.JSONDecodeError as e:
-                    last_error = f"JSON parse error: {str(e)}"
+                except (json.JSONDecodeError, ValueError) as e:
+                    last_error = f"JSON validation error: {str(e)}"
                     self.logger.warning(f"Executor attempt {attempt + 1}/{max_retries} failed: {last_error}")
                     
                     if attempt < max_retries - 1:
                         # Add error feedback to prompt for retry
-                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE HAD INVALID JSON **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output ONLY a valid JSON object. No text before {{ or after }}. Use double quotes only."
+                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output ONLY a valid, non-empty JSON object. No text before {{ or after }}. Use double quotes only."
                     
             except Exception as e:
                 self._log_to_debug("EXEC_ERR", self.executor_model, current_prompt, str(e))
                 self.logger.error(f"Executor LLM call failed: {e}")
                 raise
         
-        # All retries exhausted, return empty but valid JSON
-        self.logger.error(f"Executor failed after {max_retries} attempts. Last error: {last_error}")
-        return '{"actions": []}'
+        # All retries exhausted, raise explicit error
+        error_msg = f"Executor failed after {max_retries} attempts. Last error: {last_error}"
+        self.logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
     def analyze_milestones(self, analysis_context: str) -> Dict:
         """Analyze iteration results to identify completed milestones.
