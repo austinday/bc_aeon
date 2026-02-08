@@ -26,6 +26,7 @@ IMPORTANT_REMINDERS = _load('important_reminders.txt')
 # =============================================================================
 PLANNER_INSTRUCTIONS = _load('planner_instructions.txt')
 EXECUTOR_INSTRUCTIONS = _load('executor_instructions.txt')
+PREFLIGHT_INSTRUCTIONS = _load('preflight_instructions.txt')
 MILESTONE_ANALYZER_INSTRUCTIONS = _load('milestone_analyzer_instructions.txt')
 
 # =============================================================================

@@ -25,6 +25,7 @@ aeon/core/prompts/important_reminders.txt
 aeon/core/prompts/milestone_analyzer_instructions.txt
 aeon/core/prompts/objective_section.txt
 aeon/core/prompts/planner_instructions.txt
+aeon/core/prompts/preflight_instructions.txt
 aeon/core/prompts/research_objective_template.txt
 aeon/core/prompts/summarize_execution_prompt.txt
 aeon/core/prompts/summarize_text_prompt.txt
