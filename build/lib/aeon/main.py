@@ -46,7 +46,7 @@ def warm_up_models(strong_model, weak_model):
     
     for model in models_to_warm:
         try:
-            print(f"[SYSTEM]  >> Loading {model}...", end='', flush=True)
+            print(f"[SYSTEM]   >> Loading {model}...", end='', flush=True)
             resp = requests.post(
                 "http://localhost:8000/api/generate",
                 json={"model": model, "prompt": "hello", "options": {"num_predict": 1}},
@@ -67,7 +67,7 @@ def cleanup_transient_tools():
     try:
         # Added timeout=5s to prevent hanging if Docker daemon is broken
         subprocess.run("docker ps -a -q --filter 'name=aeon_research' --filter 'name=aeon_vision' | xargs -r docker rm -f", 
-                       shell=True, stderr=subprocess.DEVNULL, timeout=5)
+                        shell=True, stderr=subprocess.DEVNULL, timeout=5)
     except Exception as e:
         print(f"[WARN] Cleanup timed out or failed: {e}")
 
@@ -336,7 +336,7 @@ def cli():
         
         if not models:
             print("[WARN] No models found via API. Using defaults.")
-            models = ["deepseek-r1:70b", "qwen2.5:72b"]
+            models = ["qwen3:235b-iq4xs", "qwen3-coder-next:q8_0", "llama4:16x17b"]
         
         if args.strong and args.weak:
             local_strong, local_weak = args.strong, args.weak
@@ -346,7 +346,7 @@ def cli():
         
         print(f"[CONFIG] Strong: {local_strong} | Weak: {local_weak}")
         
-        # Enter session - always pass models for registry tracking
+        # Enter session - pass models for registry tracking and warmup
         session.enter(strong_model=local_strong, weak_model=local_weak, skip_warmup=args.no_warmup)
     else:
         # Cloud providers don't need local brain management

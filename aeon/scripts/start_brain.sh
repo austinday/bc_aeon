@@ -46,11 +46,11 @@ echo "[2/2] Launching Brain Node (GPU 0 -> :8000)..."
 
 docker run -d \
     --name aeon_brain_node \
-    --gpus '"device=0"' \
+    --gpus all \
     -v "$HOST_OLLAMA_DIR:/root/.ollama" \
     -e OLLAMA_KEEP_ALIVE=-1 \
     -e OLLAMA_MAX_LOADED_MODELS=2 \
-    -e OLLAMA_NUM_PARALLEL=4 \
+    -e OLLAMA_NUM_PARALLEL=1 \
     -e OLLAMA_NUM_CTX=131072 \
     -p 8000:11434 \
     ollama/ollama:latest

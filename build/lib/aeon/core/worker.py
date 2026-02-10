@@ -461,6 +461,8 @@ Result:
                 # --- PLANNER ---
                 self.print_func("Thinking (Planning)...")
                 
+                suggested_actions_str = "No specific actions suggested due to planner error."
+
                 try:
                     plan_response_str = self.llm_client.get_plan(prompt=planner_prompt)
                     if self.debug_mode:
@@ -762,6 +764,11 @@ Result:
                     actions_taken=final_actions_taken,
                     iteration_result=final_summary,
                 )
+
+            except Exception as e:
+                self.print_func(f"\n{C_RED}CRITICAL ERROR IN ITERATION: {e}{C_RESET}")
+                self.logger.error(f"Iteration failed: {e}", exc_info=True)
+                time.sleep(2) # Prevent rapid error loops
 
             except KeyboardInterrupt:
                 self.print_func(f"\n{C_RED}PAUSED (User Interrupt).{C_RESET}")

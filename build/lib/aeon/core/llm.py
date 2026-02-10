@@ -30,11 +30,11 @@ class LLMClient:
         
         # --- 1. LOCAL PROVIDER ---
         if provider == "local":
-            # Single Brain Node on Port 8000 handles both models
+            # Single Brain Node on Port 8000 handles all models
             self.planner_client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="ollama")
-            self.planner_model = local_strong or "deepseek-r1:70b"
+            self.planner_model = local_strong or "qwen3:235b-iq4xs"
             self.executor_client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="ollama")
-            self.executor_model = local_weak or "qwen2.5:72b"
+            self.executor_model = local_weak or "llama4:16x17b"
             self.summarizer_client = self.executor_client
             self.summarizer_model = self.executor_model
             self.context_limit = 128000 
@@ -104,7 +104,7 @@ class LLMClient:
             if escape_next:
                 escape_next = False
                 continue
-            if char == '\\':
+            if char == '\\' :
                 escape_next = True
                 continue
             if char == '"' and not escape_next:
@@ -206,11 +206,10 @@ class LLMClient:
                 # Validate JSON parsing
                 try:
                     parsed = json.loads(cleaned)
-                    # Executor MUST return actions
+                    # Note: Empty 'actions' lists are allowed to support pre-flight phase.
+                    # Phase-specific requirements for non-empty actions are handled in worker.py.
                     if not parsed:
                         raise ValueError("Empty JSON object returned.")
-                    if "actions" in parsed and not parsed["actions"]:
-                        raise ValueError("Actions list is empty.")
                         
                     return cleaned
                 except (json.JSONDecodeError, ValueError) as e:

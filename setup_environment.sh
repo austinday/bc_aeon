@@ -11,25 +11,15 @@ set -e
 
 # --- CONFIGURATION ---
 # Brain Models (Ollama Registry)
+# 1. qwen3-coder-next:q8_0 (Coding Specialist)
+# 2. llama4:16x17b (General Purpose)
+# 3. qwen3:235b-iq4xs (Custom Manual Install below)
 OLLAMA_MODELS=(
- "deepseek-r1:70b"
- "qwen3-next:80b"
- "gpt-oss:120b"
+ "qwen3-coder-next:q8_0"
  "llama4:16x17b"
- "qwen3:32b"
- "qwen3-coder:30b"
- "nemotron-3-nano:30b"
- "glm-4.7-flash:bf16"
- "gemma3:27b"
- "phi4:14b"
- "deepcoder:14b"
- "hf.co/TeichAI/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-GGUF:Q4_K_M"
- "hf.co/TeichAI/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-GGUF:Q8_0"
- "hf.co/TeichAI/GLM-4.7-Flash-Claude-Opus-4.5-High-Reasoning-Distill-GGUF:F16"
 )
 
 # Tool Models (Hugging Face Registry)
-# Switched to Tencent HunyuanImage-3.0 as requested
 HF_MODELS=()
 
 # Directories
@@ -85,9 +75,6 @@ docker build -t aeon_base:py3.10-cuda12.1 \
 log_step "Tagging 'aeon_base:latest'..."
 docker tag aeon_base:py3.10-cuda12.1 aeon_base:latest
 
-log_step "Tagging 'aeon_vision' (Aliasing Base)..."
-# Vision alias removed
-
 log_step "Pulling Inference Engines..."
 docker pull ollama/ollama:latest
 docker pull vllm/vllm-openai:latest
@@ -117,7 +104,7 @@ while ! curl -s http://localhost:11435/api/tags >/dev/null; do
  fi
 done
 
-log_step "Downloading Brain Models..."
+log_step "Downloading Standard Brain Models..."
 for model in "${OLLAMA_MODELS[@]}"; do
  echo -e "${C_YELLOW} >> Pulling $model...${C_RESET}"
  if docker exec aeon_setup_provisioner ollama list | grep -q "$model"; then
@@ -127,6 +114,8 @@ for model in "${OLLAMA_MODELS[@]}"; do
  fi
 done
 
+# Custom GGUF models removed due to VRAM limitations.
+
 log_step "Stopping Provisioner..."
 docker stop aeon_setup_provisioner
 
@@ -135,13 +124,12 @@ docker stop aeon_setup_provisioner
 # =================================================================================================
 print_banner "PHASE 4: TOOL SHED (Hugging Face Models)"
 
-# Load HF Token from host for Gated Repos
 HF_TOKEN_VAL=""
 if [ -f "$HOME/huggingface_access_token.txt" ]; then
     HF_TOKEN_VAL=$(cat "$HOME/huggingface_access_token.txt" | tr -d '\n')
     echo -e "${C_GREEN}[+] Loaded HuggingFace Token from host.${C_RESET}"
 else
-    echo -e "${C_YELLOW}[!] No HF Token found. Gated models (like Hunyuan) may fail.${C_RESET}"
+    echo -e "${C_YELLOW}[!] No HF Token found. Gated models may fail.${C_RESET}"
 fi
 
 for model in "${HF_MODELS[@]}"; do
@@ -150,10 +138,14 @@ for model in "${HF_MODELS[@]}"; do
  
  echo -e "${C_YELLOW} >> Downloading Tool Model: $model${C_RESET}"
  
- if [ -d "$MODELS_DIR/$clean_name" ] && [ "$(ls -A $MODELS_DIR/$clean_name)" ]; then
- echo " (Directory exists - Skipping)"
+ host_dir="$MODELS_DIR/$clean_name"
+ if [ -f "$host_dir/config.json" ] && { [ -f "$host_dir/tokenizer.json" ] || [ -f "$host_dir/tokenizer_config.json" ]; }; then
+ echo " (Already downloaded and validated - Skipping)"
  else
- # Using direct Python call to avoid CLI path issues
+ if [ -d "$host_dir" ]; then
+ echo -e "${C_YELLOW} (Incomplete download detected - re-downloading)${C_RESET}"
+ rm -rf "$host_dir"
+ fi
  docker run --rm $TTY_FLAG \
  --gpus all \
  -v "$MODELS_DIR:/models" \
