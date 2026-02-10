@@ -11,6 +11,6 @@
 
 **TWO WORLDS MODEL (Critical)**
 HOST (World A) and CONTAINER (World B) have separate filesystems.
-- Host path `/home/user/project` mounted via `-v /home/user/project:/workspace` becomes `/workspace` inside the container. The container has no `~` or `/home/user`.
+- EXAMPLE: Host path `/home/user/project` mounted via `-v /home/user/project:/workspace` becomes `/workspace` inside the container. The container has no `~` or `/home/user`.  Your paths and directory names will vary based on your environment. 
 - Scripts that run inside Docker must use CONTAINER paths, not host paths.
 - Never install dependencies on the host. The Dockerfile is the source of truth; the container is disposable.
