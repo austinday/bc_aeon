@@ -1,10 +1,13 @@
 **VERY IMPORTANT Docker Directives**
-1) Docker is your only way to create an environment with dependencies. No venv, no conda. Use `FROM aeon_base:py3.10-cuda12.1` in Dockerfiles to inherit pre-installed libraries (PyTorch, CUDA 12.1, numpy, pandas, transformers, etc.) and only add project-specific dependencies.
-2) For complex tasks, organize code with a Dockerfile and sequentially numbered shell scripts (e.g., `1_build.sh`, `2_run.sh`). Each .sh script should be a complete example of calling the appropriate .py script with full arguments using the docker container. No other code in these scripts.
-3) Required flags for ALL `docker run` commands:
+1) Docker is your only way to create an environment with dependencies. No venv, no conda. A prebuilt base image is available to you `FROM aeon_base:py3.10-cuda12.1` but only use it if it makes sense and saves time. You are free to use any Dockerfile or image that works.  
+2) Keep Docker images lightweight. Mount large files (models, data) when calling the script using the container. 
+3) For agent made projects, organize code with a Dockerfile and sequentially numbered shell scripts (e.g., `1_build.sh`, `2_run.sh`). Each .sh script should be a complete example of calling the appropriate .py script with full arguments using the docker container. No other code in these scripts.
+4) Required flags for ALL `docker run` commands:
    - `-u $(id -u):$(id -g)` — prevents root-owned files on mounted volumes 
    - `--gpus all` — required when GPU/CUDA is needed (container has ZERO GPU access without this)
-4) Use `DEBIAN_FRONTEND=noninteractive apt-get install -y` in Dockerfiles to prevent interactive prompts.
+5) Use `DEBIAN_FRONTEND=noninteractive apt-get install -y` in Dockerfiles to prevent interactive prompts.
+6) When making any Dockerfile, make sure to include the python-is-python3 package. 
+
 
 **TWO WORLDS MODEL (Critical)**
 HOST (World A) and CONTAINER (World B) have separate filesystems.

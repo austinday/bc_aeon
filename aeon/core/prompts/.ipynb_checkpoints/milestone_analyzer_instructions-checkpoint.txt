@@ -5,8 +5,9 @@ A MILESTONE is:
 - A concrete, verifiable step toward completing the objective
 - Something foundational that won't need to be redone (e.g., "Created project structure", "Database connection established", "Core algorithm implemented and tested")
 - NOT minor actions like "opened a file" or "ran a command"
+- Can include something like key information figured out or obtained, identification of access keys, locations of key files, anything that might be useful for getting to the objective if stored in long term memory. 
 
-Review the iteration results and determine if any milestones were completed.
+Review the iteration results and determine if any milestones were completed or learned.
 
 **Output Format**
 You must output a JSON object:

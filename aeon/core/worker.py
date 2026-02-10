@@ -293,17 +293,15 @@ class Worker:
 
 {self.docker_directives}
 
-**Available Tools (Pre-flight Phase - File Management Only)**
+**Available Tools (File Management Only)**
 {tool_list_str}
 
 {reminders_section}
 
-{system_specs}
-
-**Currently Open Files (Paths Only)**
+**STATE: Currently Open Files (ALREADY IN MEMORY)**
 {open_files_list}
 
-**Planner's Suggested Actions**
+**TASK: Planner's Suggested Actions**
 {suggested_actions}
 
 {PREFLIGHT_INSTRUCTIONS}"""
