@@ -1,5 +1,8 @@
-Executes a shell command on the HOST machine. Output streams in real time. Use for docker commands, file operations, git, and other host-level tasks. NEVER use for pip install or apt-get on the host; use Docker instead.
+Executes a shell command on the HOST machine (World A).
+CRITICAL: This tool CANNOT see inside Docker containers.
+- To check files inside a Container: `docker run --rm image_name ls -la /container/path`
+- NEVER try to run commands using paths that only exist inside the container (like /app, /workspace) directly with this tool.
 Schema:
   command (str, required): The shell command to execute (run via bash).
-  timeout (int, optional, default=300): Max seconds before the command is killed. Use 0 for no timeout (dangerous; avoid for network/build commands).
+  timeout (int, optional, default=300): Max seconds before the command is killed.
 Example: {"tool_name": "run_command", "parameters": {"command": "docker build -t myapp .", "timeout": 600}}

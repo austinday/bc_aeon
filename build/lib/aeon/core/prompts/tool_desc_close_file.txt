@@ -1,4 +1,5 @@
-Closes a file, removing it from Short Term Memory. Use when file information is no longer needed to free up context space.
+Closes a file, removing it from Short Term Memory. Use ONLY when you are done reading/editing a file to free up context space.
+WARNING: If you open and close a file in the same iteration, the content will NEVER be shown to you. You must keep it open for at least one turn.
 Schema:
-  file_path (str, required): Path of the file to close (must match the path used to open it).
+  file_path (str, required): Path of the file to close.
 Example: {"tool_name": "close_file", "parameters": {"file_path": "src/main.py"}}

@@ -17,7 +17,6 @@ from .prompts import (
     IMPORTANT_REMINDERS,
     PLANNER_INSTRUCTIONS,
     EXECUTOR_INSTRUCTIONS,
-    PREFLIGHT_INSTRUCTIONS,
     MILESTONE_ANALYZER_INSTRUCTIONS,
 )
 
@@ -96,15 +95,7 @@ class Worker:
             descs.append(f"- {name}: {tool.description}")
         return "\n".join(descs)
 
-    def _get_preflight_tools_description(self) -> str:
-        """Get tool descriptions for only file management tools (pre-flight phase)."""
-        preflight_tools = ['open_file', 'close_file']
-        descs = []
-        for name in preflight_tools:
-            if name in self.tools:
-                tool = self.tools[name]
-                descs.append(f"- {name}: {tool.description}")
-        return "\n".join(descs)
+
 
     def _format_open_files(self) -> str:
         if not self.open_files:
@@ -114,13 +105,7 @@ class Worker:
             out.append(f"--- FILE: {path} ---\n{content}\n--- END FILE ---")
         return "\n\n".join(out)
 
-    def _format_open_files_list(self) -> str:
-        """Return just a list of currently open file paths (no content).
-        Used for pre-flight executor context."""
-        if not self.open_files:
-            return "No files currently open."
-        paths = list(self.open_files.keys())
-        return "\n".join([f"  - {path}" for path in paths])
+
 
     def _format_open_files_compact(self) -> str:
         """Compact file manifest for the planner: names, sizes, and a brief peek.
@@ -284,29 +269,9 @@ class Worker:
 
 {PLANNER_INSTRUCTIONS}"""
 
-    def _build_preflight_executor_context(self, tool_list_str: str, system_specs: str,
-                                          suggested_actions: str, open_files_list: str) -> str:
-        """Build the pre-flight executor prompt for context gathering phase."""
-        reminders_section = f"**Important Reminders**\n{self.important_reminders}\n" if self.important_reminders.strip() else ""
 
-        return f"""{self.base_directives}
 
-{self.docker_directives}
-
-**Available Tools (File Management Only)**
-{tool_list_str}
-
-{reminders_section}
-
-**STATE: Currently Open Files (ALREADY IN MEMORY)**
-{open_files_list}
-
-**TASK: Planner's Suggested Actions**
-{suggested_actions}
-
-{PREFLIGHT_INSTRUCTIONS}"""
-
-    def _build_executor_context(self, tool_list_str: str, milestones_str: str,
+    def _build_executor_context(self, tool_list_str: str, system_specs: str, milestones_str: str,
                                 objective: str,
                                 suggested_actions: str, open_files_str: str) -> str:
         """Build the complete executor prompt with instructions at the end.
@@ -323,6 +288,8 @@ class Worker:
 {tool_list_str}
 
 {reminders_section}
+
+{system_specs}
 
 **Completed Milestones (Foundational Progress)**
 {milestones_str}
@@ -450,10 +417,10 @@ Result:
                 open_files_str = self._format_open_files()
                 
                 # Build planner prompt (instructions at end for emphasis)
-                # Planner gets compact file manifest; executor gets full content
-                compact_files_str = self._format_open_files_compact()
+                # Planner gets full file content to prevent 'I can't see the code' loops
+                # compact_files_str = self._format_open_files_compact() 
                 planner_prompt = self._build_planner_context(
-                    tool_list_str, system_specs, milestones_str, objective, history_str, compact_files_str
+                    tool_list_str, system_specs, milestones_str, objective, history_str, open_files_str
                 )
 
                 # --- PLANNER ---
@@ -501,66 +468,23 @@ Result:
                 if risk_notes:
                     self.print_func(f"{C_YELLOW}Risks:{C_RESET} {risk_notes}")
                 
-                plan_lines = self.current_plan.split('\n')
-                if len(plan_lines) > 8:
-                    preview = '\n'.join(plan_lines[:4]) + f'\n{C_YELLOW}... [plan truncated] ...{C_RESET}\n' + '\n'.join(plan_lines[-4:])
+                self.print_func(f"{C_GREEN}Next Step:{C_RESET} {suggested_actions_str}")
+
+                plan_lines = self.current_plan.strip().split('\n')
+                if len(plan_lines) > 4:
+                    preview = '\n'.join(plan_lines[:3]) + f'\n{C_YELLOW}... ({len(plan_lines)-3} more lines) ...{C_RESET}'
                 else:
-                    preview = self.current_plan
+                    preview = self.current_plan.strip()
                 self.print_func(f"{C_CYAN}Plan Update:{C_RESET}\n{preview}")
                     
 
-                # --- PRE-FLIGHT EXECUTOR (Context Gathering Phase) ---
-                if step_callback:
-                    step_callback(iteration, display_max, "Pre-flight")
-
-                self.print_func("Pre-flight: Gathering file context...")
-                
-                preflight_tool_list = self._get_preflight_tools_description()
-                open_files_list = self._format_open_files_list()
-                preflight_prompt = self._build_preflight_executor_context(
-                    preflight_tool_list, system_specs,
-                    suggested_actions_str, open_files_list
-                )
-
-                try:
-                    preflight_json = self.llm_client.get_action(prompt=preflight_prompt)
-                    preflight_data = json.loads(self._clean_action_json(preflight_json))
-                    preflight_actions = preflight_data.get("actions", [])
-                    
-                    if not preflight_actions:
-                        self.print_func("Pre-flight: File context already optimal.")
-                    else:
-                        # Execute pre-flight actions (simple - just open/close files)
-                        for action in preflight_actions:
-                            tool_name = action.get("tool_name")
-                            params = action.get("parameters", {})
-                            
-                            if tool_name not in ["open_file", "close_file"]:
-                                self.logger.warning(f"Pre-flight: Ignoring invalid tool '{tool_name}'")
-                                continue
-                                
-                            if tool_name not in self.tools:
-                                self.logger.warning(f"Pre-flight: Tool '{tool_name}' not found")
-                                continue
-                            
-                            try:
-                                result = self.tools[tool_name].execute(**params)
-                                self.print_func(f"Pre-flight: {tool_name} {params.get('file_path', '?')}")
-                            except Exception as e:
-                                self.logger.warning(f"Pre-flight {tool_name} failed: {e}")
-                                # Continue - main executor can retry if needed
-                except Exception as e:
-                    self.logger.warning(f"Pre-flight phase failed: {e}. Proceeding to main execution.")
-                    # Continue anyway - main executor has open_file if needed
-
-                # --- MAIN EXECUTOR (with retry loop) ---
+                # --- EXECUTOR ---
                 if step_callback:
                     step_callback(iteration, display_max, "Executing")
 
-                # Now format files with full content for main executor
                 executor_files_str = self._format_open_files()
                 executor_prompt = self._build_executor_context(
-                    tool_list_str, milestones_str,
+                    tool_list_str, system_specs, milestones_str,
                     objective,
                     suggested_actions_str, executor_files_str
                 )

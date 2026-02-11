@@ -1,4 +1,5 @@
-Opens a file into Short Term Memory (working memory tabs). This is the ONLY way to read file contents. Smartly summarizes large data files (CSV, JSON, FASTA) to save tokens. Use before modifying any file.
+Opens a file into Short Term Memory (working memory tabs). The content will appear in the 'Open Files' section of the NEXT turn's prompt.
+CRITICAL: Do NOT close the file in the same iteration you open it, or you will never see the content. It must remain open for at least one turn to be read.
 Schema:
   file_path (str, required): Path to the file to open. Relative or absolute.
 Example: {"tool_name": "open_file", "parameters": {"file_path": "src/main.py"}}

@@ -68,11 +68,40 @@ class LLMClient:
         self.current_iteration = iteration
 
     def _log_to_debug(self, m_type, m_name, prompt, resp):
+        """Log LLM interaction to debug file with high visibility."""
         if not self.debug_path: 
             return
         try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            header = (
+                f"\n\n\n{'#'*100}\n"
+                f"# TYPE:      {m_type}\n"
+                f"# TIMESTAMP: {timestamp}\n"
+                f"# ITERATION: {self.current_iteration}\n"
+                f"# MODEL:     {m_name}\n"
+                f"{'#'*100}\n"
+            )
+            
+            # Format Prompt Section
+            prompt_block = (
+                f"\n{'>'*40} PROMPT {'>'*40}\n"
+                f"{str(prompt)}\n"
+                f"{'<'*40} END PROMPT {'<'*36}\n"
+            )
+            
+            # Format Response Section
+            response_block = (
+                f"\n{'>'*40} RESPONSE {'>'*38}\n"
+                f"{str(resp)}\n"
+                f"{'<'*40} END RESPONSE {'<'*34}\n"
+            )
+            
             with open(self.debug_path, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*80}\nITER: {self.current_iteration} | {m_type} | {m_name}\n{'='*80}\nPROMPT:\n{prompt}\n{'-'*40}\nRESPONSE:\n{resp}\n")
+                f.write(header)
+                f.write(prompt_block)
+                f.write(response_block)
+                f.write("\n" + "-"*100 + "\n") # Trailing separator
+                
         except Exception as e:
             self.logger.warning(f"Failed to write to debug log: {e}")
 
@@ -274,7 +303,9 @@ class LLMClient:
                 model=self.summarizer_model, 
                 messages=[{"role": "user", "content": prompt}]
             )
-            return resp.choices[0].message.content
+            content = resp.choices[0].message.content
+            self._log_to_debug("SUMMARIZE_EXECUTION", self.summarizer_model, prompt, content)
+            return content
         except Exception as e:
             self.logger.warning(f"Summarize execution failed: {e}")
             # LOUD FAILURE: Explicitly report the crash to the agent
@@ -293,7 +324,9 @@ class LLMClient:
                 messages=[{"role": "user", "content": prompt}], 
                 response_format={"type": "json_object"}
             )
-            return json.loads(resp.choices[0].message.content)
+            content = resp.choices[0].message.content
+            self._log_to_debug("ANALYZE_INTERRUPTION", self.executor_model, prompt, content)
+            return json.loads(content)
         except Exception as e:
             self.logger.warning(f"Interruption analysis failed: {e}")
             return {"classification": "ADVICE", "updated_text": inp, "reasoning": "Failed to analyze"}
@@ -305,7 +338,9 @@ class LLMClient:
                 model=self.planner_model, 
                 messages=[{"role": "user", "content": prompt}]
             )
-            return resp.choices[0].message.content
+            content = resp.choices[0].message.content
+            self._log_to_debug("REASONING (THINK TOOL)", self.planner_model, prompt, content)
+            return content
         except Exception as e:
             self.logger.error(f"Reason call failed: {e}")
             return f"Error during reasoning: {e}"
@@ -318,7 +353,9 @@ class LLMClient:
                 model=self.summarizer_model, 
                 messages=[{"role": "user", "content": prompt}]
             )
-            return resp.choices[0].message.content
+            content = resp.choices[0].message.content
+            self._log_to_debug("SUMMARIZE_TEXT (WEB SEARCH)", self.summarizer_model, prompt, content)
+            return content
         except Exception as e:
             self.logger.warning(f"Summarize text failed: {e}")
             return f"Failed to summarize: {e}"

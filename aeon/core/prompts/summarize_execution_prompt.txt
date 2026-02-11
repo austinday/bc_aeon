@@ -1,2 +1,10 @@
-Summarize this execution result. IF THE OUTPUT CONTAINS ERRORS, BUGS, FAILURES, WARNINGS, UNEXPECTED RESULTS, OR EXIT CODE 1, YOU MUST STATE THIS CLEARLY AT THE START. The error output is valuable diagnostic information. Read it completely. Read the ENTIRE error message, including the bottom of stack traces. The root cause is usually at the end, not the beginning. State what the error tells you beyond the surface as well as the literal. Preserve any specific file paths, line numbers, or error codes. Context: {ctx}
+Summarize this execution result. 
+
+**CRITICAL RULES:**
+1. **DIAGNOSE ONLY:** IF THE OUTPUT CONTAINS ERRORS, FAILURES, OR EXIT CODE 1, state this clearly. Analyze the root cause (often at the end of stack traces).
+2. **NO ADVICE:** Do NOT offer "Recommended next steps" or "Try this". Do NOT tell the agent what to do next.
+3. **NO BROWSING SUGGESTIONS:** NEVER suggest running `ls`, `cd`, `find`, or `dir` to "verify" files. The agent is forbidden from browsing. 
+4. **FACTS FIRST:** Preserve specific file paths, line numbers, and error codes exactly.
+
+Context: {ctx}
 Output: {safe_out}

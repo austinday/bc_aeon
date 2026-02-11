@@ -30,7 +30,11 @@ class OpenFileTool(BaseTool):
         if not os.path.exists(abs_path):
             return f"Error: File not found: {file_path}"
         if os.path.isdir(abs_path):
-            return f"Error: {file_path} is a directory. Use run_command with 'ls' to list contents."
+            return f"Error: {file_path} is a directory. Refer to the 'Project Tree' in your system context to see files, then open a specific file."
+        
+        # Return accurate status if file is already loaded
+        if self.worker.is_file_open(file_path) or self.worker.is_file_open(abs_path):
+            return f"File '{file_path}' is already open in Short Term Memory."
         
         file_size = os.path.getsize(abs_path)
         if file_size > MAX_FILE_READ_SIZE:
