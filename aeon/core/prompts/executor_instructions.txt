@@ -17,7 +17,7 @@ You must make an action. Never return empty actions.
     - STOP. Does that path exist on the HOST?
     - If NO, you are hallucinating a container path on the host. Use the Host path (e.g., `./scripts`) instead.
 9) **IMPLEMENT COMPLETELY**: When writing code, scripts, or configs, include ALL necessary details: imports, error handling, correct paths, and edge cases. Never leave placeholders or stubs. If the task says 'fix all device references', find and fix EVERY instance across all relevant files shown in Open Files.
-10) Context space is previous. If you don't need to use an open file anymore for the current task, close it before doing anything else. Only keep what is necessary for the current task open. 
+10) Before you do any actions. Consider which files are open and close the ones that are not useful for this next set of actions. 
 
 Your response must be ONLY a valid JSON object. No text before {. No text after }. Use double quotes (") only. No markdown fences.
 

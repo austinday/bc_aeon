@@ -407,7 +407,7 @@ Result:
                         self.print_func(f"{C_RED}Agent failed to exit. Terminating.{C_RESET}")
                         break
 
-                self.print_func(f"{C_BLUE}--- Iteration {iteration} ---{C_RESET}")
+                self.print_func(f"\n{C_BLUE}{'='*60}\n ITERATION {iteration}\n{'='*60}{C_RESET}")
                 
                 # Gather context components
                 system_specs = get_runtime_info()
@@ -463,24 +463,24 @@ Result:
                 iteration_strategy = plan_data.get("iteration_strategy", "single_step")
                 risk_notes = plan_data.get("risk_notes", "")
 
+                self.print_func(f"\n{C_CYAN}--- THINKING ---{C_RESET}")
                 self.print_func(f"{C_CYAN}Analysis:{C_RESET} {analysis}")
                 self.print_func(f"{C_CYAN}Strategy:{C_RESET} {iteration_strategy}")
                 if risk_notes:
                     self.print_func(f"{C_YELLOW}Risks:{C_RESET} {risk_notes}")
                 
-                self.print_func(f"{C_GREEN}Next Step:{C_RESET} {suggested_actions_str}")
-
-                plan_lines = self.current_plan.strip().split('\n')
-                if len(plan_lines) > 4:
-                    preview = '\n'.join(plan_lines[:3]) + f'\n{C_YELLOW}... ({len(plan_lines)-3} more lines) ...{C_RESET}'
-                else:
-                    preview = self.current_plan.strip()
-                self.print_func(f"{C_CYAN}Plan Update:{C_RESET}\n{preview}")
+                self.print_func(f"\n{C_CYAN}--- PLAN ---{C_RESET}")
+                self.print_func(f"{self.current_plan.strip()}")
+                
+                self.print_func(f"\n{C_GREEN}--- NEXT ACTIONS ---{C_RESET}")
+                self.print_func(f"{suggested_actions_str}")
                     
 
                 # --- EXECUTOR ---
                 if step_callback:
                     step_callback(iteration, display_max, "Executing")
+
+                self.print_func(f"\n{C_YELLOW}--- EXECUTION ---{C_RESET}")
 
                 executor_files_str = self._format_open_files()
                 executor_prompt = self._build_executor_context(
