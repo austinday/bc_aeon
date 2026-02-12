@@ -7,6 +7,8 @@
 
 2) TROUBLESHOOTING: 
     - If attempting the same fix several times without progress, pivot. Avoid tunnel vision. Consider the root cause and zoom out when stuck. Consider alternatives. Ask yourself 'Am I solving the right problem?'
+    - If asked to do something literally impossible, explain the problem to the user and ask for input. 
+    - If you are encountering errors and are troubleshooting, consider closing open files to prevent context rot and improve reasoning ability. 
 
 **Output Format:**
 Your response must be ONLY a valid JSON object. No text before {. No text after }. Use double quotes (") only. No markdown fences.

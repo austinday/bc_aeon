@@ -65,6 +65,21 @@ class Worker:
         self.print_func(f"{C_YELLOW}Debug logging enabled: {debug_path}{C_RESET}")
         self._debug_initialized = True
 
+    def _sync_open_files(self):
+        """Synchronize open_files cache with disk state."""
+        paths = list(self.open_files.keys())
+        for path in paths:
+            if not os.path.exists(path):
+                del self.open_files[path]
+                continue
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+                if self.open_files[path] != content:
+                    self.open_files[path] = content
+            except Exception:
+                pass
+
     def register_tools(self, tools_list: List[Any]):
         for tool in tools_list:
             self.tools[tool.name] = tool
@@ -98,6 +113,7 @@ class Worker:
 
 
     def _format_open_files(self) -> str:
+        self._sync_open_files()
         if not self.open_files:
             return "No files currently open."
         out = []
@@ -110,6 +126,7 @@ class Worker:
     def _format_open_files_compact(self) -> str:
         """Compact file manifest for the planner: names, sizes, and a brief peek.
         The planner needs to know WHAT is open, not read every line."""
+        self._sync_open_files()
         if not self.open_files:
             return "No files currently open."
         out = []
@@ -128,6 +145,7 @@ class Worker:
         """Show full content only for files referenced in the suggested actions.
         Other open files get a one-line stub so the executor knows they exist
         but isn't distracted by their content."""
+        self._sync_open_files()
         if not self.open_files:
             return "No files currently open."
         # Build a lowercase search corpus from the suggested actions
@@ -237,6 +255,7 @@ class Worker:
         """Return a scannable bullet list of currently open file paths.
         This gives the planner a quick way to see what is already loaded
         without having to scan through full file contents."""
+        self._sync_open_files()
         if not self.open_files:
             return "(none)"
         return "\n".join(f"  - {path}" for path in self.open_files.keys())
