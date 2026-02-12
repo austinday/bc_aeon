@@ -9,6 +9,40 @@ STARTUP_LOCK_PATH = "/tmp/aeon_brain_startup.lock"
 MODEL_REGISTRY_PATH = "/tmp/aeon_model_registry.json"
 MODEL_REGISTRY_LOCK_PATH = "/tmp/aeon_model_registry.lock"
 
+# =============================================================================
+# CLOUD MODEL DEFINITIONS
+# =============================================================================
+CLOUD_MODELS = [
+    {
+        'model': 'grok-4-1-fast-reasoning',
+        'provider': 'grok',
+        'api_key_file': 'grok_api_key.txt',
+        'base_url': 'https://api.x.ai/v1',
+        'context_limit': 128000,
+    },
+    {
+        'model': 'grok-4-1-fast-non-reasoning',
+        'provider': 'grok',
+        'api_key_file': 'grok_api_key.txt',
+        'base_url': 'https://api.x.ai/v1',
+        'context_limit': 128000,
+    },
+    {
+        'model': 'gemini-3-pro-preview',
+        'provider': 'gemini',
+        'api_key_file': 'gemini_api_key.txt',
+        'base_url': 'https://generativelanguage.googleapis.com/v1beta/openai/',
+        'context_limit': 1000000,
+    },
+    {
+        'model': 'gemini-flash-latest',
+        'provider': 'gemini',
+        'api_key_file': 'gemini_api_key.txt',
+        'base_url': 'https://generativelanguage.googleapis.com/v1beta/openai/',
+        'context_limit': 1000000,
+    },
+]
+
 def is_container_running(name):
     try: return bool(subprocess.check_output(["docker", "ps", "-q", "-f", f"name={name}"], stderr=subprocess.DEVNULL, text=True).strip())
     except: return False
@@ -37,12 +71,12 @@ def start_local_brain_services():
     subprocess.run(["bash", str(script)], check=True)
     return wait_for_service("Aeon Brain (Ollama)", 8000)
 
-def warm_up_models(strong_model, weak_model):
-    """Preload models into VRAM by making initial requests."""
+def warm_up_models(local_model_names):
+    """Preload local models into VRAM by making initial requests."""
+    if not local_model_names:
+        return
     print("[SYSTEM] Warming up models (preloading to VRAM)...")
-    models_to_warm = [m for m in [strong_model, weak_model] if m]
-    # Deduplicate if same model used for both
-    models_to_warm = list(dict.fromkeys(models_to_warm))
+    models_to_warm = list(dict.fromkeys(local_model_names))
     
     for model in models_to_warm:
         try:
@@ -50,7 +84,7 @@ def warm_up_models(strong_model, weak_model):
             resp = requests.post(
                 "http://localhost:8000/api/generate",
                 json={"model": model, "prompt": "hello", "options": {"num_predict": 1}},
-                timeout=300  # Models can take a while to load
+                timeout=300
             )
             if resp.status_code == 200:
                 print(" OK.")
@@ -65,7 +99,6 @@ def warm_up_models(strong_model, weak_model):
 def cleanup_transient_tools():
     print("[SYSTEM] Cleaning up transient tool containers...")
     try:
-        # Added timeout=5s to prevent hanging if Docker daemon is broken
         subprocess.run("docker ps -a -q --filter 'name=aeon_research' --filter 'name=aeon_vision' | xargs -r docker rm -f", 
                         shell=True, stderr=subprocess.DEVNULL, timeout=5)
     except Exception as e:
@@ -171,18 +204,46 @@ def get_ollama_models():
     except: pass
     return []
 
-def select_model(models, label):
-    print(f"\n[MENU] {label}")
-    for i, m in enumerate(models):
-        print(f" {i+1}. {m}")
+# =============================================================================
+# UNIFIED MODEL MENU
+# =============================================================================
+
+def build_model_menu(local_models):
+    """Build a unified menu of all available models (local + cloud)."""
+    entries = []
+    for m in local_models:
+        entries.append({
+            'model': m,
+            'provider': 'local',
+            'context_limit': 128000,
+            'label': f'{m} (local)',
+        })
+    for cm in CLOUD_MODELS:
+        entry = dict(cm)
+        entry['label'] = f"{cm['model']} (cloud - key: ~/{cm['api_key_file']})"
+        entries.append(entry)
+    return entries
+
+def select_model(menu_entries, label):
+    """Display unified model menu and return selected model config."""
+    print(f'\n[MENU] {label}')
+    for i, entry in enumerate(menu_entries):
+        print(f' {i+1}. {entry["label"]}')
     while True:
         try:
-            choice = input(f"Select Model (1-{len(models)}): ")
-            if choice.isdigit() and 1 <= int(choice) <= len(models):
-                return models[int(choice)-1]
+            choice = input(f'Select Model (1-{len(menu_entries)}): ')
+            if choice.isdigit() and 1 <= int(choice) <= len(menu_entries):
+                return menu_entries[int(choice)-1]
         except (KeyboardInterrupt, EOFError): sys.exit(0)
         except: pass
-        print("Invalid choice.")
+        print('Invalid choice.')
+
+def find_model_config(model_name, menu_entries):
+    """Find a model config by name from the menu entries."""
+    for entry in menu_entries:
+        if entry['model'] == model_name:
+            return entry
+    return None
 
 class SessionManager:
     """Manages agent lifecycle with proper coordination for shared brain resources.
@@ -201,59 +262,60 @@ class SessionManager:
         self._original_sigterm = None
         self._models_used = []
 
-    def enter(self, strong_model=None, weak_model=None, skip_warmup=False):
-        """Enter the session: coordinate startup, warm models, acquire locks."""
-        # Track models for reference counting (deduplicated)
-        self._models_used = list(dict.fromkeys([m for m in [strong_model, weak_model] if m]))
-        # --- PHASE 1: Startup Coordination ---
-        # Use startup lock to ensure only one agent does startup/warmup
-        self.startup_lock = open(STARTUP_LOCK_PATH, 'w+')
+    def enter(self, strong_config=None, weak_config=None, skip_warmup=False):
+        """Enter the session: coordinate startup, warm models, acquire locks.
         
-        try:
-            # Try to get exclusive lock (non-blocking)
-            fcntl.flock(self.startup_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            is_first_starter = True
-            print("[SESSION] Acquired startup lock (first starter).")
-        except BlockingIOError:
-            # Another agent is starting up - wait for them
-            print("[SESSION] Another agent is starting up, waiting...")
-            fcntl.flock(self.startup_lock, fcntl.LOCK_SH)  # Block until startup done
-            is_first_starter = False
-            print("[SESSION] Startup complete, proceeding.")
-        
-        if is_first_starter:
-            # We're responsible for starting and warming the brain
-            brain_started = start_local_brain_services()
-            if brain_started and strong_model and not skip_warmup:
-                warm_up_models(strong_model, weak_model)
-            # Downgrade to shared lock - signals startup complete
-            fcntl.flock(self.startup_lock, fcntl.LOCK_SH)
-        
-        # --- PHASE 2: Register models for reference counting ---
-        register_models_for_agent(self._models_used)
-        
+        Only starts/warms the local brain if at least one selected model is local.
+        Cloud-only configurations skip brain management entirely.
+        """
+        # Determine which models are local (only local models need brain + registry)
+        local_models = []
+        if strong_config and strong_config.get('provider') == 'local':
+            local_models.append(strong_config['model'])
+        if weak_config and weak_config.get('provider') == 'local':
+            local_models.append(weak_config['model'])
+        local_models = list(dict.fromkeys(local_models))  # deduplicate
+        self._models_used = local_models
+
+        needs_brain = len(local_models) > 0
+
+        # --- PHASE 1: Startup Coordination (only if local models needed) ---
+        if needs_brain:
+            self.startup_lock = open(STARTUP_LOCK_PATH, 'w+')
+            try:
+                fcntl.flock(self.startup_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                is_first_starter = True
+                print("[SESSION] Acquired startup lock (first starter).")
+            except BlockingIOError:
+                print("[SESSION] Another agent is starting up, waiting...")
+                fcntl.flock(self.startup_lock, fcntl.LOCK_SH)
+                is_first_starter = False
+                print("[SESSION] Startup complete, proceeding.")
+
+            if is_first_starter:
+                brain_started = start_local_brain_services()
+                if brain_started and not skip_warmup:
+                    warm_up_models(local_models)
+                fcntl.flock(self.startup_lock, fcntl.LOCK_SH)
+        else:
+            print("[SESSION] No local models selected, skipping brain startup.")
+
+        # --- PHASE 2: Register local models for reference counting ---
+        if local_models:
+            register_models_for_agent(local_models)
+
         # --- PHASE 3: Runtime Lock ---
-        # Acquire shared runtime lock (all active agents hold this)
         self.runtime_lock = open(LOCK_FILE_PATH, 'w+')
         fcntl.flock(self.runtime_lock, fcntl.LOCK_SH)
         print("[SESSION] Acquired runtime lock (agent active).")
-        
+
         # --- PHASE 4: Signal Handlers ---
-        # Install SIGTERM handler for external kill signals.
-        # NOTE: We deliberately do NOT install SIGINT handler here.
-        # Ctrl+C should propagate as KeyboardInterrupt to the worker loop,
-        # which provides an interactive dialog for user to modify objectives.
-        self._original_sigint = None  # Not intercepted - let KeyboardInterrupt propagate
+        self._original_sigint = None
         self._original_sigterm = signal.signal(signal.SIGTERM, self._signal_handler)
         atexit.register(self._atexit_handler)
 
     def _signal_handler(self, signum, frame):
-        """Handle termination signals gracefully (SIGTERM only, not SIGINT).
-        
-        SIGINT (Ctrl+C) is NOT handled here - it propagates as KeyboardInterrupt
-        to the worker loop, which provides an interactive dialog for the user
-        to modify objectives or provide guidance.
-        """
+        """Handle termination signals gracefully (SIGTERM only, not SIGINT)."""
         print(f"\n[SESSION] Received SIGTERM, cleaning up...")
         self.exit()
         sys.exit(0)
@@ -270,14 +332,11 @@ class SessionManager:
         
         print("[SESSION] Exiting...")
         
-        # Always cleanup transient tools this agent might have spawned
         cleanup_transient_tools()
         
-        # --- Unregister models (unloads if this was last user) ---
         if self._models_used:
             unregister_models_for_agent(self._models_used)
         
-        # --- Runtime Lock Release ---
         if self.runtime_lock:
             try:
                 fcntl.flock(self.runtime_lock, fcntl.LOCK_UN)
@@ -285,13 +344,11 @@ class SessionManager:
             except Exception as e:
                 print(f"[WARN] Session cleanup error: {e}")
         
-        # --- Startup Lock Cleanup ---
         if self.startup_lock:
             try:
                 self.startup_lock.close()
             except: pass
         
-        # Restore original signal handlers
         if self._original_sigterm:
             signal.signal(signal.SIGTERM, self._original_sigterm)
         
@@ -299,66 +356,64 @@ class SessionManager:
 
 def cli():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--grok', action='store_true')
-    parser.add_argument('--gemini', action='store_true')
-    parser.add_argument('--gemini-flash', action='store_true')
-    parser.add_argument('--local', action='store_true', help='Force local mode')
     parser.add_argument('--debug', action='store_true', help='Enable detailed LLM call logging to ~/')
-    parser.add_argument('--strong', type=str, help='Model for Strong Node (Planner)')
-    parser.add_argument('--weak', type=str, help='Model for Weak Node (Executor)')
+    parser.add_argument('--strong', type=str, help='Model name for Strong Node (Planner) - skips menu')
+    parser.add_argument('--weak', type=str, help='Model name for Weak Node (Executor) - skips menu')
     parser.add_argument('--start', type=str, help='Initial objective to start immediately')
     parser.add_argument('--no-warmup', action='store_true', help='Skip model warmup (faster startup, slower first query)')
     args = parser.parse_args()
 
-    provider = "local"
-    if args.grok: provider = "grok"
-    elif args.gemini: provider = "gemini"
-    elif args.gemini_flash: provider = "gemini-flash"
+    # --- Enumerate local models (start brain if needed) ---
+    local_models = []
+    if is_container_running("aeon_brain_node"):
+        local_models = get_ollama_models()
+    else:
+        print("[SYSTEM] Starting brain to enumerate local models...")
+        start_local_brain_services()
+        local_models = get_ollama_models()
 
-    local_strong = None
-    local_weak = None
+    if not local_models:
+        print("[WARN] No local models found via API. Using defaults.")
+        local_models = ['qwen3-coder-next:q8_0', 'llama4:16x17b', 'qwen3:235b-iq4xs']
+
+    # --- Build unified model menu (local + cloud) ---
+    menu = build_model_menu(local_models)
+
+    # --- Select Strong model ---
+    if args.strong:
+        strong_config = find_model_config(args.strong, menu)
+        if not strong_config:
+            print(f"[ERROR] Model '{args.strong}' not found.")
+            print(f"  Available: {[e['model'] for e in menu]}")
+            sys.exit(1)
+    else:
+        strong_config = select_model(menu, 'Select Strong Model (Planner)')
+
+    # --- Select Weak model ---
+    if args.weak:
+        weak_config = find_model_config(args.weak, menu)
+        if not weak_config:
+            print(f"[ERROR] Model '{args.weak}' not found.")
+            print(f"  Available: {[e['model'] for e in menu]}")
+            sys.exit(1)
+    else:
+        weak_config = select_model(menu, 'Select Weak Model (Executor)')
+
+    print(f"[CONFIG] Strong: {strong_config['model']} ({strong_config['provider']}) | Weak: {weak_config['model']} ({weak_config['provider']})")
 
     session = SessionManager()
-    
-    if provider == "local":
-        # For local mode, we need to select models BEFORE entering session
-        # because session.enter() will warm them up
-        
-        # Check if brain is already running to get model list
-        if is_container_running("aeon_brain_node"):
-            models = get_ollama_models()
-        else:
-            # Temporarily start brain to get model list, then it will be
-            # properly managed by session.enter()
-            print("[SYSTEM] Starting brain to enumerate models...")
-            start_local_brain_services()
-            models = get_ollama_models()
-        
-        if not models:
-            print("[WARN] No models found via API. Using defaults.")
-            models = ["qwen3:235b-iq4xs", "qwen3-coder-next:q8_0", "llama4:16x17b"]
-        
-        if args.strong and args.weak:
-            local_strong, local_weak = args.strong, args.weak
-        else:
-            local_strong = args.strong if args.strong else select_model(models, "Select Strong Model (Planner)")
-            local_weak = args.weak if args.weak else select_model(models, "Select Weak Model (Executor)")
-        
-        print(f"[CONFIG] Strong: {local_strong} | Weak: {local_weak}")
-        
-        # Enter session - pass models for registry tracking and warmup
-        session.enter(strong_model=local_strong, weak_model=local_weak, skip_warmup=args.no_warmup)
-    else:
-        # Cloud providers don't need local brain management
-        session.enter()
+    session.enter(strong_config=strong_config, weak_config=weak_config, skip_warmup=args.no_warmup)
 
     try:
-        llm_client = LLMClient(provider=provider, local_strong=local_strong, local_weak=local_weak)
+        llm_client = LLMClient(strong_config=strong_config, weak_config=weak_config)
         worker = Worker(llm_client=llm_client, debug_mode=args.debug)
         deps = {'llm_client': llm_client, 'worker': worker}
         tools = load_tools_from_directory("aeon.tools", dependencies=deps)
         worker.register_tools(tools)
-        print(f"\nAeon Ready (Mode: {provider.upper()}, Debug: {args.debug})")
+
+        s_prov = strong_config['provider'].upper()
+        w_prov = weak_config['provider'].upper()
+        print(f"\nAeon Ready (Strong: {strong_config['model']} [{s_prov}], Weak: {weak_config['model']} [{w_prov}], Debug: {args.debug})")
         
         if args.start:
             worker.run(args.start)
@@ -370,7 +425,7 @@ def cli():
                     if obj.strip() in ['exit', 'quit']: break
                     worker.run(obj)
             except (KeyboardInterrupt, EOFError):
-                print("\n")  # Clean line after ^C
+                print("\n")
                 break
     except Exception as e:
         print(f"[ERROR] Fatal error: {e}")

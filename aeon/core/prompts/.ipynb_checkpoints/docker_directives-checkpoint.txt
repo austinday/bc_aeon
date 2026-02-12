@@ -1,16 +1,20 @@
-**VERY IMPORTANT Docker Directives**
-1) Docker is your only way to create an environment with dependencies. No venv, no conda. A prebuilt base image is available to you `FROM aeon_base:py3.10-cuda12.1` but only use it if it makes sense and saves time. You are free to use any Dockerfile or image that works.  
-2) Keep Docker images lightweight. Mount large files (models, data) when calling the script using the container. 
-3) For agent made projects, organize code with a Dockerfile and sequentially numbered shell scripts (e.g., `1_build.sh`, `2_run.sh`). Each .sh script should be a complete example of calling the appropriate .py script with full arguments using the docker container. No other code in these scripts.
-4) Required flags for ALL `docker run` commands:
-   - `-u $(id -u):$(id -g)` — prevents root-owned files on mounted volumes 
-   - `--gpus all` — required when GPU/CUDA is needed (container has ZERO GPU access without this)
-5) Use `DEBIAN_FRONTEND=noninteractive apt-get install -y` in Dockerfiles to prevent interactive prompts.
-6) When making any Dockerfile, make sure to include the python-is-python3 package. 
+**DOCKER RULES**
 
+1) HOST BARRIER: Agent is on HOST. No direct container filesystem access.
 
-**TWO WORLDS MODEL (Critical)**
-HOST (World A) and CONTAINER (World B) have separate filesystems.
-- EXAMPLE: Host path `/home/user/project` mounted via `-v /home/user/project:/workspace` becomes `/workspace` inside the container. The container has no `~` or `/home/user`.  Your paths and directory names will vary based on your environment. 
-- Scripts that run inside Docker must use CONTAINER paths, not host paths.
-- Never install dependencies on the host. The Dockerfile is the source of truth; the container is disposable.
+2) PATH TRANSLATION:
+   - HOST path: /home/user/project/scripts/main.py
+   - MOUNT flag: -v /home/user/project:/app
+   - CONTAINER path: /app/scripts/main.py
+
+3) TROUBLESHOOTING:
+   - If a `docker run` command fails with "File not found":
+   - **DO NOT** try to ls or mkdir the container path (e.g. /app) on the host. It will fail.
+   - **DO** check your -v volume mount flags. Did you map the host directory correctly?
+   - **DO** verify the file exists on the HOST at the source path.
+
+4) PERSISTENCE: Always write outputs to a mounted volume -v host_dir:container_dir.
+
+5) GPU USAGE: Always use --gpus flag when running GPU workloads.
+
+6) OWNERSHIP: Always use -u $(id -u):$(id -g) to match Host user. Avoids root output files.

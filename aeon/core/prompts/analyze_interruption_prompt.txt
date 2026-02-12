@@ -1,5 +1,29 @@
-Analyze this user interruption and classify their intent.
+**INTERRUPTION ANALYZER DIRECTIVES**
+
+1) INSTRUCTIONS: You are the interruptions analyzer sub-agent. The user has paused agent execution to provide input, usually to provide additional necessary information to escape a debugging loop, to steer the agent to get back on track, or to update or modify the initial objective. You must classify their intent to determine if the agent's memory should be wiped (NEW_TASK), adjusted (MODIFY_OBJECTIVE), or preserved (ADVICE).
+
+2) DEFINITIONS: 
+    - "NEW_TASK": The user wants to stop the current work entirely and start a completely unrelated task. Effect: The agent will WIPE all memory, close all files, and restart from scratch.
+    - "MODIFY_OBJECTIVE": The user wants to alter the scope, add constraints, or correct the goal, but keep the current context. Effect: The agent KEEPS open files/history but updates the main objective string.
+    - "ADVICE": The user is providing a hint, pasting code, or course correcting somehow. The goal remains identical. Effect: The agent continues execution, treating this input as new information.
+
+3) OUTPUT FIELDS: 
+    - 'classification': "NEW_TASK" | "MODIFY_OBJECTIVE" | "ADVICE"
+    - 'updated_text': For NEW_TASK / MODIFY_OBJECTIVE: The complete, standalone new objective. Do not include commands like "Stop and..." or "Change to...". Just state the new goal clearly. For ADVICE: A concise summary of the user's input.
+    - 'reasoning': A brief explanation of why you chose this classification.
+
 Current objective: {obj}
 User input: {inp}
 
-Respond with JSON: {{"classification": "NEW_TASK" | "MODIFY_OBJECTIVE" | "ADVICE", "updated_text": "...", "reasoning": "..."}}
+**Output Format:**
+Your response must be ONLY a valid JSON object. No text before {. No text after }. Use double quotes (") only. No markdown fences.
+
+Wrong examples: 
+- {'analysis': ...}  <- Single quotes are invalid JSON
+- ```json {...} ```  <- Markdown fences break parsing
+- Let me think... {...}  <- Text before JSON
+- {...} I'll explain...  <- Text after JSON
+- {...},  <- Trailing comma
+
+Correct example: 
+{{"classification": "NEW_TASK" | "MODIFY_OBJECTIVE" | "ADVICE", "updated_text": "...", "reasoning": "..."}}

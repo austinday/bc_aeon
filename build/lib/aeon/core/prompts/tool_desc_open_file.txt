@@ -1,5 +1,4 @@
-Opens a file into Short Term Memory (working memory tabs). The content will appear in the 'Open Files' section of the NEXT turn's prompt.
-CRITICAL: Do NOT close the file in the same iteration you open it, or you will never see the content. It must remain open for at least one turn to be read.
+Opens a file into Short Term Memory (working memory tabs). Do NOT close the file in the same iteration you open it, or you will never see the content. It must remain open for at least one turn to be read. Do not use on files that are already open. 
 Schema:
   file_path (str, required): Path to the file to open. Relative or absolute.
 Example: {"tool_name": "open_file", "parameters": {"file_path": "src/main.py"}}

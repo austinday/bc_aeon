@@ -22,44 +22,47 @@ C_RESET = '\033[0m'
 
 class LLMClient:
     """A client for interacting with Large Language Models (Cloud or Local)."""
-    def __init__(self, provider: str = "local", local_strong: str = None, local_weak: str = None):
-        self.provider = provider
+    def __init__(self, strong_config: dict = None, weak_config: dict = None):
         self.logger = get_logger()
         self.debug_path: Optional[pathlib.Path] = None
         self.current_iteration = 0
-        
-        # --- 1. LOCAL PROVIDER ---
-        if provider == "local":
-            # Single Brain Node on Port 8000 handles all models
-            self.planner_client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="ollama")
-            self.planner_model = local_strong or "qwen3:235b-iq4xs"
-            self.executor_client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="ollama")
-            self.executor_model = local_weak or "llama4:16x17b"
-            self.summarizer_client = self.executor_client
-            self.summarizer_model = self.executor_model
-            self.context_limit = 128000 
-        # --- 2. CLOUD PROVIDERS ---
-        elif provider == "gemini":
-            self.setup_cloud("gemini-3-pro-preview", "gemini-flash-latest", "gemini_api_key.txt", "https://generativelanguage.googleapis.com/v1beta/openai/")
-            self.context_limit = 1000000
-        else:
-            self.setup_cloud("grok-4-1-fast-reasoning", "grok-4-1-fast-non-reasoning", "grok_api_key.txt", "https://api.x.ai/v1")
-            self.context_limit = 128000
 
-    def setup_cloud(self, strong, weak, key_file, url):
-        api_key_path = pathlib.Path.home() / key_file
-        if not api_key_path.exists():
-            raise FileNotFoundError(f"API key file not found: {api_key_path}")
-        with open(api_key_path, 'r') as f: 
-            api_key = f.readline().strip()
-        if not api_key:
-            raise ValueError(f"API key file is empty: {api_key_path}")
-        self.planner_client = openai.OpenAI(api_key=api_key, base_url=url)
-        self.executor_client = self.planner_client
-        self.summarizer_client = self.planner_client
-        self.planner_model = strong
-        self.executor_model = strong
-        self.summarizer_model = weak
+        # Default configs for backward compatibility
+        if strong_config is None:
+            strong_config = {'model': 'qwen3:235b-iq4xs', 'provider': 'local', 'context_limit': 128000}
+        if weak_config is None:
+            weak_config = {'model': 'llama4:16x17b', 'provider': 'local', 'context_limit': 128000}
+
+        # Setup planner (strong model)
+        self.planner_client = self._create_client(strong_config)
+        self.planner_model = strong_config['model']
+
+        # Setup executor (weak model)
+        self.executor_client = self._create_client(weak_config)
+        self.executor_model = weak_config['model']
+
+        # Summarizer uses weak model
+        self.summarizer_client = self.executor_client
+        self.summarizer_model = self.executor_model
+
+        self.context_limit = min(
+            strong_config.get('context_limit', 128000),
+            weak_config.get('context_limit', 128000)
+        )
+
+    def _create_client(self, config: dict):
+        """Create an OpenAI-compatible client from a model config dict."""
+        if config['provider'] == 'local':
+            return openai.OpenAI(base_url='http://localhost:8000/v1', api_key='ollama')
+        else:
+            api_key_path = pathlib.Path.home() / config['api_key_file']
+            if not api_key_path.exists():
+                raise FileNotFoundError(f'API key file not found: {api_key_path}')
+            with open(api_key_path, 'r') as f:
+                api_key = f.readline().strip()
+            if not api_key:
+                raise ValueError(f'API key file is empty: {api_key_path}')
+            return openai.OpenAI(api_key=api_key, base_url=config['base_url'])
 
     def set_debug_path(self, path: pathlib.Path): 
         self.debug_path = path

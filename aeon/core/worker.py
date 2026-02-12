@@ -233,10 +233,19 @@ class Worker:
         except Exception as e:
             self.logger.error(f"Failed to save objective to file: {e}")
 
+    def _format_open_file_list(self) -> str:
+        """Return a scannable bullet list of currently open file paths.
+        This gives the planner a quick way to see what is already loaded
+        without having to scan through full file contents."""
+        if not self.open_files:
+            return "(none)"
+        return "\n".join(f"  - {path}" for path in self.open_files.keys())
+
     def _build_planner_context(self, tool_list_str: str, system_specs: str, 
                                milestones_str: str, objective: str, history_str: str, open_files_str: str) -> str:
         """Build the complete planner prompt with instructions at the end."""
         reminders_section = f"**Important Reminders**\n{self.important_reminders}\n" if self.important_reminders.strip() else ""
+        open_file_list = self._format_open_file_list()
         
         return f"""{self.base_directives}
 
@@ -252,7 +261,10 @@ class Worker:
 **Completed Milestones (Foundational Progress)**
 {milestones_str}
 
-**Open Files (Working Memory)**
+**Currently Open Files (already loaded — DO NOT suggest opening these)**
+{open_file_list}
+
+**Open Files (Working Memory — Full Content)**
 {open_files_str}
 
 **Objective**
@@ -279,6 +291,7 @@ class Worker:
         distilled suggested_actions from the planner which contains everything
         it needs. Sending the full plan wastes context and confuses weaker models."""
         reminders_section = f"**Important Reminders**\n{self.important_reminders}\n" if self.important_reminders.strip() else ""
+        open_file_list = self._format_open_file_list()
 
         return f"""{self.base_directives}
 
@@ -299,6 +312,9 @@ class Worker:
 
 **Your Task (from Planner)**
 {suggested_actions}
+
+**ALREADY OPEN FILES (Do NOT call open_file on these — their content is below)**
+{open_file_list}
 
 **Open Files (Working Memory)**
 {open_files_str}
@@ -482,7 +498,7 @@ Result:
 
                 self.print_func(f"\n{C_YELLOW}--- EXECUTION ---{C_RESET}")
 
-                executor_files_str = self._format_open_files()
+                executor_files_str = self._format_open_files_for_executor(suggested_actions_str)
                 executor_prompt = self._build_executor_context(
                     tool_list_str, system_specs, milestones_str,
                     objective,
