@@ -3,9 +3,10 @@
 1) HOST BARRIER: Agent is on HOST. No direct container filesystem access.
 
 2) PATH TRANSLATION:
-   - HOST path: /home/user/project/scripts/main.py
-   - MOUNT flag: -v /home/user/project:/app
+   - HOST path: <CURRENT_WORKING_DIRECTORY>/scripts/main.py
+   - MOUNT flag: -v <CURRENT_WORKING_DIRECTORY>:/app
    - CONTAINER path: /app/scripts/main.py
+   - CRITICAL: Replace <CURRENT_WORKING_DIRECTORY> with the actual root path of the project tree provided in your context. Never use literal example paths.
 
 3) TROUBLESHOOTING:
    - If a `docker run` command fails with "File not found":

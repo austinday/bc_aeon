@@ -151,7 +151,11 @@ def register_models_for_agent(models):
     pid = os.getpid()
     with open(MODEL_REGISTRY_LOCK_PATH, 'w') as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        registry = json.load(open(MODEL_REGISTRY_PATH)) if os.path.exists(MODEL_REGISTRY_PATH) else {}
+        try:
+            registry = json.load(open(MODEL_REGISTRY_PATH)) if os.path.exists(MODEL_REGISTRY_PATH) else {}
+        except (json.JSONDecodeError, EOFError):
+            print(f"[WARN] Registry corrupted, resetting: {MODEL_REGISTRY_PATH}")
+            registry = {}
         registry, orphaned = _cleanup_stale_pids(registry)
         for model in models:
             if model not in registry:
@@ -173,7 +177,11 @@ def unregister_models_for_agent(models):
     to_unload = []
     with open(MODEL_REGISTRY_LOCK_PATH, 'w') as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        registry = json.load(open(MODEL_REGISTRY_PATH)) if os.path.exists(MODEL_REGISTRY_PATH) else {}
+        try:
+            registry = json.load(open(MODEL_REGISTRY_PATH)) if os.path.exists(MODEL_REGISTRY_PATH) else {}
+        except (json.JSONDecodeError, EOFError):
+            print(f"[WARN] Registry corrupted, resetting: {MODEL_REGISTRY_PATH}")
+            registry = {}
         registry, orphaned = _cleanup_stale_pids(registry)
         to_unload.extend(orphaned)
         for model in models:

@@ -15,9 +15,7 @@ from .prompts import (
     CORE_DIRECTIVES,
     DOCKER_DIRECTIVES,
     IMPORTANT_REMINDERS,
-    PLANNER_INSTRUCTIONS,
-    EXECUTOR_INSTRUCTIONS,
-    MILESTONE_ANALYZER_INSTRUCTIONS,
+    PRIMARY_AGENT_INSTRUCTIONS
 )
 
 # Colors for terminal output
@@ -46,7 +44,7 @@ class Worker:
         self.current_plan = "No plan formulated yet."
         self.open_files = {} 
         self.recent_history = deque(maxlen=50) 
-        self.completed_milestones = []  # Foundational progress markers, append-only
+        self.memories = {}  # Key-value persistent memory
         self.last_observation = "None."
         
         # Load directives from central prompts module
@@ -94,7 +92,7 @@ class Worker:
         if abs_path in self.open_files:
             del self.open_files[abs_path]
             return True
-        # Also check original path for backwards compatibility
+        # Also check original path for backward compatibility
         if path in self.open_files:
             del self.open_files[path]
             return True
@@ -110,8 +108,6 @@ class Worker:
             descs.append(f"- {name}: {tool.description}")
         return "\n".join(descs)
 
-
-
     def _format_open_files(self) -> str:
         self._sync_open_files()
         if not self.open_files:
@@ -121,66 +117,8 @@ class Worker:
             out.append(f"--- FILE: {path} ---\n{content}\n--- END FILE ---")
         return "\n\n".join(out)
 
-
-
-    def _format_open_files_compact(self) -> str:
-        """Compact file manifest for the planner: names, sizes, and a brief peek.
-        The planner needs to know WHAT is open, not read every line."""
-        self._sync_open_files()
-        if not self.open_files:
-            return "No files currently open."
-        out = []
-        for path, content in self.open_files.items():
-            lines = content.splitlines()
-            line_count = len(lines)
-            head = lines[:8]
-            tail = lines[-4:] if line_count > 12 else []
-            peek = '\n'.join(head)
-            if tail:
-                peek += f'\n  ... ({line_count - 12} lines omitted) ...\n' + '\n'.join(tail)
-            out.append(f"--- FILE: {path} ({line_count} lines) ---\n{peek}\n--- END ---")
-        return "\n\n".join(out)
-
-    def _format_open_files_for_executor(self, suggested_actions: str) -> str:
-        """Show full content only for files referenced in the suggested actions.
-        Other open files get a one-line stub so the executor knows they exist
-        but isn't distracted by their content."""
-        self._sync_open_files()
-        if not self.open_files:
-            return "No files currently open."
-        # Build a lowercase search corpus from the suggested actions
-        actions_lower = suggested_actions.lower()
-        out_relevant = []
-        out_background = []
-        for path, content in self.open_files.items():
-            basename = os.path.basename(path).lower()
-            # Match on basename or full path appearing in the actions text
-            if basename in actions_lower or path.lower() in actions_lower:
-                out_relevant.append(f"--- FILE: {path} ---\n{content}\n--- END FILE ---")
-            else:
-                line_count = content.count('\n') + 1
-                out_background.append(f"  {path} ({line_count} lines) — not referenced in current actions, use open_file to view")
-        parts = []
-        if out_relevant:
-            parts.append("\n\n".join(out_relevant))
-        if out_background:
-            parts.append("Other open files (content hidden):\n" + "\n".join(out_background))
-        # Fallback: if nothing matched, show everything (safe default)
-        if not out_relevant and self.open_files:
-            return self._format_open_files()
-        return "\n\n".join(parts)
-
     def _format_history(self) -> str:
-        """Format history with tiered detail levels and token budgeting.
-
-        Tiers (counting from most recent):
-          - FULL   (last 3):  Complete action + full summary
-          - BRIEF  (next 7):  Action + first 2 sentences of summary
-          - MINIMAL (older):  One-line action label with OK/FAIL tag
-
-        Fills newest-first until max_history_tokens budget is exhausted.
-        Zero extra LLM calls - purely algorithmic compression.
-        """
+        """Format history with tiered detail levels and token budgeting."""
         if not self.recent_history:
             return "No recent history."
 
@@ -230,16 +168,16 @@ class Worker:
             result += ' [...]'
         return result
         
-    def _format_milestones(self) -> str:
-        if not self.completed_milestones:
-            return "No milestones completed yet."
-        return "\n".join([f"[x] {m}" for m in self.completed_milestones])
+    def _format_memories(self) -> str:
+        if not self.memories:
+            return "No memories recorded yet."
+        return "\n".join([f"{k}: {v}" for k, v in self.memories.items()])
 
     def _reset_state(self, initial_observation="Project started."):
         self.current_plan = "Initial state. Need to formulate a plan."
         self.open_files = {}
         self.recent_history.clear()
-        self.completed_milestones = []
+        self.memories = {}
         self.last_observation = initial_observation
 
     def _save_objective(self, objective: str):
@@ -252,17 +190,14 @@ class Worker:
             self.logger.error(f"Failed to save objective to file: {e}")
 
     def _format_open_file_list(self) -> str:
-        """Return a scannable bullet list of currently open file paths.
-        This gives the planner a quick way to see what is already loaded
-        without having to scan through full file contents."""
         self._sync_open_files()
         if not self.open_files:
             return "(none)"
         return "\n".join(f"  - {path}" for path in self.open_files.keys())
 
-    def _build_planner_context(self, tool_list_str: str, system_specs: str, 
-                               milestones_str: str, objective: str, history_str: str, open_files_str: str) -> str:
-        """Build the complete planner prompt with instructions at the end."""
+    def _build_primary_agent_context(self, tool_list_str: str, system_specs: str, 
+                               memories_str: str, objective: str, history_str: str, open_files_str: str) -> str:
+        """Build the context for the unified Primary Agent."""
         reminders_section = f"**Important Reminders**\n{self.important_reminders}\n" if self.important_reminders.strip() else ""
         open_file_list = self._format_open_file_list()
         
@@ -275,19 +210,10 @@ class Worker:
 
 {reminders_section}
 
+**Persistent Memories (Key Details)**
+{memories_str}
+
 {system_specs}
-
-**Completed Milestones (Foundational Progress)**
-{milestones_str}
-
-**Currently Open Files (already loaded — DO NOT suggest opening these)**
-{open_file_list}
-
-**Open Files (Working Memory — Full Content)**
-{open_files_str}
-
-**Objective**
-{objective}
 
 **Current Saved Plan**
 {self.current_plan}
@@ -295,53 +221,21 @@ class Worker:
 **Recent History (Last 10 steps)**
 {history_str}
 
-**Last Observation (From previous step)**
-{self.last_observation}
-
-{PLANNER_INSTRUCTIONS}"""
-
-
-
-    def _build_executor_context(self, tool_list_str: str, system_specs: str, milestones_str: str,
-                                objective: str,
-                                suggested_actions: str, open_files_str: str) -> str:
-        """Build the complete executor prompt with instructions at the end.
-        Note: The full plan is intentionally omitted. The executor receives the
-        distilled suggested_actions from the planner which contains everything
-        it needs. Sending the full plan wastes context and confuses weaker models."""
-        reminders_section = f"**Important Reminders**\n{self.important_reminders}\n" if self.important_reminders.strip() else ""
-        open_file_list = self._format_open_file_list()
-
-        return f"""{self.base_directives}
-
-{self.docker_directives}
-
-**Available Tools**
-{tool_list_str}
-
-{reminders_section}
-
-{system_specs}
-
-**Completed Milestones (Foundational Progress)**
-{milestones_str}
-
-**Objective**
-{objective}
-
-**Your Task (from Planner)**
-{suggested_actions}
-
-**ALREADY OPEN FILES (Do NOT call open_file on these — their content is below)**
+**Currently Open Files (already loaded in context)**
 {open_file_list}
 
-**Open Files (Working Memory)**
+**Open Files (Full Content)**
 {open_files_str}
 
-{EXECUTOR_INSTRUCTIONS}"""
+**Last Observation (Result of previous step)**
+{self.last_observation}
+
+**Objective**
+{objective}
+
+{PRIMARY_AGENT_INSTRUCTIONS}"""
 
     def _build_base_context(self, tool_list_str: str) -> str:
-        """Build base context without role-specific instructions (used for milestone analyzer)."""
         return f"""{self.base_directives}
 
 {self.docker_directives}
@@ -350,58 +244,14 @@ class Worker:
 {tool_list_str}
 """
 
-    def _analyze_milestones(self, objective: str, iteration: int, 
-                            actions_taken: List[str], iteration_result: str) -> None:
-        """Analyze the iteration results to identify any completed milestones.
-        Milestones are foundational progress markers that won't need to be redone.
-        Uses a minimal prompt - the analyzer only needs the objective, existing
-        milestones, and this iteration's results. No tools/directives/history needed.
-        """
-        try:
-            milestones_str = self._format_milestones()
-            
-            analysis_context = f"""{MILESTONE_ANALYZER_INSTRUCTIONS}
-
-**Objective**
-{objective}
-
-**Already Completed Milestones**
-{milestones_str}
-
-**This Iteration (#{iteration})**
-Actions Taken: {', '.join(actions_taken)}
-Result:
-{iteration_result}
-"""
-            
-            response = self.llm_client.analyze_milestones(analysis_context)
-            
-            if response and isinstance(response, dict):
-                new_milestones = response.get("milestones_achieved", [])
-                if new_milestones and isinstance(new_milestones, list):
-                    for milestone in new_milestones:
-                        if milestone and isinstance(milestone, str) and milestone.strip() and milestone not in self.completed_milestones:
-                            self.completed_milestones.append(milestone.strip())
-                            self.print_func(f"{C_GREEN}>> MILESTONE ACHIEVED: {milestone}{C_RESET}")
-                            
-        except Exception as e:
-            self.logger.warning(f"Milestone analysis failed: {e}")
-            # Non-fatal - continue without milestone update
-
     def _clean_action_json(self, raw_str: str) -> str:
-        """Clean and extract JSON from potentially markdown-wrapped LLM response."""
         clean_json = raw_str.strip()
-        
-        # Handle ```json with optional whitespace/newline
         if clean_json.startswith("```json"):
             clean_json = clean_json[7:].lstrip()
         elif clean_json.startswith("```"):
             clean_json = clean_json[3:].lstrip()
-        
-        # Handle closing fence with optional whitespace
         if clean_json.endswith("```"):
             clean_json = clean_json[:-3].rstrip()
-        
         return clean_json.strip()
 
     # --- MAIN LOOP ---
@@ -412,13 +262,8 @@ Result:
         self.logger.info("Starting Execution for: %s", objective)
         self._save_objective(objective)
         
-        # Debug logging is now initialized in __init__, not here
-        # This prevents multiple debug files per worker instance
-
         iteration = 0
-        # Prime the observation with the objective to ensure the Planner registers it immediately
         self.last_observation = f"User input received: {objective}"
-
         self.print_func(f"{C_GREEN}Objective: {objective}{C_RESET}\n")
 
         graceful_exit_triggered = False
@@ -435,7 +280,7 @@ Result:
                 if max_iterations is not None and iteration > max_iterations:
                     if not graceful_exit_triggered:
                         graceful_exit_triggered = True
-                        msg = f"SYSTEM ALERT: Max iterations ({max_iterations}) reached. You have ONE final step. You MUST use a terminal tool ({', '.join(terminal_tools)}) NOW to report your findings (even if incomplete)."
+                        msg = f"SYSTEM ALERT: Max iterations ({max_iterations}) reached. You have ONE final step. You MUST use a terminal tool ({', '.join(terminal_tools)}) NOW to report your findings."
                         self.last_observation = msg
                         self.print_func(f"{C_RED}Max iterations reached. Forcing final report.{C_RESET}")
                     else:
@@ -447,323 +292,151 @@ Result:
                 # Gather context components
                 system_specs = get_runtime_info()
                 tool_list_str = self._get_tools_description()
-                milestones_str = self._format_milestones()
+                memories_str = self._format_memories()
                 history_str = self._format_history()
                 open_files_str = self._format_open_files()
                 
-                # Build planner prompt (instructions at end for emphasis)
-                # Planner gets full file content to prevent 'I can't see the code' loops
-                # compact_files_str = self._format_open_files_compact() 
-                planner_prompt = self._build_planner_context(
-                    tool_list_str, system_specs, milestones_str, objective, history_str, open_files_str
+                # Build Primary Agent prompt
+                prompt = self._build_primary_agent_context(
+                    tool_list_str, system_specs, memories_str, objective, history_str, open_files_str
                 )
 
-                # --- PLANNER ---
-                self.print_func("Thinking (Planning)...")
-                
-                suggested_actions_str = "No specific actions suggested due to planner error."
+                self.print_func("Thinking (Primary Agent)...")
 
+                # === PRIMARY AGENT CALL ===
+                response_str = self.llm_client.get_primary_agent_response(prompt=prompt)
+                if self.debug_mode:
+                    self.print_func(f"{C_YELLOW}[DEBUG] Primary Agent Raw Output:\n{response_str}{C_RESET}")
+                
                 try:
-                    plan_response_str = self.llm_client.get_plan(prompt=planner_prompt)
-                    if self.debug_mode:
-                        self.print_func(f"{C_YELLOW}[DEBUG] Planner Raw Output:\n{plan_response_str}{C_RESET}")
-                    
-                    suggested_actions_str = "No specific actions suggested."
-                    
-                    # PARSE PLANNER RESPONSE
-                    plan_data = json.loads(plan_response_str)
-                    self.current_plan = plan_data.get("updated_plan") or self.current_plan
-                except Exception as e:
-                    self.print_func(f"{C_RED}PLANNER CRASHED: {e}{C_RESET}")
-                    plan_data = {}
-                
-                # Format suggested actions for executor (now free-form text from planner)
-                next_actions = plan_data.get("next_actions") or ""
-                if next_actions:
-                    if isinstance(next_actions, str):
-                        suggested_actions_str = next_actions
-                    elif isinstance(next_actions, list):
-                        # Backwards compatibility if planner still outputs list
-                        action_lines = []
-                        for act in next_actions:
-                            if isinstance(act, dict):
-                                action_lines.append(f"- {act.get('tool', 'unknown')}: {act.get('purpose', 'N/A')}")
-                            else:
-                                action_lines.append(f"- {act}")
-                        suggested_actions_str = "\n".join(action_lines)
+                    response_data = json.loads(response_str)
+                except json.JSONDecodeError as e:
+                    self.print_func(f"{C_RED}Primary Agent JSON Parse Error: {e}{C_RESET}")
+                    self.last_observation = f"JSON Parse Error: {e}"
+                    continue
+
+                # Extract fields
+                thought = response_data.get("thought", "(No thought provided)")
+                updated_plan = response_data.get("updated_plan")
+                actions = response_data.get("actions", [])
+
+                if updated_plan:
+                    if isinstance(updated_plan, list):
+                        self.current_plan = "\n".join(updated_plan)
                     else:
-                        suggested_actions_str = str(next_actions)
-                
-                analysis = plan_data.get("analysis", "")
-                iteration_strategy = plan_data.get("iteration_strategy", "single_step")
-                risk_notes = plan_data.get("risk_notes", "")
+                        self.current_plan = str(updated_plan)
 
-                self.print_func(f"\n{C_CYAN}--- THINKING ---{C_RESET}")
-                self.print_func(f"{C_CYAN}Analysis:{C_RESET} {analysis}")
-                self.print_func(f"{C_CYAN}Strategy:{C_RESET} {iteration_strategy}")
-                if risk_notes:
-                    self.print_func(f"{C_YELLOW}Risks:{C_RESET} {risk_notes}")
+                self.print_func(f"\n{C_CYAN}--- THOUGHT ---{C_RESET}")
+                self.print_func(f"{thought}")
                 
-                self.print_func(f"\n{C_CYAN}--- PLAN ---{C_RESET}")
-                self.print_func(f"{self.current_plan.strip()}")
-                
-                self.print_func(f"\n{C_GREEN}--- NEXT ACTIONS ---{C_RESET}")
-                self.print_func(f"{suggested_actions_str}")
-                    
+                if updated_plan:
+                    self.print_func(f"\n{C_CYAN}--- UPDATED PLAN ---{C_RESET}")
+                    self.print_func(f"{self.current_plan}")
 
-                # --- EXECUTOR ---
+                if not actions:
+                    self.print_func(f"{C_RED}No actions returned by agent.{C_RESET}")
+                    self.last_observation = "Error: You returned an empty action list. You must take at least one action."
+                    continue
+
+                # === EXECUTION PHASE ===
                 if step_callback:
                     step_callback(iteration, display_max, "Executing")
 
                 self.print_func(f"\n{C_YELLOW}--- EXECUTION ---{C_RESET}")
+                
+                combined_summary_parts = []
+                actions_taken_str = []
+                
+                if len(actions) > 15:
+                    actions = actions[:15]
+                    self.logger.warning("Truncated actions to 15")
 
-                executor_files_str = self._format_open_files_for_executor(suggested_actions_str)
-                executor_prompt = self._build_executor_context(
-                    tool_list_str, system_specs, milestones_str,
-                    objective,
-                    suggested_actions_str, executor_files_str
-                )
-
-                max_exec_retries = 3
-                last_fail_step = -1
-                stuck_count = 0
-                exec_error_feedback = ""
-                final_summary = "No actions executed."
-                final_actions_taken = []
-
-                for exec_attempt in range(max_exec_retries + 1):
-                    # On retries, augment prompt with error feedback and refreshed file state
-                    if exec_attempt > 0:
-                        self.print_func(f"{C_YELLOW}Executor self-correcting (retry {exec_attempt}/{max_exec_retries})...{C_RESET}")
-                        refreshed_files = self._format_open_files()
-                        retry_addendum = (
-                            f"\n\n**EXECUTION ERROR FEEDBACK (Retry {exec_attempt}/{max_exec_retries})**\n"
-                            f"Your previous set of actions failed during execution. Here is what happened:\n"
-                            f"{exec_error_feedback}\n\n"
-                            f"**Updated Open Files (may reflect changes from successful steps)**\n"
-                            f"{refreshed_files}\n\n"
-                            f"Revise your actions to fix the error. Do NOT repeat the exact same failing action unchanged."
-                        )
-                        current_prompt = executor_prompt + retry_addendum
-                    else:
-                        current_prompt = executor_prompt
-
-                    action_json_str = self.llm_client.get_action(prompt=current_prompt)
-                    if self.debug_mode:
-                        self.print_func(f"{C_YELLOW}[DEBUG] Executor Raw Output:\n{action_json_str}{C_RESET}")
-
-                    # --- Parse actions ---
-                    actions = []
-                    parse_failed = False
-                    try:
-                        clean_json = self._clean_action_json(action_json_str)
-                        parsed = json.loads(clean_json)
-                        if isinstance(parsed, list):
-                            actions = parsed
-                        elif isinstance(parsed, dict):
-                            if "actions" in parsed and isinstance(parsed["actions"], list):
-                                actions = parsed["actions"]
-                            elif "tool_name" in parsed:
-                                actions = [parsed]
-                    except json.JSONDecodeError as e:
-                        exec_error_feedback = f"Your response was not valid JSON. Parse error: {e}. Raw start: {action_json_str[:300]}..."
-                        self.print_func(f"{C_RED}JSON Parse Failed: {e}{C_RESET}")
-                        parse_failed = True
-                    except Exception as e:
-                        exec_error_feedback = f"Unexpected parse error: {e}"
-                        self.print_func(f"{C_RED}Action Parse Failed: {e}{C_RESET}")
-                        parse_failed = True
-
-                    if parse_failed:
-                        if exec_attempt == max_exec_retries:
-                            final_summary = f"Failed to parse executor response after {max_exec_retries + 1} attempts. Last error: {exec_error_feedback}"
+                for idx, action_data in enumerate(actions):
+                    tool_name = action_data.get("tool_name")
+                    params = action_data.get("parameters", {})
+                    
+                    if not tool_name:
+                        combined_summary_parts.append(f"Action {idx+1}: Missing tool_name.")
                         continue
 
-                    if not actions:
-                        exec_error_feedback = "No actions were parsed from your response. You MUST return at least one action."
-                        if exec_attempt == max_exec_retries:
-                            final_summary = "No actions parsed from executor after all retries."
+                    if tool_name not in self.tools:
+                        combined_summary_parts.append(f"Action {idx+1}: Tool '{tool_name}' not found.")
                         continue
 
-                    # --- Execute actions ---
-                    combined_summary_parts = []
-                    actions_taken_str = []
-                    error_at_step = -1
-                    hit_early_exit = False
+                    self.print_func(f"{C_YELLOW}Executing (Step {idx+1}):{C_RESET} {tool_name} {params}")
+                    actions_taken_str.append(tool_name)
 
-                    if len(actions) > 15:
-                        actions = actions[:15]
-                        self.logger.warning("Truncated actions to 15")
+                    if tool_name in terminal_tools:
+                        try:
+                            tool = self.tools[tool_name]
+                            result_str = str(tool.execute(**params))
+                        except Exception as e:
+                            result_str = f"Error executing terminal tool {tool_name}: {e}"
+                        self.print_func(f"\n{C_GREEN}{result_str}{C_RESET}")
+                        self.recent_history.append({"iteration": iteration, "action": tool_name, "summary": result_str})
+                        if step_callback: step_callback(iteration, display_max, "Complete")
+                        return
 
-                    for idx, action_data in enumerate(actions):
-                        tool_name = action_data.get("tool_name")
-                        params = action_data.get("parameters", {})
-                        allow_failure = action_data.get("allow_failure", False)
-
-                        if not tool_name:
-                            combined_summary_parts.append(f"Action {idx+1}: Missing tool_name in action data.")
-                            error_at_step = idx
-                            break
-
-                        if tool_name not in self.tools:
-                            combined_summary_parts.append(f"Action {idx+1}: Tool '{tool_name}' not found. Available: {list(self.tools.keys())}")
-                            error_at_step = idx
-                            break
-
-                        self.print_func(f"{C_YELLOW}Executing (Step {idx+1}):{C_RESET} {tool_name} {params}")
-                        actions_taken_str.append(tool_name)
-
-                        if tool_name in terminal_tools:
-                            try:
-                                tool = self.tools[tool_name]
-                                result_str = str(tool.execute(**params))
-                            except Exception as e:
-                                result_str = f"Error executing terminal tool {tool_name}: {e}"
-                            self.print_func(f"\n{C_GREEN}{result_str}{C_RESET}")
-                            self.recent_history.append({"iteration": iteration, "action": tool_name, "summary": result_str})
-                            if step_callback: step_callback(iteration, display_max, "Complete")
+                    elif tool_name == "get_user_input":
+                        try:
+                            self.print_func(f"{C_YELLOW}Agent Request: {params.get('prompt')}\n> {C_RESET}")
+                            user_in = input()
+                            combined_summary_parts.append(f"User Input: {user_in}")
+                        except EOFError:
                             return
+                        break # Stop execution chain to process input
 
-                        elif tool_name == "get_user_input":
-                            try:
-                                self.print_func(f"{C_YELLOW}Agent Request: {params.get('prompt')}\n> {C_RESET}")
-                                user_in = input()
-                                combined_summary_parts.append(f"User Input: {user_in}")
-                            except EOFError:
-                                return
-                            hit_early_exit = True
-                            break
-
-                        else:
-                            try:
-                                tool = self.tools[tool_name]
-                                raw_result = tool.execute(**params)
-                            except TypeError as e:
-                                raw_result = f"Tool Parameter Error: {e}. Check required parameters for '{tool_name}'."
-                            except Exception as e:
-                                raw_result = f"Tool Execution Error: {type(e).__name__}: {e}"
-
-                            result_str = str(raw_result)
-                            combined_summary_parts.append(f"Action {idx+1} ({tool_name}):\n{result_str}")
-
-                            if "COMMAND FAILED" in result_str or result_str.strip().startswith("Error:"):
-                                if not allow_failure:
-                                    error_at_step = idx
-                                    break
-
-                    # --- Summarize this attempt ---
-                    if not combined_summary_parts:
-                        attempt_summary = "No actions executed."
                     else:
-                        full_raw_output = "\n\n".join(combined_summary_parts)
-                        if len(full_raw_output) < 200 and len(actions) == 1 and actions[0].get("tool_name") != "run_command":
-                            attempt_summary = full_raw_output
-                        else:
-                            command_context = f"Chain: {', '.join(actions_taken_str)}"
-                            attempt_summary = self.llm_client.summarize_execution(command_context, full_raw_output)
+                        try:
+                            tool = self.tools[tool_name]
+                            raw_result = tool.execute(**params)
+                        except TypeError as e:
+                            raw_result = f"Tool Parameter Error: {e}"
+                        except Exception as e:
+                            raw_result = f"Tool Execution Error: {type(e).__name__}: {e}"
 
-                    # --- Decide: success, retry, or escalate ---
-                    if error_at_step == -1 or hit_early_exit:
-                        # All actions succeeded (or user input was requested)
-                        final_summary = attempt_summary
-                        final_actions_taken = actions_taken_str
-                        break
+                        result_str = str(raw_result)
+                        combined_summary_parts.append(f"Action {idx+1} ({tool_name}):\n{result_str}")
+                        
+                        # Stop chain on command failure so the agent can react immediately
+                        if "COMMAND FAILED" in result_str or result_str.strip().startswith("Error:"):
+                             break
 
-                    # Error occurred — check if we're making forward progress
-                    if error_at_step <= last_fail_step:
-                        stuck_count += 1
+                # Summarize results
+                if not combined_summary_parts:
+                    attempt_summary = "No actions executed."
+                else:
+                    full_raw_output = "\n\n".join(combined_summary_parts)
+                    if len(full_raw_output) < 200 and len(actions) == 1:
+                        attempt_summary = full_raw_output
                     else:
-                        # Failing later in the chain means earlier steps got fixed
-                        stuck_count = 0
-                    last_fail_step = error_at_step
+                        command_context = f"Chain: {', '.join(actions_taken_str)}"
+                        attempt_summary = self.llm_client.summarize_execution(command_context, full_raw_output)
 
-                    # Stuck on same (or earlier) step too many times -> escalate to planner
-                    if stuck_count >= 2:
-                        self.print_func(f"{C_RED}Executor stuck at step {error_at_step + 1} after {exec_attempt + 1} attempts. Escalating to planner.{C_RESET}")
-                        final_summary = (
-                            f"EXECUTOR STUCK at step {error_at_step + 1} across {exec_attempt + 1} retries. "
-                            f"Needs planner intervention.\n{attempt_summary}"
-                        )
-                        final_actions_taken = actions_taken_str
-                        break
-
-                    # Still have retries left — build detailed feedback for the executor
-                    if exec_attempt < max_exec_retries:
-                        success_lines = [f"  Step {i+1} ({actions_taken_str[i]}): OK" for i in range(error_at_step)]
-                        fail_tool = actions_taken_str[error_at_step] if error_at_step < len(actions_taken_str) else "unknown"
-                        fail_line = f"  Step {error_at_step + 1} ({fail_tool}): FAILED"
-                        exec_error_feedback = (
-                            f"Executed {len(actions_taken_str)} action(s). Failed at step {error_at_step + 1}.\n"
-                            + ("\n".join(success_lines) + "\n" if success_lines else "")
-                            + fail_line + "\n"
-                            + f"Error details:\n{attempt_summary}"
-                        )
-                        self.print_func(
-                            f"{C_YELLOW}Error at step {error_at_step + 1}. "
-                            f"Retrying executor ({exec_attempt + 1}/{max_exec_retries})...{C_RESET}"
-                        )
-                    else:
-                        # Out of retries entirely
-                        final_summary = (
-                            f"EXECUTOR FAILED after {max_exec_retries + 1} attempts. "
-                            f"Last error at step {error_at_step + 1}.\n{attempt_summary}"
-                        )
-                        final_actions_taken = actions_taken_str
-
-                self.last_observation = final_summary
-                self.recent_history.append({"iteration": iteration, "action": f"Chain: {len(final_actions_taken)} tools", "summary": final_summary})
-
-                # --- MILESTONE ANALYSIS (after iteration completes) ---
-                # Analyze if any foundational milestones were achieved this iteration
-                self._analyze_milestones(
-                    objective=objective,
-                    iteration=iteration,
-                    actions_taken=final_actions_taken,
-                    iteration_result=final_summary,
-                )
+                self.last_observation = attempt_summary
+                self.recent_history.append({"iteration": iteration, "action": f"Chain: {len(actions_taken_str)} tools", "summary": attempt_summary})
 
             except Exception as e:
                 self.print_func(f"\n{C_RED}CRITICAL ERROR IN ITERATION: {e}{C_RESET}")
                 self.logger.error(f"Iteration failed: {e}", exc_info=True)
-                time.sleep(2) # Prevent rapid error loops
+                time.sleep(2)
 
             except KeyboardInterrupt:
                 self.print_func(f"\n{C_RED}PAUSED (User Interrupt).{C_RESET}")
                 try:
-                    self.print_func(f"{C_YELLOW}Interruption Detected. Enter guidance to steer the agent, or press Enter to resume.{C_RESET}")
-                    self.print_func(f"{C_YELLOW}(Type 'exit' or press Ctrl+C again to abort task){C_RESET}")
+                    self.print_func(f"{C_YELLOW}Interruption Detected. Enter guidance or press Enter to resume.{C_RESET}")
                     user_guidance = input(f"{C_BLUE}User Guidance > {C_RESET}")
                     
                     if not user_guidance.strip():
                         self.print_func("Resuming...")
                         continue
-                        
+                    
                     if user_guidance.lower() in ['exit', 'quit']:
                         self.print_func("Aborting task.")
                         break
 
-                    self.print_func("Analyzing interruption...")
-                    analysis = self.llm_client.analyze_interruption(objective, user_guidance)
-                    
-                    intent = analysis.get("classification", "ADVICE")
-                    updated_text = analysis.get("updated_text", user_guidance)
-                    reasoning = analysis.get("reasoning", "")
-                    
-                    self.print_func(f"Interpretation: {intent} ({reasoning})")
-                    
-                    if intent == "NEW_TASK":
-                        self.print_func(f"{C_GREEN}Switching to NEW TASK: {updated_text}{C_RESET}")
-                        objective = updated_text
-                        self._reset_state(initial_observation=f"Task switched by user: {user_guidance}")
-                        self._save_objective(objective)
-                    elif intent == "MODIFY_OBJECTIVE":
-                        self.print_func(f"{C_GREEN}Updating OBJECTIVE: {updated_text}{C_RESET}")
-                        objective = updated_text
-                        self.last_observation = f"USER INTERRUPTION: {user_guidance} (Objective Updated)"
-                        self._save_objective(objective)
-                    else:
-                        self.print_func(f"{C_GREEN}Advice received.{C_RESET}")
-                        self.last_observation = f"USER ADVICE: {user_guidance}"
+                    self.print_func(f"{C_GREEN}Guidance received.{C_RESET}")
+                    self.last_observation = f"USER INTERJECTION: {user_guidance}"
                         
                 except (KeyboardInterrupt, EOFError):
                     self.print_func(f"\n{C_RED}Forced Exit.{C_RESET}")

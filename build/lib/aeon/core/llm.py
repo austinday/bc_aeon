@@ -21,7 +21,12 @@ C_YELLOW = '\033[93m'
 C_RESET = '\033[0m'
 
 class LLMClient:
-    """A client for interacting with Large Language Models (Cloud or Local)."""
+    """A client for interacting with Large Language Models (Cloud or Local).
+    
+    Uses two model tiers:
+    - Primary (strong): Powers the main agent loop (reasoning + action selection).
+    - Utility (weak): Powers summarization, interruption analysis, and other support tasks.
+    """
     def __init__(self, strong_config: dict = None, weak_config: dict = None):
         self.logger = get_logger()
         self.debug_path: Optional[pathlib.Path] = None
@@ -33,17 +38,13 @@ class LLMClient:
         if weak_config is None:
             weak_config = {'model': 'llama4:16x17b', 'provider': 'local', 'context_limit': 128000}
 
-        # Setup planner (strong model)
-        self.planner_client = self._create_client(strong_config)
-        self.planner_model = strong_config['model']
+        # Primary model (strong) - used for the main agent loop
+        self.primary_client = self._create_client(strong_config)
+        self.primary_model = strong_config['model']
 
-        # Setup executor (weak model)
-        self.executor_client = self._create_client(weak_config)
-        self.executor_model = weak_config['model']
-
-        # Summarizer uses weak model
-        self.summarizer_client = self.executor_client
-        self.summarizer_model = self.executor_model
+        # Utility model (weak) - used for summarization, analysis, etc.
+        self.utility_client = self._create_client(weak_config)
+        self.utility_model = weak_config['model']
 
         self.context_limit = min(
             strong_config.get('context_limit', 128000),
@@ -78,10 +79,10 @@ class LLMClient:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             header = (
                 f"\n\n\n{'#'*100}\n"
-                f"# TYPE:      {m_type}\n"
+                f"# TYPE:       {m_type}\n"
                 f"# TIMESTAMP: {timestamp}\n"
                 f"# ITERATION: {self.current_iteration}\n"
-                f"# MODEL:     {m_name}\n"
+                f"# MODEL:      {m_name}\n"
                 f"{'#'*100}\n"
             )
             
@@ -165,128 +166,52 @@ class LLMClient:
         self.logger.warning(f"No JSON object found in response: {content[:200]}...")
         return "{}"
 
-    def get_plan(self, prompt: str, max_retries: int = 3) -> str:
-        """Get plan from planner LLM with retry logic for JSON parsing errors."""
+    def get_primary_agent_response(self, prompt: str, max_retries: int = 3) -> str:
+        """Get combined reasoning and action from the Primary Agent (Strong Model)."""
         current_prompt = prompt
         last_error = None
         
         for attempt in range(max_retries):
             try:
-                resp = self.planner_client.chat.completions.create(
-                    model=self.planner_model, 
+                resp = self.primary_client.chat.completions.create(
+                    model=self.primary_model, 
                     messages=[{"role": "user", "content": current_prompt}], 
-                    temperature=0.3,
+                    temperature=0.2,
                     response_format={"type": "json_object"}
                 )
                 raw = resp.choices[0].message.content
                 
-                # DEBUG PRINT TO CONSOLE
                 if self.debug_path:
-                    print(f"{C_YELLOW}[LLM RAW - PLANNER]\n{raw}{C_RESET}")
+                    print(f"{C_YELLOW}[LLM RAW - PRIMARY AGENT]\n{raw}{C_RESET}")
                 
-                self._log_to_debug("PLANNER", self.planner_model, current_prompt, raw)
+                self._log_to_debug("PRIMARY_AGENT", self.primary_model, current_prompt, raw)
                 
                 cleaned = self._clean_json_response(raw)
                 
-                # Validate JSON parsing
+                # Validate JSON parsing and Schema
                 try:
                     parsed = json.loads(cleaned)
                     if not parsed:
                         raise ValueError("Empty JSON object returned.")
+                    # Schema check: Must have 'actions'
+                    if 'actions' not in parsed:
+                         raise ValueError("JSON missing required 'actions' field.")
                     return cleaned
                 except (json.JSONDecodeError, ValueError) as e:
                     last_error = f"JSON validation error: {str(e)}"
-                    self.logger.warning(f"Planner attempt {attempt + 1}/{max_retries} failed: {last_error}")
+                    self.logger.warning(f"Primary Agent attempt {attempt + 1}/{max_retries} failed: {last_error}")
                     
                     if attempt < max_retries - 1:
-                        # Add error feedback to prompt for retry
-                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output ONLY a valid, non-empty JSON object. No text before {{ or after }}. Use double quotes only."
+                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output ONLY a valid JSON object containing 'thought' and 'actions'."
                     
             except Exception as e:
-                self._log_to_debug("PLANNER_ERR", self.planner_model, current_prompt, str(e))
-                self.logger.error(f"Planner LLM call failed: {e}")
+                self._log_to_debug("PRIMARY_AGENT_ERR", self.primary_model, current_prompt, str(e))
+                self.logger.error(f"Primary Agent LLM call failed: {e}")
                 raise
         
-        # All retries exhausted, raise explicit error to avoid silent failure
-        error_msg = f"Planner failed after {max_retries} attempts. Last error: {last_error}"
+        error_msg = f"Primary Agent failed after {max_retries} attempts. Last error: {last_error}"
         self.logger.error(error_msg)
         raise RuntimeError(error_msg)
-
-    def get_action(self, prompt: str, max_retries: int = 3) -> str:
-        """Get action from executor LLM with retry logic for JSON parsing errors."""
-        current_prompt = prompt
-        last_error = None
-        
-        for attempt in range(max_retries):
-            try:
-                resp = self.executor_client.chat.completions.create(
-                    model=self.executor_model, 
-                    messages=[{"role": "user", "content": current_prompt}], 
-                    temperature=0.1,
-                    response_format={"type": "json_object"}
-                )
-                raw = resp.choices[0].message.content
-                
-                # DEBUG PRINT TO CONSOLE
-                if self.debug_path:
-                    print(f"{C_YELLOW}[LLM RAW - EXECUTOR]\n{raw}{C_RESET}")
-                
-                self._log_to_debug("EXECUTOR", self.executor_model, current_prompt, raw)
-                
-                cleaned = self._clean_json_response(raw)
-                
-                # Validate JSON parsing
-                try:
-                    parsed = json.loads(cleaned)
-                    # Note: Empty 'actions' lists are allowed to support pre-flight phase.
-                    # Phase-specific requirements for non-empty actions are handled in worker.py.
-                    if not parsed:
-                        raise ValueError("Empty JSON object returned.")
-                        
-                    return cleaned
-                except (json.JSONDecodeError, ValueError) as e:
-                    last_error = f"JSON validation error: {str(e)}"
-                    self.logger.warning(f"Executor attempt {attempt + 1}/{max_retries} failed: {last_error}")
-                    
-                    if attempt < max_retries - 1:
-                        # Add error feedback to prompt for retry
-                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output ONLY a valid, non-empty JSON object. No text before {{ or after }}. Use double quotes only."
-                    
-            except Exception as e:
-                self._log_to_debug("EXEC_ERR", self.executor_model, current_prompt, str(e))
-                self.logger.error(f"Executor LLM call failed: {e}")
-                raise
-        
-        # All retries exhausted, raise explicit error
-        error_msg = f"Executor failed after {max_retries} attempts. Last error: {last_error}"
-        self.logger.error(error_msg)
-        raise RuntimeError(error_msg)
-
-    def analyze_milestones(self, analysis_context: str) -> Dict:
-        """Analyze iteration results to identify completed milestones.
-        Uses the summarizer model (weaker/faster) since this is a lightweight analysis task.
-        """
-        try:
-            resp = self.summarizer_client.chat.completions.create(
-                model=self.summarizer_model,
-                messages=[{"role": "user", "content": analysis_context}],
-                temperature=0.1,
-                response_format={"type": "json_object"}
-            )
-            raw = resp.choices[0].message.content
-            self._log_to_debug("MILESTONE_ANALYZER", self.summarizer_model, analysis_context, raw)
-            
-            # Parse JSON response
-            clean_json = self._clean_json_response(raw)
-            return json.loads(clean_json)
-        except json.JSONDecodeError as e:
-            self._log_to_debug("MILESTONE_PARSE_ERR", self.summarizer_model, analysis_context, str(e))
-            self.logger.warning(f"Failed to parse milestone analysis JSON: {e}")
-            return {}
-        except Exception as e:
-            self._log_to_debug("MILESTONE_ERR", self.summarizer_model, analysis_context, str(e))
-            self.logger.warning(f"Milestone analysis failed: {e}")
-            return {}
 
     def _truncate_with_tail(self, text: str, head_len: int = 500, tail_len: int = 1000) -> str:
         """Truncate text keeping both head (context) and tail (errors)."""
@@ -296,22 +221,18 @@ class LLMClient:
 
     def summarize_execution(self, ctx, raw_out) -> str:
         """Summarize execution output for history."""
-        # Smart truncate before sending to LLM to prevent context overflow
-        # Use a generous 20k window for the LLM context, biasing towards tail (error logs)
         safe_out = self._truncate_with_tail(raw_out, head_len=4000, tail_len=16000)
-        
         prompt = SUMMARIZE_EXECUTION_PROMPT.format(ctx=ctx, safe_out=safe_out)
         try:
-            resp = self.summarizer_client.chat.completions.create(
-                model=self.summarizer_model, 
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model, 
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("SUMMARIZE_EXECUTION", self.summarizer_model, prompt, content)
+            self._log_to_debug("SUMMARIZE_EXECUTION", self.utility_model, prompt, content)
             return content
         except Exception as e:
             self.logger.warning(f"Summarize execution failed: {e}")
-            # LOUD FAILURE: Explicitly report the crash to the agent
             tail_sample = raw_out[-1000:] if len(raw_out) > 1000 else raw_out
             return (f"!! SYSTEM ERROR: SUMMARIZATION FAILED !!\n"
                     f"Reason: {str(e)}\n"
@@ -322,27 +243,27 @@ class LLMClient:
         """Analyze user interruption to classify intent."""
         prompt = ANALYZE_INTERRUPTION_PROMPT.format(obj=obj, inp=inp)
         try:
-            resp = self.executor_client.chat.completions.create(
-                model=self.executor_model, 
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model, 
                 messages=[{"role": "user", "content": prompt}], 
                 response_format={"type": "json_object"}
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("ANALYZE_INTERRUPTION", self.executor_model, prompt, content)
+            self._log_to_debug("ANALYZE_INTERRUPTION", self.utility_model, prompt, content)
             return json.loads(content)
         except Exception as e:
             self.logger.warning(f"Interruption analysis failed: {e}")
             return {"classification": "ADVICE", "updated_text": inp, "reasoning": "Failed to analyze"}
 
     def reason(self, prompt: str) -> str:
-        """General reasoning/thinking call."""
+        """General reasoning/thinking call (uses primary/strong model)."""
         try:
-            resp = self.planner_client.chat.completions.create(
-                model=self.planner_model, 
+            resp = self.primary_client.chat.completions.create(
+                model=self.primary_model, 
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("REASONING (THINK TOOL)", self.planner_model, prompt, content)
+            self._log_to_debug("REASONING (THINK TOOL)", self.primary_model, prompt, content)
             return content
         except Exception as e:
             self.logger.error(f"Reason call failed: {e}")
@@ -352,12 +273,12 @@ class LLMClient:
         """Summarize text in context of a query."""
         prompt = SUMMARIZE_TEXT_PROMPT.format(query=query, text=text)
         try:
-            resp = self.summarizer_client.chat.completions.create(
-                model=self.summarizer_model, 
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model, 
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("SUMMARIZE_TEXT (WEB SEARCH)", self.summarizer_model, prompt, content)
+            self._log_to_debug("SUMMARIZE_TEXT (WEB SEARCH)", self.utility_model, prompt, content)
             return content
         except Exception as e:
             self.logger.warning(f"Summarize text failed: {e}")

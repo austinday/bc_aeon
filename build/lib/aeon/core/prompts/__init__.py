@@ -22,12 +22,9 @@ DOCKER_DIRECTIVES = _load('docker_directives.txt')
 IMPORTANT_REMINDERS = _load('important_reminders.txt')
 
 # =============================================================================
-# AGENT INSTRUCTIONS (Planner, Executor, Milestone Analyzer)
+# AGENT INSTRUCTIONS
 # =============================================================================
-PLANNER_INSTRUCTIONS = _load('planner_instructions.txt')
-EXECUTOR_INSTRUCTIONS = _load('executor_instructions.txt')
-PREFLIGHT_INSTRUCTIONS = _load('preflight_instructions.txt')
-MILESTONE_ANALYZER_INSTRUCTIONS = _load('milestone_analyzer_instructions.txt')
+PRIMARY_AGENT_INSTRUCTIONS = _load('primary_agent_instructions.txt')
 
 # =============================================================================
 # LLM PROMPT TEMPLATES (for llm.py)
@@ -60,6 +57,8 @@ TOOL_DESC_DOCKER_EXEC = _load('tool_desc_docker_exec.txt')
 TOOL_DESC_DOCKER_WRITE_FILE = _load('tool_desc_docker_write_file.txt')
 TOOL_DESC_DOCKER_READ_FILE = _load('tool_desc_docker_read_file.txt')
 TOOL_DESC_SUBMIT_FINDINGS = _load('tool_desc_submit_findings.txt')
+TOOL_DESC_MEMORIZE_DETAIL = _load('tool_desc_memorize_detail.txt')
+TOOL_DESC_FORGET_DETAIL = _load('tool_desc_forget_detail.txt')
 
 # =============================================================================
 # VESTIGIAL / LEGACY (kept for compatibility)

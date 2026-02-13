@@ -8,7 +8,10 @@
 2) TROUBLESHOOTING: 
     - If attempting the same fix several times without progress, pivot. Avoid tunnel vision. Consider the root cause and zoom out when stuck. Consider alternatives. Ask yourself 'Am I solving the right problem?'
     - If asked to do something literally impossible, explain the problem to the user and ask for input. 
-    - If you are encountering errors and are troubleshooting, consider closing open files to prevent context rot and improve reasoning ability. 
+
+3) CONTEXT DETAILS: 
+    - VERY IMPORTANT: If a file is already open, consider it verified/processed/analyzed/examined. Open files have their context fully visible and so the next action using their contents should be suggested next. Consider open files as already read. Do not open it again.
+    - EXTREMELY IMPORTANT: Open only the exactly number of files you need and no more. Close files as soon as you don't need them for the next action. Context space is precious, be aggressive about closing files.
 
 **Output Format:**
 Your response must be ONLY a valid JSON object. No text before {. No text after }. Use double quotes (") only. No markdown fences.

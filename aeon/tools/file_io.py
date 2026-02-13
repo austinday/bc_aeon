@@ -1,5 +1,7 @@
 from .base import BaseTool
 import os
+import ast as ast_module
+import re as re_module
 import base64
 import json
 from ..core.prompts import (
@@ -34,8 +36,11 @@ class OpenFileTool(BaseTool):
         
         # Return accurate status if file is already loaded
         if self.worker.is_file_open(file_path) or self.worker.is_file_open(abs_path):
-            return f"File '{file_path}' is already open in Short Term Memory."
+            return f"File '{file_path}' is already open in working memory."
         
+        max_files = float('inf')
+        auto_close_msg = None
+
         file_size = os.path.getsize(abs_path)
         if file_size > MAX_FILE_READ_SIZE:
              # Deterministic rejection of large files
@@ -64,7 +69,12 @@ class OpenFileTool(BaseTool):
 
             # Update Worker State with absolute path for consistency
             self.worker.update_open_file(abs_path, content)
-            return f"File '{file_path}' opened in Short Term Memory."
+            msg = f"File '{file_path}' opened in working memory."
+            if auto_close_msg:
+                msg = f"{auto_close_msg}\n{msg}"
+            slots_used = len(self.worker.open_files)
+            msg += f" ({slots_used}/{max_files} slots used)"
+            return msg
 
         except UnicodeDecodeError as e:
             return f"Error: File appears to be binary or has encoding issues: {e}"
