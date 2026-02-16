@@ -1,4 +1,2 @@
-These are your available tools.
+**AVAILABLE TOOLS**
 {tools}
-No other tools are available.
-

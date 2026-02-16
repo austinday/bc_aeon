@@ -37,7 +37,6 @@ SUMMARIZE_TEXT_PROMPT = _load('summarize_text_prompt.txt')
 # TOOL PROMPT TEMPLATES
 # =============================================================================
 THINK_TOOL_PROMPT = _load('think_tool_prompt.txt')
-RESEARCH_OBJECTIVE_TEMPLATE = _load('research_objective_template.txt')
 
 # =============================================================================
 # TOOL DESCRIPTIONS
@@ -52,18 +51,12 @@ TOOL_DESC_SEARCH_WEB = _load('tool_desc_search_web.txt')
 TOOL_DESC_RUN_COMMAND = _load('tool_desc_run_command.txt')
 TOOL_DESC_TASK_COMPLETE = _load('tool_desc_task_complete.txt')
 TOOL_DESC_GET_USER_INPUT = _load('tool_desc_get_user_input.txt')
-TOOL_DESC_CONDUCT_RESEARCH = _load('tool_desc_conduct_research.txt')
-TOOL_DESC_DOCKER_EXEC = _load('tool_desc_docker_exec.txt')
-TOOL_DESC_DOCKER_WRITE_FILE = _load('tool_desc_docker_write_file.txt')
-TOOL_DESC_DOCKER_READ_FILE = _load('tool_desc_docker_read_file.txt')
-TOOL_DESC_SUBMIT_FINDINGS = _load('tool_desc_submit_findings.txt')
 TOOL_DESC_MEMORIZE_DETAIL = _load('tool_desc_memorize_detail.txt')
 TOOL_DESC_FORGET_DETAIL = _load('tool_desc_forget_detail.txt')
 
 # =============================================================================
-# VESTIGIAL / LEGACY (kept for compatibility)
+# CONTEXT SECTIONS
 # =============================================================================
 CONVERSATION_HISTORY = _load('conversation_history.txt')
 OBJECTIVE_SECTION = _load('objective_section.txt')
-RESPONSE_FORMAT = _load('response_format.txt')
 TOOLS_SECTION = _load('tools_section.txt')

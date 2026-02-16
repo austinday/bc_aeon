@@ -1,8 +1,0 @@
-Returns a lightweight structural outline of a file WITHOUT loading it into working memory. Use this FIRST to orient yourself on a file before deciding whether to open it. No slot limit — you can peek at as many files as you want.
-For Python: shows imports, class/method signatures, top-level function signatures, and constants with line numbers.
-For Shell: shows header comments and function definitions.
-For other text: shows first 20 lines and total line count.
-Does NOT consume a working memory slot. Does NOT allow editing. Use open_file only after peeking, and only for files you will actively edit.
-Schema:
-  file_path (str, required): Path to the file to peek at.
-Example: {"tool_name": "peek_file", "parameters": {"file_path": "scripts/pipeline.py"}}

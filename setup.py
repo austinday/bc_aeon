@@ -1,4 +1,12 @@
+import os
+import shutil
 from setuptools import setup, find_packages
+
+# Automatically wipe stale build/cache directories before installing
+for cache_dir in ['build', 'aeon.egg-info']:
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_dir)
+    if os.path.exists(cache_path):
+        shutil.rmtree(cache_path, ignore_errors=True)
 
 setup(
     name="aeon",

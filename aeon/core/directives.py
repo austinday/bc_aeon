@@ -1,8 +1,8 @@
 """
 Core Directives and Configuration for the Aeon Agent.
-This module re-exports directives from the central prompts module for backward compatibility.
+Re-exports from the central prompts module for backward compatibility.
 """
 
-from .prompts import CORE_DIRECTIVES, DOCKER_DIRECTIVES
+from .prompts import CORE_DIRECTIVES, DOCKER_DIRECTIVES, IMPORTANT_REMINDERS
 
-__all__ = ['CORE_DIRECTIVES', 'DOCKER_DIRECTIVES']
+__all__ = ['CORE_DIRECTIVES', 'DOCKER_DIRECTIVES', 'IMPORTANT_REMINDERS']
