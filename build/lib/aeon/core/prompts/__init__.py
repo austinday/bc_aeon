@@ -54,6 +54,11 @@ TOOL_DESC_GET_USER_INPUT = _load('tool_desc_get_user_input.txt')
 TOOL_DESC_MEMORIZE_DETAIL = _load('tool_desc_memorize_detail.txt')
 TOOL_DESC_FORGET_DETAIL = _load('tool_desc_forget_detail.txt')
 
+# === GENERATIVE TOOLS (ComfyUI-backed) ===
+# Each generative modality gets its own tool description.
+# To add a new one: create tool_desc_generate_<modality>.txt and load it here.
+TOOL_DESC_GENERATE_IMAGE = _load('tool_desc_generate_image.txt')
+
 # =============================================================================
 # CONTEXT SECTIONS
 # =============================================================================

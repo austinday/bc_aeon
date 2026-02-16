@@ -8,6 +8,10 @@ aeon.egg-info/dependency_links.txt
 aeon.egg-info/entry_points.txt
 aeon.egg-info/requires.txt
 aeon.egg-info/top_level.txt
+aeon/comfyui/__init__.py
+aeon/comfyui/backend.py
+aeon/comfyui/profiles/hunyuan_image.json
+aeon/comfyui/workflows/hunyuan_image_api.json
 aeon/core/__init__.py
 aeon/core/directives.py
 aeon/core/llm.py
@@ -29,6 +33,7 @@ aeon/core/prompts/think_tool_prompt.txt
 aeon/core/prompts/tool_desc_close_file.txt
 aeon/core/prompts/tool_desc_edit_file.txt
 aeon/core/prompts/tool_desc_forget_detail.txt
+aeon/core/prompts/tool_desc_generate_image.txt
 aeon/core/prompts/tool_desc_get_user_input.txt
 aeon/core/prompts/tool_desc_memorize_detail.txt
 aeon/core/prompts/tool_desc_open_file.txt
@@ -42,12 +47,14 @@ aeon/core/prompts/tools_section.txt
 aeon/scripts/__init__.py
 aeon/scripts/clear_gpu.sh
 aeon/scripts/start_brain.sh
+aeon/scripts/start_comfyui.sh
 aeon/scripts/start_vllm.sh
 aeon/services/__init__.py
 aeon/tools/__init__.py
 aeon/tools/base.py
 aeon/tools/communication.py
 aeon/tools/file_io.py
+aeon/tools/generate_image.py
 aeon/tools/loader.py
 aeon/tools/memory.py
 aeon/tools/search.py

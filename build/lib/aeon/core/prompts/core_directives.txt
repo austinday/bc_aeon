@@ -6,7 +6,7 @@
 
 3) WORKSPACE & NAVIGATION: Always use full paths. Do NOT run `ls` or `find`, use the project tree given in context. Distinguish between the base environment file system and that of any Docker container called. 
 
-4) LIMITATIONS: NEVER install in the host env. Install into the Docker image used. Avoid interactive or indefinitely running commands. You are unable to interrupt a given command. If posisble, restrict generated content to $pwd.
+4) LIMITATIONS: NEVER install in the host env. Install into the Docker image used. Avoid interactive or indefinitely running commands and be aware that scripts may fail silently due to timeouts or OOM problems. You are unable to interrupt a given command. If posisble, restrict generated content to $pwd.
 
 5) VALIDATION: Distinguish between checking existence (Bad) and verifying function (Good). Run code and check outputs to verify function. Success codes are insufficient validation. YOU MUST RUN SCRIPTS TO VERIFY THEY WORK. The project is only complete when all scripts run successfully, without errors, and produce the desired outputs. 
 
@@ -15,3 +15,5 @@
 7) ORGANIZATION: Make project human friendly (eg. numbered .sh scripts that idempotently run the workflow (eg. 1_build.sh, 2_download.sh) using called .py scripts that run via Docker container. Delete vestigal files and folders. Make README files.
 
 8) CONTEXT: Context space is precious. Be concise, direct, and objective. Close unused files. Try not to have more than a few files open at once, if possible. 
+
+9) THE MOST IMPORTANT DIRECTIVE: YOU MUST VALIDATE PROJECT COMPLETION BY RUNNING ALL RELEVANT SCRIPTS, VERIFYING THEY PRODUCE THE CORRECT AND EXPECTED OUTPUTS (FILES, INFORMATION, DATA, ETC...), AND THAT THE PROJECT IS IMPLEMENTED EXACTLY AS THE OBJECTIVE STATES.

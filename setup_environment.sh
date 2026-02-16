@@ -157,9 +157,88 @@ for model in "${HF_MODELS[@]}"; do
 done
 
 # =================================================================================================
-# PHASE 5: FINALIZATION
+# PHASE 5: COMFYUI GENERATIVE ENGINE
 # =================================================================================================
-print_banner "PHASE 5: FINALIZATION"
+print_banner "PHASE 5: COMFYUI GENERATIVE ENGINE"
+
+COMFYUI_MODELS_DIR="$MODELS_DIR/comfyui_models"
+COMFYUI_OUTPUT_DIR="$HOME/bc_aeon/comfyui_output"
+mkdir -p "$COMFYUI_MODELS_DIR"
+mkdir -p "$COMFYUI_OUTPUT_DIR"
+
+log_step "Building ComfyUI Docker image (aeon_comfyui:latest)..."
+COMFYUI_DOCKERFILE_DIR="$(cd "$(dirname "$0")/aeon/comfyui" && pwd)"
+if [ -f "$COMFYUI_DOCKERFILE_DIR/Dockerfile" ]; then
+    docker build -t aeon_comfyui:latest -f "$COMFYUI_DOCKERFILE_DIR/Dockerfile" "$COMFYUI_DOCKERFILE_DIR"
+else
+    echo -e "${C_YELLOW}[!] ComfyUI Dockerfile not found, skipping image build.${C_RESET}"
+fi
+
+# --- Model: HunyuanImage 3.0 Instruct INT8 (text-to-image) ---
+log_step "Downloading ComfyUI model: EricRollei/HunyuanImage-3.0-Instruct-INT8..."
+HUNYUAN_DIR="$COMFYUI_MODELS_DIR/hunyuan_image_int8"
+if [ -d "$HUNYUAN_DIR" ] && [ "$(ls -A $HUNYUAN_DIR 2>/dev/null)" ]; then
+    echo "  (Already downloaded - Skipping)"
+else
+    mkdir -p "$HUNYUAN_DIR"
+    docker run --rm $TTY_FLAG \
+        -v "$COMFYUI_MODELS_DIR:/models" \
+        -e HF_HOME=/tmp/cache \
+        ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
+        aeon_base:py3.10-cuda12.1 \
+        bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c \"from huggingface_hub import snapshot_download; snapshot_download(repo_id='EricRollei/HunyuanImage-3.0-Instruct-INT8', local_dir='/models/hunyuan_image_int8', local_dir_use_symlinks=False)\""
+fi
+
+log_step "Merging HunyuanImage shards into a single safetensors file..."
+if [ ! -f "$HUNYUAN_DIR/hunyuan_image_merged.safetensors" ]; then
+    cat << 'EOF' > "$HUNYUAN_DIR/merge_shards.py"
+import json, os
+from safetensors.torch import load_file, save_file
+d = '/models/hunyuan_image_int8'
+idx = os.path.join(d, 'model.safetensors.index.json')
+out = os.path.join(d, 'hunyuan_image_merged.safetensors')
+if os.path.exists(idx):
+    with open(idx) as f:
+        shards = sorted(list(set(json.load(f)['weight_map'].values())))
+    sd = {}
+    for s in shards:
+        print(f"Loading {s}...")
+        sd.update(load_file(os.path.join(d, s)))
+    print("Saving merged file...")
+    save_file(sd, out)
+    print("Done!")
+EOF
+    docker run --rm $TTY_FLAG \
+        -v "$COMFYUI_MODELS_DIR:/models" \
+        aeon_base:py3.10-cuda12.1 \
+        bash -c "uv pip install --system --no-cache-dir safetensors && python3 /models/hunyuan_image_int8/merge_shards.py"
+    rm -f "$HUNYUAN_DIR/merge_shards.py"
+else
+    echo "  (Already merged - Skipping)"
+fi
+
+# --- VAE: HunyuanVideo VAE (shared across Hunyuan model family) ---
+log_step "Downloading ComfyUI VAE: HunyuanVideo VAE..."
+COMFYUI_VAE_DIR="$COMFYUI_MODELS_DIR/vae"
+mkdir -p "$COMFYUI_VAE_DIR"
+if [ -f "$COMFYUI_VAE_DIR/hunyuan_video_vae.safetensors" ]; then
+    echo "  (Already downloaded - Skipping)"
+else
+    docker run --rm $TTY_FLAG \
+        -v "$COMFYUI_VAE_DIR:/vae_output" \
+        -e HF_HOME=/tmp/cache \
+        ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
+        aeon_base:py3.10-cuda12.1 \
+        bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c \"from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='hunyuanvideo-community/HunyuanVideo', filename='vae/diffusion_pytorch_model.safetensors', local_dir='/tmp/hf_dl', local_dir_use_symlinks=False)\" && cp /tmp/hf_dl/vae/diffusion_pytorch_model.safetensors /vae_output/hunyuan_video_vae.safetensors"
+fi
+
+log_step "Fixing ComfyUI permissions..."
+sudo chown -R $(id -u):$(id -g) "$COMFYUI_MODELS_DIR" "$COMFYUI_OUTPUT_DIR" "$COMFYUI_MODELS_DIR/vae"
+
+# =================================================================================================
+# PHASE 6: FINALIZATION
+# =================================================================================================
+print_banner "PHASE 6: FINALIZATION"
 log_step "Fixing Permissions..."
 sudo chown -R $(id -u):$(id -g) "$MODELS_DIR"
 log_step "Environment Ready."

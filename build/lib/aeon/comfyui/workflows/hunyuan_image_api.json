@@ -1,0 +1,76 @@
+{
+    "_comment": "ComfyUI API-format workflow for HunyuanImage 3.0 INT8 using HunyuanVideoWrapper nodes. HyVideoModelLoader outputs ONLY the model (index 0). The VAE must be loaded separately via HyVideoVAELoader (node 8). Text encoders are auto-downloaded on first run. If this workflow fails, run ComfyUI interactively (bash start_comfyui.sh --ui), build a working graph, then Save (API Format) and replace dynamic values with {{PLACEHOLDERS}}.",
+    "1": {
+        "class_type": "HyVideoModelLoader",
+        "inputs": {
+            "model": "hunyuan_image_int8/hunyuan_image_merged.safetensors",
+            "base_precision": "bf16",
+            "quantization": "disabled",
+            "load_device": "main_device"
+        }
+    },
+    "2": {
+        "class_type": "DownloadAndLoadHyVideoTextEncoder",
+        "inputs": {
+            "llm_model": "Kijai/llava-llama-3-8b-text-encoder-tokenizer",
+            "clip_model": "openai/clip-vit-large-patch14",
+            "precision": "fp16"
+        }
+    },
+    "3": {
+        "class_type": "HyVideoTextEncode",
+        "inputs": {
+            "text_encoders": ["2", 0],
+            "prompt": "{{PROMPT}}",
+            "force_offload": true
+        }
+    },
+    "4": {
+        "class_type": "EmptyHunyuanImageLatent",
+        "inputs": {
+            "width": "{{WIDTH}}",
+            "height": "{{HEIGHT}}",
+            "batch_size": 1
+        }
+    },
+    "5": {
+        "class_type": "HyVideoSampler",
+        "inputs": {
+            "model": ["1", 0],
+            "hyvid_embeds": ["3", 0],
+            "width": "{{WIDTH}}",
+            "height": "{{HEIGHT}}",
+            "num_frames": 1,
+            "steps": "{{STEPS}}",
+            "embedded_guidance_scale": "{{CFG_SCALE}}",
+            "flow_shift": "{{FLOW_SHIFT}}",
+            "seed": "{{SEED}}",
+            "force_offload": true
+        }
+    },
+    "6": {
+        "class_type": "HyVideoDecode",
+        "inputs": {
+            "vae": ["8", 0],
+            "samples": ["5", 0],
+            "enable_vae_tiling": true,
+            "temporal_tiling_sample_size": 16,
+            "spatial_tile_sample_min_size": 256,
+            "auto_tile_size": true
+        }
+    },
+    "7": {
+        "class_type": "SaveImage",
+        "inputs": {
+            "images": ["6", 0],
+            "filename_prefix": "aeon_output"
+        }
+    },
+    "8": {
+        "class_type": "HyVideoVAELoader",
+        "inputs": {
+            "model_name": "hunyuan_video_vae.safetensors",
+            "precision": "bf16"
+        }
+    }
+}

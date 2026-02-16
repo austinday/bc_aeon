@@ -1,0 +1,12 @@
+Generates an image from a text prompt using a local AI model. Use this when the objective requires creating, generating, or producing an image. The image is saved to disk and the file path is returned.
+Schema:
+  prompt (str, required): A detailed text description of the image to generate. Be specific and descriptive for best results.
+  negative_prompt (str, optional, default=""): Things to avoid in the generated image (e.g., 'blurry, low quality').
+  width (int, optional, default=1024): Image width in pixels.
+  height (int, optional, default=1024): Image height in pixels.
+  steps (int, optional, default=30): Sampling steps. More steps = higher quality but slower. 20-50 is typical.
+  cfg_scale (float, optional, default=6.0): Embedded guidance scale. Higher = more literal. 3-10 is typical.
+  flow_shift (float, optional, default=7.0): Flow shift parameter for the sampler. 5-10 is typical.
+  seed (int, optional, default=-1): Random seed for reproducibility. -1 for random.
+Example: {"tool_name": "generate_image", "parameters": {"prompt": "a photorealistic cat astronaut floating in space, Earth in the background, dramatic lighting"}}
+Example: {"tool_name": "generate_image", "parameters": {"prompt": "architectural blueprint of a modern house", "width": 1536, "height": 1024, "steps": 40}}

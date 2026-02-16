@@ -99,7 +99,7 @@ def warm_up_models(local_model_names):
 def cleanup_transient_tools():
     print("[SYSTEM] Cleaning up transient tool containers...")
     try:
-        subprocess.run("docker ps -a -q --filter 'name=aeon_research' --filter 'name=aeon_vision' | xargs -r docker rm -f", 
+        subprocess.run("docker ps -a -q --filter 'name=aeon_research' --filter 'name=aeon_vision' --filter 'name=aeon_comfyui' | xargs -r docker rm -f", 
                         shell=True, stderr=subprocess.DEVNULL, timeout=5)
     except Exception as e:
         print(f"[WARN] Cleanup timed out or failed: {e}")
