@@ -10,7 +10,8 @@
         "width": {"type": "int", "required": false, "default": 1024},
         "height": {"type": "int", "required": false, "default": 1024},
         "steps": {"type": "int", "required": false, "default": 50},
-        "cfg_scale": {"type": "float", "required": false, "default": 1.0},
-        "seed": {"type": "int", "required": false, "default": -1}
+        "guidance": {"type": "float", "required": false, "default": 3.5},
+        "seed": {"type": "int", "required": false, "default": -1},
+        "filename_prefix": {"type": "string", "required": false, "default": "aeon_temp"}
     }
 }

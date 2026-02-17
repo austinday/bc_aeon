@@ -1,4 +1,0 @@
-Removes a previously memorized detail from your persistent memory context. Use this to clean up outdated or incorrect memories.
-Schema:
-  key (str, required): The unique identifier of the memory to forget.
-Example: {"tool_name": "forget_detail", "parameters": {"key": "db_password"}}

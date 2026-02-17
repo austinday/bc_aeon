@@ -1,0 +1,17 @@
+{
+  "model_id": "pi_flux2",
+  "display_name": "pi-Flux.2 dev FP8 (piFlow LoRA)",
+  "output_type": "image",
+  "description": "Uncensored, high-quality Flux.2-dev T2I using piFlow LoRA for fast few-step sampling (best quality at 20 steps). Uses GPU1, FP8 models (~12GB VRAM).",
+  "workflow_file": "pi_flux2_api.json",
+  "parameters": {
+    "PROMPT": {"default": ""},
+    "WIDTH": {"default": 1024},
+    "HEIGHT": {"default": 1024},
+    "STEPS": {"default": 20, "min": 4, "max": 50},
+    "GUIDANCE": {"default": 4.0},
+    "SHIFT": {"default": 3.2},
+    "SEED": {"default": -1},
+    "FILENAME_PREFIX": {"default": "aeon_pi_flux"}
+  }
+}

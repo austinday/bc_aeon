@@ -181,13 +181,13 @@ log_step "Downloading Flux.2-dev FP8 UNet to diffusion_models/..."
 UNET_DIR="$COMFYUI_MODELS_DIR/diffusion_models"
 mkdir -p "$UNET_DIR"
 FLUX_UNET="flux2_dev_fp8mixed.safetensors"
-if [ ! -f "$UNET_DIR/$FLUX_UNET" ]; then
+if [ ! -f "$UNET_DIR/$(basename "$FLUX_UNET")" ]; then
   docker run --rm $TTY_FLAG \
     -v "$UNET_DIR:/diffusion_models" \
     -e HF_HOME=/tmp/cache \
     ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
     aeon_base:py3.10-cuda12.1 \
-    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"$FLUX_UNET\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/unet/$FLUX_UNET\")'"
+    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"split_files/diffusion_models/flux2_dev_fp8mixed.safetensors\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/diffusion_models/flux2_dev_fp8mixed.safetensors\")'"
   echo "  Downloaded $FLUX_UNET"
 else
   echo "  $FLUX_UNET already exists"
@@ -196,14 +196,14 @@ fi
 log_step "Downloading Flux.2 Mistral FP8 Text Encoder to text_encoders/..."
 TEXT_ENCODERS_DIR="$COMFYUI_MODELS_DIR/text_encoders"
 mkdir -p "$TEXT_ENCODERS_DIR"
-MISTRAL_MODEL="mistral_3_small_flux2_bf16.safetensors"
-if [ ! -f "$TEXT_ENCODERS_DIR/$MISTRAL_MODEL" ]; then
+ MISTRAL_MODEL="mistral_3_small_flux2_fp8.safetensors"
+if [ ! -f "$TEXT_ENCODERS_DIR/$(basename "$MISTRAL_MODEL")" ]; then
   docker run --rm $TTY_FLAG \
     -v "$TEXT_ENCODERS_DIR:/text_encoders" \
     -e HF_HOME=/tmp/cache \
     ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
     aeon_base:py3.10-cuda12.1 \
-    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"$MISTRAL_MODEL\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/text_encoders/$MISTRAL_MODEL\")'"
+     bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"split_files/text_encoders/mistral_3_small_flux2_fp8.safetensors\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/text_encoders/mistral_3_small_flux2_fp8.safetensors\")'"
   echo "  Downloaded $MISTRAL_MODEL"
 else
   echo "  $MISTRAL_MODEL already exists"
@@ -219,26 +219,27 @@ if [ ! -f "$VAE_DIR/$FLUX_VAE" ]; then
     -e HF_HOME=/tmp/cache \
     ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
     aeon_base:py3.10-cuda12.1 \
-    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"black-forest-labs/FLUX.2-dev\", filename=\"$FLUX_VAE\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/vae/$FLUX_VAE\")'"
+    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"split_files/vae/flux2-vae.safetensors\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/vae/flux2-vae.safetensors\")'"
   echo "  Downloaded $FLUX_VAE"
 else
   echo "  $FLUX_VAE already exists"
 fi
+ log_step "Downloading pi-Flow LoRA adapter to loras/..."
+ LORAS_DIR="$COMFYUI_MODELS_DIR/loras"
+ mkdir -p "$LORAS_DIR"
+ PIFLOW_LORA="gmflux2_k8_piid_4step.safetensors"
+ if [ ! -f "$LORAS_DIR/$PIFLOW_LORA" ]; then
+   docker run --rm $TTY_FLAG \
+     -v "$LORAS_DIR:/loras" \
+     -e HF_HOME=/tmp/cache \
+     ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
+     aeon_base:py3.10-cuda12.1 \
+     bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Lakonik/pi-FLUX.2\", filename=\"gmflux2_k8_piid_4step/diffusion_pytorch_model.safetensors\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/loras/gmflux2_k8_piid_4step.safetensors\")'"
+   echo "  Downloaded $PIFLOW_LORA"
+ else
+   echo "  $PIFLOW_LORA already exists"
+ fi
 
-log_step "Downloading Flux T5XXL FP16 Text Encoder to text_encoders/..."
-
-T5_MODEL="t5xxl_fp16.safetensors"
-if [ ! -f "$TEXT_ENCODERS_DIR/$T5_MODEL" ]; then
-  docker run --rm $TTY_FLAG \
-    -v "$TEXT_ENCODERS_DIR:/text_encoders" \
-    -e HF_HOME=/tmp/cache \
-    ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
-    aeon_base:py3.10-cuda12.1 \
-    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"comfyanonymous/flux_text_encoders\", filename=\"$T5_MODEL\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/text_encoders/$T5_MODEL\")'"
-  echo "  Downloaded $T5_MODEL"
-else
-  echo "  $T5_MODEL already exists"
-fi
 
 log_step "Fixing ComfyUI permissions..."
 sudo chown -R $(id -u):$(id -g) "$COMFYUI_MODELS_DIR" "$COMFYUI_OUTPUT_DIR" "$COMFYUI_MODELS_DIR/vae"

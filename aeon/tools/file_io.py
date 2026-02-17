@@ -6,7 +6,7 @@ from ..core.prompts import (
     TOOL_DESC_OPEN_FILE,
     TOOL_DESC_CLOSE_FILE,
     TOOL_DESC_WRITE_FILE,
-    TOOL_DESC_EDIT_FILE,
+    TOOL_DESC_EDIT_FILE_LINES,
 )
 from .analyzers import FileAnalyzer
 
@@ -81,63 +81,65 @@ class OpenFileTool(BaseTool):
         return f"File '{file_path}' opened in working memory. ({slots_used} files open)"
 
 
-class EditFileTool(BaseTool):
-    """A tool to make targeted edits to a file via unique string replacement."""
+class EditFileLinesTool(BaseTool):
+    """Edit a file by replacing a range of lines identified by line number.
+
+    Automatically adjusts line numbers when multiple edits target the same
+    file within a single iteration. The agent always uses the ORIGINAL line
+    numbers it saw in OPEN FILES at the start of the iteration.
+
+    Offset logic:
+    - Each edit records (original_start, original_end, delta) where
+      delta = lines_added - lines_removed.
+    - Subsequent edits look at all prior edits: if a prior edit's original
+      range ended before our original start, we shift by its delta.
+    - Overlapping edits (targeting lines within an already-edited range)
+      are detected and rejected with a clear error.
+    - The offset list is stored on worker.line_offsets[abs_path] and
+      cleared at the start of each iteration by the worker.
+    """
     def __init__(self, worker):
         super().__init__(
-            name='edit_file',
-            description=TOOL_DESC_EDIT_FILE
+            name='edit_file_lines',
+            description=TOOL_DESC_EDIT_FILE_LINES
         )
         self.worker = worker
 
-    @staticmethod
-    def _normalize(s):
-        """Normalize a string for fuzzy comparison: collapse whitespace, strip escape chars."""
-        import re as _re
-        # Collapse all whitespace runs (spaces, tabs) to single space, preserve newlines
-        s = _re.sub(r'[^\S\n]+', ' ', s)
-        # Remove backslash escapes before quotes (common bash/python nesting issue)
-        s = s.replace('\\"', '"').replace("\\'", "'")
-        return s.strip()
+    def _check_overlap(self, abs_path: str, orig_start: int, orig_end: int) -> str:
+        """Check if this edit overlaps with any prior edit. Returns error string or None."""
+        prior_edits = self.worker.line_offsets.get(abs_path, [])
+        for p_start, p_end, _delta in prior_edits:
+            # Two ranges [a,b] and [c,d] overlap iff a <= d and c <= b
+            if orig_start <= p_end and p_start <= orig_end:
+                return (
+                    f'Error: Edit range (lines {orig_start}-{orig_end}) overlaps with a '
+                    f'prior edit in this batch (lines {p_start}-{p_end}). '
+                    f'Overlapping edits in the same batch are not supported. '
+                    f'Combine them into a single edit, or use write_file to rewrite the whole file.'
+                )
+        return None
 
-    @staticmethod
-    def _find_best_match(content, old_str, context_lines=5):
-        """Find the most similar region in content to old_str using difflib."""
-        import difflib
-        old_lines = old_str.splitlines()
-        content_lines = content.splitlines()
-        if not old_lines or not content_lines:
-            return None
-        matcher = difflib.SequenceMatcher(None, [], old_lines)
-        best_ratio = 0.0
-        best_start = 0
-        # Slide a window of similar size over the file
-        window = max(len(old_lines), 1)
-        for i in range(max(1, len(content_lines) - window + 1)):
-            chunk = content_lines[i:i + window + 2]  # slightly larger window
-            matcher.set_seq1(chunk)
-            ratio = matcher.ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_start = i
-        if best_ratio < 0.3:
-            return None
-        # Return context around best match
-        start = max(0, best_start - context_lines)
-        end = min(len(content_lines), best_start + window + context_lines + 2)
-        preview = '\n'.join(
-            f'{i+1:4d} | {content_lines[i]}'
-            for i in range(start, end)
-        )
-        return best_ratio, best_start + 1, preview
+    def _compute_shift(self, abs_path: str, orig_start: int) -> int:
+        """Compute cumulative line shift from all prior edits that are above orig_start."""
+        prior_edits = self.worker.line_offsets.get(abs_path, [])
+        shift = 0
+        for p_start, p_end, p_delta in prior_edits:
+            # Prior edit ended strictly before our original start = it's above us
+            if p_end < orig_start:
+                shift += p_delta
+        return shift
 
-    def execute(self, file_path: str, old_str: str, new_str: str = '') -> str:
+    def _record_edit(self, abs_path: str, orig_start: int, orig_end: int, delta: int):
+        """Record this edit for future offset calculations."""
+        if abs_path not in self.worker.line_offsets:
+            self.worker.line_offsets[abs_path] = []
+        self.worker.line_offsets[abs_path].append((orig_start, orig_end, delta))
+
+    def execute(self, file_path: str, start_line: int, end_line: int = None, new_content: str = '') -> str:
         if not file_path:
             return 'Error: file_path parameter is required.'
-        if not old_str:
-            return 'Error: old_str parameter is required and cannot be empty.'
-        if new_str is None:
-            new_str = ''
+        if start_line is None:
+            return 'Error: start_line parameter is required (1-indexed).'
 
         abs_path = os.path.abspath(file_path)
         if not os.path.exists(abs_path):
@@ -147,98 +149,107 @@ class EditFileTool(BaseTool):
 
         try:
             with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
+                lines = f.readlines()
         except Exception as e:
             return f'Error reading file: {type(e).__name__}: {e}'
 
-        count = content.count(old_str)
+        total_lines = len(lines)
 
-        # --- FALLBACK: normalized matching if exact match fails ---
-        used_normalized = False
-        if count == 0:
-            norm_old = self._normalize(old_str)
-            # Try to find a unique region that matches after normalization
-            # Scan content line-by-line to find matching region
-            content_lines = content.splitlines(keepends=True)
-            old_lines = old_str.splitlines()
-            old_line_count = len(old_lines)
+        # Validate start_line
+        try:
+            start_line = int(start_line)
+        except (TypeError, ValueError):
+            return f'Error: start_line must be an integer, got {type(start_line).__name__}.'
+        if start_line < 1:
+            return f'Error: start_line must be >= 1 (got {start_line}). Lines are 1-indexed.'
 
-            candidates = []
-            for i in range(len(content_lines) - old_line_count + 1):
-                chunk = ''.join(content_lines[i:i + old_line_count])
-                if self._normalize(chunk) == norm_old:
-                    candidates.append((i, chunk))
+        # Handle end_line
+        insert_mode = False
+        if end_line is not None:
+            try:
+                end_line = int(end_line)
+            except (TypeError, ValueError):
+                return f'Error: end_line must be an integer, got {type(end_line).__name__}.'
+            if end_line == 0:
+                insert_mode = True
+        else:
+            end_line = start_line
 
-            if len(candidates) == 1:
-                # Unique normalized match found -- use the actual raw text
-                actual_old = candidates[0][1]
-                # Perform the replacement with the actual raw text
-                if actual_old.endswith('\n') and not old_str.endswith('\n'):
-                    actual_old = actual_old.rstrip('\n')
-                count = content.count(actual_old)
-                if count == 1:
-                    old_str = actual_old
-                    used_normalized = True
-                else:
-                    count = 0  # fall through to error
-            elif len(candidates) > 1:
-                return (
-                    f'Error: old_str matches {len(candidates)} locations in {file_path} '
-                    f'after normalizing whitespace/escapes. '
-                    f'Include more surrounding context to disambiguate.'
-                )
+        if new_content is None:
+            new_content = ''
 
-        if count == 0:
-            # Still not found -- provide helpful diagnostics
-            match_info = self._find_best_match(content, old_str)
-            if match_info:
-                ratio, line_num, preview = match_info
-                return (
-                    f'Error: old_str not found in {file_path} (even after normalizing whitespace/escapes). '
-                    f'Closest match ({ratio:.0%} similar) near line {line_num}:\n'
-                    f'--- File content near best match ---\n{preview}\n'
-                    f'--- Your old_str (repr) ---\n{repr(old_str[:300])}\n'
-                    f'HINT: Check for escaped quotes (\\" vs "), tabs vs spaces, '
-                    f'or trailing whitespace differences.'
-                )
+        # Save the original line numbers the agent specified
+        orig_start = start_line
+        orig_end = end_line if not insert_mode else start_line
+
+        # Check for overlapping edits in this batch
+        if not insert_mode:
+            overlap_err = self._check_overlap(abs_path, orig_start, orig_end)
+            if overlap_err:
+                return overlap_err
+
+        # Compute shift from prior edits in this iteration
+        shift = self._compute_shift(abs_path, orig_start)
+        adj_start = max(1, orig_start + shift)
+        adj_end = max(1, orig_end + shift) if not insert_mode else adj_start
+
+        # Prepare replacement lines
+        new_lines = []
+        if new_content:
+            new_lines = new_content.splitlines(True)
+            if new_lines and not new_lines[-1].endswith('\n'):
+                new_lines[-1] += '\n'
+
+        if insert_mode:
+            if adj_start > total_lines:
+                lines.extend(new_lines)
+                action = f'Appended {len(new_lines)} line(s) to end of file'
             else:
-                total_lines = len(content.splitlines())
-                preview_lines = content.splitlines()[:20]
-                preview = '\n'.join(preview_lines)
+                idx = max(0, adj_start - 1)
+                lines[idx:idx] = new_lines
+                action = f'Inserted {len(new_lines)} line(s) before original line {orig_start}'
+            delta = len(new_lines)
+            self._record_edit(abs_path, orig_start, orig_start, delta)
+        else:
+            if adj_start > total_lines:
                 return (
-                    f'Error: old_str not found in {file_path} ({total_lines} lines). '
-                    f'No similar region found. The text may not exist in this file.\n'
-                    f'--- First 20 lines of file ---\n{preview}'
+                    f'Error: start_line {orig_start} (adjusted to {adj_start}) '
+                    f'is beyond end of file ({total_lines} lines). '
+                    f'To append, use end_line=0 for insert mode.'
+                )
+            if adj_end < adj_start:
+                return (
+                    f'Error: end_line ({orig_end}) must be >= start_line ({orig_start}), '
+                    f'or set end_line=0 for insert mode.'
                 )
 
-        if count > 1:
-            return (
-                f'Error: old_str is not unique in {file_path} '
-                f'(found {count} occurrences). '
-                f'Include more surrounding context in old_str to make it unique.'
+            s = adj_start - 1  # 0-indexed
+            e = min(adj_end, total_lines)
+            removed_count = e - s
+            lines[s:e] = new_lines
+            delta = len(new_lines) - removed_count
+            self._record_edit(abs_path, orig_start, orig_end, delta)
+            action = (
+                f'Replaced original lines {orig_start}-{orig_end} '
+                f'(adjusted to {adj_start}-{min(adj_end, total_lines)}, '
+                f'{removed_count} removed, {len(new_lines)} added)'
             )
 
-        new_content = content.replace(old_str, new_str, 1)
-
+        # Write back
         try:
             with open(abs_path, 'w', encoding='utf-8') as f:
-                f.write(new_content)
+                f.writelines(lines)
         except PermissionError:
             return f'Error: Permission denied writing to {file_path}'
         except Exception as e:
             return f'Error writing file: {type(e).__name__}: {e}'
 
-        # If the file is open in working memory, update the cached content
+        # Update working memory if file is open
+        new_content_full = ''.join(lines)
         if self.worker.is_file_open(file_path) or self.worker.is_file_open(abs_path):
-            self.worker.update_open_file(abs_path, new_content)
+            self.worker.update_open_file(abs_path, new_content_full)
 
-        lines_removed = old_str.count('\n') + 1
-        lines_added = new_str.count('\n') + 1
-        norm_note = ' (matched via normalized whitespace/escapes)' if used_normalized else ''
-        return (
-            f'Successfully edited {file_path}. '
-            f'Replaced {lines_removed} line(s) with {lines_added} line(s).{norm_note}'
-        )
+        return f'Successfully edited {file_path}. {action}. File now has {len(lines)} line(s).'
 
 
 class CloseFileTool(BaseTool):
@@ -289,9 +300,11 @@ class WriteFileTool(BaseTool):
                 f.write(content_decoded)
 
             # Always remove from working memory after writing.
-            # The agent wrote the content so it already knows what is in it.
             self.worker.close_file(file_path)
             self.worker.close_file(abs_path)
+
+            # Clear any line offsets since the file was fully rewritten
+            self.worker.line_offsets.pop(abs_path, None)
 
             return f"Successfully wrote to {file_path}."
         except PermissionError:

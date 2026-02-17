@@ -36,6 +36,7 @@ WORKDIR /opt/ComfyUI
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 RUN cd /opt/ComfyUI && git checkout master && git pull origin master
+RUN pip3 install --no-cache-dir -r requirements.txt --upgrade
 
 # Common dependencies many models share
 RUN pip3 install --no-cache-dir \
@@ -49,11 +50,6 @@ RUN pip3 install --no-cache-dir \
 # Each block installs one custom node pack. Add new ones here as needed.
 # The || true ensures the build doesn't fail if a requirements.txt is missing.
 
-# HunyuanVideo/Image wrapper (supports Hunyuan-DiT family incl. INT8)
-RUN cd /opt/ComfyUI/custom_nodes && \
-    git clone https://github.com/kijai/ComfyUI-HunyuanVideoWrapper.git && \
-    cd ComfyUI-HunyuanVideoWrapper && \
-    pip3 install --no-cache-dir -r requirements.txt || true
 
 # GGUF loader for quantized models
 RUN cd /opt/ComfyUI/custom_nodes && \
@@ -66,15 +62,19 @@ RUN cd /opt/ComfyUI/custom_nodes && \
     git clone https://github.com/EricRollei/Comfy_HunyuanImage3.git && \
     cd Comfy_HunyuanImage3 && \
     pip3 install --no-cache-dir -r requirements.txt || true
-
-# === FOR FUTURE LLMs: Add more custom node packs here ===
-# Example for a video model:
-# RUN cd /opt/ComfyUI/custom_nodes && \
-#     git clone https://github.com/author/ComfyUI-SomeVideoNodes.git && \
 #     cd ComfyUI-SomeVideoNodes && \
 #     pip3 install --no-cache-dir -r requirements.txt || true
 # =========================================================
 
+ # pi-Flow nodes for FLUX.2 optimized sampling
+ RUN cd /opt/ComfyUI/custom_nodes && \
+     git clone https://github.com/Lakonik/ComfyUI-piFlow.git && \
+     cd ComfyUI-piFlow && \
+     pip3 install --no-cache-dir -r requirements.txt || true
+RUN cd /opt/ComfyUI/custom_nodes && \
+    git clone https://github.com/ltdrdata/ComfyUI-Manager.git ComfyUI-Manager && \
+    cd ComfyUI-Manager && \
+    pip3 install --no-cache-dir -r requirements.txt || true
 # Create mount point directories
 RUN mkdir -p /opt/ComfyUI/models/checkpoints \
     /opt/ComfyUI/models/clip \
@@ -84,6 +84,8 @@ RUN mkdir -p /opt/ComfyUI/models/checkpoints \
     /opt/ComfyUI/models/text_encoders \
     /opt/ComfyUI/output \
     /opt/ComfyUI/input
+RUN mkdir -p /opt/ComfyUI/user/default && \
+    chown -R 1000:1000 /opt/ComfyUI || true
 
 EXPOSE 8188
 

@@ -31,10 +31,12 @@ from ..core.prompts import TOOL_DESC_GENERATE_IMAGE
 
 import re
 import shutil
+from pathlib import Path
+import os
 
 
 class GenerateImageTool(BaseTool):
-    """Agent-facing tool for text-to-image generation. Uses Flux.2-dev for unrestricted high-quality images."""
+    """Agent-facing tool for text-to-image generation. Uses pi-Flux.2-dev-fp8 for unrestricted high-quality images."""
 
     def __init__(self):
         super().__init__(
@@ -43,19 +45,21 @@ class GenerateImageTool(BaseTool):
         )
         self.backend = ComfyUIBackend()
 
-    def execute(self, prompt: str, 
+    def execute(self, prompt: str, negative_prompt: str = "", 
                 width: int = 1024, height: int = 1024,
-                steps: int = 50, cfg_scale: float = 1.0,
+                steps: int = 20, guidance: float = 4.0, shift: float = 3.2,
                 seed: int = -1, output_path: str = None) -> str:
         """
-        Generate an image from a text prompt using Flux.2-dev (uncensored, high quality).
+        Generate an image from a text prompt using pi-Flux.2-dev-fp8 (uncensored, high quality).
 
         Args:
             prompt: Detailed description of the image.
-            width/height: Resolution (e.g., 1024).
-            steps: Sampling steps (20-50 for quality/speed).
-            cfg_scale: Guidance (1.0 recommended for Flux).
-            seed: Random seed (-1 for random).
+             negative_prompt: Negative prompt (ignored by piFlow sampler).
+              width/height: Resolution (e.g., 1024 x 1024 recommended).
+             steps: Sampling steps (20+ for piFlow quality/speed).
+             guidance: Flux Guidance (4.0 recommended for piFlow).
+             shift: Flow shift (3.2 recommended for piFlow).
+             seed: Random seed (-1 for random).
             output_path: Optional path to move the generated PNG.
 
         Returns:
@@ -66,29 +70,40 @@ class GenerateImageTool(BaseTool):
 
         params = {
             'prompt': prompt,
+            'negative_prompt': negative_prompt,
             'width': width,
             'height': height,
             'steps': steps,
-            'cfg_scale': cfg_scale,
+            'guidance': guidance,
+            'shift': shift,
             'seed': seed,
         }
 
-        print(f'{self.C_CYAN}[GenerateImage] Flux.2-dev T2I{self.C_RESET}')
-        print(f'{self.C_CYAN}Prompt: {prompt[:120]}{ "..." if len(prompt) > 120 else "" }{self.C_RESET}')
-        print(f'{self.C_CYAN}Params: {width}×{height}, steps={steps}, cfg={cfg_scale}, seed={seed}{self.C_RESET}')
-
-        result = self.backend.run_model('flux_image', params)
-
         if output_path:
-            image_match = re.search(r'^/home/aday/bc_aeon/comfyui_output/[^ \t\n\r]*\.png', result, re.MULTILINE)
-            if image_match:
-                full_path = image_match.group(0).strip()
-                shutil.move(full_path, output_path)
-                print(f'{self.C_CYAN}[GenerateImage] Moved output to: {output_path}{self.C_RESET}')
-                return f"✅ Flux.2-dev image generated and saved to: {output_path}"
-            else:
-                print(f'{self.C_CYAN}[GenerateImage] Parse fail - no PNG path found.{self.C_RESET}')
-                return f"⚠️ Generation complete but could not auto-move to {output_path}. Backend result:\n{result[:500]}..."
+            output_prefix = Path(output_path).stem
+            params['FILENAME_PREFIX'] = output_prefix
+        print(f'{self.C_CYAN}[GenerateImage] pi-Flux.2 T2I{self.C_RESET}')
+        print(f'{self.C_CYAN}Prompt: {prompt[:120]}{ "..." if len(prompt) > 120 else "" }{self.C_RESET}')
+        print(f'{self.C_CYAN}Params: {width}×{height}, steps={steps}, guidance={guidance}, shift={shift}, seed={seed}{self.C_RESET}')
 
-        print(f'{self.C_CYAN}[GenerateImage] Backend result:\n{result[:400]}...{self.C_RESET}')
+        result = self.backend.run_model('pi_flux2', params)
+
+        output_dir = str(Path.home() / 'bc_aeon' / 'comfyui_output')
+        output_dir_path = Path(output_dir)
+        if output_path:
+            png_files = list(output_dir_path.glob(f'{output_prefix}*.png'))
+            if png_files:
+                latest_png = max(png_files, key=lambda p: p.stat().st_mtime)
+                full_path = latest_png
+                if full_path.exists():
+                    shutil.move(str(full_path), output_path)
+                    print(f'{self.C_CYAN}[GenerateImage] Moved {full_path.name} to: {output_path}{self.C_RESET}')
+                    return f"✅ Flux.2-dev image generated and saved to: {output_path}"
+            print(f'{self.C_CYAN}[GenerateImage] No PNGs with prefix "{output_prefix}" found in {output_dir}.{self.C_RESET}')
+            print(f'{self.C_CYAN}Recent PNGs:{self.C_RESET}')
+            recent = sorted(output_dir_path.glob('*.png'), key=lambda p: p.stat().st_mtime, reverse=True)[:3]
+            for p in recent:
+                print(f'  {p.name} (mtime: {p.stat().st_mtime:.0f})')
         return result
+    def run(self, **kwargs):
+        return self.execute(**kwargs)

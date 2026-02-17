@@ -37,21 +37,30 @@ else
 fi
 
 if [ -n "$EXTRA_FLAGS" ]; then
-    docker run -d \
-        --name $CONTAINER_NAME \
-        --gpus all \
-        -p ${PORT}:8188 \
-        -v "${MODELS_DIR}:/opt/ComfyUI/models/diffusion_models" \
-        -v "${OUTPUT_DIR}:/opt/ComfyUI/output" \
-        $IMAGE_NAME \
+     docker run -d \
+         --name $CONTAINER_NAME \
+         -u "$(id -u):$(id -g)" \
+         --gpus '"device=1"' \
+         -p ${PORT}:8188 \
+         -v "${MODELS_DIR}:/opt/ComfyUI/models/diffusion_models" \
+         -v "${MODELS_DIR}/text_encoders:/opt/ComfyUI/models/text_encoders" \
+         -v "${MODELS_DIR}/vae:/opt/ComfyUI/models/vae" \
+         -v "${MODELS_DIR}/loras:/opt/ComfyUI/models/loras" \
+         -v "${OUTPUT_DIR}:/opt/ComfyUI/output" \
+         $IMAGE_NAME \
         $EXTRA_FLAGS
 else
-    docker run -d \
-        --name $CONTAINER_NAME \
-        --gpus all \
-        -p ${PORT}:8188 \
-        -v "${MODELS_DIR}:/opt/ComfyUI/models/diffusion_models" \
-        -v "${OUTPUT_DIR}:/opt/ComfyUI/output" \
+     docker run -d \
+         --name $CONTAINER_NAME \
+         -u "$(id -u):$(id -g)" \
+         --gpus '"device=1"' \
+         -p ${PORT}:8188 \
+         -v "${MODELS_DIR}:/opt/ComfyUI/models/diffusion_models" \
+         -v "${MODELS_DIR}/text_encoders:/opt/ComfyUI/models/text_encoders" \
+         -v "${MODELS_DIR}/vae:/opt/ComfyUI/models/vae" \
+         -v "${MODELS_DIR}/loras:/opt/ComfyUI/models/loras" \
+         -v "${OUTPUT_DIR}:/opt/ComfyUI/output" \
+         $IMAGE_NAME
         $IMAGE_NAME
 fi
 

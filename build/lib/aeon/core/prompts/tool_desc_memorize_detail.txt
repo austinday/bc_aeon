@@ -1,5 +1,0 @@
-Memorizes a key detail, fact, or piece of information that might be useful later in the project. This saves it to your persistent memory context.
-Schema:
-  key (str, required): A unique identifier or name for the memory.
-  value (str, required): The actual fact, detail, or information to remember.
-Example: {"tool_name": "memorize_detail", "parameters": {"key": "db_password", "value": "supersecret123"}}

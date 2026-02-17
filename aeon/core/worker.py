@@ -47,10 +47,11 @@ class Worker:
         # --- STATE MODEL ---
         self.current_plan = "No plan formulated yet."
         self.open_files = {}
-        self.recent_history = deque(maxlen=50)
         self.memories = {}  # Key-value persistent memory
         self.last_observation = "None."
-        self.action_log = deque(maxlen=50)  # Persistent factual record of actions taken
+        self.action_log = []  # Persistent factual record of attempts (intents + results)
+        self.pending_iteration_state = None # Holds intent/actions while awaiting result
+        self.line_offsets = {}  # Per-file edit history for auto line-number adjustment
 
         # Load directives from central prompts module
         self.base_directives = CORE_DIRECTIVES
@@ -118,69 +119,12 @@ class Worker:
             return "No files currently open."
         out = []
         for path, content in self.open_files.items():
-            out.append(f">>> FILE: {path} >>>\n{content}\n<<< END FILE: {path} <<<")
+            numbered_lines = []
+            for i, line in enumerate(content.splitlines(), 1):
+                numbered_lines.append(f"{i:4d} | {line}")
+            numbered_content = "\n".join(numbered_lines)
+            out.append(f">>> FILE: {path} >>>\n{numbered_content}\n<<< END FILE: {path} <<<")
         return "\n\n".join(out)
-
-    def _format_history(self) -> str:
-        """Format history with tiered detail levels and token budgeting.
-        
-        Tiers (by recency from most recent):
-        - FULL:    0-6   (last 7 steps)  - complete context
-        - BRIEF:   7-11  (next 5 steps)  - action + first 2 sentences
-        - MINIMAL: 12-20 (next 9 steps)  - one-line label with pass/fail
-        """
-        if not self.recent_history:
-            return "No recent history."
-
-        items = list(self.recent_history)  # oldest-first from deque
-        budget_tokens = self.max_history_tokens
-        used_tokens = 0
-        formatted = []  # collects entries newest-first
-
-        for idx_from_end, step in enumerate(reversed(items)):
-            if idx_from_end > 20:
-                break
-
-            iteration = step['iteration']
-            action = step['action']
-            summary = step.get('summary', '')
-
-            if idx_from_end < 7:
-                # FULL tier
-                entry = f"STEP {iteration} [FULL]:\nAction: {action}\nResult Summary: {summary}\n"
-            elif idx_from_end < 12:
-                # BRIEF tier — deterministic char truncation (no LLM interpretation)
-                brief = summary[:300]
-                if len(summary) > 300:
-                    brief += ' [...]'
-                entry = f"STEP {iteration} [BRIEF]:\nAction: {action}\nOutput: {brief}\n"
-            else:
-                # MINIMAL tier
-                status = 'FAIL' if any(kw in summary.upper() for kw in ('FAILED', 'ERROR', 'STUCK')) else 'OK'
-                entry = f"STEP {iteration}: {action} [{status}]\n"
-
-            entry_tokens = estimate_tokens(entry)
-            if used_tokens + entry_tokens > budget_tokens:
-                remaining = len(items) - len(formatted)
-                formatted.append(f"... [{remaining} older steps omitted due to context budget] ...")
-                break
-            formatted.append(entry)
-            used_tokens += entry_tokens
-
-        # Reverse back to chronological order
-        formatted.reverse()
-        return "\n".join(formatted)
-
-    @staticmethod
-    def _first_n_sentences(text: str, n: int) -> str:
-        """Extract roughly the first n sentences from text."""
-        if not text:
-            return ''
-        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-        result = ' '.join(sentences[:n])
-        if len(sentences) > n:
-            result += ' [...]'
-        return result
 
     def _format_memories(self) -> str:
         if not self.memories:
@@ -200,23 +144,30 @@ class Worker:
             + text[-tail_budget:]
         )
 
-    def _format_action_log(self) -> str:
-        """Format the persistent action log. Purely factual, no interpretation."""
-        if not self.action_log:
+    def _format_attempt_log(self) -> str:
+        """Format the persistent attempt log (intents + results)."""
+        if not self.action_log and not self.pending_iteration_state:
             return "(No actions taken yet.)"
+        
         lines = []
         for entry in self.action_log:
-            status = 'OK' if entry['ok'] else 'FAIL'
-            lines.append(f"[iter {entry['iter']}] {entry['tool']}({entry['target']}) [{status}]")
-        return "\n".join(lines)
+            lines.append(entry)
+            
+        if self.pending_iteration_state:
+            p = self.pending_iteration_state
+            actions_str = ", ".join(p['actions'])
+            lines.append(f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {actions_str}\n- Result: (Pending...)")
+            
+        return "\n\n".join(lines)
 
     def _reset_state(self, initial_observation="Project started."):
         self.current_plan = "Initial state. Need to formulate a plan."
         self.open_files = {}
-        self.recent_history.clear()
         self.memories = {}
         self.last_observation = initial_observation
         self.action_log.clear()
+        self.pending_iteration_state = None
+        self.line_offsets.clear()
 
     def _save_objective(self, objective: str):
         try:
@@ -228,13 +179,13 @@ class Worker:
             self.logger.error(f"Failed to save objective to file: {e}")
 
     def _build_primary_agent_context(self, tool_list_str: str, system_specs: str,
-                               memories_str: str, objective: str, history_str: str, open_files_str: str) -> str:
+                               memories_str: str, objective: str, open_files_str: str) -> str:
         """Build the full context prompt for the Primary Agent."""
         reminders_section = f"**IMPORTANT REMINDERS**\n{self.important_reminders}\n\n" if self.important_reminders.strip() else ""
 
         tools_text = TOOLS_SECTION.format(tools=tool_list_str)
         objective_text = OBJECTIVE_SECTION.format(objective=objective)
-        action_log_str = self._format_action_log()
+        attempt_log_str = self._format_attempt_log()
 
         return f"""{self.base_directives}
 
@@ -244,20 +195,18 @@ class Worker:
 {reminders_section}**PERSISTENT MEMORIES**
 {memories_str}
 
-**ACTION LOG** (factual record of all actions this session — do NOT redo completed work)
-{action_log_str}
+**ATTEMPT LOG** (Historical record of intents and results)
+{attempt_log_str}
 
 {system_specs}
 
 **CURRENT PLAN**
 {self.current_plan}
 
-{CONVERSATION_HISTORY}
-{history_str}
-
 **OPEN FILES**
 {'='*60}
 (These are loaded in your working memory. Do NOT re-open them.)
+(Line numbers shown before | are for use with edit_file_lines.)
 {'='*60}
 {open_files_str}
 {'='*60}
@@ -316,6 +265,9 @@ END OPEN FILES
 
                 self.print_func(f"\n{C_BLUE}{'='*60}\n ITERATION {iteration}\n{'='*60}{C_RESET}")
 
+                # Reset per-iteration line offset tracking
+                self.line_offsets.clear()
+
                 # Sync open files before building context
                 self._sync_open_files()
 
@@ -323,12 +275,11 @@ END OPEN FILES
                 system_specs = get_runtime_info()
                 tool_list_str = self._get_tools_description()
                 memories_str = self._format_memories()
-                history_str = self._format_history()
                 open_files_str = self._format_open_files()
 
                 # Build Primary Agent prompt
                 prompt = self._build_primary_agent_context(
-                    tool_list_str, system_specs, memories_str, objective, history_str, open_files_str
+                    tool_list_str, system_specs, memories_str, objective, open_files_str
                 )
 
                 self.print_func("Thinking (Primary Agent)...")
@@ -347,6 +298,8 @@ END OPEN FILES
 
                 # Extract fields
                 thought = response_data.get("thought", "(No thought provided)")
+                previous_result_summary = response_data.get("previous_result_summary", "N/A (first turn)")
+                intent = response_data.get("intent", "(No intent provided)")
                 updated_plan = response_data.get("updated_plan")
                 actions = response_data.get("actions", [])
 
@@ -356,8 +309,14 @@ END OPEN FILES
                     else:
                         self.current_plan = str(updated_plan)
 
+                self.print_func(f"\n{C_CYAN}--- PREVIOUS RESULT SUMMARY ---{C_RESET}")
+                self.print_func(f"{previous_result_summary}")
+
                 self.print_func(f"\n{C_CYAN}--- THOUGHT ---{C_RESET}")
                 self.print_func(f"{thought}")
+                
+                self.print_func(f"\n{C_CYAN}--- INTENT ---{C_RESET}")
+                self.print_func(f"{intent}")
 
                 if updated_plan:
                     self.print_func(f"\n{C_CYAN}--- UPDATED PLAN ---{C_RESET}")
@@ -367,6 +326,14 @@ END OPEN FILES
                     self.print_func(f"{C_RED}No actions returned by agent.{C_RESET}")
                     self.last_observation = "Error: You returned an empty action list. You must take at least one action."
                     continue
+
+                # Resolve pending iteration state now that we have the summary
+                if self.pending_iteration_state:
+                    p = self.pending_iteration_state
+                    acts_str = ", ".join(p['actions'])
+                    finished_entry = f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {acts_str}\n- Result: {previous_result_summary}"
+                    self.action_log.append(finished_entry)
+                    self.pending_iteration_state = None
 
                 # === EXECUTION PHASE ===
                 if step_callback:
@@ -395,7 +362,9 @@ END OPEN FILES
                         continue
 
                     self.print_func(f"{C_YELLOW}Executing (Step {idx+1}):{C_RESET} {tool_name} {params}")
-                    actions_taken_str.append(tool_name)
+                    
+                    action_desc = f"{tool_name}({str(params)[:40]}...)" if params else f"{tool_name}()"
+                    actions_taken_str.append(action_desc)
 
                     if tool_name in terminal_tools:
                         try:
@@ -404,7 +373,18 @@ END OPEN FILES
                         except Exception as e:
                             result_str = f"Error executing terminal tool {tool_name}: {e}"
                         self.print_func(f"\n{C_GREEN}{result_str}{C_RESET}")
-                        self.recent_history.append({"iteration": iteration, "action": tool_name, "summary": result_str})
+                        
+                        self.pending_iteration_state = {
+                            'iter': iteration,
+                            'intent': intent,
+                            'actions': actions_taken_str
+                        }
+                        p = self.pending_iteration_state
+                        acts_str = ", ".join(p['actions'])
+                        finished_entry = f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {acts_str}\n- Result: Task marked complete. {result_str}"
+                        self.action_log.append(finished_entry)
+                        self.pending_iteration_state = None
+                        
                         if step_callback: step_callback(iteration, display_max, "Complete")
                         return
 
@@ -439,7 +419,17 @@ END OPEN FILES
                             self.last_observation = f"User responded to prompt '{params.get('prompt', '')}': {updated_text}"
                             self.print_func(f"{C_GREEN}Input noted, continuing.{C_RESET}")
 
-                        self.recent_history.append({"iteration": iteration, "action": "get_user_input", "summary": self.last_observation})
+                        self.pending_iteration_state = {
+                            'iter': iteration,
+                            'intent': intent,
+                            'actions': actions_taken_str
+                        }
+                        p = self.pending_iteration_state
+                        acts_str = ", ".join(p['actions'])
+                        finished_entry = f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {acts_str}\n- Result: User input handled. {self.last_observation}"
+                        self.action_log.append(finished_entry)
+                        self.pending_iteration_state = None
+                        
                         user_input_handled = True
                         break  # Stop execution chain to process input
 
@@ -455,17 +445,8 @@ END OPEN FILES
                         result_str = str(raw_result)
                         combined_summary_parts.append(f"Action {idx+1} ({tool_name}):\n{result_str}")
 
-                        # Record to persistent action log (deterministic facts only)
-                        is_fail = "COMMAND FAILED" in result_str or result_str.strip().startswith("Error:")
-                        target = str(params.get('file_path', params.get('command', params.get('query', ''))))[:80]
-                        self.action_log.append({
-                            'iter': iteration,
-                            'tool': tool_name,
-                            'target': target,
-                            'ok': not is_fail,
-                        })
-
                         # Stop chain on command failure so the agent can react immediately
+                        is_fail = "COMMAND FAILED" in result_str or result_str.strip().startswith("Error:")
                         if is_fail:
                             break
 
@@ -482,7 +463,13 @@ END OPEN FILES
 
                 actions_list = ", ".join(actions_taken_str) if actions_taken_str else "none"
                 self.last_observation = f"Actions: [{actions_list}]\nOutput:\n{raw_output}"
-                self.recent_history.append({"iteration": iteration, "action": f"Chain: {', '.join(actions_taken_str)}", "summary": raw_output})
+                
+                # Cache the pending iteration state to be finalized next iteration
+                self.pending_iteration_state = {
+                    'iter': iteration,
+                    'intent': intent,
+                    'actions': actions_taken_str
+                }
 
             except Exception as e:
                 self.print_func(f"\n{C_RED}CRITICAL ERROR IN ITERATION: {e}{C_RESET}")

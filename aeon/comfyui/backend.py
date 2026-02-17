@@ -31,6 +31,7 @@ import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
+import getpass
 from typing import Dict, Any, Optional, List
 
 from ..core.logger import get_logger
@@ -164,22 +165,30 @@ class ComfyUIBackend:
         #   can all find the files regardless of which subdir they search.
         # - output: where ComfyUI writes generated files (images, video, audio)
         # ============================================
+        uid = os.getuid()
+        gid = os.getgid()
         cmd = [
             'docker', 'run', '-d',
+            '-u', f'{uid}:{gid}',
             '--name', COMFYUI_CONTAINER_NAME,
             '--gpus', 'device=1',
             '-p', f'{COMFYUI_PORT}:8188',
             # Mount the model lake into ALL ComfyUI model directories that loaders check
             '-v', f'{MODELS_BASE}:/opt/ComfyUI/models',
-            '-v', f'{MODELS_BASE}:/opt/ComfyUI/models/checkpoints',
-            '-v', f'{MODELS_BASE}:/opt/ComfyUI/models/diffusion_models',
-            '-v', f'{MODELS_BASE}:/opt/ComfyUI/models/unet',
+            '-v', f'{MODELS_BASE}/checkpoints:/opt/ComfyUI/models/checkpoints',
+            '-v', f'{MODELS_BASE}/diffusion_models:/opt/ComfyUI/models/diffusion_models',
+            '-v', f'{MODELS_BASE}/unet:/opt/ComfyUI/models/unet',
             '-v', f'{MODELS_BASE}/clip:/opt/ComfyUI/models/clip',
             '-v', f'{MODELS_BASE}/text_encoders:/opt/ComfyUI/models/text_encoders',
             '-v', f'{MODELS_BASE}/llm:/opt/ComfyUI/models/llm',
             # Mount VAE directory separately (HyVideoVAELoader looks here)
             '-v', f'{VAE_HOST_DIR}:/opt/ComfyUI/models/vae',
+            '-v', f'{MODELS_BASE}/loras:/opt/ComfyUI/models/loras',
+            '-v', '/etc/passwd:/etc/passwd:ro',
+            '-v', '/etc/group:/etc/group:ro',
             # Mount output directory so host can access generated files
+            '-e', f'USER={getpass.getuser()}',
+            '-e', 'TORCHINDUCTOR_CACHE_DIR=/tmp/torch_cache',
             '-v', f'{OUTPUT_HOST_DIR}:/opt/ComfyUI/output',
             COMFYUI_IMAGE_NAME
         ]
@@ -491,6 +500,16 @@ class ComfyUIBackend:
                         if fname:
                             host_path = OUTPUT_HOST_DIR / subfolder / fname if subfolder else OUTPUT_HOST_DIR / fname
                             files.append(str(host_path))
+            # Handle SaveImage and similar 'ui' outputs
+            ui_output = node_output.get('ui', {})
+            for media_key in ('images', 'audio', 'video', 'gifs'):
+                if media_key in ui_output:
+                    for item in ui_output[media_key]:
+                        fname = item.get('filename', '')
+                        subfolder = item.get('subfolder', '')
+                        if fname:
+                            host_path = OUTPUT_HOST_DIR / subfolder / fname if subfolder else OUTPUT_HOST_DIR / fname
+                            files.append(str(host_path))
         return files
 
     # =========================================================================
@@ -621,6 +640,7 @@ class ComfyUIBackend:
         # Poll for result
         result = self._poll_completion(prompt_id, timeout=generation_timeout)
         debug_lines.append(f'[DEBUG] Poll result status: {result.get("status")}')
+        print('FULL RESULT:', json.dumps(result, indent=2, default=str))
 
         if result['status'] == 'success':
             output_files = self._find_output_files(result.get('outputs', {}))
