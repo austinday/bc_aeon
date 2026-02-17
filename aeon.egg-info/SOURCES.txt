@@ -10,7 +10,10 @@ aeon.egg-info/requires.txt
 aeon.egg-info/top_level.txt
 aeon/comfyui/__init__.py
 aeon/comfyui/backend.py
+aeon/comfyui/profiles/flux_image.json
 aeon/comfyui/profiles/hunyuan_image.json
+aeon/comfyui/workflows/flux_image_api.json
+aeon/comfyui/workflows/hunyuan_image3_api.json
 aeon/comfyui/workflows/hunyuan_image_api.json
 aeon/core/__init__.py
 aeon/core/directives.py

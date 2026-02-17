@@ -1,57 +1,17 @@
 {
     "model_id": "hunyuan_image",
-    "display_name": "HunyuanImage 3.0 Instruct (INT8)",
-    "description": "Text-to-image generation using Tencent Hunyuan-DiT 3.0 INT8 quantized via HunyuanVideoWrapper nodes. Generates high-quality images from text prompts.",
-    "huggingface_repo": "EricRollei/HunyuanImage-3.0-Instruct-INT8",
+    "display_name": "HunyuanImage 3.0 Instruct Distil INT8 (Fast)",
+    "description": "Official Distil-INT8 model - 8 steps, very fast, excellent quality",
+    "huggingface_repo": "EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8",
     "output_type": "image",
-    "workflow_file": "hunyuan_image_api.json",
+    "workflow_file": "hunyuan_image3_api.json",
     "parameters": {
-        "prompt": {
-            "type": "string",
-            "required": true,
-            "description": "Text description of the image to generate"
-        },
-        "negative_prompt": {
-            "type": "string",
-            "required": false,
-            "default": "",
-            "description": "Things to avoid in the image (NOTE: not used by HyVideoSampler, kept for API compatibility)"
-        },
-        "width": {
-            "type": "int",
-            "required": false,
-            "default": 1024,
-            "description": "Image width in pixels"
-        },
-        "height": {
-            "type": "int",
-            "required": false,
-            "default": 1024,
-            "description": "Image height in pixels"
-        },
-        "steps": {
-            "type": "int",
-            "required": false,
-            "default": 30,
-            "description": "Number of sampling steps"
-        },
-        "cfg_scale": {
-            "type": "float",
-            "required": false,
-            "default": 6.0,
-            "description": "Embedded guidance scale (maps to HyVideoSampler embedded_guidance_scale)"
-        },
-        "flow_shift": {
-            "type": "float",
-            "required": false,
-            "default": 7.0,
-            "description": "Flow shift parameter for the sampler"
-        },
-        "seed": {
-            "type": "int",
-            "required": false,
-            "default": -1,
-            "description": "Random seed (-1 for random)"
-        }
+        "prompt": {"type": "string", "required": true},
+        "resolution": {"type": "string", "required": false, "default": "1024x1024"},
+        "steps": {"type": "int", "required": false, "default": 8},
+        "cfg_scale": {"type": "float", "required": false, "default": 2.5},
+        "seed": {"type": "int", "required": false, "default": -1},
+        "system_prompt": {"type": "string", "required": false, "default": "dynamic"},
+        "force_reload": {"type": "boolean", "required": false, "default": false}
     }
 }

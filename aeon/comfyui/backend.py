@@ -100,13 +100,13 @@ class ComfyUIBackend:
             lines.append(f'    {p.get("description", "")}')
         return '\n'.join(lines)
 
-    def _load_workflow(self, workflow_file: str) -> Optional[dict]:
-        """Load a workflow template JSON from the workflows directory."""
+    def _load_workflow(self, workflow_file: str) -> Optional[str]:
+        """Load a workflow template JSON from the workflows directory as a raw string."""
         wf_path = WORKFLOWS_DIR / workflow_file
         if not wf_path.exists():
             return None
         with open(wf_path, 'r') as f:
-            return json.load(f)
+            return f.read()
 
     # =========================================================================
     # CONTAINER LIFECYCLE
@@ -170,6 +170,7 @@ class ComfyUIBackend:
             '--gpus', 'device=1',
             '-p', f'{COMFYUI_PORT}:8188',
             # Mount the model lake into ALL ComfyUI model directories that loaders check
+            '-v', f'{MODELS_BASE}:/opt/ComfyUI/models',
             '-v', f'{MODELS_BASE}:/opt/ComfyUI/models/checkpoints',
             '-v', f'{MODELS_BASE}:/opt/ComfyUI/models/diffusion_models',
             '-v', f'{MODELS_BASE}:/opt/ComfyUI/models/unet',
@@ -350,23 +351,22 @@ class ComfyUIBackend:
     # WORKFLOW EXECUTION
     # =========================================================================
 
-    def _substitute_params(self, workflow: dict, params: Dict[str, Any]) -> dict:
+    def _substitute_params(self, wf_str: str, params: Dict[str, Any]) -> dict:
         """
-        Replace {{PLACEHOLDER}} tokens in workflow JSON with actual values.
-
-        Numeric values replace the QUOTED placeholder (so ComfyUI sees a number,
-        not a string). String values do plain text replacement.
+        Replace {{PLACEHOLDER}} tokens in workflow JSON string with actual values.
         """
-        wf_str = json.dumps(workflow)
         for key, value in params.items():
             placeholder = '{{' + key.upper() + '}}'
-            if isinstance(value, (int, float)):
-                # Replace "{{PLACEHOLDER}}" (with quotes) -> raw number
+            if isinstance(value, bool):
+                val_str = 'true' if value else 'false'
+                wf_str = wf_str.replace('"' + placeholder + '"', val_str)
+                wf_str = wf_str.replace(placeholder, val_str)
+            elif isinstance(value, (int, float)):
                 wf_str = wf_str.replace('"' + placeholder + '"', str(value))
-                # Also handle if it appears unquoted
                 wf_str = wf_str.replace(placeholder, str(value))
             else:
-                wf_str = wf_str.replace(placeholder, str(value))
+                escaped_val = json.dumps(str(value))[1:-1]
+                wf_str = wf_str.replace(placeholder, escaped_val)
         return json.loads(wf_str)
 
     def discover_nodes(self, keyword: str = '') -> dict:
@@ -545,9 +545,14 @@ class ComfyUIBackend:
                     f'Available: {list(self._load_profiles().keys())}')
         debug_lines.append(f'[DEBUG] Profile loaded: {profile.get("display_name", model_id)}')
 
+        # Apply defaults from profile
+        for p_key, p_info in profile.get('parameters', {}).items():
+            if p_key not in params and 'default' in p_info:
+                params[p_key] = p_info['default']
+
         # Handle seed randomization
         if params.get('seed', -1) == -1:
-            params['seed'] = random.randint(0, 2**32 - 1)
+            params['seed'] = random.randint(0, 2147483647)
         debug_lines.append(f'[DEBUG] Final seed: {params["seed"]}')
 
         # Ensure container is running
@@ -583,17 +588,21 @@ class ComfyUIBackend:
             debug_lines.append('[DEBUG] No workflow_file key in profile.')
             return '\n'.join(debug_lines) + '\n' + f'Error: No workflow_file in profile "{model_id}".'
 
-        workflow = self._load_workflow(workflow_file)
-        if workflow is None:
+        wf_str = self._load_workflow(workflow_file)
+        if wf_str is None:
             debug_lines.append(f'[DEBUG] Workflow file not found: {WORKFLOWS_DIR / workflow_file}')
             return '\n'.join(debug_lines) + '\n' + f'Error: Workflow "{workflow_file}" not found in {WORKFLOWS_DIR}.'
-        debug_lines.append(f'[DEBUG] Workflow loaded: {workflow_file} ({len(workflow)} nodes)')
+        debug_lines.append(f'[DEBUG] Workflow loaded: {workflow_file}')
+
+        # Substitute parameters into workflow string and parse JSON
+        try:
+            workflow = self._substitute_params(wf_str, params)
+        except Exception as e:
+            debug_lines.append(f'[DEBUG] JSON parse error after substitution: {e}')
+            return '\n'.join(debug_lines) + '\n' + f'Error parsing workflow JSON: {e}'
 
         # Strip metadata keys (like _comment) that aren't ComfyUI nodes
         workflow = {k: v for k, v in workflow.items() if not k.startswith('_')}
-
-        # Substitute parameters into workflow
-        workflow = self._substitute_params(workflow, params)
         debug_lines.append(f'[DEBUG] Substituted workflow (submitted to ComfyUI):\n{json.dumps(workflow, indent=2)}')
 
         # Submit to ComfyUI

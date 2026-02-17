@@ -1,0 +1,16 @@
+{
+    "model_id": "flux_image",
+    "display_name": "Flux.2-dev (Unrestricted Best Quality)",
+    "description": "Full precision Flux.2-dev txt2img - highest quality, unrestricted prompts",
+    "huggingface_repo": "black-forest-labs/FLUX.2-dev",
+    "output_type": "image",
+    "workflow_file": "flux_image_api.json",
+    "parameters": {
+        "prompt": {"type": "string", "required": true},
+        "width": {"type": "int", "required": false, "default": 1024},
+        "height": {"type": "int", "required": false, "default": 1024},
+        "steps": {"type": "int", "required": false, "default": 50},
+        "cfg_scale": {"type": "float", "required": false, "default": 1.0},
+        "seed": {"type": "int", "required": false, "default": -1}
+    }
+}

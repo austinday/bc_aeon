@@ -1,0 +1,72 @@
+{
+  "3": {
+    "inputs": {
+      "width": {{WIDTH}},
+      "height": {{HEIGHT}},
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage"
+  },
+  "4": {
+    "inputs": {
+      "unet_name": "flux2_dev_fp8mixed.safetensors"
+    },
+    "class_type": "UNetLoader"
+  },
+  "5": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader"
+  },
+  "6": {
+    "inputs": {
+      "seed": {{SEED}},
+      "steps": {{STEPS}},
+      "cfg": {{CFG_SCALE}},
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": ["4", 0],
+      "positive": ["7", 0],
+      "negative": ["8", 0],
+      "latent_image": ["3", 0]
+    },
+    "class_type": "KSampler"
+  },
+  "7": {
+    "inputs": {
+      "text": "{{PROMPT}}",
+      "clip": ["9", 0]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "8": {
+    "inputs": {
+      "text": "",
+      "clip": ["9", 0]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "9": {
+    "inputs": {
+      "clip_name1": "mistral_3_small_flux2_bf16.safetensors",
+      "clip_name2": "t5xxl_fp16.safetensors"
+    },
+    "class_type": "DualCLIPLoader"
+  },
+  "10": {
+    "inputs": {
+      "samples": ["6", 0],
+      "vae": ["5", 0]
+    },
+    "class_type": "VAEDecode"
+  },
+  "11": {
+    "inputs": {
+      "filename_prefix": "aeon_output",
+      "images": ["10", 0]
+    },
+    "class_type": "SaveImage"
+  }
+}

@@ -29,9 +29,12 @@ from .base import BaseTool
 from ..comfyui.backend import ComfyUIBackend
 from ..core.prompts import TOOL_DESC_GENERATE_IMAGE
 
+import re
+import shutil
+
 
 class GenerateImageTool(BaseTool):
-    """Agent-facing tool for text-to-image generation."""
+    """Agent-facing tool for text-to-image generation. Uses Flux.2-dev for unrestricted high-quality images."""
 
     def __init__(self):
         super().__init__(
@@ -40,41 +43,52 @@ class GenerateImageTool(BaseTool):
         )
         self.backend = ComfyUIBackend()
 
-    def execute(self, prompt: str, negative_prompt: str = '',
+    def execute(self, prompt: str, 
                 width: int = 1024, height: int = 1024,
-                steps: int = 30, cfg_scale: float = 6.0,
-                flow_shift: float = 7.0, seed: int = -1) -> str:
+                steps: int = 50, cfg_scale: float = 1.0,
+                seed: int = -1, output_path: str = None) -> str:
         """
-        Generate an image from a text prompt.
+        Generate an image from a text prompt using Flux.2-dev (uncensored, high quality).
 
-        Returns a string describing the result: either the output file path(s)
-        on success, or an error message with debugging hints on failure.
+        Args:
+            prompt: Detailed description of the image.
+            width/height: Resolution (e.g., 1024).
+            steps: Sampling steps (20-50 for quality/speed).
+            cfg_scale: Guidance (1.0 recommended for Flux).
+            seed: Random seed (-1 for random).
+            output_path: Optional path to move the generated PNG.
+
+        Returns:
+            Success message with path, or error/debug info.
         """
         if not prompt:
             return 'Error: prompt parameter is required. Describe the image you want to generate.'
 
         params = {
             'prompt': prompt,
-            'negative_prompt': negative_prompt,
             'width': width,
             'height': height,
             'steps': steps,
             'cfg_scale': cfg_scale,
-            'flow_shift': flow_shift,
             'seed': seed,
         }
 
-        print(f'{self.C_CYAN}[GenerateImage] Calling ComfyUI backend with model=hunyuan_image{self.C_RESET}')
-        print(f'{self.C_CYAN}[GenerateImage] Prompt: {prompt[:100]}...{self.C_RESET}')
-        print(f'{self.C_CYAN}[GenerateImage] Params: {width}x{height}, steps={steps}, cfg={cfg_scale}, flow_shift={flow_shift}, seed={seed}{self.C_RESET}')
+        print(f'{self.C_CYAN}[GenerateImage] Flux.2-dev T2I{self.C_RESET}')
+        print(f'{self.C_CYAN}Prompt: {prompt[:120]}{ "..." if len(prompt) > 120 else "" }{self.C_RESET}')
+        print(f'{self.C_CYAN}Params: {width}×{height}, steps={steps}, cfg={cfg_scale}, seed={seed}{self.C_RESET}')
 
-        result = self.backend.run_model('hunyuan_image', params)
+        result = self.backend.run_model('flux_image', params)
 
-        print(f'{self.C_CYAN}[GenerateImage] Result length: {len(result)} chars{self.C_RESET}')
-        print(f'{self.C_CYAN}[GenerateImage] === FULL DEBUG RESULT ==={self.C_RESET}')
-        # Print full result in chunks to avoid terminal buffer issues
-        for i in range(0, len(result), 1000):
-            print(f'{self.C_CYAN}{result[i:i+1000]}{self.C_RESET}')
-        print(f'{self.C_CYAN}[GenerateImage] === END DEBUG RESULT ==={self.C_RESET}')
+        if output_path:
+            image_match = re.search(r'^/home/aday/bc_aeon/comfyui_output/[^ \t\n\r]*\.png', result, re.MULTILINE)
+            if image_match:
+                full_path = image_match.group(0).strip()
+                shutil.move(full_path, output_path)
+                print(f'{self.C_CYAN}[GenerateImage] Moved output to: {output_path}{self.C_RESET}')
+                return f"✅ Flux.2-dev image generated and saved to: {output_path}"
+            else:
+                print(f'{self.C_CYAN}[GenerateImage] Parse fail - no PNG path found.{self.C_RESET}')
+                return f"⚠️ Generation complete but could not auto-move to {output_path}. Backend result:\n{result[:500]}..."
 
+        print(f'{self.C_CYAN}[GenerateImage] Backend result:\n{result[:400]}...{self.C_RESET}')
         return result

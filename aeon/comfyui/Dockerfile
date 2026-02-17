@@ -35,6 +35,8 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git /opt/ComfyUI
 WORKDIR /opt/ComfyUI
 RUN pip3 install --no-cache-dir -r requirements.txt
 
+RUN cd /opt/ComfyUI && git checkout master && git pull origin master
+
 # Common dependencies many models share
 RUN pip3 install --no-cache-dir \
     accelerate transformers sentencepiece protobuf \
@@ -57,6 +59,12 @@ RUN cd /opt/ComfyUI/custom_nodes && \
 RUN cd /opt/ComfyUI/custom_nodes && \
     git clone https://github.com/city96/ComfyUI-GGUF.git && \
     cd ComfyUI-GGUF && \
+    pip3 install --no-cache-dir -r requirements.txt || true
+
+# HunyuanImage 3.0 dedicated nodes (INT8/BF16/NF4 support)
+RUN cd /opt/ComfyUI/custom_nodes && \
+    git clone https://github.com/EricRollei/Comfy_HunyuanImage3.git && \
+    cd Comfy_HunyuanImage3 && \
     pip3 install --no-cache-dir -r requirements.txt || true
 
 # === FOR FUTURE LLMs: Add more custom node packs here ===

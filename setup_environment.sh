@@ -175,61 +175,69 @@ else
 fi
 
 # --- Model: HunyuanImage 3.0 Instruct INT8 (text-to-image) ---
-log_step "Downloading ComfyUI model: EricRollei/HunyuanImage-3.0-Instruct-INT8..."
-HUNYUAN_DIR="$COMFYUI_MODELS_DIR/hunyuan_image_int8"
-if [ -d "$HUNYUAN_DIR" ] && [ "$(ls -A $HUNYUAN_DIR 2>/dev/null)" ]; then
-    echo "  (Already downloaded - Skipping)"
+
+
+log_step "Downloading Flux.2-dev FP8 UNet to diffusion_models/..."
+UNET_DIR="$COMFYUI_MODELS_DIR/diffusion_models"
+mkdir -p "$UNET_DIR"
+FLUX_UNET="flux2_dev_fp8mixed.safetensors"
+if [ ! -f "$UNET_DIR/$FLUX_UNET" ]; then
+  docker run --rm $TTY_FLAG \
+    -v "$UNET_DIR:/diffusion_models" \
+    -e HF_HOME=/tmp/cache \
+    ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
+    aeon_base:py3.10-cuda12.1 \
+    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"$FLUX_UNET\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/unet/$FLUX_UNET\")'"
+  echo "  Downloaded $FLUX_UNET"
 else
-    mkdir -p "$HUNYUAN_DIR"
-    docker run --rm $TTY_FLAG \
-        -v "$COMFYUI_MODELS_DIR:/models" \
-        -e HF_HOME=/tmp/cache \
-        ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
-        aeon_base:py3.10-cuda12.1 \
-        bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c \"from huggingface_hub import snapshot_download; snapshot_download(repo_id='EricRollei/HunyuanImage-3.0-Instruct-INT8', local_dir='/models/hunyuan_image_int8', local_dir_use_symlinks=False)\""
+  echo "  $FLUX_UNET already exists"
 fi
 
-log_step "Merging HunyuanImage shards into a single safetensors file..."
-if [ ! -f "$HUNYUAN_DIR/hunyuan_image_merged.safetensors" ]; then
-    cat << 'EOF' > "$HUNYUAN_DIR/merge_shards.py"
-import json, os
-from safetensors.torch import load_file, save_file
-d = '/models/hunyuan_image_int8'
-idx = os.path.join(d, 'model.safetensors.index.json')
-out = os.path.join(d, 'hunyuan_image_merged.safetensors')
-if os.path.exists(idx):
-    with open(idx) as f:
-        shards = sorted(list(set(json.load(f)['weight_map'].values())))
-    sd = {}
-    for s in shards:
-        print(f"Loading {s}...")
-        sd.update(load_file(os.path.join(d, s)))
-    print("Saving merged file...")
-    save_file(sd, out)
-    print("Done!")
-EOF
-    docker run --rm $TTY_FLAG \
-        -v "$COMFYUI_MODELS_DIR:/models" \
-        aeon_base:py3.10-cuda12.1 \
-        bash -c "uv pip install --system --no-cache-dir safetensors && python3 /models/hunyuan_image_int8/merge_shards.py"
-    rm -f "$HUNYUAN_DIR/merge_shards.py"
+log_step "Downloading Flux.2 Mistral FP8 Text Encoder to text_encoders/..."
+TEXT_ENCODERS_DIR="$COMFYUI_MODELS_DIR/text_encoders"
+mkdir -p "$TEXT_ENCODERS_DIR"
+MISTRAL_MODEL="mistral_3_small_flux2_bf16.safetensors"
+if [ ! -f "$TEXT_ENCODERS_DIR/$MISTRAL_MODEL" ]; then
+  docker run --rm $TTY_FLAG \
+    -v "$TEXT_ENCODERS_DIR:/text_encoders" \
+    -e HF_HOME=/tmp/cache \
+    ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
+    aeon_base:py3.10-cuda12.1 \
+    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"$MISTRAL_MODEL\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/text_encoders/$MISTRAL_MODEL\")'"
+  echo "  Downloaded $MISTRAL_MODEL"
 else
-    echo "  (Already merged - Skipping)"
+  echo "  $MISTRAL_MODEL already exists"
 fi
 
-# --- VAE: HunyuanVideo VAE (shared across Hunyuan model family) ---
-log_step "Downloading ComfyUI VAE: HunyuanVideo VAE..."
-COMFYUI_VAE_DIR="$COMFYUI_MODELS_DIR/vae"
-mkdir -p "$COMFYUI_VAE_DIR"
-if [ -f "$COMFYUI_VAE_DIR/hunyuan_video_vae.safetensors" ]; then
-    echo "  (Already downloaded - Skipping)"
+log_step "Downloading Flux.2-dev VAE to vae/..."
+VAE_DIR="$COMFYUI_MODELS_DIR/vae"
+mkdir -p "$VAE_DIR"
+FLUX_VAE="flux2-vae.safetensors"
+if [ ! -f "$VAE_DIR/$FLUX_VAE" ]; then
+  docker run --rm $TTY_FLAG \
+    -v "$VAE_DIR:/vae" \
+    -e HF_HOME=/tmp/cache \
+    ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
+    aeon_base:py3.10-cuda12.1 \
+    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"black-forest-labs/FLUX.2-dev\", filename=\"$FLUX_VAE\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/vae/$FLUX_VAE\")'"
+  echo "  Downloaded $FLUX_VAE"
 else
-    docker run --rm $TTY_FLAG \
-        -v "$COMFYUI_VAE_DIR:/vae_output" \
-        -e HF_HOME=/tmp/cache \
-        ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
-        aeon_base:py3.10-cuda12.1 \
-        bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c \"from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='hunyuanvideo-community/HunyuanVideo', filename='vae/diffusion_pytorch_model.safetensors', local_dir='/tmp/hf_dl', local_dir_use_symlinks=False)\" && cp /tmp/hf_dl/vae/diffusion_pytorch_model.safetensors /vae_output/hunyuan_video_vae.safetensors"
+  echo "  $FLUX_VAE already exists"
+fi
+
+log_step "Downloading Flux T5XXL FP16 Text Encoder to text_encoders/..."
+
+T5_MODEL="t5xxl_fp16.safetensors"
+if [ ! -f "$TEXT_ENCODERS_DIR/$T5_MODEL" ]; then
+  docker run --rm $TTY_FLAG \
+    -v "$TEXT_ENCODERS_DIR:/text_encoders" \
+    -e HF_HOME=/tmp/cache \
+    ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
+    aeon_base:py3.10-cuda12.1 \
+    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"comfyanonymous/flux_text_encoders\", filename=\"$T5_MODEL\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/text_encoders/$T5_MODEL\")'"
+  echo "  Downloaded $T5_MODEL"
+else
+  echo "  $T5_MODEL already exists"
 fi
 
 log_step "Fixing ComfyUI permissions..."

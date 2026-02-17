@@ -53,11 +53,29 @@ class GenerateImageTool(BaseTool):
         if not prompt:
             return 'Error: prompt parameter is required. Describe the image you want to generate.'
 
+        # Dynamically discover valid resolution strings from the ComfyUI API
+        self.backend._ensure_running()
+        nodes = self.backend.discover_nodes('HunyuanInstructGenerate')
+        chosen_res = f"{width}x{height}"
+        if 'HunyuanInstructGenerate' in nodes:
+            try:
+                valid_res = nodes['HunyuanInstructGenerate']['input']['required']['resolution'][0]
+                target_res = f"{width}x{height}"
+                if isinstance(valid_res, list) and len(valid_res) > 0:
+                    chosen_res = valid_res[0]  # Fallback to the first option (usually 'Auto')
+                    for r in valid_res:
+                        if target_res in r:
+                            chosen_res = r
+                            break
+            except Exception:
+                pass
+
         params = {
             'prompt': prompt,
             'negative_prompt': negative_prompt,
             'width': width,
             'height': height,
+            'resolution': chosen_res,
             'steps': steps,
             'cfg_scale': cfg_scale,
             'flow_shift': flow_shift,
