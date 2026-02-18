@@ -1,0 +1,22 @@
+**DOCKER RULES**
+
+1) HOST BARRIER: Agent is on HOST. No direct container filesystem access.
+
+2) PATH TRANSLATION:
+   - HOST path: <CURRENT_WORKING_DIRECTORY>/scripts/main.py
+   - MOUNT flag: -v <CURRENT_WORKING_DIRECTORY>:/app
+   - CONTAINER path: /app/scripts/main.py
+   - CRITICAL: Replace <CURRENT_WORKING_DIRECTORY> with the actual root path of the project tree provided in your context. Never use literal example paths.
+
+3) TROUBLESHOOTING:
+   - If a `docker run` command fails with "File not found":
+   - **DO NOT** try to ls or mkdir the container path (e.g. /app) on the host. It will fail.
+   - **DO** check your -v volume mount flags. Did you map the host directory correctly?
+   - **DO** verify the file exists on the HOST at the source path.
+
+4) PERSISTENCE: Always write outputs to a mounted volume -v host_dir:container_dir.
+
+5) GPU USAGE: Always use --gpus flag when running GPU workloads.
+
+6) OWNERSHIP: Always use -u $(id -u):$(id -g) to match Host user. Avoids root output files.
+

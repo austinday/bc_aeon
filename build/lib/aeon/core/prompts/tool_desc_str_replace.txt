@@ -1,0 +1,9 @@
+Makes a targeted edit to a file by replacing a specific string with a new string. Use this for small, surgical changes (fixing a bug, updating a function, changing a parameter, etc.). This is preferred over write_file for any change that affects less than ~50% of the file.
+The old_str must uniquely identify the section to change. Include enough surrounding context (a few lines above/below) to make it unique, but keep it as short as possible. If an exact match is not found, a fuzzy match will be attempted automatically.
+Schema:
+  file_path (str, required): Path to the file to edit.
+  old_str (str, required): The exact string to find in the file. Must appear exactly once. Include enough context to be unique.
+  new_str (str, required): The replacement string. Use empty string to delete the matched section.
+Example (short inline): {"tool_name": "str_replace", "parameters": {"file_path": "src/config.py", "old_str": "timeout = 30", "new_str": "timeout = 60"}}
+Example (multi-line with content blocks): {"tool_name": "str_replace", "parameters": {"file_path": "src/main.py", "old_str": "__BLOCK_1__", "new_str": "__BLOCK_2__"}}
+For multi-line old_str/new_str, use "__BLOCK_N__" placeholders and write the actual content in content blocks after the JSON. See RESPONSE FORMAT in your instructions.

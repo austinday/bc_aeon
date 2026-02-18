@@ -1,15 +1,21 @@
-from aeon.tools.generate_image import GenerateImageTool
+#!/usr/bin/env python3
 
-tool = GenerateImageTool()
-result = tool.run(
-    prompt="a photorealistic cat astronaut floating in space, Earth in the background, dramatic lighting",
-    negative_prompt="",
+import sys
+sys.path.append('aeon')
+
+from aeon.tools.flux_dev2 import FluxDev2Tool
+
+
+tool = FluxDev2Tool()
+
+print('Running FluxDev2Tool test...')
+result = tool.generate_image(
+    prompt='a photorealistic cat astronaut floating in space, Earth in the background, dramatic lighting',
     width=1024,
     height=1024,
-    steps=20,
-    guidance=4.0,
-    shift=3.2,
-    seed=-1,
-    output_path="test_flux_cat.png"
+    steps=28,
+    guidance=3.5,
+    shift=6.0,
+    filename_prefix='test_flux_cat'
 )
-print(result)
+print(f'Generated image: {result}') 

@@ -1,253 +1,92 @@
 #!/bin/bash
-set -e
 
-# =================================================================================================
-# AEON ENVIRONMENT SETUP (Unified Model Lake Architecture)
-# =================================================================================================
-# 1. Builds the core Docker images (Base & Vision).
-# 2. Downloads AI Models (Ollama & HuggingFace) into a unified ./aeon_models directory.
-# 3. Prepares the runtime (Ollama/vLLM) to use these persistent, host-mounted models.
-# =================================================================================================
+set -euo pipefail
 
-# --- CONFIGURATION ---
-# Brain Models (Ollama Registry)
-# 1. qwen3-coder-next:q8_0 (Coding Specialist)
-# 2. llama4:16x17b (General Purpose)
-# 3. qwen3:235b-iq4xs (Custom Manual Install below)
-OLLAMA_MODELS=(
- "qwen3-coder-next:q8_0"
- "llama4:16x17b"
-)
-
-# Tool Models (Hugging Face Registry)
-HF_MODELS=()
-
-# Directories
-MODELS_DIR="$HOME/bc_aeon/aeon_models"
-OLLAMA_DIR="$MODELS_DIR/ollama_home"
-
-# Colors
-C_CYAN='\033[96m'
-C_GREEN='\033[92m'
-C_YELLOW='\033[93m'
-C_RED='\033[91m'
-C_RESET='\033[0m'
-
-# TTY Detection
-TTY_FLAG=""
-if [ -t 1 ]; then TTY_FLAG="-it"; fi
-
-print_banner() {
- echo ""
- echo -e "${C_CYAN}======================================================================${C_RESET}"
- echo -e "${C_CYAN} $1${C_RESET}"
- echo -e "${C_CYAN}======================================================================${C_RESET}"
-}
+PROJECT_ROOT="/home/aday/bc_aeon"
+MODEL_BASE="$PROJECT_ROOT/aeon_models/comfyui_models"
+HF_TOKEN_FILE="/home/aday/huggingface_access_token.txt"
 
 log_step() {
- echo -e "${C_GREEN}[+] $1${C_RESET}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
-# =================================================================================================
-# PHASE 1: PREPARATION & CLEANUP
-# =================================================================================================
-print_banner "PHASE 1: PREPARATION"
-
-log_step "Creating Unified Model Lake at: $MODELS_DIR"
-mkdir -p "$OLLAMA_DIR"
-
-log_step "Stopping any existing Aeon containers..."
-docker stop aeon_brain_node aeon_strong_node aeon_weak_node aeon_vllm aeon_setup_provisioner >/dev/null 2>&1 || true
-docker rm -f aeon_setup_provisioner >/dev/null 2>&1 || true
-
-# =================================================================================================
-# PHASE 2: THE FOUNDRY (Docker Builds)
-# =================================================================================================
-print_banner "PHASE 2: THE FOUNDRY (Building Images)"
-
-log_step "Building 'aeon_base' (The Core Runtime)..."
-docker build -t aeon_base:py3.10-cuda12.1 \
- --build-arg PYTHON_VERSION_MINOR=10 \
- --build-arg CUDA_VERSION=12.1.1 \
- --build-arg PYTORCH_CUDA_SUFFIX=cu121 \
- .
-
-log_step "Tagging 'aeon_base:latest'..."
-docker tag aeon_base:py3.10-cuda12.1 aeon_base:latest
-
-log_step "Pulling Inference Engines..."
-docker pull ollama/ollama:latest
-docker pull vllm/vllm-openai:latest
-
-# =================================================================================================
-# PHASE 3: BRAIN TRANSPLANT (Ollama Models)
-# =================================================================================================
-print_banner "PHASE 3: BRAIN TRANSPLANT (Ollama Models)"
-
-log_step "Starting Provisioner Container..."
-docker run -d --rm \
- --name aeon_setup_provisioner \
- --gpus all \
- -v "$OLLAMA_DIR:/root/.ollama" \
- -p 11435:11434 \
- ollama/ollama:latest
-
-log_step "Waiting for Provisioner API..."
-count=0
-while ! curl -s http://localhost:11435/api/tags >/dev/null; do
- sleep 1
- count=$((count+1))
- if [ $count -ge 30 ]; then
- echo -e "${C_RED}Error: Provisioner failed to start.${C_RESET}"
- docker logs aeon_setup_provisioner
- exit 1
- fi
-done
-
-log_step "Downloading Standard Brain Models..."
-for model in "${OLLAMA_MODELS[@]}"; do
- echo -e "${C_YELLOW} >> Pulling $model...${C_RESET}"
- if docker exec aeon_setup_provisioner ollama list | grep -q "$model"; then
- echo " (Already present)"
- else
- docker exec $TTY_FLAG aeon_setup_provisioner ollama pull "$model"
- fi
-done
-
-# Custom GGUF models removed due to VRAM limitations.
-
-log_step "Stopping Provisioner..."
-docker stop aeon_setup_provisioner
-
-# =================================================================================================
-# PHASE 4: TOOL SHED (Hugging Face Models)
-# =================================================================================================
-print_banner "PHASE 4: TOOL SHED (Hugging Face Models)"
-
-HF_TOKEN_VAL=""
-if [ -f "$HOME/huggingface_access_token.txt" ]; then
-    HF_TOKEN_VAL=$(cat "$HOME/huggingface_access_token.txt" | tr -d '\n')
-    echo -e "${C_GREEN}[+] Loaded HuggingFace Token from host.${C_RESET}"
-else
-    echo -e "${C_YELLOW}[!] No HF Token found. Gated models may fail.${C_RESET}"
+# Load HF_TOKEN if not set
+if [[ -z "${HF_TOKEN:-}" && -f "$HF_TOKEN_FILE" ]]; then
+    export HF_TOKEN=$(cat "$HF_TOKEN_FILE" | tr -d '\n')
+    log_step "Loaded HF_TOKEN from $HF_TOKEN_FILE"
 fi
 
-for model in "${HF_MODELS[@]}"; do
- clean_name=$(basename "$model")
- target_dir="/models/$clean_name"
- 
- echo -e "${C_YELLOW} >> Downloading Tool Model: $model${C_RESET}"
- 
- host_dir="$MODELS_DIR/$clean_name"
- if [ -f "$host_dir/config.json" ] && { [ -f "$host_dir/tokenizer.json" ] || [ -f "$host_dir/tokenizer_config.json" ]; }; then
- echo " (Already downloaded and validated - Skipping)"
- else
- if [ -d "$host_dir" ]; then
- echo -e "${C_YELLOW} (Incomplete download detected - re-downloading)${C_RESET}"
- rm -rf "$host_dir"
- fi
- docker run --rm $TTY_FLAG \
- --gpus all \
- -v "$MODELS_DIR:/models" \
- -e HF_HOME=/tmp/cache \
- -e HF_TOKEN="$HF_TOKEN_VAL" \
- aeon_base:py3.10-cuda12.1 \
- bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c \"from huggingface_hub import snapshot_download; snapshot_download(repo_id='$model', local_dir='$target_dir', local_dir_use_symlinks=False)\""
- fi
-done
-
-# =================================================================================================
-# PHASE 5: COMFYUI GENERATIVE ENGINE
-# =================================================================================================
-print_banner "PHASE 5: COMFYUI GENERATIVE ENGINE"
-
-COMFYUI_MODELS_DIR="$MODELS_DIR/comfyui_models"
-COMFYUI_OUTPUT_DIR="$HOME/bc_aeon/comfyui_output"
-mkdir -p "$COMFYUI_MODELS_DIR"
-mkdir -p "$COMFYUI_OUTPUT_DIR"
-
-log_step "Building ComfyUI Docker image (aeon_comfyui:latest)..."
-COMFYUI_DOCKERFILE_DIR="$(cd "$(dirname "$0")/aeon/comfyui" && pwd)"
-if [ -f "$COMFYUI_DOCKERFILE_DIR/Dockerfile" ]; then
-    docker build -t aeon_comfyui:latest -f "$COMFYUI_DOCKERFILE_DIR/Dockerfile" "$COMFYUI_DOCKERFILE_DIR"
-else
-    echo -e "${C_YELLOW}[!] ComfyUI Dockerfile not found, skipping image build.${C_RESET}"
+if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "ERROR: HF_TOKEN environment variable required for model downloads."
+    echo "Create $HF_TOKEN_FILE with your token or export HF_TOKEN."
+    exit 1
 fi
 
-# --- Model: HunyuanImage 3.0 Instruct INT8 (text-to-image) ---
+log_step "PHASE 1: Create model directories (idempotent)"
+mkdir -p "$MODEL_BASE"/{clip,unet,vae,transformers}
 
-
-log_step "Downloading Flux.2-dev FP8 UNet to diffusion_models/..."
-UNET_DIR="$COMFYUI_MODELS_DIR/diffusion_models"
-mkdir -p "$UNET_DIR"
-FLUX_UNET="flux2_dev_fp8mixed.safetensors"
-if [ ! -f "$UNET_DIR/$(basename "$FLUX_UNET")" ]; then
-  docker run --rm $TTY_FLAG \
-    -v "$UNET_DIR:/diffusion_models" \
-    -e HF_HOME=/tmp/cache \
-    ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
-    aeon_base:py3.10-cuda12.1 \
-    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"split_files/diffusion_models/flux2_dev_fp8mixed.safetensors\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/diffusion_models/flux2_dev_fp8mixed.safetensors\")'"
-  echo "  Downloaded $FLUX_UNET"
+log_step "PHASE 2: Check/Idempotent Docker build aeon_base:latest"
+if ! docker images | grep -q 'aeon_base:latest'; then
+    log_step "Building aeon_base:latest"
+    docker build -t aeon_base:latest -f "$PROJECT_ROOT/aeon/comfyui/Dockerfile.aeon_base" "$PROJECT_ROOT/aeon/comfyui/"
 else
-  echo "  $FLUX_UNET already exists"
+    log_step "aeon_base:latest exists, skipping build"
 fi
 
-log_step "Downloading Flux.2 Mistral FP8 Text Encoder to text_encoders/..."
-TEXT_ENCODERS_DIR="$COMFYUI_MODELS_DIR/text_encoders"
-mkdir -p "$TEXT_ENCODERS_DIR"
- MISTRAL_MODEL="mistral_3_small_flux2_fp8.safetensors"
-if [ ! -f "$TEXT_ENCODERS_DIR/$(basename "$MISTRAL_MODEL")" ]; then
-  docker run --rm $TTY_FLAG \
-    -v "$TEXT_ENCODERS_DIR:/text_encoders" \
-    -e HF_HOME=/tmp/cache \
-    ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
-    aeon_base:py3.10-cuda12.1 \
-     bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"split_files/text_encoders/mistral_3_small_flux2_fp8.safetensors\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/text_encoders/mistral_3_small_flux2_fp8.safetensors\")'"
-  echo "  Downloaded $MISTRAL_MODEL"
+log_step "PHASE 3: Idempotent Docker build aeon/comfyui:latest"
+if ! docker images | grep -q 'aeon/comfyui:latest'; then
+    log_step "Building aeon/comfyui:latest"
+    docker build -t aeon/comfyui:latest -f "$PROJECT_ROOT/aeon/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/comfyui/"
 else
-  echo "  $MISTRAL_MODEL already exists"
+    log_step "aeon/comfyui:latest exists, skipping build"
 fi
 
-log_step "Downloading Flux.2-dev VAE to vae/..."
-VAE_DIR="$COMFYUI_MODELS_DIR/vae"
-mkdir -p "$VAE_DIR"
-FLUX_VAE="flux2-vae.safetensors"
-if [ ! -f "$VAE_DIR/$FLUX_VAE" ]; then
-  docker run --rm $TTY_FLAG \
-    -v "$VAE_DIR:/vae" \
-    -e HF_HOME=/tmp/cache \
-    ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
-    aeon_base:py3.10-cuda12.1 \
-    bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Comfy-Org/flux2-dev\", filename=\"split_files/vae/flux2-vae.safetensors\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/vae/flux2-vae.safetensors\")'"
-  echo "  Downloaded $FLUX_VAE"
-else
-  echo "  $FLUX_VAE already exists"
-fi
- log_step "Downloading pi-Flow LoRA adapter to loras/..."
- LORAS_DIR="$COMFYUI_MODELS_DIR/loras"
- mkdir -p "$LORAS_DIR"
- PIFLOW_LORA="gmflux2_k8_piid_4step.safetensors"
- if [ ! -f "$LORAS_DIR/$PIFLOW_LORA" ]; then
-   docker run --rm $TTY_FLAG \
-     -v "$LORAS_DIR:/loras" \
-     -e HF_HOME=/tmp/cache \
-     ${HF_TOKEN_VAL:+-e HF_TOKEN="$HF_TOKEN_VAL"} \
-     aeon_base:py3.10-cuda12.1 \
-     bash -c "python3 -c 'import huggingface_hub' 2>/dev/null || uv pip install --system --no-cache-dir huggingface_hub; python3 -c 'from huggingface_hub import hf_hub_download; import shutil; path = hf_hub_download(repo_id=\"Lakonik/pi-FLUX.2\", filename=\"gmflux2_k8_piid_4step/diffusion_pytorch_model.safetensors\", local_dir=\"/tmp/hf\"); shutil.move(path, \"/loras/gmflux2_k8_piid_4step.safetensors\")'"
-   echo "  Downloaded $PIFLOW_LORA"
- else
-   echo "  $PIFLOW_LORA already exists"
- fi
+log_step "PHASE 4: Download Flux Dev FP8 models (idempotent, requires HF_TOKEN)"
 
+CUDA_IMAGE="nvcr.io/nvidia/cuda:12.1.0-devel-ubuntu22.04"
 
-log_step "Fixing ComfyUI permissions..."
-sudo chown -R $(id -u):$(id -g) "$COMFYUI_MODELS_DIR" "$COMFYUI_OUTPUT_DIR" "$COMFYUI_MODELS_DIR/vae"
+# Function to download model idempotently
+download_model() {
+    local model_id="$1"
+    local local_path="$2"
+    local filename="$3"
 
-# =================================================================================================
-# PHASE 6: FINALIZATION
-# =================================================================================================
-print_banner "PHASE 6: FINALIZATION"
-log_step "Fixing Permissions..."
-sudo chown -R $(id -u):$(id -g) "$MODELS_DIR"
-log_step "Environment Ready."
+    if [[ -f "$MODEL_BASE/$local_path/$filename" ]]; then
+        log_step "Model $filename already exists, skipping."
+        return
+    fi
+
+    log_step "Downloading $filename from $model_id..."
+
+    docker run --rm \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -v "$MODEL_BASE:/models" \
+        "$CUDA_IMAGE" \
+        bash -c ": > /dev/tcp/huggingface.co/443 && \
+        apt-get update && apt-get install -y python3 python3-pip git && \
+        pip3 install --no-cache-dir huggingface_hub[cli] && \
+        python3 -c 'from huggingface_hub import snapshot_download; snapshot_download(repo_id=\"$model_id\", local_dir=\"/models/$local_path\", local_dir_use_symlinks=False, resume_download=True)' && \
+        echo 'Download complete'"
+
+    chown -R $(id -u):$(id -g) "$MODEL_BASE/$local_path" || true
+}
+
+# clip_l
+log_step "Downloading clip_l.safetensors..."
+download_model "comfyanonymous/flux_text_encoders" "clip" "clip_l.safetensors"
+
+# Mistral 7B instruct FP8 for clip_name2 (skipped: use t5xxl_fp8_e4m3fn.safetensors from clip/ instead)
+# log_step "Downloading mistral text encoder..."
+# download_model "comfyanonymous/flux_text_encoders" "transformers/mistral_instruct" "mistral_instruct_7b_flux.1_dev.safetensors"  # Wrong repo/filename
+
+# Flux1-dev FP8 unet
+log_step "Downloading flux1-dev unet FP8..."
+download_model "Kijai/flux-fp8" "unet" "flux1-dev-fp8.safetensors"
+
+# VAE ae.safetensors
+log_step "Downloading ae.safetensors VAE..."
+download_model "black-forest-labs/FLUX.1-dev" "vae" "ae.safetensors"
+
+log_step "PHASE 4 complete: All Flux Dev FP8 models downloaded."
+
+log_step "Setup complete. Models in $MODEL_BASE/{clip,unet,vae,transformers}"

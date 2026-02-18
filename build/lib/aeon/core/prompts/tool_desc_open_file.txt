@@ -1,0 +1,4 @@
+Opens a file and loads its FULL content into working memory so it can be read and edited. Use this to read, examine, or edit files. File contents stay up to date until closed. No need to re-open files already in working memory.
+Schema:
+  file_path (str, required): Path to the file to open. Relative or absolute.
+Example: {"tool_name": "open_file", "parameters": {"file_path": "src/main.py"}}

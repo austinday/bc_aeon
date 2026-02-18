@@ -1,0 +1,5 @@
+**OBJECTIVE**
+{objective}
+Above is your objective. If unclear, ambiguous, or conversational, use "get_user_input" tool to clarify before proceeding. 
+
+

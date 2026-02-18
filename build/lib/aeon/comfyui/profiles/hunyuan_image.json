@@ -1,0 +1,17 @@
+{
+    "model_id": "hunyuan_image",
+    "display_name": "HunyuanImage 3.0 Instruct Distil INT8 (Fast)",
+    "description": "Official Distil-INT8 model - 8 steps, very fast, excellent quality",
+    "huggingface_repo": "EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8",
+    "output_type": "image",
+    "workflow_file": "hunyuan_image3_api.json",
+    "parameters": {
+        "prompt": {"type": "string", "required": true},
+        "resolution": {"type": "string", "required": false, "default": "1024x1024"},
+        "steps": {"type": "int", "required": false, "default": 8},
+        "cfg_scale": {"type": "float", "required": false, "default": 2.5},
+        "seed": {"type": "int", "required": false, "default": -1},
+        "system_prompt": {"type": "string", "required": false, "default": "dynamic"},
+        "force_reload": {"type": "boolean", "required": false, "default": false}
+    }
+}
