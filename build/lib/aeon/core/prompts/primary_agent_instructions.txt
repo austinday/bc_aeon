@@ -26,6 +26,7 @@
     - 'previous_result_summary': Objective, factual summary of the LAST STEP RESULT. (Use 'N/A' on turn 1).
     - 'intent': A strict, 1-2 sentence factual statement of what you are attempting to achieve in this specific iteration.
     - 'updated_plan': Numbered steps needed to complete the task from the current state to the complete state. (Long term steps) 
+    - 'memory_update': (Optional) Object with 'memorize' (dict of key:value pairs to save to persistent memory) and/or 'forget' (list of keys to remove). Include ONLY when you discovered something worth saving or an existing memory is stale. Omit entirely when there is nothing to remember or forget.
     - 'actions': One or more actions that the agent must currently take to make progress towards the objective. (Short term steps) These need to be substantial, not simply opening files. Every group of actions should usually include some str_replace, write_file, or run_command operation. Learn through actions, not by passive inspection. Do not queue multiple modification actions (str_replace, write_file) for the same file in a single actions array. Execute one modification, wait to observe the result, and then proceed. Always prefer str_replace for existing files. Only use write_file for brand new files or if you are replacing the majority of a file's code.
 
 7) RESPONSE FORMAT:
@@ -72,6 +73,7 @@ MULTI-LINE EXAMPLE (code goes in content blocks after the JSON):
   "previous_result_summary": "Test revealed an off-by-one error.",
   "intent": "Fix the bug and create a helper module.",
   "updated_plan": ["1. Fix loop", "2. Add helper", "3. Retest"],
+  "memory_update": {"memorize": {"bug_root_cause": "off-by-one in main.py loop, range excludes last item"}},
   "actions": [
     {"tool_name": "str_replace", "parameters": {"file_path": "main.py", "old_str": "__BLOCK_1__", "new_str": "__BLOCK_2__"}},
     {"tool_name": "write_file", "parameters": {"file_path": "helper.py", "content": "__BLOCK_3__"}},

@@ -43,6 +43,21 @@ CLOUD_MODELS = [
     },
 ]
 
+# =============================================================================
+# LLAMA.CPP SERVED MODELS (GGUF, GPU+RAM hybrid, continuous batching)
+# =============================================================================
+LLAMACPP_MODELS = [
+    {
+        'model': 'Qwen3.5-397B-A17B-MXFP4',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8001/v1',
+        'context_limit': 32768,
+        'container_name': 'aeon_qwen397b',
+        'start_script': 'start_qwen397b.sh',
+        'health_port': 8001,
+    },
+]
+
 def is_container_running(name):
     try: return bool(subprocess.check_output(["docker", "ps", "-q", "-f", f"name={name}"], stderr=subprocess.DEVNULL, text=True).strip())
     except: return False
@@ -103,6 +118,60 @@ def cleanup_transient_tools():
                         shell=True, stderr=subprocess.DEVNULL, timeout=5)
     except Exception as e:
         print(f"[WARN] Cleanup timed out or failed: {e}")
+
+# =============================================================================
+# LLAMA.CPP SERVER LIFECYCLE
+# =============================================================================
+
+def is_llamacpp_model(config):
+    """Check if a model config is a llama.cpp-served model."""
+    return config and config.get('provider') == 'llamacpp'
+
+def get_llamacpp_config(model_name):
+    """Find llama.cpp model config by name."""
+    for m in LLAMACPP_MODELS:
+        if m['model'] == model_name:
+            return m
+    return None
+
+def start_llamacpp_server(config):
+    """Start the llama.cpp server container for a given model config."""
+    container_name = config['container_name']
+    port = config['health_port']
+    
+    # Check if already running and healthy
+    if is_container_running(container_name):
+        try:
+            resp = requests.get(f'http://localhost:{port}/health', timeout=5)
+            if resp.status_code == 200:
+                print(f"[LLAMACPP] {container_name} already running and healthy.")
+                return True
+        except:
+            pass
+    
+    script_name = config['start_script']
+    script = Path(__file__).parent / 'scripts' / script_name
+    if not script.exists():
+        print(f"[LLAMACPP] ERROR: Start script not found: {script}")
+        return False
+    
+    print(f"[LLAMACPP] Starting {config['model']} server (this may take several minutes for model loading)...")
+    result = subprocess.run(['bash', str(script)], capture_output=False)
+    if result.returncode != 0:
+        print(f"[LLAMACPP] ERROR: Failed to start {container_name}")
+        return False
+    return True
+
+def stop_llamacpp_server(config):
+    """Stop the llama.cpp server container."""
+    container_name = config['container_name']
+    print(f"[LLAMACPP] Stopping {container_name}...")
+    try:
+        subprocess.run(['docker', 'stop', container_name], capture_output=True, timeout=30)
+        subprocess.run(['docker', 'rm', container_name], capture_output=True, timeout=10)
+        print(f"[LLAMACPP] {container_name} stopped and removed.")
+    except Exception as e:
+        print(f"[WARN] Failed to stop {container_name}: {e}")
 
 def unload_local_brain():
     print("[SYSTEM] Last agent exiting. Releasing Brain VRAM...")
@@ -170,11 +239,15 @@ def register_models_for_agent(models):
         requests.post("http://localhost:8000/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
 
 def unregister_models_for_agent(models):
-    """Unregister this agent's PID and unload models with no remaining users."""
+    """Unregister this agent's PID and unload Ollama models with no remaining users.
+    Note: llama.cpp container lifecycle is handled separately in SessionManager.exit().
+    """
     if not models:
         return
     pid = os.getpid()
     to_unload = []
+    # Determine which models are llama.cpp (don't try Ollama unload for them)
+    llamacpp_model_names = {m['model'] for m in LLAMACPP_MODELS}
     with open(MODEL_REGISTRY_LOCK_PATH, 'w') as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
@@ -198,6 +271,9 @@ def unregister_models_for_agent(models):
         with open(MODEL_REGISTRY_PATH, 'w') as f:
             json.dump(registry, f, indent=2)
     for model in to_unload:
+        if model in llamacpp_model_names:
+            print(f"[SYSTEM] Skipping Ollama unload for llama.cpp model '{model}' (container lifecycle handled separately).")
+            continue
         print(f"[SYSTEM] Unloading {model}...")
         try:
             requests.post("http://localhost:8000/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
@@ -217,15 +293,19 @@ def get_ollama_models():
 # =============================================================================
 
 def build_model_menu(local_models):
-    """Build a unified menu of all available models (local + cloud)."""
+    """Build a unified menu of all available models (local + cloud + llamacpp)."""
     entries = []
     for m in local_models:
         entries.append({
             'model': m,
             'provider': 'local',
             'context_limit': 128000,
-            'label': f'{m} (local)',
+            'label': f'{m} (local/ollama)',
         })
+    for lm in LLAMACPP_MODELS:
+        entry = dict(lm)
+        entry['label'] = f"{lm['model']} (local/llama.cpp, GPU0+RAM, parallel={4})"
+        entries.append(entry)
     for cm in CLOUD_MODELS:
         entry = dict(cm)
         entry['label'] = f"{cm['model']} (cloud - key: ~/{cm['api_key_file']})"
@@ -269,14 +349,16 @@ class SessionManager:
         self._original_sigint = None
         self._original_sigterm = None
         self._models_used = []
+        self._llamacpp_configs = []  # llama.cpp model configs used by this agent
 
     def enter(self, strong_config=None, weak_config=None, skip_warmup=False):
         """Enter the session: coordinate startup, warm models, acquire locks.
         
         Only starts/warms the local brain if at least one selected model is local.
         Cloud-only configurations skip brain management entirely.
+        llama.cpp models get their own container lifecycle.
         """
-        # Determine which models are local (only local models need brain + registry)
+        # Determine which models are local Ollama (need brain + registry)
         local_models = []
         if strong_config and strong_config.get('provider') == 'local':
             local_models.append(strong_config['model'])
@@ -285,9 +367,17 @@ class SessionManager:
         local_models = list(dict.fromkeys(local_models))  # deduplicate
         self._models_used = local_models
 
+        # Determine which models are llama.cpp served
+        llamacpp_configs = []
+        for cfg in [strong_config, weak_config]:
+            if cfg and is_llamacpp_model(cfg):
+                if cfg not in llamacpp_configs:
+                    llamacpp_configs.append(cfg)
+        self._llamacpp_configs = llamacpp_configs
+
         needs_brain = len(local_models) > 0
 
-        # --- PHASE 1: Startup Coordination (only if local models needed) ---
+        # --- PHASE 1: Startup Coordination (only if local Ollama models needed) ---
         if needs_brain:
             self.startup_lock = open(STARTUP_LOCK_PATH, 'w+')
             try:
@@ -306,9 +396,17 @@ class SessionManager:
                     warm_up_models(local_models)
                 fcntl.flock(self.startup_lock, fcntl.LOCK_SH)
         else:
-            print("[SESSION] No local models selected, skipping brain startup.")
+            print("[SESSION] No local Ollama models selected, skipping brain startup.")
 
-        # --- PHASE 2: Register local models for reference counting ---
+        # --- PHASE 1b: Start llama.cpp servers (shared across agents via ref counting) ---
+        for lcfg in llamacpp_configs:
+            model_name = lcfg['model']
+            register_models_for_agent([model_name])
+            self._models_used.append(model_name)
+            if not start_llamacpp_server(lcfg):
+                print(f"[SESSION] WARNING: Failed to start llama.cpp server for {model_name}")
+
+        # --- PHASE 2: Register local Ollama models for reference counting ---
         if local_models:
             register_models_for_agent(local_models)
 
@@ -333,7 +431,7 @@ class SessionManager:
         self.exit()
 
     def exit(self):
-        """Exit the session: cleanup tools, release locks, maybe unload brain."""
+        """Exit the session: cleanup tools, release locks, maybe unload brain / stop containers."""
         if self._cleanup_done:
             return
         self._cleanup_done = True
@@ -343,7 +441,27 @@ class SessionManager:
         cleanup_transient_tools()
         
         if self._models_used:
+            # Check which llamacpp models will have zero users after unregister
+            llamacpp_to_stop = []
+            for lcfg in self._llamacpp_configs:
+                model_name = lcfg['model']
+                # Peek at registry to see if we're the last user
+                try:
+                    with open(MODEL_REGISTRY_LOCK_PATH, 'w') as lock_fd:
+                        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+                        registry = json.load(open(MODEL_REGISTRY_PATH)) if os.path.exists(MODEL_REGISTRY_PATH) else {}
+                        pids = registry.get(model_name, [])
+                        alive_pids = [p for p in pids if _pid_exists(p) and p != os.getpid()]
+                        if not alive_pids:
+                            llamacpp_to_stop.append(lcfg)
+                except:
+                    pass  # If we can't check, unregister will handle it
+
             unregister_models_for_agent(self._models_used)
+            
+            # Stop llama.cpp containers that have no remaining users
+            for lcfg in llamacpp_to_stop:
+                stop_llamacpp_server(lcfg)
         
         if self.runtime_lock:
             try:

@@ -303,6 +303,17 @@ END OPEN FILES
                     else:
                         self.current_plan = str(updated_plan)
 
+                # Process memory_update (persistent memory management)
+                memory_update = response_data.get("memory_update")
+                if memory_update and isinstance(memory_update, dict):
+                    for key, value in memory_update.get("memorize", {}).items():
+                        self.memories[str(key)] = str(value)
+                        self.print_func(f"{C_CYAN}[Memory +] {key}: {value}{C_RESET}")
+                    for key in memory_update.get("forget", []):
+                        if str(key) in self.memories:
+                            del self.memories[str(key)]
+                            self.print_func(f"{C_CYAN}[Memory -] Forgot: {key}{C_RESET}")
+
                 self.print_func(f"\n{C_CYAN}--- PREVIOUS RESULT SUMMARY ---{C_RESET}")
                 self.print_func(f"{previous_result_summary}")
 

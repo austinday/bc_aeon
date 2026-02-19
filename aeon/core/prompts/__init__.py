@@ -51,13 +51,8 @@ TOOL_DESC_SEARCH_WEB = _load('tool_desc_search_web.txt')
 TOOL_DESC_RUN_COMMAND = _load('tool_desc_run_command.txt')
 TOOL_DESC_TASK_COMPLETE = _load('tool_desc_task_complete.txt')
 TOOL_DESC_GET_USER_INPUT = _load('tool_desc_get_user_input.txt')
-TOOL_DESC_MEMORIZE_DETAIL = _load('tool_desc_memorize_detail.txt')
-TOOL_DESC_FORGET_DETAIL = _load('tool_desc_forget_detail.txt')
-
 # === GENERATIVE TOOLS (ComfyUI-backed) ===
-# Each generative modality gets its own tool description.
 # To add a new one: create tool_desc_generate_<modality>.txt and load it here.
-TOOL_DESC_GENERATE_IMAGE = _load('tool_desc_generate_image.txt')
 
 # =============================================================================
 # CONTEXT SECTIONS

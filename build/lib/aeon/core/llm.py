@@ -54,6 +54,8 @@ class LLMClient:
         """Create an OpenAI-compatible client from a model config dict."""
         if config['provider'] == 'local':
             return openai.OpenAI(base_url='http://localhost:8000/v1', api_key='ollama')
+        elif config['provider'] == 'llamacpp':
+            return openai.OpenAI(base_url=config['base_url'], api_key='no-key-needed')
         else:
             api_key_path = pathlib.Path.home() / config['api_key_file']
             if not api_key_path.exists():
