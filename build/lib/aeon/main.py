@@ -51,10 +51,19 @@ LLAMACPP_MODELS = [
         'model': 'Qwen3.5-397B-A17B-MXFP4',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8001/v1',
-        'context_limit': 32768,
+        'context_limit': 131072,
         'container_name': 'aeon_qwen397b',
         'start_script': 'start_qwen397b.sh',
         'health_port': 8001,
+    },
+    {
+        'model': 'Qwen3.5-397B-A17B-MXFP4-DualGPU',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8003/v1',
+        'context_limit': 16384,
+        'container_name': 'aeon_qwen397b_dual',
+        'start_script': 'start_qwen397b_dual.sh',
+        'health_port': 8003,
     },
 ]
 
@@ -304,7 +313,10 @@ def build_model_menu(local_models):
         })
     for lm in LLAMACPP_MODELS:
         entry = dict(lm)
-        entry['label'] = f"{lm['model']} (local/llama.cpp, GPU0+RAM, parallel={4})"
+        if 'DualGPU' in lm['model']:
+            entry['label'] = f"{lm['model']} (local/llama.cpp, GPU0+GPU1+RAM, parallel=1)"
+        else:
+            entry['label'] = f"{lm['model']} (local/llama.cpp, GPU0+RAM, parallel=1)"
         entries.append(entry)
     for cm in CLOUD_MODELS:
         entry = dict(cm)

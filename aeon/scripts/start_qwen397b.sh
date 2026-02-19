@@ -6,9 +6,9 @@
 # Continuous batching + parallel slots for multi-agent sharing.
 #
 # Usage:
-#   bash start_qwen397b.sh              # Default settings
-#   NGL=40 bash start_qwen397b.sh       # Override GPU layers
-#   PARALLEL=8 bash start_qwen397b.sh   # Override parallel slots
+#   bash start_qwen397b.sh               # Default settings
+#   NGL=40 bash start_qwen397b.sh        # Override GPU layers
+#   PARALLEL=8 bash start_qwen397b.sh    # Override parallel slots
 # =============================================================================
 set -e
 
@@ -20,8 +20,11 @@ MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/Qwen3.5-397B-A17B-MXFP4/MXFP4_
 # Tunable parameters (override via environment variables)
 N_GPU_LAYERS=${NGL:-0}           # 0 = let llama.cpp auto-fit to available VRAM. Override with NGL=N.
 PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot maximizes VRAM for model layers
-CTX_SIZE=${CTX:-16384}           # Reduced context to free VRAM (override with CTX=32768)
-BATCH_SIZE=${BATCH:-2048}        # Prompt processing batch size
+CTX_SIZE=${CTX:-131072}          # Context window per slot (128k)
+BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
+
+# Auto-detect physical CPU cores for optimal llama.cpp thread count
+PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
 
 # Auto-detect the first shard (the one llama.cpp needs to find all splits)
 MODEL_FILE=$(ls -1 "${MODELS_DIR}"/*.gguf 2>/dev/null | sort | head -1 | xargs -r basename)
@@ -80,6 +83,8 @@ docker run -d \
     --parallel ${PARALLEL_SLOTS} \
     --ctx-size ${CTX_SIZE} \
     --batch-size ${BATCH_SIZE} \
+    --threads ${PHYSICAL_CORES} \
+    --mlock \
     --flash-attn on \
     --host 0.0.0.0 \
     --port 8001 \

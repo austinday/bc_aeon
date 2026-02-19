@@ -1,4 +1,5 @@
 import os
+import time
 import openai
 import pathlib
 import sys
@@ -339,12 +340,21 @@ class LLMClient:
 
         for attempt in range(max_retries):
             try:
+                start_time = time.time()
                 resp = self.primary_client.chat.completions.create(
                     model=self.primary_model,
                     messages=[{"role": "user", "content": current_prompt}],
                     temperature=0.2,
                 )
+                elapsed = time.time() - start_time
                 raw = resp.choices[0].message.content
+
+                try:
+                    comp_tokens = resp.usage.completion_tokens
+                except AttributeError:
+                    comp_tokens = estimate_tokens(raw)
+                tps = comp_tokens / elapsed if elapsed > 0 else 0
+                print(f"\033[96m[Performance] {self.primary_model} speed: {tps:.2f} t/s ({comp_tokens} tokens in {elapsed:.2f}s)\033[0m")
 
                 if self.debug_path:
                     print(f"{C_YELLOW}[LLM RAW - PRIMARY AGENT]\n{raw}{C_RESET}")

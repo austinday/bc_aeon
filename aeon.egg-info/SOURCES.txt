@@ -53,6 +53,7 @@ aeon/scripts/clear_gpu.sh
 aeon/scripts/start_brain.sh
 aeon/scripts/start_comfyui.sh
 aeon/scripts/start_qwen397b.sh
+aeon/scripts/start_qwen397b_dual.sh
 aeon/scripts/start_vllm.sh
 aeon/services/__init__.py
 aeon/tools/__init__.py
