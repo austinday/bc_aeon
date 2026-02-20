@@ -61,7 +61,6 @@ else
          -v "${MODELS_DIR}/loras:/opt/ComfyUI/models/loras" \
          -v "${OUTPUT_DIR}:/opt/ComfyUI/output" \
          $IMAGE_NAME
-        $IMAGE_NAME
 fi
 
 echo "[ComfyUI] Waiting for API..."

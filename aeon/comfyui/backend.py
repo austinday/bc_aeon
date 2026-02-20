@@ -83,7 +83,14 @@ class ComfyUIBackend:
         config = self.model_workflows[model_id]
         workflow = self._load_json(config['workflow_path'])
         profile = self._load_json(config['profile_path'])
-        full_params = {**profile.get('defaults', {}), **params}
+        # Extract defaults from profile parameters structure
+        defaults = {}
+        for param_name, param_def in profile.get('parameters', {}).items():
+            if isinstance(param_def, dict) and 'default' in param_def:
+                defaults[param_name.upper()] = param_def['default']
+        # Merge: defaults < user params (uppercase keys to match workflow {{PLACEHOLDERS}})
+        upper_params = {k.upper(): v for k, v in params.items()}
+        full_params = {**defaults, **upper_params}
         workflow = self._substitute_params(workflow, full_params)
         self.start_container()
         try:
@@ -97,7 +104,7 @@ class ComfyUIBackend:
                 print(logs.stderr)
                 prompt_resp.raise_for_status()
             # Poll /history
-            prompt_id = list(workflow['3'].keys())[0]  # Assume last node ID
+            prompt_id = prompt_resp.json()['prompt_id']
             for _ in range(300):  # 5min timeout
                 hist_resp = requests.get(f'http://localhost:{self.host_port}/history/{prompt_id}')
                 if hist_resp.status_code == 200 and hist_resp.json():
