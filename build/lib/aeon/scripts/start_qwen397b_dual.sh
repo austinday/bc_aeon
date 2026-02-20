@@ -7,19 +7,19 @@ set -e
 CONTAINER_NAME='aeon_qwen397b_dual'
 IMAGE_NAME='aeon_llamacpp:latest'
 PORT=8003
-MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/Qwen3.5-397B-A17B-MXFP4/MXFP4_MOE"
+MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/Qwen3.5-397B-A17B-MXFP4"
 
 # Tunable parameters
 N_GPU_LAYERS=${NGL:-48}          # 48/61 layers (~170GB) to fit inside 192GB combined VRAM safely
 PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot maximizes VRAM for model layers
-CTX_SIZE=${CTX:-16384}           # 16k context to leave VRAM for layers
+CTX_SIZE=${CTX:-131072}           # 16k context to leave VRAM for layers
 BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
 
-MODEL_FILE=$(ls -1 "${MODELS_DIR}"/*.gguf 2>/dev/null | sort | head -1 | xargs -r basename)
+MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "MXFP4" | sort | head -1 | sed 's|^\./||')
 if [ -z "$MODEL_FILE" ]; then
-    echo "[Qwen397B-Dual] ERROR: No .gguf files found in ${MODELS_DIR}"
+    echo "[Qwen397B-Dual] ERROR: No .gguf files matching MXFP4 found in ${MODELS_DIR}"
     exit 1
 fi
 
@@ -57,10 +57,11 @@ docker run -d \
     --gpus '"device=0,1"' \
     -p ${PORT}:8001 \
     -v "${MODELS_DIR}:/models:ro" \
-    --shm-size=1g \
+    --shm-size=16g \
     --ulimit memlock=-1 \
     $IMAGE_NAME \
     --model "/models/${MODEL_FILE}" \
+    --split-mode layer \
     --n-gpu-layers ${N_GPU_LAYERS} \
     --parallel ${PARALLEL_SLOTS} \
     --ctx-size ${CTX_SIZE} \
@@ -69,7 +70,9 @@ docker run -d \
     --flash-attn on \
     --host 0.0.0.0 \
     --port 8001 \
-    --metrics
+    --metrics \
+    --mlock \
+    --no-mmap
 
 echo "[Qwen397B-Dual] Waiting for server to load model (this may take several minutes)..."
 count=0

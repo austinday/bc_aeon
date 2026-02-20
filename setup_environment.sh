@@ -103,50 +103,45 @@ import os, sys
 from huggingface_hub import hf_hub_download, list_repo_files
 
 REPO = "unsloth/Qwen3.5-397B-A17B-GGUF"
-PREFIX = "MXFP4_MOE/Qwen3.5-397B-A17B-MXFP4"
 TARGET = "/models"
+MODELS_TO_DOWNLOAD = ["MXFP4", "UD-Q3_K_XL", "Q6_K", "UD-TQ1_0"]
 
-print(f"Listing files in {REPO} matching {PREFIX}...", flush=True)
+print(f"Listing files in {REPO}...", flush=True)
 all_files = list_repo_files(REPO)
-shards = sorted([f for f in all_files if f.startswith(PREFIX) and f.endswith(".gguf")])
-print(f"Found {len(shards)} shard(s):", flush=True)
-for s in shards:
-    print(f"  {s}", flush=True)
 
-if not shards:
-    print("ERROR: No matching GGUF shards found in repo!", flush=True)
-    all_mxfp4 = [f for f in all_files if "MXFP4" in f]
-    print(f"All MXFP4 files in repo: {all_mxfp4}", flush=True)
-    sys.exit(1)
+for prefix in MODELS_TO_DOWNLOAD:
+    print(f"\nProcessing {prefix}...", flush=True)
+    shards = sorted([f for f in all_files if prefix in f and f.endswith(".gguf")])
+    print(f"Found {len(shards)} shard(s):", flush=True)
+    for s in shards:
+        print(f"  {s}", flush=True)
 
-all_done = True
-for i, shard in enumerate(shards, 1):
-    dest = os.path.join(TARGET, shard)
-    if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000_000:
-        sz = os.path.getsize(dest) / (1024**3)
-        print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
+    if not shards:
+        print(f"ERROR: No matching GGUF shards found in repo for {prefix}!", flush=True)
         continue
-    all_done = False
-    print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
-    hf_hub_download(
-        repo_id=REPO,
-        filename=shard,
-        local_dir=TARGET,
-    )
-    sz = os.path.getsize(dest) / (1024**3)
-    print(f"  Done: {sz:.1f}GB", flush=True)
 
-if all_done:
-    print("All shards already present and valid.", flush=True)
-else:
-    print("All shards downloaded successfully.", flush=True)
+    all_done = True
+    for i, shard in enumerate(shards, 1):
+        dest = os.path.join(TARGET, shard)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000_000:
+            sz = os.path.getsize(dest) / (1024**3)
+            print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
+            continue
+        all_done = False
+        print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
+        hf_hub_download(
+            repo_id=REPO,
+            filename=shard,
+            local_dir=TARGET,
+        )
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"  Done: {sz:.1f}GB", flush=True)
 
-total = sum(
-    os.path.getsize(os.path.join(TARGET, s))
-    for s in shards
-    if os.path.exists(os.path.join(TARGET, s))
-)
-print(f"Total model size: {total / (1024**3):.1f}GB", flush=True)
+    if all_done:
+        print(f"All {prefix} shards already present and valid.", flush=True)
+    else:
+        print(f"All {prefix} shards downloaded successfully.", flush=True)
 PYEOF
 
 # Run download with live output (-t for progress bars)
@@ -169,6 +164,87 @@ fi
 
 chown -R $(id -u):$(id -g) "$QWEN_GGUF_DIR" 2>/dev/null || true
 log_step "PHASE 5 complete."
+
+# =============================================================================
+# PHASE 5.5: Qwen3-Coder-Next-Abliterated-Q8_0 (llama.cpp served)
+# =============================================================================
+QWEN3_CODER_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3-Coder-Next-Abliterated"
+log_step "PHASE 5.5: Download Qwen3-Coder-Next-Abliterated-Q8_0 GGUF model shards"
+mkdir -p "$QWEN3_CODER_GGUF_DIR"
+
+QWEN3_CODER_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen3_coder_XXXXXX.py)
+cat > "$QWEN3_CODER_DL_SCRIPT" << 'PYEOF'
+import os, sys
+from huggingface_hub import hf_hub_download, list_repo_files
+
+REPO = "bartowski/huihui-ai_Qwen3-Coder-Next-abliterated-GGUF"
+TARGET = "/models"
+PREFIX = "Q8_0"
+
+print(f"Listing files in {REPO}...", flush=True)
+try:
+    all_files = list_repo_files(REPO)
+except Exception as e:
+    print(f"Failed to list repo: {e}")
+    sys.exit(1)
+
+print(f"\nProcessing {PREFIX}...", flush=True)
+shards = sorted([f for f in all_files if PREFIX in f and f.endswith(".gguf")])
+print(f"Found {len(shards)} shard(s):", flush=True)
+for s in shards:
+    print(f"  {s}", flush=True)
+
+if not shards:
+    print(f"ERROR: No matching GGUF shards found in repo for {PREFIX}!", flush=True)
+    sys.exit(1)
+
+all_done = True
+for i, shard in enumerate(shards, 1):
+    dest = os.path.join(TARGET, shard)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000_000:
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
+        continue
+    all_done = False
+    print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
+    try:
+        hf_hub_download(
+            repo_id=REPO,
+            filename=shard,
+            local_dir=TARGET,
+        )
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"  Done: {sz:.1f}GB", flush=True)
+    except Exception as e:
+        print(f"Failed to download {shard}: {e}")
+        sys.exit(1)
+
+if all_done:
+    print(f"All {PREFIX} shards already present and valid.", flush=True)
+else:
+    print(f"All {PREFIX} shards downloaded successfully.", flush=True)
+PYEOF
+
+TTY_FLAG=""
+if [ -t 0 ]; then TTY_FLAG="-t"; fi
+docker run --rm $TTY_FLAG \
+    -e HF_TOKEN="$HF_TOKEN" \
+    -e PYTHONUNBUFFERED=1 \
+    -v "$QWEN3_CODER_GGUF_DIR:/models" \
+    -v "$QWEN3_CODER_DL_SCRIPT:/download.py:ro" \
+    python:3.12-slim \
+    bash -c "pip install --no-cache-dir huggingface_hub && python3 /download.py"
+
+DL_EXIT=$?
+rm -f "$QWEN3_CODER_DL_SCRIPT"
+if [[ $DL_EXIT -ne 0 ]]; then
+    log_step "ERROR: Qwen3 Coder GGUF download failed (exit code $DL_EXIT)"
+    exit 1
+fi
+
+chown -R $(id -u):$(id -g) "$QWEN3_CODER_GGUF_DIR" 2>/dev/null || true
+log_step "PHASE 5.5 complete."
 
 # =============================================================================
 # PHASE 6: Build llama.cpp server Docker image (for GGUF model serving)

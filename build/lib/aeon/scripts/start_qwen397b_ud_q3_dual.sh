@@ -1,33 +1,33 @@
 #!/bin/bash
 # =============================================================================
-# Start llama.cpp server for Qwen3.5-397B-A17B-MXFP4 GGUF on DUAL GPUs
+# Start llama.cpp server for Qwen3.5-397B-A17B-UD-Q3_K_XL GGUF on DUAL GPUs
 # =============================================================================
 set -e
 
-CONTAINER_NAME='aeon_qwen397b_dual'
+CONTAINER_NAME='aeon_qwen397b_ud_q3_dual'
 IMAGE_NAME='aeon_llamacpp:latest'
-PORT=8003
+PORT=8004
 MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/Qwen3.5-397B-A17B-MXFP4"
 
 # Tunable parameters
-N_GPU_LAYERS=${NGL:-48}          # 48/61 layers (~170GB) to fit inside 192GB combined VRAM safely
+N_GPU_LAYERS=${NGL:-61}          # Fits entirely in 192GB VRAM
 PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot maximizes VRAM for model layers
-CTX_SIZE=${CTX:-131072}           # 16k context to leave VRAM for layers
+CTX_SIZE=${CTX:-131072}          # 128k context
 BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
 
-MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "MXFP4" | sort | head -1 | sed 's|^\./||')
+MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "UD-Q3_K_XL" | sort | head -1 | sed 's|^\./||')
 if [ -z "$MODEL_FILE" ]; then
-    echo "[Qwen397B-Dual] ERROR: No .gguf files matching MXFP4 found in ${MODELS_DIR}"
+    echo "[UD-Q3-Dual] ERROR: No .gguf files matching UD-Q3_K_XL found in ${MODELS_DIR}"
     exit 1
 fi
 
-echo "[Qwen397B-Dual] Using model file: ${MODEL_FILE}"
-echo "[Qwen397B-Dual] Checking for existing container..."
+echo "[UD-Q3-Dual] Using model file: ${MODEL_FILE}"
+echo "[UD-Q3-Dual] Checking for existing container..."
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "[Qwen397B-Dual] Container already running. Checking health..."
+        echo "[UD-Q3-Dual] Container already running. Checking health..."
         count=0
         while true; do
             HC=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null || echo "000")
@@ -35,22 +35,22 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
             sleep 2
             count=$((count+1))
             if [ $count -ge 10 ]; then
-                echo "[Qwen397B-Dual] Running but unhealthy (HTTP $HC). Restarting..."
+                echo "[UD-Q3-Dual] Running but unhealthy (HTTP $HC). Restarting..."
                 docker rm -f $CONTAINER_NAME >/dev/null 2>&1
                 break
             fi
         done
         if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null)" = "200" ]; then
-            echo "[Qwen397B-Dual] Already running and healthy on port $PORT."
+            echo "[UD-Q3-Dual] Already running and healthy on port $PORT."
             exit 0
         fi
     else
-        echo "[Qwen397B-Dual] Removing stopped container..."
+        echo "[UD-Q3-Dual] Removing stopped container..."
         docker rm -f $CONTAINER_NAME >/dev/null 2>&1
     fi
 fi
 
-echo "[Qwen397B-Dual] Starting llama.cpp server..."
+echo "[UD-Q3-Dual] Starting llama.cpp server..."
 
 docker run -d \
     --name $CONTAINER_NAME \
@@ -74,7 +74,7 @@ docker run -d \
     --mlock \
     --no-mmap
 
-echo "[Qwen397B-Dual] Waiting for server to load model (this may take several minutes)..."
+echo "[UD-Q3-Dual] Waiting for server to load model (this may take several minutes)..."
 count=0
 while true; do
     HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null || echo "000")
@@ -82,14 +82,14 @@ while true; do
     sleep 5
     count=$((count+1))
     if [ $count -ge 120 ]; then
-        echo "[Qwen397B-Dual] ERROR: Server did not become healthy within 10 minutes."
+        echo "[UD-Q3-Dual] ERROR: Server did not become healthy within 10 minutes."
         docker logs $CONTAINER_NAME --tail 30
         exit 1
     fi
     if [ $((count % 6)) -eq 0 ]; then
         elapsed=$((count * 5))
-        echo "[Qwen397B-Dual] Still loading... (${elapsed}s)"
+        echo "[UD-Q3-Dual] Still loading... (${elapsed}s)"
     fi
 done
 
-echo "[Qwen397B-Dual] Server ready on port $PORT."
+echo "[UD-Q3-Dual] Server ready on port $PORT."

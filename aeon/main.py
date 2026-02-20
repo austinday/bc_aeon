@@ -48,22 +48,54 @@ CLOUD_MODELS = [
 # =============================================================================
 LLAMACPP_MODELS = [
     {
-        'model': 'Qwen3.5-397B-A17B-MXFP4',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8001/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_qwen397b',
-        'start_script': 'start_qwen397b.sh',
-        'health_port': 8001,
-    },
-    {
         'model': 'Qwen3.5-397B-A17B-MXFP4-DualGPU',
+        'label': 'Smart Slow: Qwen3.5-397B (MXFP4) | Req: 2 GPUs + System RAM, 128k ctx | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8003/v1',
-        'context_limit': 16384,
+        'context_limit': 131072,
         'container_name': 'aeon_qwen397b_dual',
         'start_script': 'start_qwen397b_dual.sh',
         'health_port': 8003,
+    },
+    {
+        'model': 'Qwen3.5-397B-A17B-UD-Q3_K_XL-DualGPU',
+        'label': 'Smart Fast: Qwen3.5-397B (UD-Q3_K_XL) | Req: 2 GPUs (no RAM offload), 128k ctx | Local/llama.cpp',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8004/v1',
+        'context_limit': 131072,
+        'container_name': 'aeon_qwen397b_ud_q3_dual',
+        'start_script': 'start_qwen397b_ud_q3_dual.sh',
+        'health_port': 8004,
+    },
+    {
+        'model': 'Qwen3.5-397B-A17B-Q6_K',
+        'label': 'Smart Builder: Qwen3.5-397B (Q6_K) | Req: 1 GPU + System RAM, 128k ctx | Local/llama.cpp',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8005/v1',
+        'context_limit': 131072,
+        'container_name': 'aeon_qwen397b_q6_single',
+        'start_script': 'start_qwen397b_q6_single.sh',
+        'health_port': 8005,
+    },
+    {
+        'model': 'Qwen3.5-397B-A17B-UD-TQ1_0',
+        'label': 'Fast Builder: Qwen3.5-397B (UD-TQ1_0) | Req: 1 GPU (no RAM offload), 128k ctx | Local/llama.cpp',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8006/v1',
+        'context_limit': 131072,
+        'container_name': 'aeon_qwen397b_ud_tq1_single',
+        'start_script': 'start_qwen397b_ud_tq1_single.sh',
+        'health_port': 8006,
+    },
+    {
+        'model': 'Qwen3-Coder-Next-Abliterated-Q8_0',
+        'label': 'Qwen3-Coder-Next (Q8_0) | Req: One GPU0, no CPU offload, 128k ctx | Abliterated | Local/llama.cpp',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8007/v1',
+        'context_limit': 131072,
+        'container_name': 'aeon_qwen3_coder_q8',
+        'start_script': 'start_qwen3_coder_q8.sh',
+        'health_port': 8007,
     },
 ]
 
@@ -304,36 +336,40 @@ def get_ollama_models():
 def build_model_menu(local_models):
     """Build a unified menu of all available models (local + cloud + llamacpp)."""
     entries = []
+    entries.append({'label': '--- Local Models ---', 'is_header': True})
     for m in local_models:
         entries.append({
             'model': m,
             'provider': 'local',
             'context_limit': 128000,
-            'label': f'{m} (local/ollama)',
+            'label': f'{m} | Req: One GPU0 | Unknown if Abliterated | Local/Ollama',
         })
     for lm in LLAMACPP_MODELS:
         entry = dict(lm)
-        if 'DualGPU' in lm['model']:
-            entry['label'] = f"{lm['model']} (local/llama.cpp, GPU0+GPU1+RAM, parallel=1)"
-        else:
-            entry['label'] = f"{lm['model']} (local/llama.cpp, GPU0+RAM, parallel=1)"
         entries.append(entry)
+
+    entries.append({'label': '--- API Models ---', 'is_header': True})
     for cm in CLOUD_MODELS:
         entry = dict(cm)
-        entry['label'] = f"{cm['model']} (cloud - key: ~/{cm['api_key_file']})"
+        entry['label'] = f"{cm['model']} | Req: Internet | Unrestricted status depends on API | API/Cloud"
         entries.append(entry)
     return entries
 
 def select_model(menu_entries, label):
     """Display unified model menu and return selected model config."""
     print(f'\n[MENU] {label}')
-    for i, entry in enumerate(menu_entries):
-        print(f' {i+1}. {entry["label"]}')
+    selectable = []
+    for entry in menu_entries:
+        if entry.get('is_header'):
+            print(f" {entry['label']}")
+        else:
+            selectable.append(entry)
+            print(f"  {len(selectable)}. {entry['label']}")
     while True:
         try:
-            choice = input(f'Select Model (1-{len(menu_entries)}): ')
-            if choice.isdigit() and 1 <= int(choice) <= len(menu_entries):
-                return menu_entries[int(choice)-1]
+            choice = input(f'Select Model (1-{len(selectable)}): ')
+            if choice.isdigit() and 1 <= int(choice) <= len(selectable):
+                return selectable[int(choice)-1]
         except (KeyboardInterrupt, EOFError): sys.exit(0)
         except: pass
         print('Invalid choice.')
@@ -511,8 +547,8 @@ def cli():
         local_models = get_ollama_models()
 
     if not local_models:
-        print("[WARN] No local models found via API. Using defaults.")
-        local_models = ['qwen3-coder-next:q8_0', 'llama4:16x17b', 'qwen3:235b-iq4xs']
+        print("[WARN] No local models found via API.")
+        local_models = []
 
     # --- Build unified model menu (local + cloud) ---
     menu = build_model_menu(local_models)

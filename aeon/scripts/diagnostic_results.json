@@ -1,0 +1,104 @@
+[
+  {
+    "mode": "Single GPU",
+    "port": 8001,
+    "status": "success",
+    "inference": {
+      "success": true,
+      "elapsed_sec": 2.691913366317749,
+      "tokens_generated": 0,
+      "tokens_per_sec": 0.0,
+      "prompt_tokens": 100
+    },
+    "gpu_before": [
+      {
+        "gpu": 0,
+        "used_gb": 94.714111328125,
+        "total_gb": 95.5927734375,
+        "utilization": 6
+      },
+      {
+        "gpu": 1,
+        "used_gb": 79.76165771484375,
+        "total_gb": 95.5927734375,
+        "utilization": 7
+      }
+    ],
+    "gpu_after": [
+      {
+        "gpu": 0,
+        "used_gb": 94.880126953125,
+        "total_gb": 95.5927734375,
+        "utilization": 100
+      },
+      {
+        "gpu": 1,
+        "used_gb": 79.76165771484375,
+        "total_gb": 95.5927734375,
+        "utilization": 0
+      }
+    ],
+    "cpu_ram_before": {
+      "used_gb": 9.327686309814453,
+      "total_gb": 251.16205215454102,
+      "percent": 81.9
+    },
+    "cpu_ram_after": {
+      "used_gb": 9.564994812011719,
+      "total_gb": 251.16205215454102,
+      "percent": 82.0
+    },
+    "cpu_ram_delta_gb": 0.23730850219726562
+  },
+  {
+    "mode": "Dual GPU",
+    "port": 8003,
+    "status": "success",
+    "inference": {
+      "success": true,
+      "elapsed_sec": 1.6139395236968994,
+      "tokens_generated": 0,
+      "tokens_per_sec": 0.0,
+      "prompt_tokens": 100
+    },
+    "gpu_before": [
+      {
+        "gpu": 0,
+        "used_gb": 94.880126953125,
+        "total_gb": 95.5927734375,
+        "utilization": 100
+      },
+      {
+        "gpu": 1,
+        "used_gb": 79.76165771484375,
+        "total_gb": 95.5927734375,
+        "utilization": 0
+      }
+    ],
+    "gpu_after": [
+      {
+        "gpu": 0,
+        "used_gb": 94.882080078125,
+        "total_gb": 95.5927734375,
+        "utilization": 48
+      },
+      {
+        "gpu": 1,
+        "used_gb": 79.76361083984375,
+        "total_gb": 95.5927734375,
+        "utilization": 0
+      }
+    ],
+    "cpu_ram_before": {
+      "used_gb": 9.564994812011719,
+      "total_gb": 251.16205215454102,
+      "percent": 82.0
+    },
+    "cpu_ram_after": {
+      "used_gb": 10.374794006347656,
+      "total_gb": 251.16205215454102,
+      "percent": 82.4
+    },
+    "cpu_ram_delta_gb": 0.8097991943359375
+  }
+]
