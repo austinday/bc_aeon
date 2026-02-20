@@ -54,10 +54,11 @@ aeon/scripts/clear_gpu.sh
 aeon/scripts/diagnostic_qwen.py
 aeon/scripts/start_brain.sh
 aeon/scripts/start_comfyui.sh
-aeon/scripts/start_qwen397b_dual.sh
-aeon/scripts/start_qwen397b_q6_single.sh
-aeon/scripts/start_qwen397b_ud_q3_dual.sh
-aeon/scripts/start_qwen397b_ud_tq1_single.sh
+aeon/scripts/start_minimax_m25_q8.sh
+aeon/scripts/start_qwen397b_light.sh
+aeon/scripts/start_qwen397b_max.sh
+aeon/scripts/start_qwen397b_medium.sh
+aeon/scripts/start_qwen397b_q6k.sh
 aeon/scripts/start_qwen3_coder_q8.sh
 aeon/scripts/start_vllm.sh
 aeon/services/__init__.py
@@ -65,6 +66,7 @@ aeon/tools/__init__.py
 aeon/tools/base.py
 aeon/tools/communication.py
 aeon/tools/file_io.py
+aeon/tools/flux.py
 aeon/tools/loader.py
 aeon/tools/search.py
 aeon/tools/system.py

@@ -15,3 +15,9 @@
 7) ORGANIZATION: Make project human friendly (eg. numbered .sh scripts that idempotently run the workflow (eg. 1_build.sh, 2_download.sh) using called .py scripts that run via Docker container. Delete vestigal files and folders. Make README files.
 
 8) CONTEXT: Context space is precious. Be concise, direct, and objective. Close unused files. Try not to have more than a few files open at once, if possible. 
+
+9) PERSISTENT MEMORY: Each iteration, briefly consider whether you learned anything worth saving (credentials, discovered paths, key decisions, configuration values, environment details) or whether any existing memory is now outdated or wrong. If so, include a 'memory_update' field in your JSON output. Memory is cheap — prefer to save useful details rather than re-discover them. But keep it clean: forget stale entries, and don't memorize things already visible in open files or the project tree.
+
+10) ANTI-LOOPING: NEVER run the same command twice in a row expecting different results. You never have to 'ls' to see files, all project files are represented in your project overview in your context. If it's not there, it doesn't exist. If it is, you can see its contents fully using the open_file tool. You never need to 'inspect' 'verify' or 'examine', just do the next step given the information you have.
+
+11) THE MOST IMPORTANT DIRECTIVE: YOU MUST VALIDATE PROJECT COMPLETION BY RUNNING ALL RELEVANT SCRIPTS, VERIFYING THEY PRODUCE THE CORRECT AND EXPECTED OUTPUTS (FILES, INFORMATION, DATA, ETC...), AND THAT THE PROJECT IS IMPLEMENTED EXACTLY AS THE OBJECTIVE STATES. BE VERY CRITICAL WHEN CONSIDERING USING THE TASK_COMPLETE TOOL. 

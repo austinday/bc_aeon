@@ -112,11 +112,11 @@ log_step "PHASE 7 complete: All FLUX.2-dev FP8 models downloaded."
 log_step "PHASE 4 complete."
 
 # =============================================================================
-# PHASE 5: Qwen3.5-397B-A17B-Q6_K GGUF (llama.cpp served)
+# PHASE 5: Qwen3.5-397B-A17B-IQ4_XS GGUF (llama.cpp served)
 # =============================================================================
 QWEN_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3.5-397B-A17B"
 
-log_step "PHASE 5: Download Qwen3.5-397B-A17B-Q6_K GGUF model shards"
+log_step "PHASE 5: Download Qwen3.5-397B-A17B-IQ4_XS GGUF model shards"
 mkdir -p "$QWEN_GGUF_DIR"
 
 # Write download script to temp file (avoids quoting hell in docker bash -c)
@@ -127,7 +127,7 @@ from huggingface_hub import hf_hub_download, list_repo_files
 
 REPO = "unsloth/Qwen3.5-397B-A17B-GGUF"
 TARGET = "/models"
-MODELS_TO_DOWNLOAD = ["Q5_K_S"]
+MODELS_TO_DOWNLOAD = ["IQ4_XS", "Q6_K"]
 
 print(f"Listing files in {REPO}...", flush=True)
 all_files = list_repo_files(REPO)
@@ -270,10 +270,10 @@ chown -R $(id -u):$(id -g) "$QWEN3_CODER_GGUF_DIR" 2>/dev/null || true
 log_step "PHASE 5.5 complete."
 
 # =============================================================================
-# PHASE 5.6: MiniMax-M2.5 GGUF — Q8_0 (llama.cpp served)
+# PHASE 5.6: MiniMax-M2.5-IQ4_XS GGUF (llama.cpp served)
 # =============================================================================
 MINIMAX_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/MiniMax-M2.5"
-log_step "PHASE 5.6: Download MiniMax-M2.5-Q8_0 GGUF model shards"
+log_step "PHASE 5.6: Download MiniMax-M2.5-IQ4_XS GGUF model shards"
 mkdir -p "$MINIMAX_GGUF_DIR"
 
 MINIMAX_DL_SCRIPT=$(mktemp /tmp/aeon_dl_minimax_XXXXXX.py)
@@ -283,7 +283,7 @@ from huggingface_hub import hf_hub_download, list_repo_files
 
 REPO = "unsloth/MiniMax-M2.5-GGUF"
 TARGET = "/models"
-PREFIXES = ["Q5_K_M"]
+PREFIX = "IQ4_XS"
 
 print(f"Listing files in {REPO}...", flush=True)
 try:
@@ -292,43 +292,42 @@ except Exception as e:
     print(f"Failed to list repo: {e}")
     sys.exit(1)
 
-for PREFIX in PREFIXES:
-    print(f"\nProcessing {PREFIX}...", flush=True)
-    shards = sorted([f for f in all_files if PREFIX in f and f.endswith(".gguf")])
-    print(f"Found {len(shards)} shard(s):", flush=True)
-    for s in shards:
-        print(f"  {s}", flush=True)
+print(f"\nProcessing {PREFIX}...", flush=True)
+shards = sorted([f for f in all_files if PREFIX in f and f.endswith(".gguf")])
+print(f"Found {len(shards)} shard(s):", flush=True)
+for s in shards:
+    print(f"  {s}", flush=True)
 
-    if not shards:
-        print(f"ERROR: No matching GGUF shards found in repo for {PREFIX}!", flush=True)
+if not shards:
+    print(f"ERROR: No matching GGUF shards found in repo for {PREFIX}!", flush=True)
+    sys.exit(1)
+
+all_done = True
+for i, shard in enumerate(shards, 1):
+    dest = os.path.join(TARGET, shard)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.exists(dest) and os.path.getsize(dest) > 100_000_000:
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
+        continue
+    all_done = False
+    print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
+    try:
+        hf_hub_download(
+            repo_id=REPO,
+            filename=shard,
+            local_dir=TARGET,
+        )
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"  Done: {sz:.1f}GB", flush=True)
+    except Exception as e:
+        print(f"Failed to download {shard}: {e}")
         sys.exit(1)
 
-    all_done = True
-    for i, shard in enumerate(shards, 1):
-        dest = os.path.join(TARGET, shard)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if os.path.exists(dest) and os.path.getsize(dest) > 100_000_000:
-            sz = os.path.getsize(dest) / (1024**3)
-            print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
-            continue
-        all_done = False
-        print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
-        try:
-            hf_hub_download(
-                repo_id=REPO,
-                filename=shard,
-                local_dir=TARGET,
-            )
-            sz = os.path.getsize(dest) / (1024**3)
-            print(f"  Done: {sz:.1f}GB", flush=True)
-        except Exception as e:
-            print(f"Failed to download {shard}: {e}")
-            sys.exit(1)
-
-    if all_done:
-        print(f"All {PREFIX} shards already present and valid.", flush=True)
-    else:
-        print(f"All {PREFIX} shards downloaded successfully.", flush=True)
+if all_done:
+    print(f"All {PREFIX} shards already present and valid.", flush=True)
+else:
+    print(f"All {PREFIX} shards downloaded successfully.", flush=True)
 PYEOF
 
 TTY_FLAG=""
@@ -352,6 +351,87 @@ chown -R $(id -u):$(id -g) "$MINIMAX_GGUF_DIR" 2>/dev/null || true
 log_step "PHASE 5.6 complete."
 
 # =============================================================================
+# PHASE 5.7: GLM-5-IQ4_XS GGUF (llama.cpp served)
+# =============================================================================
+GLM5_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/GLM-5"
+log_step "PHASE 5.7: Download GLM-5-IQ4_XS GGUF model shards"
+mkdir -p "$GLM5_GGUF_DIR"
+
+GLM5_DL_SCRIPT=$(mktemp /tmp/aeon_dl_glm5_XXXXXX.py)
+cat > "$GLM5_DL_SCRIPT" << 'PYEOF'
+import os, sys
+from huggingface_hub import hf_hub_download, list_repo_files
+
+REPO = "unsloth/GLM-5-GGUF"
+TARGET = "/models"
+PREFIX = "IQ4_XS"
+
+print(f"Listing files in {REPO}...", flush=True)
+try:
+    all_files = list_repo_files(REPO)
+except Exception as e:
+    print(f"Failed to list repo: {e}")
+    sys.exit(1)
+
+print(f"\nProcessing {PREFIX}...", flush=True)
+shards = sorted([f for f in all_files if PREFIX in f and f.endswith(".gguf")])
+print(f"Found {len(shards)} shard(s):", flush=True)
+for s in shards:
+    print(f"  {s}", flush=True)
+
+if not shards:
+    print(f"ERROR: No matching GGUF shards found in repo for {PREFIX}!", flush=True)
+    sys.exit(1)
+
+all_done = True
+for i, shard in enumerate(shards, 1):
+    dest = os.path.join(TARGET, shard)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.exists(dest) and os.path.getsize(dest) > 100_000_000:
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
+        continue
+    all_done = False
+    print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
+    try:
+        hf_hub_download(
+            repo_id=REPO,
+            filename=shard,
+            local_dir=TARGET,
+        )
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"  Done: {sz:.1f}GB", flush=True)
+    except Exception as e:
+        print(f"Failed to download {shard}: {e}")
+        sys.exit(1)
+
+if all_done:
+    print(f"All {PREFIX} shards already present and valid.", flush=True)
+else:
+    print(f"All {PREFIX} shards downloaded successfully.", flush=True)
+PYEOF
+
+TTY_FLAG=""
+if [ -t 0 ]; then TTY_FLAG="-t"; fi
+docker run --rm $TTY_FLAG \
+    -e HF_TOKEN="$HF_TOKEN" \
+    -e PYTHONUNBUFFERED=1 \
+    -v "$GLM5_GGUF_DIR:/models" \
+    -v "$GLM5_DL_SCRIPT:/download.py:ro" \
+    python:3.12-slim \
+    bash -c "pip install --no-cache-dir huggingface_hub && python3 /download.py"
+
+DL_EXIT=$?
+rm -f "$GLM5_DL_SCRIPT"
+if [[ $DL_EXIT -ne 0 ]]; then
+    log_step "ERROR: GLM-5 GGUF download failed (exit code $DL_EXIT)"
+    exit 1
+fi
+
+chown -R $(id -u):$(id -g) "$GLM5_GGUF_DIR" 2>/dev/null || true
+log_step "PHASE 5.7 complete."
+
+# =============================================================================
 # PHASE 6: Build llama.cpp server Docker image (for GGUF model serving)
 # =============================================================================
 log_step "PHASE 6: Build aeon_llamacpp:latest Docker image"
@@ -359,4 +439,4 @@ log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take
 docker build -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
 log_step "aeon_llamacpp:latest built successfully."
 
-log_step "Setup complete. Models in $MODEL_BASE/{clip,unet,vae,transformers}, $QWEN_GGUF_DIR, $MINIMAX_GGUF_DIR"
+log_step "Setup complete. Models in $MODEL_BASE/{clip,unet,vae,transformers}, $QWEN_GGUF_DIR, $MINIMAX_GGUF_DIR, $GLM5_GGUF_DIR"

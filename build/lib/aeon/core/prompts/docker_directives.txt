@@ -16,7 +16,7 @@
 
 4) PERSISTENCE: Always write outputs to a mounted volume -v host_dir:container_dir.
 
-5) GPU USAGE: Always use --gpus flag when running GPU workloads.
+5) GPU USAGE: Always use --gpus flag when running GPU workloads. Default to using gpu1 and avoid using -all. Check gpu usage before allocating memory to avoid a crash. 
 
 6) OWNERSHIP: Always use -u $(id -u):$(id -g) to match Host user. Avoids root output files.
 

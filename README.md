@@ -28,7 +28,11 @@ aeon --debug                # Enable LLM call logging to ~/aeon_debug_*.log
 ## Model Support
 
 - **Local (Ollama)**: Any model pulled into the Ollama brain node (GPU 0, port 8000)
-- **Local (llama.cpp)**: Qwen3.5-397B-A17B-MXFP4 GGUF (GPU 0 + RAM offload, port 8001)
+- **Local (llama.cpp)**:
+  - Qwen3.5-397B-A17B Q6_K (dual GPU + RAM spillover, port 8005)
+  - MiniMax-M2.5 Q8_0 (dual GPU + RAM spillover, port 8013, 200k ctx)
+  - GLM-5 IQ4_XS (dual GPU + RAM spillover, port 8011, 200k ctx)
+  - Qwen3-Coder-Next-Abliterated Q8_0 (single GPU, port 8007)
 - **Cloud**: Grok, Gemini (API keys in `~/grok_api_key.txt`, `~/gemini_api_key.txt`)
 
 Strong model (planner/reasoner) and weak model (summarizer/utility) are selected independently.

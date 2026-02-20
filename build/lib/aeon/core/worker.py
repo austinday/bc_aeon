@@ -51,6 +51,10 @@ class Worker:
         self.last_observation = "None."
         self.action_log = []  # Persistent factual record of attempts (intents + results)
         self.pending_iteration_state = None # Holds intent/actions while awaiting result
+        self._recent_commands = []  # Rolling window for loop detection
+        self._recent_outputs = []   # Corresponding outputs for loop detection
+        self.MAX_REPEAT_WINDOW = 5  # How many recent commands to track
+        self.REPEAT_THRESHOLD = 2   # How many identical commands before warning
 
         # Load directives from central prompts module
         self.base_directives = CORE_DIRECTIVES
@@ -166,6 +170,8 @@ class Worker:
         self.last_observation = initial_observation
         self.action_log.clear()
         self.pending_iteration_state = None
+        self._recent_commands.clear()
+        self._recent_outputs.clear()
 
     def _save_objective(self, objective: str):
         try:
@@ -275,6 +281,24 @@ END OPEN FILES
                 prompt = self._build_primary_agent_context(
                     tool_list_str, system_specs, memories_str, objective, open_files_str
                 )
+
+                # Context overflow warning
+                prompt_tokens = estimate_tokens(prompt)
+                ctx_limit = self.llm_client.context_limit
+                if prompt_tokens > ctx_limit * 0.85:
+                    pct = prompt_tokens / ctx_limit * 100
+                    self.print_func(f"{C_RED}WARNING: Prompt is ~{prompt_tokens} tokens ({pct:.0f}% of {ctx_limit} context limit). Close files or context will be truncated!{C_RESET}")
+                    if prompt_tokens > ctx_limit * 0.95:
+                        # Auto-close oldest files to recover space
+                        files_to_close = list(self.open_files.keys())
+                        if len(files_to_close) > 2:
+                            for f in files_to_close[:-2]:  # Keep last 2 files
+                                self.close_file(f)
+                                self.print_func(f"{C_YELLOW}Auto-closed '{f}' to free context space.{C_RESET}")
+                            open_files_str = self._format_open_files()
+                            prompt = self._build_primary_agent_context(
+                                tool_list_str, system_specs, memories_str, objective, open_files_str
+                            )
 
                 self.print_func("Thinking (Primary Agent)...")
 
@@ -468,6 +492,39 @@ END OPEN FILES
 
                 actions_list = ", ".join(actions_taken_str) if actions_taken_str else "none"
                 self.last_observation = f"Actions: [{actions_list}]\nOutput:\n{raw_output}"
+
+                # --- LOOP DETECTION ---
+                # Build a fingerprint of the commands executed this iteration
+                cmd_fingerprint = "|".join(actions_taken_str)
+                output_fingerprint = raw_output.strip()[:2000]  # First 2k chars for comparison
+                self._recent_commands.append(cmd_fingerprint)
+                self._recent_outputs.append(output_fingerprint)
+                # Keep only the rolling window
+                if len(self._recent_commands) > self.MAX_REPEAT_WINDOW:
+                    self._recent_commands.pop(0)
+                    self._recent_outputs.pop(0)
+                # Check for repeated identical command+output pairs
+                if len(self._recent_commands) >= self.REPEAT_THRESHOLD:
+                    recent_pairs = list(zip(self._recent_commands[-self.REPEAT_THRESHOLD:], self._recent_outputs[-self.REPEAT_THRESHOLD:]))
+                    if len(set(recent_pairs)) == 1:
+                        repeat_count = self.REPEAT_THRESHOLD
+                        # Count actual streak length
+                        for i in range(len(self._recent_commands) - 1, -1, -1):
+                            if (self._recent_commands[i], self._recent_outputs[i]) == recent_pairs[0]:
+                                repeat_count = len(self._recent_commands) - i
+                            else:
+                                break
+                        loop_warning = (
+                            f"\n\n** LOOP DETECTED: You have run the SAME command(s) {repeat_count} times in a row "
+                            f"and received IDENTICAL output each time. The situation is NOT changing. **\n"
+                            f"You MUST do something DIFFERENT now. Options:\n"
+                            f"- If you were waiting for a background process: it is NOT running or has finished. Move on.\n"
+                            f"- If a file/directory doesn't exist: create it, download it, or fix the script that should have created it.\n"
+                            f"- If you're stuck: pivot your approach, re-read your attempt log, or ask the user for help.\n"
+                            f"- DO NOT run the same command again."
+                        )
+                        self.last_observation += loop_warning
+                        self.print_func(f"{C_RED}{loop_warning}{C_RESET}")
                 
                 # Cache the pending iteration state to be finalized next iteration
                 self.pending_iteration_state = {

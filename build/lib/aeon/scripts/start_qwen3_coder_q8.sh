@@ -68,6 +68,8 @@ docker run -d \
     --batch-size ${BATCH_SIZE} \
     --threads ${PHYSICAL_CORES} \
     --flash-attn on \
+    --cache-type-k q8_0 \
+    --cache-type-v q8_0 \
     --host 0.0.0.0 \
     --port 8001 \
     --metrics \

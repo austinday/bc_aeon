@@ -89,5 +89,8 @@ RUN mkdir -p /opt/ComfyUI/user/default && \
 
 EXPOSE 8188
 
+# Ensure main.py is executable (fixes Permission denied error)
+RUN chmod +x /opt/ComfyUI/main.py
+
 # API-only mode (no browser UI needed for agent usage)
-CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188", "--disable-auto-launch"]
+CMD ["python3", "/opt/ComfyUI/main.py", "--listen", "0.0.0.0", "--port", "8188", "--disable-auto-launch"]

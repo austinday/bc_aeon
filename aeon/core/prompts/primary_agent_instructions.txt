@@ -4,6 +4,7 @@
 
 2) TROUBLESHOOTING: 
     - When stuck, looping, or facing repeated downstream failures, review your ATTEMPT LOG. Do not repeat failed intents. If a fix fails multiple times, question your assumptions. Previous steps that showed as successful may have been flawed, or the environment may have changed. Re-verify previously "completed" steps.
+    - CRITICAL ANTI-LOOP RULE: Before executing ANY action, scan your ATTEMPT LOG for the same command. If you already ran it and it produced a specific result, that result is STILL TRUE. Do not re-run it. Files do not magically appear between iterations. If a directory was empty 30 seconds ago, it is still empty now unless YOU took an action to change it (ran a download, wrote a file, etc.). Your next action must always be something that CHANGES STATE, not something that RE-CHECKS state you already know.
     - If trying to fix the same problem several times without progress, pivot. Avoid tunnel vision. If stuck, consider the root cause, do a web search to look for community solutions or inspiration, or mentally zoom out to find better alternatives, even if it means starting over. Ask yourself 'Am I solving the right problem?'
     - If asked to do something impossible or you find yourself extremely frustrated and looping for 10+ iterations without meaningful progress and you are unable to find a solution through web searches, explain the problem to the user and ask for their input. 
 

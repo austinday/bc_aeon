@@ -48,44 +48,44 @@ CLOUD_MODELS = [
 # =============================================================================
 LLAMACPP_MODELS = [
     {
-        'model': 'Qwen3.5-397B-A17B-MXFP4-DualGPU',
-        'label': 'Smart Slow: Qwen3.5-397B (MXFP4) | Req: 2 GPUs + System RAM, 128k ctx | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8003/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_qwen397b_dual',
-        'start_script': 'start_qwen397b_dual.sh',
-        'health_port': 8003,
-    },
-    {
-        'model': 'Qwen3.5-397B-A17B-UD-Q3_K_XL-DualGPU',
-        'label': 'Smart Fast: Qwen3.5-397B (UD-Q3_K_XL) | Req: 2 GPUs (no RAM offload), 128k ctx | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8004/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_qwen397b_ud_q3_dual',
-        'start_script': 'start_qwen397b_ud_q3_dual.sh',
-        'health_port': 8004,
-    },
-    {
-        'model': 'Qwen3.5-397B-A17B-Q6_K',
-        'label': 'Smart Builder: Qwen3.5-397B (Q6_K) | Req: 1 GPU + System RAM, 128k ctx | Local/llama.cpp',
+        'model': 'Qwen3.5-397B-A17B-IQ4_XS',
+        'label': 'Qwen3.5-397B MoE (IQ4_XS) MAX | Both GPUs full, ~5-8 t/s, 128k ctx | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8005/v1',
         'context_limit': 131072,
-        'container_name': 'aeon_qwen397b_q6_single',
-        'start_script': 'start_qwen397b_q6_single.sh',
+        'container_name': 'aeon_qwen397b',
+        'start_script': 'start_qwen397b_max.sh',
         'health_port': 8005,
     },
     {
-        'model': 'Qwen3.5-397B-A17B-UD-TQ1_0',
-        'label': 'Fast Builder: Qwen3.5-397B (UD-TQ1_0) | Req: 1 GPU (no RAM offload), 128k ctx | Local/llama.cpp',
+        'model': 'Qwen3.5-397B-A17B-IQ4_XS',
+        'label': 'Qwen3.5-397B MoE (IQ4_XS) MEDIUM | GPU1 24GB free, ~4-6 t/s, 128k ctx | Local/llama.cpp',
         'provider': 'llamacpp',
-        'base_url': 'http://localhost:8006/v1',
+        'base_url': 'http://localhost:8005/v1',
         'context_limit': 131072,
-        'container_name': 'aeon_qwen397b_ud_tq1_single',
-        'start_script': 'start_qwen397b_ud_tq1_single.sh',
-        'health_port': 8006,
+        'container_name': 'aeon_qwen397b',
+        'start_script': 'start_qwen397b_medium.sh',
+        'health_port': 8005,
+    },
+    {
+        'model': 'Qwen3.5-397B-A17B-IQ4_XS',
+        'label': 'Qwen3.5-397B MoE (IQ4_XS) LIGHT | GPU1 48GB free, ~3-5 t/s, 128k ctx | Local/llama.cpp',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8005/v1',
+        'context_limit': 131072,
+        'container_name': 'aeon_qwen397b',
+        'start_script': 'start_qwen397b_light.sh',
+        'health_port': 8005,
+    },
+    {
+        'model': 'MiniMax-M2.5-Q5_K_M',
+        'label': 'MiniMax-M2.5 MoE (Q5_K_M) | Req: GPU0 full + GPU1 partial, all on GPU, 128k ctx | Not Abliterated | Local/llama.cpp',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8013/v1',
+        'context_limit': 131072,
+        'container_name': 'aeon_minimax_m25',
+        'start_script': 'start_minimax_m25_q8.sh',
+        'health_port': 8013,
     },
     {
         'model': 'Qwen3-Coder-Next-Abliterated-Q8_0',
@@ -531,8 +531,9 @@ class SessionManager:
 def cli():
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true', help='Enable detailed LLM call logging to ~/')
-    parser.add_argument('--strong', type=str, help='Model name for Strong Node (Planner) - skips menu')
-    parser.add_argument('--weak', type=str, help='Model name for Weak Node (Executor) - skips menu')
+    parser.add_argument('--strong', type=str, dest='model', help='Model name - skips menu')
+    parser.add_argument('--model', type=str, help='Model name - skips menu (alias for --strong)')
+    parser.add_argument('--weak', type=str, help=argparse.SUPPRESS)
     parser.add_argument('--start', type=str, help='Initial objective to start immediately')
     parser.add_argument('--no-warmup', action='store_true', help='Skip model warmup (faster startup, slower first query)')
     args = parser.parse_args()
@@ -553,27 +554,20 @@ def cli():
     # --- Build unified model menu (local + cloud) ---
     menu = build_model_menu(local_models)
 
-    # --- Select Strong model ---
-    if args.strong:
-        strong_config = find_model_config(args.strong, menu)
+    # --- Select model (used for both planning and utility tasks) ---
+    model_name = args.model or args.weak  # --weak kept for backward compat
+    if model_name:
+        strong_config = find_model_config(model_name, menu)
         if not strong_config:
-            print(f"[ERROR] Model '{args.strong}' not found.")
-            print(f"  Available: {[e['model'] for e in menu]}")
+            print(f"[ERROR] Model '{model_name}' not found.")
+            print(f"  Available: {[e['model'] for e in menu if not e.get('is_header')]}")
             sys.exit(1)
     else:
-        strong_config = select_model(menu, 'Select Strong Model (Planner)')
+        strong_config = select_model(menu, 'Select Model')
 
-    # --- Select Weak model ---
-    if args.weak:
-        weak_config = find_model_config(args.weak, menu)
-        if not weak_config:
-            print(f"[ERROR] Model '{args.weak}' not found.")
-            print(f"  Available: {[e['model'] for e in menu]}")
-            sys.exit(1)
-    else:
-        weak_config = select_model(menu, 'Select Weak Model (Executor)')
+    weak_config = strong_config
 
-    print(f"[CONFIG] Strong: {strong_config['model']} ({strong_config['provider']}) | Weak: {weak_config['model']} ({weak_config['provider']})")
+    print(f"[CONFIG] Model: {strong_config['model']} ({strong_config['provider']})")
 
     session = SessionManager()
     session.enter(strong_config=strong_config, weak_config=weak_config, skip_warmup=args.no_warmup)
@@ -585,9 +579,8 @@ def cli():
         tools = load_tools_from_directory("aeon.tools", dependencies=deps)
         worker.register_tools(tools)
 
-        s_prov = strong_config['provider'].upper()
-        w_prov = weak_config['provider'].upper()
-        print(f"\nAeon Ready (Strong: {strong_config['model']} [{s_prov}], Weak: {weak_config['model']} [{w_prov}], Debug: {args.debug})")
+        prov = strong_config['provider'].upper()
+        print(f"\nAeon Ready (Model: {strong_config['model']} [{prov}], Debug: {args.debug})")
         
         if args.start:
             worker.run(args.start)
