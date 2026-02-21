@@ -14,6 +14,18 @@ MODEL_REGISTRY_LOCK_PATH = "/tmp/aeon_model_registry.lock"
 # =============================================================================
 CLOUD_MODELS = [
     {
+        'model': 'gemini-3.1-pro',
+        'provider': 'vertex',
+        'project_id': 'trout-cricket-9761108088181001',
+        'context_limit': 2000000,
+    },
+    {
+        'model': 'gemini-3.1-pro',
+        'provider': 'vertex',
+        'project_id': 'ai-ml-355015',
+        'context_limit': 2000000,
+    },
+    {
         'model': 'grok-4-1-fast-reasoning',
         'provider': 'grok',
         'api_key_file': 'grok_api_key.txt',
@@ -155,8 +167,8 @@ def warm_up_models(local_model_names):
 def cleanup_transient_tools():
     print("[SYSTEM] Cleaning up transient tool containers...")
     try:
-        subprocess.run("docker ps -a -q --filter 'name=aeon_research' --filter 'name=aeon_vision' --filter 'name=aeon_comfyui' | xargs -r docker rm -f", 
-                        shell=True, stderr=subprocess.DEVNULL, timeout=5)
+        subprocess.run("docker ps -a -q --filter 'name=aeon_research' --filter 'name=aeon_vision' | xargs -r docker rm -f", 
+                       shell=True, stderr=subprocess.DEVNULL, timeout=5)
     except Exception as e:
         print(f"[WARN] Cleanup timed out or failed: {e}")
 
@@ -349,10 +361,20 @@ def build_model_menu(local_models):
         entries.append(entry)
 
     entries.append({'label': '--- API Models ---', 'is_header': True})
+    vertex_models = []
     for cm in CLOUD_MODELS:
         entry = dict(cm)
-        entry['label'] = f"{cm['model']} | Req: Internet | Unrestricted status depends on API | API/Cloud"
-        entries.append(entry)
+        if cm.get('provider') == 'vertex':
+            entry['label'] = f"Vertex AI - Gemini 3.1 Pro (Billing: {cm['project_id']})"
+            vertex_models.append(entry)
+        else:
+            entry['label'] = f"{cm['model']} | Req: Internet | Unrestricted status depends on API | API/Cloud"
+            entries.append(entry)
+    
+    if vertex_models:
+        entries.append({'label': '--- Vertex AI Models ---', 'is_header': True})
+        entries.extend(vertex_models)
+        
     return entries
 
 def select_model(menu_entries, label):

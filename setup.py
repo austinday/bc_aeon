@@ -19,8 +19,6 @@ setup(
             "scripts/*.py",
             "services/*.yml",
             "core/prompts/*.txt",
-            "comfyui/profiles/*.json",
-            "comfyui/workflows/*.json",
         ]
     },
     install_requires=[

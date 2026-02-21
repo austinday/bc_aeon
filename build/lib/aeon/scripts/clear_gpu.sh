@@ -2,9 +2,8 @@
 # Hard reset for GPU memory. 
 # Restarts Ollama containers (instant VRAM flush) and kills vLLM.
 
-echo "[1/4] Stopping transient tools (vLLM, ComfyUI)..."
+echo "[1/4] Stopping transient tools (vLLM)..."
 docker rm -f aeon_vllm >/dev/null 2>&1 || true
-docker rm -f aeon_comfyui >/dev/null 2>&1 || true
 
 echo "[2/4] Restarting Brain Node (Ollama)..."
 # We use restart because 'keep_alive=0' API calls can sometimes fail if the model is stuck generating.

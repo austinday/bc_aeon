@@ -3,7 +3,6 @@
 set -euo pipefail
 
 PROJECT_ROOT="/home/aday/bc_aeon"
-MODEL_BASE="$PROJECT_ROOT/aeon_models/comfyui_models"
 HF_TOKEN_FILE="/home/aday/huggingface_access_token.txt"
 
 log_step() {
@@ -22,21 +21,15 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
     exit 1
 fi
 
-log_step "PHASE 1: Create model directories (idempotent)"
-mkdir -p "$MODEL_BASE"/{clip,unet,vae,transformers}
-
-log_step "PHASE 2: Build Docker images (layer cache makes unchanged builds fast)"
+log_step "PHASE 1: Build Docker images (layer cache makes unchanged builds fast)"
 
 # Stop any running containers that depend on these images
-for cname in aeon_comfyui aeon_qwen397b; do
+for cname in aeon_qwen397b; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
         log_step "Stopping stale container: $cname"
         docker rm -f "$cname" >/dev/null 2>&1 || true
     fi
 done
-
-log_step "Building aeon/comfyui:latest..."
-docker build -t aeon/comfyui:latest -f "$PROJECT_ROOT/aeon/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/comfyui/"
 
 if ! docker image inspect aeon_downloader:latest >/dev/null 2>&1; then
     log_step "Building aeon_downloader:latest..."
@@ -51,69 +44,6 @@ EOF
 else
     log_step "aeon_downloader:latest image already exists, skipping build."
 fi
-
-log_step "PHASE 4: Download Flux Dev FP8 models (idempotent, requires HF_TOKEN)"
-
-# Function to download model idempotently
-download_model() {
-    local model_id="$1"
-    local local_path="$2"
-    local filename="$3"
-
-    if [[ -f "$MODEL_BASE/$local_path/$filename" ]]; then
-        log_step "Model $filename already exists, skipping."
-        return
-    fi
-
-    log_step "Downloading $filename from $model_id..."
-
-    docker run --rm \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -v "$MODEL_BASE:/models" \
-        aeon_downloader:latest \
-        python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id=\"$model_id\", local_dir=\"/models/$local_path\", local_dir_use_symlinks=False, resume_download=True)"
-
-    chown -R $(id -u):$(id -g) "$MODEL_BASE/$local_path" || true
-}
-
-# clip_l
-log_step "Downloading clip_l.safetensors..."
-download_model "comfyanonymous/flux_text_encoders" "clip" "clip_l.safetensors"
-
-# Flux1-dev FP8 unet
-log_step "Downloading flux1-dev unet FP8..."
-download_model "Kijai/flux-fp8" "unet" "flux1-dev-fp8.safetensors"
-
-# VAE ae.safetensors
-log_step "Downloading ae.safetensors VAE..."
-download_model "black-forest-labs/FLUX.1-dev" "vae" "ae.safetensors"
-
-log_step "PHASE 4 complete: All Flux Dev FP8 models downloaded."
-
-# =============================================================================
-# PHASE 7: FLUX.2-dev FP8 models (for FLUX.2 image generation tools)
-# =============================================================================
-log_step "PHASE 7: Download FLUX.2-dev FP8 models"
-
-# FLUX.2-dev FP8 diffusion model (pi-Flow LoRA enabled)
-log_step "Downloading flux2_dev_fp8mixed.safetensors (FLUX.2-dev FP8)..."
-download_model "Kijai/flux-fp8" "flux2" "flux2_dev_fp8mixed.safetensors"
-
-# FLUX.2 VAE
-log_step "Downloading flux2-vae.safetensors..."
-download_model "black-forest-labs/FLUX.2-dev" "flux2/vae" "flux2-vae.safetensors"
-
-# FLUX.2 text encoders (CLIP)
-log_step "Downloading mistral_3_small_flux2_fp8.safetensors (CLIP)..."
-download_model "Kijai/flux-fp8" "flux2/text_encoders" "mistral_3_small_flux2_fp8.safetensors"
-
-# FLUX.2 pi-Flow LoRA adapter
-log_step "Downloading gmflux2_k8_piid_4step.safetensors (pi-Flow LoRA)..."
-download_model "Kijai/flux-fp8" "flux2/adapters" "gmflux2_k8_piid_4step.safetensors"
-
-log_step "PHASE 7 complete: All FLUX.2-dev FP8 models downloaded."
-
-log_step "PHASE 4 complete."
 
 # =============================================================================
 # PHASE 5: Qwen3.5-397B-A17B-Q6_K GGUF (llama.cpp served)
@@ -376,4 +306,4 @@ log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take
 docker build -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
 log_step "aeon_llamacpp:latest built successfully."
 
-log_step "Setup complete. Models in $MODEL_BASE/{clip,unet,vae,transformers}, $QWEN_GGUF_DIR, $MINIMAX_GGUF_DIR"
+log_step "Setup complete. Models in $QWEN_GGUF_DIR, $MINIMAX_GGUF_DIR"

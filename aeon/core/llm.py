@@ -5,6 +5,8 @@ import pathlib
 import sys
 import json
 import re
+import subprocess
+import requests
 from datetime import datetime
 from typing import Dict, Optional
 sys.setrecursionlimit(2000)
@@ -20,6 +22,89 @@ from .prompts import (
 # ANSI Colors for debug printing
 C_YELLOW = '\033[93m'
 C_RESET = '\033[0m'
+
+class VertexAIClient:
+    def __init__(self, project_id, model_id):
+        self.project_id = project_id
+        self.model_id = model_id
+        self.chat = self.Chat(self)
+        self._cached_token = None
+        self._token_expiry = 0
+
+    def get_access_token(self):
+        if self._cached_token and time.time() < self._token_expiry - 300:
+            return self._cached_token
+        try:
+            token = subprocess.check_output(['gcloud', 'auth', 'print-access-token'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+            self._cached_token = token
+            self._token_expiry = time.time() + 3600
+            return token
+        except subprocess.CalledProcessError:
+            print(f'\n{C_YELLOW}Error: Failed to get access token via gcloud.{C_RESET}')
+            print(f'{C_YELLOW}Please authenticate by running: gcloud auth login{C_RESET}')
+            sys.exit(1)
+
+    class Chat:
+        def __init__(self, parent):
+            self.parent = parent
+            self.completions = self.Completions(parent)
+
+        class Completions:
+            def __init__(self, parent):
+                self.parent = parent
+
+            def create(self, model, messages, temperature=0.7, response_format=None):
+                contents = []
+                system_prompt = None
+                for msg in messages:
+                    if msg['role'] == 'system':
+                        system_prompt = msg['content']
+                    else:
+                        role = 'user' if msg['role'] == 'user' else 'model'
+                        contents.append({'role': role, 'parts': [{'text': msg['content']}]})
+                
+                url = f'https://aiplatform.googleapis.com/v1/projects/{self.parent.project_id}/locations/global/publishers/google/models/{self.parent.model_id}:generateContent'
+                headers = {
+                    'Authorization': f'Bearer {self.parent.get_access_token()}',
+                    'Content-Type': 'application/json'
+                }
+                
+                data = {
+                    'contents': contents,
+                    'generationConfig': {'temperature': temperature, 'maxOutputTokens': 8192},
+                    'safetySettings': [
+                        {'category': 'HARM_CATEGORY_HATE_SPEECH', 'threshold': 'OFF'},
+                        {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'OFF'}
+                    ]
+                }
+                if response_format and response_format.get('type') == 'json_object':
+                    data['generationConfig']['responseMimeType'] = 'application/json'
+                    
+                if system_prompt:
+                    data['systemInstruction'] = {
+                        'parts': [{'text': system_prompt}]
+                    }
+                    
+                response = requests.post(url, headers=headers, json=data)
+                if response.status_code != 200:
+                    raise Exception(f'Vertex AI API Error {response.status_code}: {response.text}')
+                
+                resp_json = response.json()
+                try:
+                    text = resp_json['candidates'][0]['content']['parts'][0]['text']
+                except (KeyError, IndexError):
+                    text = ''
+                
+                # Mock response object to match expected OpenAI schema
+                class MockChoice:
+                    def __init__(self, text):
+                        self.message = type('MockMessage', (), {'content': text})()
+                class MockResponse:
+                    def __init__(self, text):
+                        self.choices = [MockChoice(text)]
+                        self.usage = type('MockUsage', (), {'completion_tokens': len(text)//4})()
+                        
+                return MockResponse(text)
 
 class LLMClient:
     """A client for interacting with Large Language Models (Cloud or Local).
@@ -57,6 +142,8 @@ class LLMClient:
             return openai.OpenAI(base_url='http://localhost:8000/v1', api_key='ollama')
         elif config['provider'] == 'llamacpp':
             return openai.OpenAI(base_url=config['base_url'], api_key='no-key-needed')
+        elif config['provider'] == 'vertex':
+            return VertexAIClient(config['project_id'], config['model'])
         else:
             api_key_path = pathlib.Path.home() / config['api_key_file']
             if not api_key_path.exists():
