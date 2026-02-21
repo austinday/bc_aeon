@@ -3,8 +3,8 @@
 # Start llama.cpp server for Qwen3.5-397B-A17B IQ4_XS (or Q5_K_S fallback)
 #
 # GPU MODES (set via QWEN_MODE env var):
-#   max    - Both GPUs full, ~87% on GPU, fastest (~5-8 t/s)
-#   medium - GPU0 full + GPU1 leaves 24GB free (~75% on GPU, ~4-6 t/s)
+#   max    - Both GPUs full, ~87% on GPU, fastest (~9 t/s)
+#   medium - GPU0 full + GPU1 leaves 24GB free (~75% on GPU, ~6 t/s)
 #   light  - GPU0 full + GPU1 leaves 48GB free (~64% on GPU, ~3-5 t/s)
 #
 # Usage: QWEN_MODE=max bash start_qwen397b_q6k.sh
@@ -27,21 +27,21 @@ case "$MODE" in
         N_GPU_LAYERS=${NGL:-55}
         TENSOR_SPLIT=${TSPLIT:-48,52}
         CTX_SIZE=${CTX:-131072}
-        echo "[Qwen397B] Mode: MAX (both GPUs full, 128k ctx, ~4-6 t/s)"
+        echo "[Qwen397B] Mode: MAX (both GPUs full, 128k ctx, ~9 t/s)"
         ;;
     medium)
         # GPU0 full, GPU1 leaves ~24GB free for light tools
         # Budget: GPU0 ~82GB, GPU1 ~67GB (29GB free)
-        N_GPU_LAYERS=${NGL:-48}
-        TENSOR_SPLIT=${TSPLIT:-54,46}
+        N_GPU_LAYERS=${NGL:-49}
+        TENSOR_SPLIT=${TSPLIT:-55,45}
         CTX_SIZE=${CTX:-131072}
-        echo "[Qwen397B] Mode: MEDIUM (GPU1 leaves ~28GB free, 128k ctx, ~3-5 t/s)"
+        echo "[Qwen397B] Mode: MEDIUM (GPU1 leaves ~28GB free, 128k ctx, ~6 t/s)"
         ;;
     light)
         # GPU0 full, GPU1 leaves ~48GB free for ComfyUI/heavy tools
         # Budget: GPU0 ~84GB, GPU1 ~45GB (51GB free)
-        N_GPU_LAYERS=${NGL:-40}
-        TENSOR_SPLIT=${TSPLIT:-64,36}
+        N_GPU_LAYERS=${NGL:-41}
+        TENSOR_SPLIT=${TSPLIT:-65,35}
         CTX_SIZE=${CTX:-131072}
         echo "[Qwen397B] Mode: LIGHT (GPU1 leaves ~48GB free, 128k ctx, ~2.5-4 t/s)"
         ;;

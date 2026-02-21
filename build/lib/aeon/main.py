@@ -49,7 +49,7 @@ CLOUD_MODELS = [
 LLAMACPP_MODELS = [
     {
         'model': 'Qwen3.5-397B-A17B-IQ4_XS',
-        'label': 'Qwen3.5-397B MoE (IQ4_XS) MAX | Both GPUs full, ~5-8 t/s, 128k ctx | Local/llama.cpp',
+        'label': 'Qwen3.5-397B MoE (IQ4_XS) MAX | Both GPUs full, ~9 t/s, 128k ctx | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8005/v1',
         'context_limit': 131072,
@@ -59,7 +59,7 @@ LLAMACPP_MODELS = [
     },
     {
         'model': 'Qwen3.5-397B-A17B-IQ4_XS',
-        'label': 'Qwen3.5-397B MoE (IQ4_XS) MEDIUM | GPU1 24GB free, ~4-6 t/s, 128k ctx | Local/llama.cpp',
+        'label': 'Qwen3.5-397B MoE (IQ4_XS) MEDIUM | GPU1 24GB free, ~6 t/s, 128k ctx | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8005/v1',
         'context_limit': 131072,
@@ -89,10 +89,10 @@ LLAMACPP_MODELS = [
     },
     {
         'model': 'Qwen3-Coder-Next-Abliterated-Q8_0',
-        'label': 'Qwen3-Coder-Next (Q8_0) | Req: One GPU0, no CPU offload, 128k ctx | Abliterated | Local/llama.cpp',
+        'label': 'Qwen3-Coder-Next (Q8_0) | Req: One GPU0, no CPU offload, 256k ctx | Abliterated | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8007/v1',
-        'context_limit': 131072,
+        'context_limit': 262144,
         'container_name': 'aeon_qwen3_coder_q8',
         'start_script': 'start_qwen3_coder_q8.sh',
         'health_port': 8007,

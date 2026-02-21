@@ -76,7 +76,7 @@ docker run -d \
     --parallel ${PARALLEL_SLOTS} \
     --ctx-size ${CTX_SIZE} \
     --batch-size ${BATCH_SIZE} \
-    --threads 5 \
+    --threads ${PHYSICAL_CORES} \
     --flash-attn on \
     --cache-type-k q8_0 \
     --cache-type-v q8_0 \
