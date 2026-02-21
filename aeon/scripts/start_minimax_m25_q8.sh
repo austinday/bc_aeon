@@ -12,12 +12,12 @@ PORT=8013
 MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/MiniMax-M2.5"
 
 # Tunable parameters
-N_GPU_LAYERS=${NGL:-60}          # Most layers on GPU, slight CPU spillover for safety
+N_GPU_LAYERS=${NGL:-50}          # Fewer layers on GPU to leave VRAM headroom for 128k KV cache
 PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot maximizes VRAM for model layers
-CTX_SIZE=${CTX:-131072}          # 128k context (q8 KV cache keeps VRAM manageable)
+CTX_SIZE=${CTX:-131072}          # 128k context (q8 KV cache)
 BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
-# tensor-split ratio: GPU0 maxed, GPU1 gets remainder
-TENSOR_SPLIT=${TSPLIT:-92,70}
+# tensor-split ratio: balanced to leave KV cache room on both GPUs
+TENSOR_SPLIT=${TSPLIT:-54,46}
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
 
@@ -63,6 +63,8 @@ docker run -d \
     -v "${MODELS_DIR}:/models:ro" \
     --shm-size=16g \
     --ulimit memlock=-1 \
+    --memory="200g" \
+    --memory-swap="200g" \
     $IMAGE_NAME \
     --model "/models/${MODEL_FILE}" \
     --split-mode layer \
