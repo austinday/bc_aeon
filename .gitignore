@@ -24,3 +24,4 @@ data/
 
 # System
 .DS_Store
+.previous_objective.txt
