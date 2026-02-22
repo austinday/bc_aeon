@@ -90,8 +90,8 @@ LLAMACPP_MODELS = [
         'health_port': 8005,
     },
     {
-        'model': 'MiniMax-M2.5-Q5_K_M',
-        'label': 'MiniMax-M2.5 MoE (Q5_K_M) | Req: GPU0 full + GPU1 partial, all on GPU, 128k ctx | Not Abliterated | Local/llama.cpp',
+        'model': 'MiniMax-M2.5-Q5_K_S',
+        'label': 'MiniMax-M2.5 MoE (Q5_K_S) | Req: GPU0 full + GPU1 partial, all on GPU, 128k ctx | Not Abliterated | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8013/v1',
         'context_limit': 131072,

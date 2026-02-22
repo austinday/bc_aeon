@@ -212,10 +212,10 @@ chown -R $(id -u):$(id -g) "$QWEN3_CODER_GGUF_DIR" 2>/dev/null || true
 log_step "PHASE 5.5 complete."
 
 # =============================================================================
-# PHASE 5.6: MiniMax-M2.5 GGUF — Q8_0 (llama.cpp served)
+# PHASE 5.6: MiniMax-M2.5 GGUF — Q5_K_S (llama.cpp served)
 # =============================================================================
 MINIMAX_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/MiniMax-M2.5"
-log_step "PHASE 5.6: Download MiniMax-M2.5-Q8_0 GGUF model shards"
+log_step "PHASE 5.6: Download MiniMax-M2.5-Q5_K_S GGUF model shards"
 mkdir -p "$MINIMAX_GGUF_DIR"
 
 if [[ -f "$MINIMAX_GGUF_DIR/.download_complete" ]]; then
@@ -228,7 +228,7 @@ from huggingface_hub import hf_hub_download, list_repo_files
 
 REPO = "unsloth/MiniMax-M2.5-GGUF"
 TARGET = "/models"
-PREFIXES = ["Q5_K_M"]
+PREFIXES = ["Q5_K_S"]
 
 print(f"Listing files in {REPO}...", flush=True)
 try:
@@ -306,4 +306,61 @@ log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take
 docker build -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
 log_step "aeon_llamacpp:latest built successfully."
 
-log_step "Setup complete. Models in $QWEN_GGUF_DIR, $MINIMAX_GGUF_DIR"
+# Build ComfyUI Docker image (for FLUX image generation tool)
+log_step "PHASE 6b: Build aeon_comfyui:latest Docker image"
+log_step "Building aeon_comfyui:latest (installs PyTorch + ComfyUI + GGUF plugin, may take 5-10 min on first build)..."
+docker build -t aeon_comfyui:latest -f "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
+log_step "aeon_comfyui:latest built successfully."
+
+# =============================================================================
+# PHASE 7: ComfyUI Models (FLUX)
+# =============================================================================
+COMFY_MODELS_DIR="$PROJECT_ROOT/aeon_models/comfyui"
+log_step "PHASE 7: Download FLUX GGUF models and encoders for ComfyUI"
+mkdir -p "$COMFY_MODELS_DIR/unet"
+mkdir -p "$COMFY_MODELS_DIR/text_encoders"
+mkdir -p "$COMFY_MODELS_DIR/vae"
+
+if [[ -f "$COMFY_MODELS_DIR/.download_complete" ]]; then
+    log_step "FLUX models already downloaded, skipping."
+else
+    FLUX_DL_SCRIPT=$(mktemp /tmp/aeon_dl_flux_XXXXXX.py)
+    cat > "$FLUX_DL_SCRIPT" << 'PYEOF'
+import os, sys
+from huggingface_hub import hf_hub_download
+
+print('Downloading Flux 2 Dev UNet GGUF...', flush=True)
+hf_hub_download(repo_id='unsloth/FLUX.2-dev-GGUF', filename='flux2-dev-Q8_0.gguf', local_dir='/models/unet')
+
+print('Downloading Flux 2 VAE...', flush=True)
+hf_hub_download(repo_id='Comfy-Org/flux2-dev', filename='vae/flux2-vae.safetensors', local_dir='/models')
+
+print('Downloading FLUX.2 Mistral text encoder...', flush=True)
+hf_hub_download(repo_id='Comfy-Org/flux2-dev', filename='text_encoders/mistral_3_small_flux2_bf16.safetensors', local_dir='/models')
+
+print('Downloads complete!', flush=True)
+PYEOF
+
+    TTY_FLAG=""
+    if [ -t 0 ]; then TTY_FLAG="-t"; fi
+    docker run --rm $TTY_FLAG \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$COMFY_MODELS_DIR:/models" \
+        -v "$FLUX_DL_SCRIPT:/download.py:ro" \
+        aeon_downloader:latest \
+        python3 /download.py
+
+    DL_EXIT=$?
+    rm -f "$FLUX_DL_SCRIPT"
+    if [[ $DL_EXIT -ne 0 ]]; then
+        log_step "ERROR: FLUX download failed (exit code $DL_EXIT)"
+        exit 1
+    fi
+
+    touch "$COMFY_MODELS_DIR/.download_complete"
+fi
+chown -R $(id -u):$(id -g) "$COMFY_MODELS_DIR" 2>/dev/null || true
+log_step "PHASE 7 complete."
+
+log_step "Setup complete. Models in $QWEN_GGUF_DIR, $MINIMAX_GGUF_DIR, $COMFY_MODELS_DIR"

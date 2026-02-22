@@ -1,0 +1,7 @@
+Generates a high-quality image using the FLUX.2/1 GGUF model via a local ComfyUI API and saves it to a specified file path.
+Schema:
+  prompt (str, required): The detailed description of the image to generate.
+  output_path (str, required): The absolute or relative file path where the resulting image should be saved (e.g., './output/hero_image.png').
+  width (int, optional, default=1024): The width of the generated image.
+  height (int, optional, default=1024): The height of the generated image.
+Example: {"tool_name": "generate_image", "parameters": {"prompt": "A futuristic city skyline at sunset, cyberpunk style", "output_path": "assets/city.png", "width": 1024, "height": 512}}

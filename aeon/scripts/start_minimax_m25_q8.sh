@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Start llama.cpp server for MiniMax-M2.5-Q5_K_M GGUF
+# Start llama.cpp server for MiniMax-M2.5-Q5_K_S GGUF
 # Fits entirely on dual GPU (no CPU spillover)
 # GPU0 maxed (~92GB), GPU1 gets remainder (~70GB)
 # =============================================================================
@@ -20,21 +20,21 @@ PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot maximizes VRAM for model layers
 CTX_SIZE=${CTX:-131072}          # 128k context (q8 KV cache) - ~10.4GB KV fits with 54/46 tensor split
 BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
 # tensor-split: max out GPU0, GPU1 gets remainder + KV cache headroom
-TENSOR_SPLIT=${TSPLIT:-45,40}
+TENSOR_SPLIT=${TSPLIT:-46,39}
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
 
-MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "Q5_K_M" | sort | head -1 | sed 's|^\./||')
+MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "Q5_K_S" | sort | head -1 | sed 's|^\./||')
 if [ -z "$MODEL_FILE" ]; then
-    echo "[MiniMax-M2.5-Q5KM] ERROR: No .gguf files matching Q5_K_M found in ${MODELS_DIR}"
+    echo "[MiniMax-M2.5-Q5KS] ERROR: No .gguf files matching Q5_K_S found in ${MODELS_DIR}"
     exit 1
 fi
 
-echo "[MiniMax-M2.5-Q5KM] Using model file: ${MODEL_FILE}"
-echo "[MiniMax-M2.5-Q5KM] Checking for existing container..."
+echo "[MiniMax-M2.5-Q5KS] Using model file: ${MODEL_FILE}"
+echo "[MiniMax-M2.5-Q5KS] Checking for existing container..."
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "[MiniMax-M2.5-Q5KM] Container already running. Checking health..."
+        echo "[MiniMax-M2.5-Q5KS] Container already running. Checking health..."
         count=0
         while true; do
             HC=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null || echo "000")
@@ -42,22 +42,22 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
             sleep 2
             count=$((count+1))
             if [ $count -ge 10 ]; then
-                echo "[MiniMax-M2.5-Q5KM] Running but unhealthy (HTTP $HC). Restarting..."
+                echo "[MiniMax-M2.5-Q5KS] Running but unhealthy (HTTP $HC). Restarting..."
                 docker rm -f $CONTAINER_NAME >/dev/null 2>&1
                 break
             fi
         done
         if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null)" = "200" ]; then
-            echo "[MiniMax-M2.5-Q5KM] Already running and healthy on port $PORT."
+            echo "[MiniMax-M2.5-Q5KS] Already running and healthy on port $PORT."
             exit 0
         fi
     else
-        echo "[MiniMax-M2.5-Q5KM] Removing stopped container..."
+        echo "[MiniMax-M2.5-Q5KS] Removing stopped container..."
         docker rm -f $CONTAINER_NAME >/dev/null 2>&1
     fi
 fi
 
-echo "[MiniMax-M2.5-Q5KM] Starting llama.cpp server (all layers on GPU, GPU0 maxed)..."
+echo "[MiniMax-M2.5-Q5KS] Starting llama.cpp server (all layers on GPU, GPU0 maxed)..."
 
 docker run -d \
     --name $CONTAINER_NAME \
@@ -86,12 +86,12 @@ docker run -d \
     --mlock \
     --no-mmap
 
-echo "[MiniMax-M2.5-Q5KM] Waiting for server to load model (this may take several minutes)..."
+echo "[MiniMax-M2.5-Q5KS] Waiting for server to load model (this may take several minutes)..."
 count=0
 while true; do
     # Check if container crashed
     if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "[MiniMax-M2.5-Q5KM] ERROR: Container crashed during model loading!"
+        echo "[MiniMax-M2.5-Q5KS] ERROR: Container crashed during model loading!"
         echo "--- Container Logs ---"
         docker logs --tail 40 $CONTAINER_NAME
         echo "---"
@@ -102,14 +102,14 @@ while true; do
     sleep 5
     count=$((count+1))
     if [ $count -ge 120 ]; then
-        echo "[MiniMax-M2.5-Q5KM] ERROR: Server did not become healthy within 10 minutes."
+        echo "[MiniMax-M2.5-Q5KS] ERROR: Server did not become healthy within 10 minutes."
         docker logs $CONTAINER_NAME --tail 30
         exit 1
     fi
     if [ $((count % 6)) -eq 0 ]; then
         elapsed=$((count * 5))
-        echo "[MiniMax-M2.5-Q5KM] Still loading... (${elapsed}s)"
+        echo "[MiniMax-M2.5-Q5KS] Still loading... (${elapsed}s)"
     fi
 done
 
-echo "[MiniMax-M2.5-Q5KM] Server ready on port $PORT."
+echo "[MiniMax-M2.5-Q5KS] Server ready on port $PORT."
