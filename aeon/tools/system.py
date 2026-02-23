@@ -60,7 +60,21 @@ class RunCommandTool(BaseTool):
             output = "".join(output_lines)
             
             if return_code != 0:
-                return f"COMMAND FAILED (Exit Code {return_code})\n\nOUTPUT:\n{output}"
+                debug_info = ""
+                out_lower = output.lower()
+                if "is a directory" in out_lower:
+                    debug_info += "\n[SYSTEM AUTO-DEBUG] Fact: The target path is a directory, not a file."
+                if "no such file or directory" in out_lower:
+                    debug_info += "\n[SYSTEM AUTO-DEBUG] Fact: The specified path does not exist on this filesystem."
+                if "permission denied" in out_lower:
+                    import getpass
+                    debug_info += f"\n[SYSTEM AUTO-DEBUG] Fact: The current user '{getpass.getuser()}' lacks permissions for this operation."
+                if "command not found" in out_lower:
+                    debug_info += "\n[SYSTEM AUTO-DEBUG] Fact: The executable is not installed or not in the system PATH."
+                if "file exists" in out_lower:
+                    debug_info += "\n[SYSTEM AUTO-DEBUG] Fact: The target path already exists."
+
+                return f"COMMAND FAILED (Exit Code {return_code})\n\nOUTPUT:\n{output}{debug_info}"
             
             if not output.strip():
                 return "Command executed successfully with no output."

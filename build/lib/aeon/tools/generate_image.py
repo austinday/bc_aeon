@@ -38,19 +38,17 @@ class GenerateImageTool(BaseTool):
         abs_output_path = os.path.abspath(output_path)
         os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
 
-        # Construct the FLUX GGUF Workflow JSON for ComfyUI
-        # Uses standard KSampler (Euler/Simple) which handles FLUX natively in updated ComfyUI
         workflow = {
             "1": {
                 "class_type": "UnetLoaderGGUF",
                 "inputs": {
-                    "unet_name": "flux2-dev-Q8_0.gguf"
+                    "unet_name": "flux2-dev-Q4_K_S.gguf"
                 }
             },
             "2": {
                 "class_type": "CLIPLoader",
                 "inputs": {
-                    "clip_name": "mistral_3_small_flux2_bf16.safetensors",
+                    "clip_name": "mistral_3_small_flux2_fp8.safetensors",
                     "type": "flux2"
                 }
             },
@@ -86,7 +84,7 @@ class GenerateImageTool(BaseTool):
                 "class_type": "KSampler",
                 "inputs": {
                     "seed": random.randint(1, 0xffffffffffffffff),
-                    "steps": 20,
+                    "steps": 25,
                     "cfg": 1.0,
                     "sampler_name": "euler",
                     "scheduler": "simple",
@@ -115,14 +113,12 @@ class GenerateImageTool(BaseTool):
 
         try:
             print(f"{self.C_CYAN}Submitting image generation workflow to ComfyUI...{self.C_RESET}")
-            # 1. Submit Prompt
             req = requests.post(f"{self.comfy_url}/prompt", json={"prompt": workflow}, timeout=5)
             if req.status_code != 200:
                 return f"Error submitting workflow to ComfyUI: {req.text}"
             
             prompt_id = req.json()["prompt_id"]
             
-            # 2. Poll for completion
             print(f"{self.C_CYAN}Waiting for image generation to complete...{self.C_RESET}")
             max_retries = 120 # 6 minutes max wait
             for _ in range(max_retries):
@@ -130,12 +126,10 @@ class GenerateImageTool(BaseTool):
                 history = history_req.json()
                 
                 if prompt_id in history:
-                    # Execution finished
                     outputs = history[prompt_id].get("outputs", {})
                     if "9" not in outputs:
                         return "Error: ComfyUI execution completed but SaveImage node did not produce output. Check server logs."
                     
-                    # 3. Retrieve the generated image
                     image_info = outputs["9"]["images"][0]
                     filename = image_info["filename"]
                     subfolder = image_info["subfolder"]

@@ -18,8 +18,7 @@ from .prompts import (
     IMPORTANT_REMINDERS,
     PRIMARY_AGENT_INSTRUCTIONS,
     TOOLS_SECTION,
-    OBJECTIVE_SECTION,
-    CONVERSATION_HISTORY
+    OBJECTIVE_SECTION
 )
 
 # Colors for terminal output
@@ -122,11 +121,7 @@ class Worker:
             return "No files currently open."
         out = []
         for path, content in self.open_files.items():
-            numbered_lines = []
-            for i, line in enumerate(content.splitlines(), 1):
-                numbered_lines.append(f"{i:4d} | {line}")
-            numbered_content = "\n".join(numbered_lines)
-            out.append(f">>> FILE: {path} >>>\n{numbered_content}\n<<< END FILE: {path} <<<")
+            out.append(f"--- FILE: {path} ---\n{content}\n--- END FILE: {path} ---")
         return "\n\n".join(out)
 
     def _format_memories(self) -> str:
@@ -134,7 +129,7 @@ class Worker:
             return "No memories recorded yet."
         return "\n".join([f"{k}: {v}" for k, v in self.memories.items()])
 
-    def _truncate_output(self, text: str, max_chars: int = 6000) -> str:
+    def _truncate_output(self, text: str, max_chars: int = 10000) -> str:
         """Deterministic head+tail truncation. Prioritizes tail (where errors appear)."""
         if len(text) <= max_chars:
             return text
@@ -196,7 +191,8 @@ class Worker:
 {self.docker_directives}
 
 {tools_text}
-{reminders_section}**PERSISTENT MEMORIES**
+{reminders_section}
+**PERSISTENT MEMORIES**
 {memories_str}
 
 **ATTEMPT LOG** (Historical record of intents and results)
@@ -208,13 +204,9 @@ class Worker:
 {self.current_plan}
 
 **OPEN FILES**
-{'='*60}
-(These are loaded in your working memory. Do NOT re-open them.)
-{'='*60}
+===[ IN WORKING MEMORY ]===
 {open_files_str}
-{'='*60}
-END OPEN FILES
-{'='*60}
+===[ END OPEN FILES ]===
 
 **LAST STEP RESULT**
 {self.last_observation}
@@ -268,6 +260,11 @@ END OPEN FILES
 
                 self.print_func(f"\n{C_BLUE}{'='*60}\n ITERATION {iteration}\n{'='*60}{C_RESET}")
 
+                # Enforce strict 10-iteration limit on the action log
+                if len(self.action_log) > 10:
+                    self.print_func(f"{C_CYAN}Truncating action log to last 10 iterations to preserve context focus...{C_RESET}")
+                    self.action_log = self.action_log[-10:]
+
                 # Sync open files before building context
                 self._sync_open_files()
 
@@ -289,16 +286,7 @@ END OPEN FILES
                     pct = prompt_tokens / ctx_limit * 100
                     self.print_func(f"{C_RED}WARNING: Prompt is ~{prompt_tokens} tokens ({pct:.0f}% of {ctx_limit} context limit). Close files or context will be truncated!{C_RESET}")
                     if prompt_tokens > ctx_limit * 0.95:
-                        # Auto-close oldest files to recover space
-                        files_to_close = list(self.open_files.keys())
-                        if len(files_to_close) > 2:
-                            for f in files_to_close[:-2]:  # Keep last 2 files
-                                self.close_file(f)
-                                self.print_func(f"{C_YELLOW}Auto-closed '{f}' to free context space.{C_RESET}")
-                            open_files_str = self._format_open_files()
-                            prompt = self._build_primary_agent_context(
-                                tool_list_str, system_specs, memories_str, objective, open_files_str
-                            )
+                        raise RuntimeError(f"Context limit exceeded ({prompt_tokens} > {ctx_limit * 0.95} limit). Throwing error as requested.")
 
                 self.print_func("Thinking (Primary Agent)...")
 
@@ -517,10 +505,10 @@ END OPEN FILES
                         loop_warning = (
                             f"\n\n** LOOP DETECTED: You have run the SAME command(s) {repeat_count} times in a row "
                             f"and received IDENTICAL output each time. The situation is NOT changing. **\n"
-                            f"You MUST do something DIFFERENT now. Options:\n"
-                            f"- If you were waiting for a background process: it is NOT running or has finished. Move on.\n"
-                            f"- If a file/directory doesn't exist: create it, download it, or fix the script that should have created it.\n"
-                            f"- If you're stuck: pivot your approach, re-read your attempt log, or ask the user for help.\n"
+                            f"You MUST do something DIFFERENT now. You are STUCK.\n"
+                            f"- You MUST use the `think` tool on your next turn to explicitly analyze WHY the previous command failed.\n"
+                            f"- Write out the exact error message, list three possible root causes, and select the most likely one before taking any further action.\n"
+                            f"- Zoom out and target a different part of the problem, or try a completely different approach.\n"
                             f"- DO NOT run the same command again."
                         )
                         self.last_observation += loop_warning
@@ -536,6 +524,8 @@ END OPEN FILES
             except Exception as e:
                 self.print_func(f"\n{C_RED}CRITICAL ERROR IN ITERATION: {e}{C_RESET}")
                 self.logger.error(f"Iteration failed: {e}", exc_info=True)
+                if "Context limit exceeded" in str(e):
+                    raise
                 time.sleep(2)
 
             except KeyboardInterrupt:

@@ -29,7 +29,7 @@ PRIMARY_AGENT_INSTRUCTIONS = _load('primary_agent_instructions.txt')
 # =============================================================================
 # LLM PROMPT TEMPLATES (for llm.py)
 # =============================================================================
-SUMMARIZE_EXECUTION_PROMPT = _load('summarize_execution_prompt.txt')
+COMPRESS_ACTION_LOG_PROMPT = _load('compress_action_log_prompt.txt')
 ANALYZE_INTERRUPTION_PROMPT = _load('analyze_interruption_prompt.txt')
 SUMMARIZE_TEXT_PROMPT = _load('summarize_text_prompt.txt')
 
@@ -57,6 +57,5 @@ TOOL_DESC_GENERATE_IMAGE = _load('tool_desc_generate_image.txt')
 # =============================================================================
 # CONTEXT SECTIONS
 # =============================================================================
-CONVERSATION_HISTORY = _load('conversation_history.txt')
 OBJECTIVE_SECTION = _load('objective_section.txt')
 TOOLS_SECTION = _load('tools_section.txt')

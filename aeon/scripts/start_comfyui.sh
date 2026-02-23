@@ -17,11 +17,11 @@ docker rm -f aeon_comfyui >/dev/null 2>&1 || true
 
 docker run -d \
     --name aeon_comfyui \
-    --gpus '"device=1"' \
+    --gpus device=1 \
     -p 8188:8188 \
-    -v "$MODELS_DIR/unet:/workspace/ComfyUI/models/unet" \
-    -v "$MODELS_DIR/text_encoders:/workspace/ComfyUI/models/text_encoders" \
-    -v "$MODELS_DIR/vae:/workspace/ComfyUI/models/vae" \
+    -v "$PROJECT_ROOT/aeon_models/comfyui/unet:/workspace/ComfyUI/models/unet" \
+    -v "$PROJECT_ROOT/aeon_models/comfyui/split_files/text_encoders:/workspace/ComfyUI/models/text_encoders" \
+    -v "$PROJECT_ROOT/aeon_models/comfyui/split_files/vae:/workspace/ComfyUI/models/vae" \
     -v "$OUTPUT_DIR:/workspace/ComfyUI/output" \
     aeon_comfyui:latest
 

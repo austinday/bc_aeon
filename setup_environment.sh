@@ -215,10 +215,10 @@ log_step "PHASE 5.5 complete."
 # PHASE 5.6: MiniMax-M2.5 GGUF — Q5_K_S (llama.cpp served)
 # =============================================================================
 MINIMAX_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/MiniMax-M2.5"
-log_step "PHASE 5.6: Download MiniMax-M2.5-Q5_K_S GGUF model shards"
+log_step "PHASE 5.6: Download MiniMax-M2.5 GGUF model shards (Q5_K_S, Q6_K, Q8_0)"
 mkdir -p "$MINIMAX_GGUF_DIR"
 
-if [[ -f "$MINIMAX_GGUF_DIR/.download_complete" ]]; then
+if [[ -f "$MINIMAX_GGUF_DIR/.download_complete_v2" ]]; then
     log_step "MiniMax GGUF already downloaded, skipping."
 else
     MINIMAX_DL_SCRIPT=$(mktemp /tmp/aeon_dl_minimax_XXXXXX.py)
@@ -228,7 +228,7 @@ from huggingface_hub import hf_hub_download, list_repo_files
 
 REPO = "unsloth/MiniMax-M2.5-GGUF"
 TARGET = "/models"
-PREFIXES = ["Q5_K_S"]
+PREFIXES = ["Q5_K_S", "Q6_K", "Q8_0"]
 
 print(f"Listing files in {REPO}...", flush=True)
 try:
@@ -293,7 +293,7 @@ PYEOF
         exit 1
     fi
 
-    touch "$MINIMAX_GGUF_DIR/.download_complete"
+    touch "$MINIMAX_GGUF_DIR/.download_complete_v2"
 fi
 chown -R $(id -u):$(id -g) "$MINIMAX_GGUF_DIR" 2>/dev/null || true
 log_step "PHASE 5.6 complete."
@@ -330,13 +330,13 @@ import os, sys
 from huggingface_hub import hf_hub_download
 
 print('Downloading Flux 2 Dev UNet GGUF...', flush=True)
-hf_hub_download(repo_id='unsloth/FLUX.2-dev-GGUF', filename='flux2-dev-Q8_0.gguf', local_dir='/models/unet')
+hf_hub_download(repo_id='unsloth/FLUX.2-dev-GGUF', filename='flux2-dev-Q4_K_S.gguf', local_dir='/models/unet')
 
 print('Downloading Flux 2 VAE...', flush=True)
-hf_hub_download(repo_id='Comfy-Org/flux2-dev', filename='vae/flux2-vae.safetensors', local_dir='/models')
+hf_hub_download(repo_id='Comfy-Org/flux2-dev', filename='split_files/vae/flux2-vae.safetensors', local_dir='/models')
 
 print('Downloading FLUX.2 Mistral text encoder...', flush=True)
-hf_hub_download(repo_id='Comfy-Org/flux2-dev', filename='text_encoders/mistral_3_small_flux2_bf16.safetensors', local_dir='/models')
+hf_hub_download(repo_id='Comfy-Org/flux2-dev', filename='split_files/text_encoders/mistral_3_small_flux2_fp8.safetensors', local_dir='/models')
 
 print('Downloads complete!', flush=True)
 PYEOF

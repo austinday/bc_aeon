@@ -14,7 +14,7 @@ from .system_info import get_runtime_info
 from .logger import get_logger
 from .utils import estimate_tokens
 from .prompts import (
-    SUMMARIZE_EXECUTION_PROMPT,
+    COMPRESS_ACTION_LOG_PROMPT,
     ANALYZE_INTERRUPTION_PROMPT,
     SUMMARIZE_TEXT_PROMPT,
 )
@@ -493,25 +493,20 @@ class LLMClient:
             return text
         return text[:head_len] + f"\n... [TRUNCATED {len(text) - (head_len + tail_len)} CHARS] ...\n" + text[-tail_len:]
 
-    def summarize_execution(self, ctx, raw_out) -> str:
-        """Summarize execution output for history."""
-        safe_out = self._truncate_with_tail(raw_out, head_len=4000, tail_len=16000)
-        prompt = SUMMARIZE_EXECUTION_PROMPT.format(ctx=ctx, safe_out=safe_out)
+    def compress_action_log(self, log_text: str) -> str:
+        """Compress a long action log down to ~25% of its size using the utility model."""
+        prompt = COMPRESS_ACTION_LOG_PROMPT.format(log=log_text)
         try:
             resp = self.utility_client.chat.completions.create(
                 model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("SUMMARIZE_EXECUTION", self.utility_model, prompt, content)
+            self._log_to_debug("COMPRESS_ACTION_LOG", self.utility_model, prompt, content)
             return content
         except Exception as e:
-            self.logger.warning(f"Summarize execution failed: {e}")
-            tail_sample = raw_out[-1000:] if len(raw_out) > 1000 else raw_out
-            return (f"!! SYSTEM ERROR: SUMMARIZATION FAILED !!\n"
-                    f"Reason: {str(e)}\n"
-                    f"Output Length: {len(raw_out)}\n"
-                    f"--- RAW TAIL (Last 1000 chars) ---\n{tail_sample}")
+            self.logger.warning(f"Action log compression failed: {e}")
+            return log_text
 
     def analyze_interruption(self, obj, inp) -> Dict:
         """Analyze user interruption to classify intent."""
