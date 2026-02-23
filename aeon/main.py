@@ -61,7 +61,8 @@ CLOUD_MODELS = [
 LLAMACPP_MODELS = [
     {
         'model': 'Qwen3.5-397B-A17B-IQ4_XS',
-        'label': 'Qwen3.5-397B MoE (IQ4_XS) MAX | Both GPUs full, ~9 t/s, 128k ctx | Local/llama.cpp',
+        'family': 'Qwen3.5',
+        'label': 'Qwen3.5-397B MoE MAX (IQ4_XS)   | GPU0: Max, GPU1: Max       | ~9 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8005/v1',
         'context_limit': 131072,
@@ -71,7 +72,8 @@ LLAMACPP_MODELS = [
     },
     {
         'model': 'Qwen3.5-397B-A17B-IQ4_XS',
-        'label': 'Qwen3.5-397B MoE (IQ4_XS) MEDIUM | GPU1 24GB free, ~6 t/s, 128k ctx | Local/llama.cpp',
+        'family': 'Qwen3.5',
+        'label': 'Qwen3.5-397B MoE MED (IQ4_XS)   | GPU0: Max, GPU1: 24GB Free | ~6 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8005/v1',
         'context_limit': 131072,
@@ -81,7 +83,8 @@ LLAMACPP_MODELS = [
     },
     {
         'model': 'Qwen3.5-397B-A17B-IQ4_XS',
-        'label': 'Qwen3.5-397B MoE (IQ4_XS) LIGHT | GPU1 48GB free, ~3-5 t/s, 128k ctx | Local/llama.cpp',
+        'family': 'Qwen3.5',
+        'label': 'Qwen3.5-397B MoE LITE (IQ4_XS)  | GPU0: Max, GPU1: 48GB Free | ~4 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8005/v1',
         'context_limit': 131072,
@@ -91,7 +94,8 @@ LLAMACPP_MODELS = [
     },
     {
         'model': 'MiniMax-M2.5-Q5_K_S',
-        'label': 'MiniMax-M2.5 MoE (Q5_K_S) | Req: GPU0 full + GPU1 partial, all on GPU, 128k ctx | Not Abliterated | Local/llama.cpp',
+        'family': 'MiniMax',
+        'label': 'MiniMax-M2.5 MoE MAX (Q5_K_S)   | GPU0: Max, GPU1: Max       | ~8 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8013/v1',
         'context_limit': 131072,
@@ -101,7 +105,8 @@ LLAMACPP_MODELS = [
     },
     {
         'model': 'MiniMax-M2.5-Q5_K_S-Light',
-        'label': 'MiniMax-M2.5 MoE (Q5_K_S) LIGHT | GPU1 ~48GB free, CPU Offload, 128k ctx | Local/llama.cpp',
+        'family': 'MiniMax',
+        'label': 'MiniMax-M2.5 MoE LITE (Q5_K_S)  | GPU0: Max, GPU1: 48GB Free | ~5 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8014/v1',
         'context_limit': 131072,
@@ -111,7 +116,8 @@ LLAMACPP_MODELS = [
     },
     {
         'model': 'MiniMax-M2.5-Q6_K-Light',
-        'label': 'MiniMax-M2.5 MoE (Q6_K) LIGHT | GPU1 ~48GB free, CPU Offload, 128k ctx | Local/llama.cpp',
+        'family': 'MiniMax',
+        'label': 'MiniMax-M2.5 MoE LITE (Q6_K)    | GPU0: Max, GPU1: 48GB Free | ~4 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8015/v1',
         'context_limit': 131072,
@@ -121,7 +127,8 @@ LLAMACPP_MODELS = [
     },
     {
         'model': 'MiniMax-M2.5-Q8_0-Light',
-        'label': 'MiniMax-M2.5 MoE (Q8_0) LIGHT | GPU1 ~48GB free, CPU Offload, 128k ctx | Local/llama.cpp',
+        'family': 'MiniMax',
+        'label': 'MiniMax-M2.5 MoE LITE (Q8_0)    | GPU0: Max, GPU1: 48GB Free | ~2 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8016/v1',
         'context_limit': 131072,
@@ -131,7 +138,8 @@ LLAMACPP_MODELS = [
     },
     {
         'model': 'Qwen3-Coder-Next-Abliterated-Q8_0',
-        'label': 'Qwen3-Coder-Next (Q8_0) | Req: One GPU0, no CPU offload, 256k ctx | Abliterated | Local/llama.cpp',
+        'family': 'Qwen3-Coder',
+        'label': 'Qwen3-Coder-Next (Q8_0)         | GPU0: Max, GPU1: Idle      | ~25 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8007/v1',
         'context_limit': 262144,
@@ -414,24 +422,32 @@ def build_model_menu(local_models):
             'model': m,
             'provider': 'local',
             'context_limit': 128000,
-            'label': f'{m} | Req: One GPU0 | Unknown if Abliterated | Local/Ollama',
+            'label': f'{m:<31} | GPU0: Max, GPU1: Idle      | ~?? t/s | 128k ctx | Abliterated: ?   | Local/Ollama',
         })
+        
+    last_family = None
     for lm in LLAMACPP_MODELS:
+        family = lm.get('family', 'Other')
+        if last_family is not None and family != last_family:
+            entries.append({'label': '', 'is_header': True})
+        last_family = family
         entry = dict(lm)
         entries.append(entry)
 
+    entries.append({'label': '', 'is_header': True})
     entries.append({'label': '--- API Models ---', 'is_header': True})
     vertex_models = []
     for cm in CLOUD_MODELS:
         entry = dict(cm)
         if cm.get('provider') == 'vertex':
-            entry['label'] = f"Vertex AI - Gemini 3.1 Pro (Billing: {cm['project_id']})"
+            entry['label'] = f"Vertex AI - {cm['model']} (Billing: {cm['project_id']})"
             vertex_models.append(entry)
         else:
-            entry['label'] = f"{cm['model']} | Req: Internet | Unrestricted status depends on API | API/Cloud"
+            entry['label'] = f"{cm['model']:<31} | Req: Internet              | ~-- t/s | -- ctx   | Unrestricted: ?  | API/Cloud"
             entries.append(entry)
     
     if vertex_models:
+        entries.append({'label': '', 'is_header': True})
         entries.append({'label': '--- Vertex AI Models ---', 'is_header': True})
         entries.extend(vertex_models)
         
@@ -443,10 +459,13 @@ def select_model(menu_entries, label):
     selectable = []
     for entry in menu_entries:
         if entry.get('is_header'):
-            print(f" {entry['label']}")
+            if entry['label'] == '':
+                print("")
+            else:
+                print(f" {entry['label']}")
         else:
             selectable.append(entry)
-            print(f"  {len(selectable)}. {entry['label']}")
+            print(f" {len(selectable):>2}. {entry['label']}")
     while True:
         try:
             choice = input(f'Select Model (1-{len(selectable)}): ')
