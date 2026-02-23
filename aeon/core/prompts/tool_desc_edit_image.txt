@@ -1,0 +1,8 @@
+CRITICAL: MUST USE THIS TOOL for ANY image editing, alteration, or style transfer request. Whenever the user asks you to edit, change, or modify an existing image, you MUST call this tool. Do NOT write your own Python scripts, do NOT use curl, and do NOT try to interact with the ComfyUI API manually.
+Edits an existing image based on a text prompt using the FLUX.2 GGUF model via a local ComfyUI API and saves it to a specified file path.
+Schema:
+  input_path (str, required): The absolute or relative file path of the existing image to edit.
+  prompt (str, required): The detailed visual description of the desired output image.
+  output_path (str, required): The absolute or relative file path where the resulting edited image should be saved.
+  denoise (float, optional, default=0.75): How much to alter the image. 0.0 is no change, 1.0 is a completely new image. 0.6-0.8 is usually best for editing.
+Example: {"tool_name": "edit_image", "parameters": {"input_path": "photo.png", "prompt": "make it winter, snowy", "output_path": "photo_winter.png", "denoise": 0.75}}

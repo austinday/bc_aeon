@@ -197,8 +197,38 @@ def warm_up_models(local_model_names):
 def cleanup_transient_tools():
     print("[SYSTEM] Cleaning up transient tool containers...")
     try:
+        # Clean standard transient tools
         subprocess.run("docker ps -a -q --filter 'name=aeon_research' --filter 'name=aeon_vision' | xargs -r docker rm -f", 
                        shell=True, stderr=subprocess.DEVNULL, timeout=5)
+        
+        # Safely evaluate ComfyUI cleanup using its registry
+        import fcntl
+        registry_path = "/tmp/aeon_comfyui_registry.json"
+        lock_path = "/tmp/aeon_comfyui_registry.lock"
+        my_pid = os.getpid()
+        
+        try:
+            with open(lock_path, 'w') as lock_fd:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                if os.path.exists(registry_path):
+                    with open(registry_path, 'r') as f:
+                        active_pids = json.load(f)
+                    
+                    # Check if any *other* agents are alive and using it
+                    other_alive_pids = []
+                    for p in active_pids:
+                        if p == my_pid: continue
+                        try:
+                            os.kill(p, 0)
+                            other_alive_pids.append(p)
+                        except OSError:
+                            pass
+                            
+                    if not other_alive_pids:
+                        subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stderr=subprocess.DEVNULL)
+        except:
+            pass # Fallback: let the tool handle its own cleanup next time
+            
     except Exception as e:
         print(f"[WARN] Cleanup timed out or failed: {e}")
 

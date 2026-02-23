@@ -53,6 +53,7 @@ TOOL_DESC_TASK_COMPLETE = _load('tool_desc_task_complete.txt')
 TOOL_DESC_GET_USER_INPUT = _load('tool_desc_get_user_input.txt')
 # === GENERATIVE TOOLS (ComfyUI-backed) ===
 TOOL_DESC_GENERATE_IMAGE = _load('tool_desc_generate_image.txt')
+TOOL_DESC_EDIT_IMAGE = _load('tool_desc_edit_image.txt')
 
 # =============================================================================
 # CONTEXT SECTIONS
