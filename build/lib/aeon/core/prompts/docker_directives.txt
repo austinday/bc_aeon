@@ -1,0 +1,22 @@
+**DOCKER RULES**
+
+1) HOST BARRIER: Agent is on HOST. No direct container filesystem access.
+
+2) SETUP VS RUNTIME: Heavy lifting (tool installations, Dockerfile builds, downloading large models) should be done in `setup_environment.sh`. Runtime execution should rely on mounting these pre-downloaded files and directories as volumes.
+
+3) PATH TRANSLATION:
+   - HOST path: <CURRENT_WORKING_DIRECTORY>/scripts/main.py
+   - MOUNT flag: -v <CURRENT_WORKING_DIRECTORY>:/app
+   - CONTAINER path: /app/scripts/main.py
+   - CRITICAL: Replace <CURRENT_WORKING_DIRECTORY> with the actual root path of the project tree provided in your context. Never use literal example paths.
+
+4) TROUBLESHOOTING & VOLUMES:
+   - If you encounter "Permission denied" or "File exists" inside a container via `docker exec`, REMEMBER: mounted volumes (-v) exist on the HOST. You can and should fix permissions, manage files, or download models directly on the host machine where you already have access, rather than hacking around inside the container.
+   - If a `docker run` command fails with "File not found", check your -v volume mount flags and verify the file exists on the HOST at the source path.
+   - If you find yourself hacking away inside a docker container, you're using them wrong. Stop, take a breath, and figure out how to do the task the expected and proper way. Docker containers should be mostly pre-built during agent setup or once ahead of time and only large files need to be mounted at runtime for a quick start. 
+
+5) PERSISTENCE: Always write outputs to a mounted volume -v host_dir:container_dir.
+
+6) GPU USAGE: Always use --gpus flag when running GPU workloads. Default to using gpu1 and avoid using -all. Check gpu usage before allocating memory to avoid a crash.
+
+7) OWNERSHIP: Always use -u $(id -u):$(id -g) to match Host user. Avoids root output files.

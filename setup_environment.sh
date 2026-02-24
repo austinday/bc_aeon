@@ -299,11 +299,84 @@ chown -R $(id -u):$(id -g) "$MINIMAX_GGUF_DIR" 2>/dev/null || true
 log_step "PHASE 5.6 complete."
 
 # =============================================================================
+# PHASE 5.7: Qwen3-VL-32B-Instruct GGUF (Vision-Language Model for llama.cpp)
+# =============================================================================
+QWEN3_VL_DIR="$PROJECT_ROOT/aeon_models/vl_models/Qwen3-VL-32B-Instruct-GGUF"
+log_step "PHASE 5.7: Download Qwen3-VL-32B-Instruct Q8_0 GGUF for vision analysis tool"
+mkdir -p "$QWEN3_VL_DIR"
+
+if [[ -f "$QWEN3_VL_DIR/.download_complete" ]]; then
+    log_step "Qwen3-VL-32B GGUF already downloaded, skipping."
+else
+    QWEN3_VL_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen3_vl_XXXXXX.py)
+    cat > "$QWEN3_VL_DL_SCRIPT" << 'PYEOF'
+import os, sys
+from huggingface_hub import hf_hub_download, list_repo_files
+
+REPO = 'unsloth/Qwen3-VL-32B-Instruct-GGUF'
+TARGET = '/models'
+
+print(f'Listing files in {REPO}...', flush=True)
+try:
+    repo_files = list_repo_files(REPO)
+    mmproj_file = next(f for f in repo_files if f.startswith('mmproj') and f.endswith('.gguf'))
+except StopIteration:
+    print('ERROR: No mmproj file found in repo!')
+    sys.exit(1)
+except Exception as e:
+    print(f'ERROR: {e}')
+    sys.exit(1)
+
+FILES = [
+    'Qwen3-VL-32B-Instruct-Q8_0.gguf',
+    mmproj_file,
+]
+
+for fname in FILES:
+    print(f'Downloading {fname} from {REPO}...', flush=True)
+    try:
+        hf_hub_download(
+            repo_id=REPO,
+            filename=fname,
+            local_dir=TARGET,
+        )
+        print(f'  -> {fname} complete.', flush=True)
+    except Exception as e:
+        print(f'ERROR: Failed to download {fname}: {e}', flush=True)
+        sys.exit(1)
+
+print('All files downloaded successfully!', flush=True)
+PYEOF
+
+    TTY_FLAG=""
+    if [ -t 0 ]; then TTY_FLAG="-t"; fi
+    docker run --rm $TTY_FLAG \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$QWEN3_VL_DIR:/models" \
+        -v "$QWEN3_VL_DL_SCRIPT:/download.py:ro" \
+        aeon_downloader:latest \
+        python3 /download.py
+
+    DL_EXIT=$?
+    rm -f "$QWEN3_VL_DL_SCRIPT"
+    if [[ $DL_EXIT -ne 0 ]]; then
+        log_step "ERROR: Qwen3-VL GGUF download failed (exit code $DL_EXIT)"
+        exit 1
+    fi
+
+    touch "$QWEN3_VL_DIR/.download_complete"
+fi
+chown -R $(id -u):$(id -g) "$QWEN3_VL_DIR" 2>/dev/null || true
+log_step "PHASE 5.7 complete."
+
+# =============================================================================
 # PHASE 6: Build llama.cpp server Docker image (for GGUF model serving)
 # =============================================================================
 log_step "PHASE 6: Build aeon_llamacpp:latest Docker image"
 log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take 5-10 min on first build)..."
 docker build -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
+log_step "aeon_llamacpp:latest built successfully."
 log_step "aeon_llamacpp:latest built successfully."
 
 # Build ComfyUI Docker image (for FLUX image generation tool)
@@ -363,4 +436,49 @@ fi
 chown -R $(id -u):$(id -g) "$COMFY_MODELS_DIR" 2>/dev/null || true
 log_step "PHASE 7 complete."
 
-log_step "Setup complete. Models in $QWEN_GGUF_DIR, $MINIMAX_GGUF_DIR, $COMFY_MODELS_DIR"
+# =============================================================================
+# PHASE 8: PuLID FLUX Models (Consistent Characters)
+# =============================================================================
+PULID_MODELS_DIR="$PROJECT_ROOT/aeon_models/comfyui/pulid"
+CLIP_DIR="$PROJECT_ROOT/aeon_models/comfyui/clip"
+INSIGHTFACE_DIR="$PROJECT_ROOT/aeon_models/comfyui/insightface"
+
+log_step "PHASE 8: Download PuLID Flux and Face models"
+mkdir -p "$PULID_MODELS_DIR" "$CLIP_DIR" "$INSIGHTFACE_DIR"
+
+if [[ -f "$PULID_MODELS_DIR/.download_complete" ]]; then
+    log_step "PuLID models already downloaded, skipping."
+else
+    PULID_DL_SCRIPT=$(mktemp /tmp/aeon_dl_pulid_XXXXXX.py)
+    cat > "$PULID_DL_SCRIPT" << 'PYEOF'
+import os
+from huggingface_hub import hf_hub_download, snapshot_download
+
+print('Downloading PuLID Flux...', flush=True)
+hf_hub_download(repo_id='guozinan/PuLID', filename='pulid_flux_v0.9.0.safetensors', local_dir='/models/pulid')
+
+print('Downloading EvaCLIP...', flush=True)
+hf_hub_download(repo_id='QuanSun/EVA-CLIP', filename='EVA02_CLIP_L_336_psz14_s6B.pt', local_dir='/models/clip')
+
+print('Downloading AntelopeV2 (InsightFace)...', flush=True)
+snapshot_download(repo_id='kidyu/antelopev2-for-InstantID-ComfyUI', local_dir='/models/insightface/models/antelopev2')
+PYEOF
+
+    TTY_FLAG=""
+    if [ -t 0 ]; then TTY_FLAG="-t"; fi
+    docker run --rm $TTY_FLAG \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$PROJECT_ROOT/aeon_models/comfyui:/models" \
+        -v "$PULID_DL_SCRIPT:/download.py:ro" \
+        aeon_downloader:latest \
+        python3 /download.py
+        
+    rm -f "$PULID_DL_SCRIPT"
+    touch "$PULID_MODELS_DIR/.download_complete"
+fi
+chown -R $(id -u):$(id -g) "$PULID_MODELS_DIR" "$CLIP_DIR" "$INSIGHTFACE_DIR" 2>/dev/null || true
+log_step "PHASE 8 complete."
+
+log_step "Setup complete. Models in $QWEN_GGUF_DIR, $MINIMAX_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN3_VL_DIR"
+log_step "NOTE: To remove old BF16 Qwen3-VL model (if present): rm -rf $PROJECT_ROOT/aeon_models/vl_models/Qwen3-VL-32B-Instruct"
