@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # Start llama.cpp server for MiniMax-M2.5-Q5_K_S GGUF (LIGHT mode)
-# Offloads some layers to CPU to leave ~48GB free on GPU1.
-# GPU0 heavily loaded, GPU1 partially loaded.
+# Offloads all layers to GPU to prevent system RAM swapping. Fits on ~1.5 GPUs.
+# GPU0 maxed, GPU1 partially loaded.
 # =============================================================================
 set -e
 
@@ -12,7 +12,7 @@ PORT=8014
 MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/MiniMax-M2.5"
 
 # Tunable parameters
-N_GPU_LAYERS=${NGL:-50}          # Reduced to offload to CPU RAM
+N_GPU_LAYERS=${NGL:-999}         # Offload all to GPU
 PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot
 CTX_SIZE=${CTX:-131072}          # 128k context
 BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
@@ -64,8 +64,6 @@ docker run -d \
     -v "${MODELS_DIR}:/models:ro" \
     --shm-size=16g \
     --ulimit memlock=-1 \
-    --memory="200g" \
-    --memory-swap="200g" \
     $IMAGE_NAME \
     --model "/models/${MODEL_FILE}" \
     --split-mode layer \

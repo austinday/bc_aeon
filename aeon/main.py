@@ -60,53 +60,31 @@ CLOUD_MODELS = [
 # =============================================================================
 LLAMACPP_MODELS = [
     {
-        'model': 'Qwen3.5-397B-A17B-IQ4_XS',
+        'model': 'Qwen3.5-122B-A10B-Q8_0',
         'family': 'Qwen3.5',
-        'label': 'Qwen3.5-397B MoE MAX (IQ4_XS)   | GPU0: Max, GPU1: Max       | ~9 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
+        'label': 'Qwen3.5-122B MoE LITE (Q8_0)    | GPU0: Max, GPU1: ~50GB Free| ~? t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8005/v1',
         'context_limit': 131072,
-        'container_name': 'aeon_qwen397b',
-        'start_script': 'start_qwen397b_max.sh',
+        'container_name': 'aeon_qwen122b_lite',
+        'start_script': 'start_qwen_122b_q8_lite.sh',
         'health_port': 8005,
     },
     {
-        'model': 'Qwen3.5-397B-A17B-IQ4_XS',
+        'model': 'Qwen3.5-122B-A10B-Q5_K_S',
         'family': 'Qwen3.5',
-        'label': 'Qwen3.5-397B MoE MED (IQ4_XS)   | GPU0: Max, GPU1: 24GB Free | ~6 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
+        'label': 'Qwen3.5-122B MoE MAX (Q5_K_S)   | GPU0: Max, GPU1: Idle      | ~? t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
-        'base_url': 'http://localhost:8005/v1',
+        'base_url': 'http://localhost:8006/v1',
         'context_limit': 131072,
-        'container_name': 'aeon_qwen397b',
-        'start_script': 'start_qwen397b_medium.sh',
-        'health_port': 8005,
-    },
-    {
-        'model': 'Qwen3.5-397B-A17B-IQ4_XS',
-        'family': 'Qwen3.5',
-        'label': 'Qwen3.5-397B MoE LITE (IQ4_XS)  | GPU0: Max, GPU1: 48GB Free | ~4 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8005/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_qwen397b',
-        'start_script': 'start_qwen397b_light.sh',
-        'health_port': 8005,
-    },
-    {
-        'model': 'MiniMax-M2.5-Q5_K_S',
-        'family': 'MiniMax',
-        'label': 'MiniMax-M2.5 MoE MAX (Q5_K_S)   | GPU0: Max, GPU1: Max       | ~8 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8013/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_minimax_m25',
-        'start_script': 'start_minimax_m25_q8.sh',
-        'health_port': 8013,
+        'container_name': 'aeon_qwen122b_max',
+        'start_script': 'start_qwen_122b_q5_max.sh',
+        'health_port': 8006,
     },
     {
         'model': 'MiniMax-M2.5-Q5_K_S-Light',
         'family': 'MiniMax',
-        'label': 'MiniMax-M2.5 MoE LITE (Q5_K_S)  | GPU0: Max, GPU1: 48GB Free | ~5 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
+        'label': 'MiniMax-M2.5 MoE LITE (Q5_K_S)  | GPU0: Max, GPU1: Half      | ~8 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8014/v1',
         'context_limit': 131072,
@@ -115,26 +93,15 @@ LLAMACPP_MODELS = [
         'health_port': 8014,
     },
     {
-        'model': 'MiniMax-M2.5-Q6_K-Light',
-        'family': 'MiniMax',
-        'label': 'MiniMax-M2.5 MoE LITE (Q6_K)    | GPU0: Max, GPU1: 48GB Free | ~4 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
+        'model': 'Qwen3.5-27B-UD-Q8',
+        'family': 'Qwen3.5',
+        'label': 'Qwen3.5-27B-UD (Q8_K_XL)        | GPU0: Max, GPU1: Idle      | ~30 t/s | 256k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
-        'base_url': 'http://localhost:8015/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_minimax_m25_q6_light',
-        'start_script': 'start_minimax_m25_q6_light.sh',
-        'health_port': 8015,
-    },
-    {
-        'model': 'MiniMax-M2.5-Q8_0-Light',
-        'family': 'MiniMax',
-        'label': 'MiniMax-M2.5 MoE LITE (Q8_0)    | GPU0: Max, GPU1: 48GB Free | ~2 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8016/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_minimax_m25_q8_light',
-        'start_script': 'start_minimax_m25_q8_light.sh',
-        'health_port': 8016,
+        'base_url': 'http://localhost:8008/v1',
+        'context_limit': 262144,
+        'container_name': 'aeon_qwen35_27b_q8',
+        'start_script': 'start_qwen_27b_q8.sh',
+        'health_port': 8008,
     },
     {
         'model': 'Qwen3-Coder-Next-Abliterated-Q8_0',
@@ -478,7 +445,7 @@ def select_model(menu_entries, label):
 def find_model_config(model_name, menu_entries):
     """Find a model config by name from the menu entries."""
     for entry in menu_entries:
-        if entry['model'] == model_name:
+        if entry.get('model') == model_name:
             return entry
     return None
 

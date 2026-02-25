@@ -1,40 +1,35 @@
 #!/bin/bash
 # =============================================================================
-# Start llama.cpp server for MiniMax-M2.5-Q5_K_S GGUF
-# Fits entirely on dual GPU (no CPU spillover)
-# GPU0 maxed (~92GB), GPU1 gets remainder (~70GB)
+# Start llama.cpp server for Qwen3.5-122B-A10B Q5_K_S
+# Fits completely on GPU0 with ~12GB left for context
 # =============================================================================
 set -e
 
-CONTAINER_NAME='aeon_minimax_m25'
+CONTAINER_NAME='aeon_qwen122b_max'
 IMAGE_NAME='aeon_llamacpp:latest'
-PORT=8013
-MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/MiniMax-M2.5"
+PORT=8006
+MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/Qwen3.5-122B-A10B"
 
 # Tunable parameters
-# NGL=999 tells llama.cpp to offload ALL layers to GPU. It auto-caps at the
-# model's actual layer count. The --tensor-split ratio then distributes those
-# layers across GPU0 and GPU1. This only OOMs if combined VRAM < model + KV cache.
-N_GPU_LAYERS=${NGL:-999}         # All layers on GPU, zero CPU offload
-PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot maximizes VRAM for model layers
-CTX_SIZE=${CTX:-131072}          # 128k context (q8 KV cache) - ~10.4GB KV fits with 54/46 tensor split
-BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
-# tensor-split: max out GPU0, GPU1 gets remainder + KV cache headroom
-TENSOR_SPLIT=${TSPLIT:-46,39}
+N_GPU_LAYERS=${NGL:-999}
+PARALLEL_SLOTS=${PARALLEL:-1}
+CTX_SIZE=${CTX:-131072}
+BATCH_SIZE=${BATCH:-4096}
+QUANT="Q5_K_S"
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
 
-MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "Q5_K_S" | sort | head -1 | sed 's|^\./||')
+MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "${QUANT}" | sort | head -1 | sed 's|^\./||')
 if [ -z "$MODEL_FILE" ]; then
-    echo "[MiniMax-M2.5-Q5KS] ERROR: No .gguf files matching Q5_K_S found in ${MODELS_DIR}"
+    echo "[Qwen122B-Max] ERROR: No .gguf files matching ${QUANT} found in ${MODELS_DIR}"
     exit 1
 fi
 
-echo "[MiniMax-M2.5-Q5KS] Using model file: ${MODEL_FILE}"
-echo "[MiniMax-M2.5-Q5KS] Checking for existing container..."
+echo "[Qwen122B-Max] Using model file: ${MODEL_FILE}"
+echo "[Qwen122B-Max] Checking for existing container..."
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "[MiniMax-M2.5-Q5KS] Container already running. Checking health..."
+        echo "[Qwen122B-Max] Container already running. Checking health..."
         count=0
         while true; do
             HC=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null || echo "000")
@@ -42,26 +37,26 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
             sleep 2
             count=$((count+1))
             if [ $count -ge 10 ]; then
-                echo "[MiniMax-M2.5-Q5KS] Running but unhealthy (HTTP $HC). Restarting..."
+                echo "[Qwen122B-Max] Running but unhealthy (HTTP $HC). Restarting..."
                 docker rm -f $CONTAINER_NAME >/dev/null 2>&1
                 break
             fi
         done
         if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null)" = "200" ]; then
-            echo "[MiniMax-M2.5-Q5KS] Already running and healthy on port $PORT."
+            echo "[Qwen122B-Max] Already running and healthy on port $PORT."
             exit 0
         fi
     else
-        echo "[MiniMax-M2.5-Q5KS] Removing stopped container..."
+        echo "[Qwen122B-Max] Removing stopped container..."
         docker rm -f $CONTAINER_NAME >/dev/null 2>&1
     fi
 fi
 
-echo "[MiniMax-M2.5-Q5KS] Starting llama.cpp server (all layers on GPU, GPU0 maxed)..."
+echo "[Qwen122B-Max] Starting llama.cpp server..."
 
 docker run -d \
     --name $CONTAINER_NAME \
-    --gpus '"device=0,1"' \
+    --gpus '"device=0"' \
     -p ${PORT}:8001 \
     -v "${MODELS_DIR}:/models:ro" \
     --shm-size=16g \
@@ -70,13 +65,11 @@ docker run -d \
     --memory-swap="200g" \
     $IMAGE_NAME \
     --model "/models/${MODEL_FILE}" \
-    --split-mode layer \
-    --tensor-split ${TENSOR_SPLIT} \
     --n-gpu-layers ${N_GPU_LAYERS} \
     --parallel ${PARALLEL_SLOTS} \
     --ctx-size ${CTX_SIZE} \
     --batch-size ${BATCH_SIZE} \
-    --threads 5 \
+    --threads ${PHYSICAL_CORES} \
     --flash-attn on \
     --cache-type-k q8_0 \
     --cache-type-v q8_0 \
@@ -86,12 +79,11 @@ docker run -d \
     --mlock \
     --no-mmap
 
-echo "[MiniMax-M2.5-Q5KS] Waiting for server to load model (this may take several minutes)..."
+echo "[Qwen122B-Max] Waiting for server to load model (this may take several minutes)..."
 count=0
 while true; do
-    # Check if container crashed
     if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "[MiniMax-M2.5-Q5KS] ERROR: Container crashed during model loading!"
+        echo "[Qwen122B-Max] ERROR: Container crashed during model loading!"
         echo "--- Container Logs ---"
         docker logs --tail 40 $CONTAINER_NAME
         echo "---"
@@ -102,14 +94,14 @@ while true; do
     sleep 5
     count=$((count+1))
     if [ $count -ge 120 ]; then
-        echo "[MiniMax-M2.5-Q5KS] ERROR: Server did not become healthy within 10 minutes."
+        echo "[Qwen122B-Max] ERROR: Server did not become healthy within 10 minutes."
         docker logs $CONTAINER_NAME --tail 30
         exit 1
     fi
     if [ $((count % 6)) -eq 0 ]; then
         elapsed=$((count * 5))
-        echo "[MiniMax-M2.5-Q5KS] Still loading... (${elapsed}s)"
+        echo "[Qwen122B-Max] Still loading... (${elapsed}s)"
     fi
 done
 
-echo "[MiniMax-M2.5-Q5KS] Server ready on port $PORT."
+echo "[Qwen122B-Max] Server ready on port $PORT."

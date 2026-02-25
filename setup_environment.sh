@@ -24,7 +24,7 @@ fi
 log_step "PHASE 1: Build Docker images (layer cache makes unchanged builds fast)"
 
 # Stop any running containers that depend on these images
-for cname in aeon_qwen397b; do
+for cname in aeon_qwen122b_lite aeon_qwen122b_max; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
         log_step "Stopping stale container: $cname"
         docker rm -f "$cname" >/dev/null 2>&1 || true
@@ -46,11 +46,11 @@ else
 fi
 
 # =============================================================================
-# PHASE 5: Qwen3.5-397B-A17B-Q6_K GGUF (llama.cpp served)
+# PHASE 5: Qwen3.5-122B-A10B GGUF (llama.cpp served)
 # =============================================================================
-QWEN_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3.5-397B-A17B"
+QWEN_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3.5-122B-A10B"
 
-log_step "PHASE 5: Download Qwen3.5-397B-A17B-Q6_K GGUF model shards"
+log_step "PHASE 5: Download Qwen3.5-122B-A10B GGUF model shards"
 mkdir -p "$QWEN_GGUF_DIR"
 
 if [[ -f "$QWEN_GGUF_DIR/.download_complete" ]]; then
@@ -61,9 +61,9 @@ else
 import os, sys
 from huggingface_hub import hf_hub_download, list_repo_files
 
-REPO = "unsloth/Qwen3.5-397B-A17B-GGUF"
+REPO = "unsloth/Qwen3.5-122B-A10B-GGUF"
 TARGET = "/models"
-MODELS_TO_DOWNLOAD = ["Q5_K_S"]
+MODELS_TO_DOWNLOAD = ["Q8_0", "Q5_K_S"]
 
 print(f"Listing files in {REPO}...", flush=True)
 all_files = list_repo_files(REPO)
@@ -215,7 +215,7 @@ log_step "PHASE 5.5 complete."
 # PHASE 5.6: MiniMax-M2.5 GGUF — Q5_K_S (llama.cpp served)
 # =============================================================================
 MINIMAX_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/MiniMax-M2.5"
-log_step "PHASE 5.6: Download MiniMax-M2.5 GGUF model shards (Q5_K_S, Q6_K, Q8_0)"
+log_step "PHASE 5.6: Download MiniMax-M2.5 GGUF model shards (Q5_K_S)"
 mkdir -p "$MINIMAX_GGUF_DIR"
 
 if [[ -f "$MINIMAX_GGUF_DIR/.download_complete_v2" ]]; then
@@ -228,7 +228,7 @@ from huggingface_hub import hf_hub_download, list_repo_files
 
 REPO = "unsloth/MiniMax-M2.5-GGUF"
 TARGET = "/models"
-PREFIXES = ["Q5_K_S", "Q6_K", "Q8_0"]
+PREFIXES = ["Q5_K_S"]
 
 print(f"Listing files in {REPO}...", flush=True)
 try:
@@ -299,38 +299,85 @@ chown -R $(id -u):$(id -g) "$MINIMAX_GGUF_DIR" 2>/dev/null || true
 log_step "PHASE 5.6 complete."
 
 # =============================================================================
-# PHASE 5.7: Qwen3-VL-32B-Instruct GGUF (Vision-Language Model for llama.cpp)
+# PHASE 5.8: Qwen3.5-27B-GGUF (Q8_K_XL)
 # =============================================================================
-QWEN3_VL_DIR="$PROJECT_ROOT/aeon_models/vl_models/Qwen3-VL-32B-Instruct-GGUF"
-log_step "PHASE 5.7: Download Qwen3-VL-32B-Instruct Q8_0 GGUF for vision analysis tool"
+QWEN27B_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3.5-27B"
+log_step "PHASE 5.8: Download Qwen3.5-27B GGUF model"
+mkdir -p "$QWEN27B_GGUF_DIR"
+
+if [[ -f "$QWEN27B_GGUF_DIR/.download_complete" ]]; then
+    log_step "Qwen3.5-27B GGUF already downloaded, skipping."
+else
+    QWEN27B_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen27b_XXXXXX.py)
+    cat > "$QWEN27B_DL_SCRIPT" << 'PYEOF'
+import os, sys
+from huggingface_hub import hf_hub_download
+
+REPO = "unsloth/Qwen3.5-27B-GGUF"
+TARGET = "/models"
+FILENAME = "Qwen3.5-27B-UD-Q8_K_XL.gguf"
+
+print(f"Downloading {FILENAME} from {REPO}...", flush=True)
+try:
+    hf_hub_download(repo_id=REPO, filename=FILENAME, local_dir=TARGET)
+    print("Download complete.")
+except Exception as e:
+    print(f"Error downloading {FILENAME}: {e}")
+    sys.exit(1)
+PYEOF
+
+    TTY_FLAG=""
+    if [ -t 0 ]; then TTY_FLAG="-t"; fi
+    docker run --rm $TTY_FLAG \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$QWEN27B_GGUF_DIR:/models" \
+        -v "$QWEN27B_DL_SCRIPT:/download.py:ro" \
+        aeon_downloader:latest \
+        python3 /download.py
+
+    DL_EXIT=$?
+    rm -f "$QWEN27B_DL_SCRIPT"
+    if [[ $DL_EXIT -ne 0 ]]; then
+        log_step "ERROR: Qwen3.5-27B GGUF download failed"
+        exit 1
+    fi
+    touch "$QWEN27B_GGUF_DIR/.download_complete"
+fi
+chown -R $(id -u):$(id -g) "$QWEN27B_GGUF_DIR" 2>/dev/null || true
+log_step "PHASE 5.8 complete."
+
+# =============================================================================
+# PHASE 5.7: Qwen3.5-35B-A3B GGUF (Vision-Language Model for llama.cpp)
+# =============================================================================
+QWEN3_VL_DIR="$PROJECT_ROOT/aeon_models/vl_models/Qwen3.5-35B-A3B-GGUF"
+log_step "PHASE 5.7: Download Qwen3.5-35B-A3B GGUF for vision analysis tool"
 mkdir -p "$QWEN3_VL_DIR"
 
 if [[ -f "$QWEN3_VL_DIR/.download_complete" ]]; then
-    log_step "Qwen3-VL-32B GGUF already downloaded, skipping."
+    log_step "Qwen3.5-35B-A3B GGUF already downloaded, skipping."
 else
     QWEN3_VL_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen3_vl_XXXXXX.py)
     cat > "$QWEN3_VL_DL_SCRIPT" << 'PYEOF'
 import os, sys
 from huggingface_hub import hf_hub_download, list_repo_files
 
-REPO = 'unsloth/Qwen3-VL-32B-Instruct-GGUF'
+REPO = 'unsloth/Qwen3.5-35B-A3B-GGUF'
 TARGET = '/models'
 
 print(f'Listing files in {REPO}...', flush=True)
 try:
     repo_files = list_repo_files(REPO)
-    mmproj_file = next(f for f in repo_files if f.startswith('mmproj') and f.endswith('.gguf'))
-except StopIteration:
-    print('ERROR: No mmproj file found in repo!')
-    sys.exit(1)
+    mmproj_file = next((f for f in repo_files if f.startswith('mmproj') and f.endswith('.gguf')), None)
 except Exception as e:
     print(f'ERROR: {e}')
     sys.exit(1)
 
 FILES = [
-    'Qwen3-VL-32B-Instruct-Q8_0.gguf',
-    mmproj_file,
+    'Qwen3.5-35B-A3B-UD-Q8_K_XL.gguf',
 ]
+if mmproj_file:
+    FILES.append(mmproj_file)
 
 for fname in FILES:
     print(f'Downloading {fname} from {REPO}...', flush=True)

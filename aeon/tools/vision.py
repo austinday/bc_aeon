@@ -11,7 +11,7 @@ from ..core.prompts import TOOL_DESC_ANALYZE_IMAGE
 
 
 class AnalyzeImageTool(BaseTool):
-    """A tool to analyze images using Qwen3-VL-32B-Instruct via a local vLLM server."""
+    """A tool to analyze images using Qwen3.5-35B-A3B via a local vLLM server."""
 
     # Max image dimension before resizing (keeps VRAM usage reasonable)
     MAX_IMAGE_DIM = 1280
@@ -109,9 +109,9 @@ class AnalyzeImageTool(BaseTool):
 
             # Start server if not running
             if not self._check_health():
-                print(f'{self.C_CYAN}Starting Qwen3-VL vision server (loading Q8_0 GGUF via llama.cpp)...{self.C_RESET}')
+                print(f'{self.C_CYAN}Starting Qwen3.5 vision server (loading Q8_K_XL GGUF via llama.cpp)...{self.C_RESET}')
                 script_path = os.path.abspath(
-                    os.path.join(os.path.dirname(__file__), '..', 'scripts', 'start_qwen3_vl_32b.sh')
+                    os.path.join(os.path.dirname(__file__), '..', 'scripts', 'start_qwen35_vl_35b.sh')
                 )
                 res = subprocess.run(['bash', script_path], capture_output=True, text=True)
                 if res.returncode != 0:
@@ -126,7 +126,7 @@ class AnalyzeImageTool(BaseTool):
                         elapsed = attempt * 3
                         print(f'{self.C_CYAN}Still loading model... ({elapsed}s){self.C_RESET}')
                 else:
-                    return 'Error: Vision server failed to become healthy after 3 minutes. Check: docker logs aeon_qwen3_vl'
+                    return 'Error: Vision server failed to become healthy after 3 minutes. Check: docker logs aeon_qwen35_vl'
 
             # Load and encode image
             print(f'{self.C_CYAN}Encoding image for analysis...{self.C_RESET}')
@@ -154,11 +154,11 @@ class AnalyzeImageTool(BaseTool):
                 }
             ]
 
-            print(f'{self.C_CYAN}Sending image to Qwen3-VL for analysis...{self.C_RESET}')
+            print(f'{self.C_CYAN}Sending image to Qwen3.5-35B for analysis...{self.C_RESET}')
             resp = requests.post(
                 f'{self.vllm_url}/v1/chat/completions',
                 json={
-                    'model': 'Qwen3-VL-32B-Instruct-Q8_0',
+                    'model': 'Qwen3.5-35B-A3B-UD-Q8_K_XL',
                     'messages': messages,
                     'max_tokens': 2048,
                     'temperature': 0.3,
@@ -175,7 +175,7 @@ class AnalyzeImageTool(BaseTool):
             except (KeyError, IndexError):
                 return f'Error: Unexpected response format from vision server: {json.dumps(result)[:500]}'
 
-            # Strip Qwen3 thinking tags if present
+            # Strip Qwen thinking tags if present
             import re
             answer = re.sub(r'<think>.*?</think>\s*', '', answer, flags=re.DOTALL).strip()
 
@@ -183,12 +183,12 @@ class AnalyzeImageTool(BaseTool):
             return answer
 
         except Exception as e:
-            return self.format_error_message(e, 'analyzing image via Qwen3-VL', 'checking vision server logs (docker logs aeon_qwen3_vl)')
+            return self.format_error_message(e, 'analyzing image via Qwen3.5-35B', 'checking vision server logs (docker logs aeon_qwen35_vl)')
 
         finally:
             remaining_users = self._manage_registry('unregister')
             if remaining_users == 0:
                 print(f'{self.C_CYAN}Last agent finished vision task. Releasing GPU memory (stopping vision server)...{self.C_RESET}')
-                subprocess.run(['docker', 'rm', '-f', 'aeon_qwen3_vl'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(['docker', 'rm', '-f', 'aeon_qwen35_vl'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 print(f'{self.C_CYAN}Vision analysis complete. Leaving server running for {remaining_users} other active agent(s)...{self.C_RESET}')

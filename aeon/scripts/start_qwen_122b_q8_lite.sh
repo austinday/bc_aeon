@@ -1,38 +1,37 @@
 #!/bin/bash
 # =============================================================================
-# Start llama.cpp server for MiniMax-M2.5-Q8_0 GGUF (LIGHT mode)
-# Offloads some layers to CPU to leave ~48GB free on GPU1.
-# GPU0 heavily loaded, GPU1 partially loaded.
+# Start llama.cpp server for Qwen3.5-122B-A10B Q8_0
+# GPU0 maxed (~84GB used, leaving ~12GB for ctx), GPU1 gets remainder (~46GB)
 # =============================================================================
 set -e
 
-CONTAINER_NAME='aeon_minimax_m25_q8_light'
+CONTAINER_NAME='aeon_qwen122b_lite'
 IMAGE_NAME='aeon_llamacpp:latest'
-PORT=8016
-MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/MiniMax-M2.5"
+PORT=8005
+MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/Qwen3.5-122B-A10B"
 
 # Tunable parameters
-N_GPU_LAYERS=${NGL:-32}          # Reduced to offload to CPU RAM
-PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot
-CTX_SIZE=${CTX:-131072}          # 128k context
-BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
-# tensor-split: 66,34 roughly puts 2/3 on GPU0 and 1/3 on GPU1.
-TENSOR_SPLIT=${TSPLIT:-66,34}
+N_GPU_LAYERS=${NGL:-999}
+PARALLEL_SLOTS=${PARALLEL:-1}
+CTX_SIZE=${CTX:-131072}
+BATCH_SIZE=${BATCH:-4096}
+# tensor-split: 84 on GPU0, 46 on GPU1 -> Roughly 65,35
+TENSOR_SPLIT=${TSPLIT:-65,35}
 QUANT="Q8_0"
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
 
 MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "${QUANT}" | sort | head -1 | sed 's|^\./||')
 if [ -z "$MODEL_FILE" ]; then
-    echo "[MiniMax-M2.5-${QUANT}-Light] ERROR: No .gguf files matching ${QUANT} found in ${MODELS_DIR}"
+    echo "[Qwen122B-Lite] ERROR: No .gguf files matching ${QUANT} found in ${MODELS_DIR}"
     exit 1
 fi
 
-echo "[MiniMax-M2.5-${QUANT}-Light] Using model file: ${MODEL_FILE}"
-echo "[MiniMax-M2.5-${QUANT}-Light] Checking for existing container..."
+echo "[Qwen122B-Lite] Using model file: ${MODEL_FILE}"
+echo "[Qwen122B-Lite] Checking for existing container..."
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "[MiniMax-M2.5-${QUANT}-Light] Container already running. Checking health..."
+        echo "[Qwen122B-Lite] Container already running. Checking health..."
         count=0
         while true; do
             HC=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null || echo "000")
@@ -40,22 +39,22 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
             sleep 2
             count=$((count+1))
             if [ $count -ge 10 ]; then
-                echo "[MiniMax-M2.5-${QUANT}-Light] Running but unhealthy (HTTP $HC). Restarting..."
+                echo "[Qwen122B-Lite] Running but unhealthy (HTTP $HC). Restarting..."
                 docker rm -f $CONTAINER_NAME >/dev/null 2>&1
                 break
             fi
         done
         if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null)" = "200" ]; then
-            echo "[MiniMax-M2.5-${QUANT}-Light] Already running and healthy on port $PORT."
+            echo "[Qwen122B-Lite] Already running and healthy on port $PORT."
             exit 0
         fi
     else
-        echo "[MiniMax-M2.5-${QUANT}-Light] Removing stopped container..."
+        echo "[Qwen122B-Lite] Removing stopped container..."
         docker rm -f $CONTAINER_NAME >/dev/null 2>&1
     fi
 fi
 
-echo "[MiniMax-M2.5-${QUANT}-Light] Starting llama.cpp server..."
+echo "[Qwen122B-Lite] Starting llama.cpp server..."
 
 docker run -d \
     --name $CONTAINER_NAME \
@@ -84,11 +83,11 @@ docker run -d \
     --mlock \
     --no-mmap
 
-echo "[MiniMax-M2.5-${QUANT}-Light] Waiting for server to load model (this may take several minutes)..."
+echo "[Qwen122B-Lite] Waiting for server to load model (this may take several minutes)..."
 count=0
 while true; do
     if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "[MiniMax-M2.5-${QUANT}-Light] ERROR: Container crashed during model loading!"
+        echo "[Qwen122B-Lite] ERROR: Container crashed during model loading!"
         echo "--- Container Logs ---"
         docker logs --tail 40 $CONTAINER_NAME
         echo "---"
@@ -99,14 +98,14 @@ while true; do
     sleep 5
     count=$((count+1))
     if [ $count -ge 120 ]; then
-        echo "[MiniMax-M2.5-${QUANT}-Light] ERROR: Server did not become healthy within 10 minutes."
+        echo "[Qwen122B-Lite] ERROR: Server did not become healthy within 10 minutes."
         docker logs $CONTAINER_NAME --tail 30
         exit 1
     fi
     if [ $((count % 6)) -eq 0 ]; then
         elapsed=$((count * 5))
-        echo "[MiniMax-M2.5-${QUANT}-Light] Still loading... (${elapsed}s)"
+        echo "[Qwen122B-Lite] Still loading... (${elapsed}s)"
     fi
 done
 
-echo "[MiniMax-M2.5-${QUANT}-Light] Server ready on port $PORT."
+echo "[Qwen122B-Lite] Server ready on port $PORT."
