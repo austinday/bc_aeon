@@ -13,7 +13,7 @@ MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/Qwen3.5-122B-A10B"
 # Tunable parameters
 N_GPU_LAYERS=${NGL:-999}
 PARALLEL_SLOTS=${PARALLEL:-1}
-CTX_SIZE=${CTX:-131072}
+CTX_SIZE=${CTX:-262144}
 BATCH_SIZE=${BATCH:-4096}
 QUANT="Q5_K_S"
 

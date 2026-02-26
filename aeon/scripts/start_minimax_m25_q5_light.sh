@@ -14,10 +14,10 @@ MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/MiniMax-M2.5"
 # Tunable parameters
 N_GPU_LAYERS=${NGL:-999}         # Offload all to GPU
 PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot
-CTX_SIZE=${CTX:-131072}          # 128k context
+CTX_SIZE=${CTX:-65536}           # 64k context
 BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
-# tensor-split: 66,34 roughly puts 2/3 on GPU0 and 1/3 on GPU1.
-TENSOR_SPLIT=${TSPLIT:-66,34}
+# tensor-split: 58,42 shifts more layers to GPU0 utilizing the freed context VRAM.
+TENSOR_SPLIT=${TSPLIT:-58,42}
 QUANT="Q5_K_S"
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)

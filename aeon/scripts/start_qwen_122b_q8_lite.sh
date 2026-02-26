@@ -13,10 +13,10 @@ MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/Qwen3.5-122B-A10B"
 # Tunable parameters
 N_GPU_LAYERS=${NGL:-999}
 PARALLEL_SLOTS=${PARALLEL:-1}
-CTX_SIZE=${CTX:-131072}
+CTX_SIZE=${CTX:-262144}
 BATCH_SIZE=${BATCH:-4096}
 # tensor-split: 84 on GPU0, 46 on GPU1 -> Roughly 65,35
-TENSOR_SPLIT=${TSPLIT:-65,35}
+TENSOR_SPLIT=${TSPLIT:-71,29}
 QUANT="Q8_0"
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)

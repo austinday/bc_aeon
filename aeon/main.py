@@ -62,10 +62,10 @@ LLAMACPP_MODELS = [
     {
         'model': 'Qwen3.5-122B-A10B-Q8_0',
         'family': 'Qwen3.5',
-        'label': 'Qwen3.5-122B MoE LITE (Q8_0)    | GPU0: Max, GPU1: ~50GB Free| ~? t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
+        'label': 'Qwen3.5-122B MoE LITE (Q8_0)    | GPU0: 97%, GPU1: 39%     | ~43 t/s | 256k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8005/v1',
-        'context_limit': 131072,
+        'context_limit': 262144,
         'container_name': 'aeon_qwen122b_lite',
         'start_script': 'start_qwen_122b_q8_lite.sh',
         'health_port': 8005,
@@ -73,10 +73,10 @@ LLAMACPP_MODELS = [
     {
         'model': 'Qwen3.5-122B-A10B-Q5_K_S',
         'family': 'Qwen3.5',
-        'label': 'Qwen3.5-122B MoE MAX (Q5_K_S)   | GPU0: Max, GPU1: Idle      | ~? t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
+        'label': 'Qwen3.5-122B MoE MAX (Q5_K_S)   | GPU0: 100%, GPU1: 0%     | ~48 t/s | 256k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8006/v1',
-        'context_limit': 131072,
+        'context_limit': 262144,
         'container_name': 'aeon_qwen122b_max',
         'start_script': 'start_qwen_122b_q5_max.sh',
         'health_port': 8006,
@@ -84,10 +84,10 @@ LLAMACPP_MODELS = [
     {
         'model': 'MiniMax-M2.5-Q5_K_S-Light',
         'family': 'MiniMax',
-        'label': 'MiniMax-M2.5 MoE LITE (Q5_K_S)  | GPU0: Max, GPU1: Half      | ~8 t/s  | 128k ctx | Abliterated: No  | Local/llama.cpp',
+        'label': 'MiniMax-M2.5 MoE LITE (Q5_K_S)  | GPU0: 98%, GPU1: 72%     | ~53 t/s | 64k ctx  | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8014/v1',
-        'context_limit': 131072,
+        'context_limit': 65536,
         'container_name': 'aeon_minimax_m25_q5_light',
         'start_script': 'start_minimax_m25_q5_light.sh',
         'health_port': 8014,
@@ -95,7 +95,7 @@ LLAMACPP_MODELS = [
     {
         'model': 'Qwen3.5-27B-UD-Q8',
         'family': 'Qwen3.5',
-        'label': 'Qwen3.5-27B-UD (Q8_K_XL)        | GPU0: Max, GPU1: Idle      | ~30 t/s | 256k ctx | Abliterated: No  | Local/llama.cpp',
+        'label': 'Qwen3.5-27B-UD (Q8_K_XL)        | GPU0: 100%, GPU1: 0%     | ~27 t/s | 256k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8008/v1',
         'context_limit': 262144,
@@ -106,7 +106,7 @@ LLAMACPP_MODELS = [
     {
         'model': 'Qwen3-Coder-Next-Abliterated-Q8_0',
         'family': 'Qwen3-Coder',
-        'label': 'Qwen3-Coder-Next (Q8_0)         | GPU0: Max, GPU1: Idle      | ~25 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
+        'label': 'Qwen3-Coder-Next (Q8_0)         | GPU0: 100%, GPU1: 0%     | ~59 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8007/v1',
         'context_limit': 262144,
@@ -389,7 +389,7 @@ def build_model_menu(local_models):
             'model': m,
             'provider': 'local',
             'context_limit': 128000,
-            'label': f'{m:<31} | GPU0: Max, GPU1: Idle      | ~?? t/s | 128k ctx | Abliterated: ?   | Local/Ollama',
+            'label': f'{m:<31} | GPU0: 100%, GPU1: 0%     | ~?? t/s | 128k ctx | Abliterated: ?   | Local/Ollama',
         })
         
     last_family = None
