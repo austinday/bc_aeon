@@ -63,11 +63,6 @@ class OpenFileTool(BaseTool):
                 content = json.dumps(raw, indent=2)
             else:
                 content = str(raw)
-            if len(content) > MAX_FILE_READ_SIZE:
-                return (
-                    f"File '{file_path}' content is too large ({len(content):,} chars) to open directly. "
-                    f'Limit is {MAX_FILE_READ_SIZE:,} chars. Use a script to analyze this file.'
-                )
         else:
             # Structured summary (dataframe, sequence_summary, archive_contents, etc.)
             parts = [f'[File Summary: {summary_type}]']
@@ -79,6 +74,12 @@ class OpenFileTool(BaseTool):
                 else:
                     parts.append(f'{key}: {value}')
             content = '\n'.join(parts)
+
+        if len(content) > MAX_FILE_READ_SIZE:
+            return (
+                f"File '{file_path}' content is too large ({len(content):,} chars) to open directly. "
+                f"Limit is {MAX_FILE_READ_SIZE:,} chars. Use a script to analyze this file."
+            )
 
         self.worker.update_open_file(abs_path, content)
         slots_used = len(self.worker.open_files)

@@ -14,13 +14,13 @@ MODEL_REGISTRY_LOCK_PATH = "/tmp/aeon_model_registry.lock"
 # =============================================================================
 CLOUD_MODELS = [
     {
-        'model': 'gemini-3.1-pro',
+        'model': 'gemini-3.1-pro-preview',
         'provider': 'vertex',
         'project_id': 'trout-cricket-9761108088181001',
         'context_limit': 2000000,
     },
     {
-        'model': 'gemini-3.1-pro',
+        'model': 'gemini-3.1-pro-preview',
         'provider': 'vertex',
         'project_id': 'ai-ml-355015',
         'context_limit': 2000000,

@@ -9,9 +9,8 @@ echo "=================================================="
 HOST_OLLAMA_DIR="$HOME/bc_aeon/aeon_models/ollama_home"
 
 if [ ! -d "$HOST_OLLAMA_DIR" ]; then
-    echo "Error: Model directory not found at $HOST_OLLAMA_DIR"
-    echo "Please run 'bash setup_environment.sh' first."
-    exit 1
+    echo "Model directory not found at $HOST_OLLAMA_DIR. Creating it..."
+    mkdir -p "$HOST_OLLAMA_DIR"
 fi
 
 # --- 1. CLEANUP ---

@@ -73,6 +73,7 @@ class Worker:
 
     def _sync_open_files(self):
         """Synchronize open_files cache with disk state."""
+        from aeon.tools.analyzers import FileAnalyzer
         paths = list(self.open_files.keys())
         for path in paths:
             if not os.path.exists(path):
@@ -80,12 +81,40 @@ class Worker:
                 self.logger.info(f"Removed deleted file from context: {path}")
                 continue
             try:
-                with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                    content = f.read()
+                analyzer = FileAnalyzer(path)
+                result = analyzer.analyze()
+                summary_type = result.get('summary_type', '')
+                
+                if summary_type == 'opaque_binary':
+                    content = f"File '{path}' is a binary file that cannot be displayed. Use a script to analyze it."
+                elif summary_type == 'error':
+                    content = f"Error reading file: {result.get('error_message', 'Unknown error')}"
+                elif summary_type in ('empty_file', 'empty'):
+                    content = '(empty file)'
+                elif summary_type == 'full_content':
+                    raw = result.get('content', '')
+                    if isinstance(raw, (dict, list)):
+                        content = json.dumps(raw, indent=2)
+                    else:
+                        content = str(raw)
+                else:
+                    parts = [f'[File Summary: {summary_type}]']
+                    for key, value in result.items():
+                        if key in ('file_name', 'file_size_bytes', 'summary_type'):
+                            continue
+                        if isinstance(value, (dict, list)):
+                            parts.append(f'{key}: {json.dumps(value, indent=2, default=str)}')
+                        else:
+                            parts.append(f'{key}: {value}')
+                    content = '\n'.join(parts)
+
+                if len(content) > 250000:
+                    content = f"File '{path}' content is too large ({len(content):,} chars) to open directly. Limit is 250,000 chars. Use a script to analyze this file."
+
                 if self.open_files[path] != content:
                     self.open_files[path] = content
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.error(f"Error syncing file {path}: {e}")
 
     def register_tools(self, tools_list: List[Any]):
         for tool in tools_list:

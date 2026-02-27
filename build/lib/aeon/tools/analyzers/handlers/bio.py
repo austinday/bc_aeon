@@ -52,7 +52,7 @@ def summarize_hdf5(analyzer) -> Dict[str, Any]:
                     return {
                         "path": name,
                         "type": "group",
-                        "subitems": [extract_structure(child_name, child) for child_name, child in obj.items() if len([extract_structure(child_name, child)]) < 10]  # Limit depth
+                        "subitems": [extract_structure(child_name, child) for child_name, child in list(obj.items())[:10]]
                     }
                 return None
             structure = extract_structure('/', f)

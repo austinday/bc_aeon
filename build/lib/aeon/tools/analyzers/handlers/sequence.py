@@ -10,6 +10,14 @@ def summarize_record_based_data(analyzer) -> Dict[str, Any]:
     # Omit content_sample for all structure files to avoid including complex data
     protein_structure_extensions = {'.sdf', '.pdb', '.cif', '.mol2', '.gro', '.mmcif', '.pdbqt', '.ent'}
     try:
+        # Prevent OOM on massive files by returning a basic summary
+        if analyzer.file_size > 50 * 1024 * 1024:  # 50 MB limit
+            return {
+                "summary_type": "structured_record_summary", "file_format": analyzer.file_extension.lstrip('.'),
+                "record_count": "Unknown (File too large)", "record_delimiter": delimiters.get(analyzer.file_extension, 'N/A'),
+                "description": f"Large {analyzer.file_extension.lstrip('.')} file ({analyzer.file_size / 1024 / 1024:.1f} MB). Content omitted to save memory."
+            }
+
         with open(analyzer.file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
         if analyzer.file_extension in protein_structure_extensions:

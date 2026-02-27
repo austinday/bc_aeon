@@ -92,11 +92,12 @@ def summarize_numpy_archive(analyzer) -> Dict[str, Any]:
     try:
         import numpy as np
         with np.load(analyzer.file_path) as data:
-            arrays = {key: {'shape': data[key].shape, 'dtype': str(data[key].dtype)} for key in data.files}
+            total_arrays = len(data.files)
+            arrays = {key: {'shape': data[key].shape, 'dtype': str(data[key].dtype)} for key in list(data.files)[:50]}
         return {
             "summary_type": "numpy_archive_summary",
             "file_format": analyzer.file_extension.lstrip('.'),
-            "array_count": len(arrays),
+            "array_count": total_arrays,
             "arrays": arrays,
             "description": "NumPy archive file. A summary of the contained arrays, their shapes, and data types is provided."
         }
