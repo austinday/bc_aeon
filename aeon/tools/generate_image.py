@@ -154,9 +154,8 @@ class GenerateImageTool(BaseTool):
                     }
                 },
                 "9": {
-                    "class_type": "SaveImage",
+                    "class_type": "PreviewImage",
                     "inputs": {
-                        "filename_prefix": "aeon_flux",
                         "images": ["8", 0]
                     }
                 }
@@ -333,7 +332,7 @@ class EditImageTool(BaseTool):
                     }
                 },
                 "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
-                "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "aeon_flux_edit", "images": ["8", 0]}}
+                "9": {"class_type": "PreviewImage", "inputs": {"images": ["8", 0]}}
             }
 
             print(f"{self.C_CYAN}Submitting image edit workflow to ComfyUI...{self.C_RESET}")

@@ -5,6 +5,8 @@ from aeon.core.llm import LLMClient
 from aeon.tools.loader import load_tools_from_directory
 
 LOCK_FILE_PATH = "/tmp/aeon_runtime.lock"
+RESTART_STATE_PATH = "/tmp/aeon_restart_state.json"
+RESTART_BACKUP_PATH = "/tmp/aeon_restart_backup.tar.gz"
 STARTUP_LOCK_PATH = "/tmp/aeon_brain_startup.lock"
 MODEL_REGISTRY_PATH = "/tmp/aeon_model_registry.json"
 MODEL_REGISTRY_LOCK_PATH = "/tmp/aeon_model_registry.lock"
@@ -596,6 +598,210 @@ class SessionManager:
         
         print("[SESSION] Cleanup complete.")
 
+
+def _restore_backup(aeon_code_dir, backup_exists):
+    """Restore the aeon source directory from the tarball backup."""
+    import tarfile
+    import shutil
+
+    if not backup_exists or not os.path.exists(RESTART_BACKUP_PATH):
+        print('[RESTART] No backup available to restore.')
+        return False
+
+    try:
+        aeon_pkg_dir = os.path.join(aeon_code_dir, 'aeon')
+
+        # Remove the broken code
+        if os.path.isdir(aeon_pkg_dir):
+            shutil.rmtree(aeon_pkg_dir)
+
+        # Extract the backup
+        with tarfile.open(RESTART_BACKUP_PATH, 'r:gz') as tar:
+            tar.extractall(path=aeon_code_dir)
+
+        # Clean up backup file
+        os.remove(RESTART_BACKUP_PATH)
+
+        print('[RESTART] Source restored from backup successfully.')
+        return True
+    except Exception as e:
+        print(f'[RESTART] CRITICAL: Backup restoration failed: {e}')
+        print(f'[RESTART] Manual recovery may be needed. Backup at: {RESTART_BACKUP_PATH}')
+        return False
+
+
+def _execute_restart(session, worker=None):
+    """If restart_aeon was called, back up code, smoke test, reinstall, and re-exec.
+
+    Safety sequence:
+    1. Create a tarball backup of the aeon source directory
+    2. Clear __pycache__ and reinstall via pip
+    3. Run smoke_test.py to verify the new code is importable
+    4. If smoke test fails: restore from backup, delete state file, return
+       (agent continues running old code)
+    5. If smoke test passes: os.execv to relaunch with --resume
+
+    On success, this function never returns (os.execv replaces the process).
+    On failure, it restores the backup, injects an error observation into the
+    worker, and returns the objective string so the caller can re-run worker.run().
+    Returns None if no restart was pending.
+    """
+    if not os.path.exists(RESTART_STATE_PATH):
+        return
+
+    import shutil
+    import tarfile
+
+    aeon_code_dir = None
+    backup_created = False
+
+    try:
+        with open(RESTART_STATE_PATH, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+
+        objective = state.get('objective', '')
+        aeon_code_dir = state.get('aeon_code_dir')
+        if not aeon_code_dir or not os.path.isdir(aeon_code_dir):
+            print(f'[RESTART] ERROR: Invalid aeon_code_dir: {aeon_code_dir}')
+            os.remove(RESTART_STATE_PATH)
+            if worker:
+                worker.last_observation = f'RESTART FAILED: Invalid aeon_code_dir: {aeon_code_dir}. Fix the path and try again.'
+                worker.action_log.append(f'[RESTART FAILED] Invalid aeon_code_dir: {aeon_code_dir}')
+                return objective
+            return None
+
+        aeon_pkg_dir = os.path.join(aeon_code_dir, 'aeon')
+        if not os.path.isdir(aeon_pkg_dir):
+            print(f'[RESTART] ERROR: No aeon/ package directory found in {aeon_code_dir}')
+            os.remove(RESTART_STATE_PATH)
+            if worker:
+                worker.last_observation = f'RESTART FAILED: No aeon/ package found in {aeon_code_dir}. Fix the directory structure and try again.'
+                worker.action_log.append(f'[RESTART FAILED] No aeon/ package in {aeon_code_dir}')
+                return objective
+            return None
+
+        # Phase 1: Backup the aeon source directory
+        print(f'[RESTART] Creating backup of aeon source...')
+        try:
+            if os.path.exists(RESTART_BACKUP_PATH):
+                os.remove(RESTART_BACKUP_PATH)
+            with tarfile.open(RESTART_BACKUP_PATH, 'w:gz') as tar:
+                tar.add(aeon_pkg_dir, arcname='aeon')
+            backup_created = True
+            backup_size = os.path.getsize(RESTART_BACKUP_PATH)
+            print(f'[RESTART] Backup created ({backup_size / 1024:.0f} KB).')
+        except Exception as e:
+            print(f'[RESTART] WARNING: Backup failed: {e}. Proceeding without safety net.')
+
+        # Phase 2: Clear bytecode caches
+        print(f'[RESTART] Clearing __pycache__ directories...')
+        pycache_count = 0
+        for root, dirs, files in os.walk(aeon_code_dir):
+            for d in dirs:
+                if d == '__pycache__':
+                    shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+                    pycache_count += 1
+        print(f'[RESTART] Cleared {pycache_count} __pycache__ directories.')
+
+        # Phase 3: Reinstall
+        print(f'[RESTART] Reinstalling aeon from {aeon_code_dir}...')
+        result = subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '-e', '.', '--quiet'],
+            cwd=aeon_code_dir,
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f'[RESTART] ERROR: pip install failed:\n{result.stderr}')
+            _restore_backup(aeon_code_dir, backup_created)
+            os.remove(RESTART_STATE_PATH)
+            if worker:
+                worker.last_observation = f'RESTART FAILED: pip install failed. Backup restored, old code is running.\nError: {result.stderr[:500]}\nFix the code and try restart_aeon again.'
+                worker.action_log.append(f'[RESTART FAILED] pip install error. Backup restored.')
+                return objective
+            return None
+        print('[RESTART] Reinstall complete.')
+
+        # Phase 4: Smoke test
+        smoke_test_path = os.path.join(aeon_code_dir, 'aeon', 'smoke_test.py')
+        if os.path.exists(smoke_test_path):
+            print('[RESTART] Running smoke test...')
+            smoke_result = subprocess.run(
+                [sys.executable, '-B', smoke_test_path],
+                capture_output=True, text=True,
+                timeout=30,
+                cwd=aeon_code_dir
+            )
+            if smoke_result.returncode != 0:
+                smoke_output = (smoke_result.stdout or '') + (smoke_result.stderr or '')
+                print(f'[RESTART] SMOKE TEST FAILED. Output:')
+                if smoke_result.stdout:
+                    print(smoke_result.stdout)
+                if smoke_result.stderr:
+                    print(smoke_result.stderr)
+                print('[RESTART] Restoring backup and aborting restart...')
+                _restore_backup(aeon_code_dir, backup_created)
+                # Reinstall the restored code
+                subprocess.run(
+                    [sys.executable, '-m', 'pip', 'install', '-e', '.', '--quiet'],
+                    cwd=aeon_code_dir, capture_output=True
+                )
+                os.remove(RESTART_STATE_PATH)
+                print('[RESTART] Backup restored. Agent will continue with old code.')
+                if worker:
+                    worker.last_observation = (
+                        f'RESTART FAILED: Smoke test detected errors in your code. '
+                        f'Backup restored, old code is running.\n'
+                        f'Smoke test output:\n{smoke_output[:1000]}\n'
+                        f'Fix the errors above, then call restart_aeon again.'
+                    )
+                    worker.action_log.append(f'[RESTART FAILED] Smoke test failed. Backup restored. Errors: {smoke_output[:300]}')
+                    return objective
+                return None
+            print('[RESTART] Smoke test passed.')
+        else:
+            print('[RESTART] WARNING: No smoke test found, skipping validation.')
+
+        # Phase 5: Re-exec with --resume
+        original_cwd = state.get('original_cwd', os.getcwd())
+        os.chdir(original_cwd)
+
+        new_args = [
+            sys.executable, '-B', '-m', 'aeon.main',
+            '--resume', RESTART_STATE_PATH,
+            '--no-warmup',
+        ]
+        if state.get('debug_mode'):
+            new_args.append('--debug')
+        model_name = state.get('model_name')
+        if model_name:
+            new_args.extend(['--model', model_name])
+
+        # Clean up backup on successful restart
+        if backup_created and os.path.exists(RESTART_BACKUP_PATH):
+            os.remove(RESTART_BACKUP_PATH)
+
+        print(f'[RESTART] Relaunching: {" ".join(new_args)}')
+        os.execv(sys.executable, new_args)
+        # os.execv never returns on success
+
+    except Exception as e:
+        print(f'[RESTART] ERROR during restart: {e}')
+        import traceback
+        traceback.print_exc()
+        _restore_backup(aeon_code_dir, backup_created)
+        if os.path.exists(RESTART_STATE_PATH):
+            os.remove(RESTART_STATE_PATH)
+        if worker:
+            worker.last_observation = (
+                f'RESTART FAILED: Unexpected error: {e}. '
+                f'Backup restored (if available), old code is running.\n'
+                f'Fix the issue and try restart_aeon again.'
+            )
+            worker.action_log.append(f'[RESTART FAILED] Exception: {e}. Backup restored.')
+            return objective
+        return None
+
+
 def cli():
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true', help='Enable detailed LLM call logging to ~/')
@@ -604,6 +810,7 @@ def cli():
     parser.add_argument('--weak', type=str, help=argparse.SUPPRESS)
     parser.add_argument('--start', type=str, help='Initial objective to start immediately')
     parser.add_argument('--no-warmup', action='store_true', help='Skip model warmup (faster startup, slower first query)')
+    parser.add_argument('--resume', type=str, default=None, help='Path to restart state file (used internally by restart_aeon)')
     args = parser.parse_args()
 
     # --- Enumerate local models (start brain if needed) ---
@@ -643,22 +850,47 @@ def cli():
     try:
         llm_client = LLMClient(strong_config=strong_config, weak_config=weak_config)
         worker = Worker(llm_client=llm_client, debug_mode=args.debug)
+        worker.model_name = strong_config['model']
         deps = {'llm_client': llm_client, 'worker': worker}
         tools = load_tools_from_directory("aeon.tools", dependencies=deps)
         worker.register_tools(tools)
 
         prov = strong_config['provider'].upper()
-        print(f"\nAeon Ready (Model: {strong_config['model']} [{prov}], Debug: {args.debug})")
-        
+        print(f"\n\033[93mAeon Ready (Model: {strong_config['model']} [{prov}], Debug: {args.debug})\033[0m")
+
+        # --- Resume from restart if applicable ---
+        if args.resume and os.path.exists(args.resume):
+            try:
+                with open(args.resume, 'r', encoding='utf-8') as f:
+                    resume_state = json.load(f)
+                os.remove(args.resume)
+                worker.restore_state(resume_state)
+                obj = resume_state.get('objective', '')
+                print(f"[RESUME] State restored. Continuing objective: {obj}")
+                while obj:
+                    worker.run(obj)
+                    obj = _execute_restart(session, worker)
+            except Exception as e:
+                print(f"[RESUME] Failed to restore state: {e}. Starting fresh.")
+                import traceback
+                traceback.print_exc()
+                if os.path.exists(args.resume):
+                    os.remove(args.resume)
+
         if args.start:
-            worker.run(args.start)
+            obj = args.start
+            while obj:
+                worker.run(obj)
+                obj = _execute_restart(session, worker)
         
         while True:
             try:
                 obj = input("> ")
                 if obj.strip(): 
                     if obj.strip() in ['exit', 'quit']: break
-                    worker.run(obj)
+                    while obj:
+                        worker.run(obj)
+                        obj = _execute_restart(session, worker)
             except (KeyboardInterrupt, EOFError):
                 print("\n")
                 break

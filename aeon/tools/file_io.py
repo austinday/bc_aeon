@@ -15,7 +15,7 @@ from .analyzers import FileAnalyzer
 MAX_FILE_READ_SIZE = 250000
 
 # Fuzzy match confidence threshold (0.0 - 1.0)
-FUZZY_MATCH_THRESHOLD = 0.01  # Lowered to effectively guarantee a match fallback
+FUZZY_MATCH_THRESHOLD = 0.6  # Must be reasonably confident before applying a fuzzy replacement
 
 
 class OpenFileTool(BaseTool):
@@ -110,6 +110,7 @@ class StrReplaceTool(BaseTool):
             description=TOOL_DESC_STR_REPLACE
         )
         self.worker = worker
+        self._consecutive_failures = {}  # {abs_path: count} tracks fuzzy match failures per file
 
     def _normalize_whitespace(self, text: str) -> str:
         """Normalize trailing whitespace on each line for comparison."""
@@ -184,7 +185,7 @@ class StrReplaceTool(BaseTool):
         count = content.count(old_str)
         if count == 1:
             # Perfect: exactly one exact match
-            pass
+            self._consecutive_failures.pop(abs_path, None)  # Reset on success
         elif count > 1:
             return (
                 f'Error: old_str matched {count} times in {file_path}. '
@@ -210,6 +211,7 @@ class StrReplaceTool(BaseTool):
                 if end_line <= len(original_lines):
                     matched_text = ''.join(original_lines[start_line:end_line])
                     match_method = 'whitespace-normalized'
+                    self._consecutive_failures.pop(abs_path, None)  # Reset on success
                 else:
                     matched_text = None
             elif norm_count > 1:
@@ -226,16 +228,57 @@ class StrReplaceTool(BaseTool):
                 if fuzzy_match is not None:
                     matched_text = fuzzy_match
                     match_method = f'fuzzy (confidence: {score:.1%})'
+                    self._consecutive_failures.pop(abs_path, None)  # Reset on success
                 else:
-                    # Build a helpful error message
-                    # Show a snippet of what we were looking for vs closest match
+                    # Track consecutive failures for this file
+                    fail_count = self._consecutive_failures.get(abs_path, 0) + 1
+                    self._consecutive_failures[abs_path] = fail_count
+
+                    # Build diagnostic context: show what the file actually contains near where the match might be
                     search_preview = old_str[:200] + ('...' if len(old_str) > 200 else '')
-                    return (
-                        f'Error: Could not find a match for old_str in {file_path}. '
-                        f'Best fuzzy score was {score:.1%} (threshold: {FUZZY_MATCH_THRESHOLD:.0%}). '
-                        f'Searched for: {search_preview!r}\n'
-                        f'Verify the file contents with open_file, then retry with the exact text.'
-                    )
+                    first_line_of_search = old_str.split('\n')[0].strip()
+
+                    # Try to find partial line matches to help diagnose the mismatch
+                    diagnostic_lines = []
+                    content_lines = content.splitlines()
+                    for i, line in enumerate(content_lines):
+                        if first_line_of_search and first_line_of_search[:30] in line:
+                            start = max(0, i - 1)
+                            end = min(len(content_lines), i + 4)
+                            snippet = '\n'.join(f'  L{start+j+1}: {content_lines[start+j]}' for j in range(end - start))
+                            diagnostic_lines.append(snippet)
+                            break
+
+                    diagnostic = ''
+                    if diagnostic_lines:
+                        diagnostic = (
+                            f'\nNearest partial match found around these lines:\n'
+                            f'{diagnostic_lines[0]}\n'
+                            f'Compare carefully with your old_str - the mismatch may be due to '
+                            f'escape characters, quotes, or whitespace that got mangled in JSON encoding.'
+                        )
+
+                    if fail_count >= 3:
+                        # Third strike: escalate to write_file
+                        self._consecutive_failures[abs_path] = 0  # Reset counter
+                        return (
+                            f'Error: str_replace has failed {fail_count} times on {file_path}. '
+                            f'Best fuzzy score was {score:.1%} (threshold: {FUZZY_MATCH_THRESHOLD:.0%}). '
+                            f'The old_str you are providing does not match what is actually in the file. '
+                            f'This is likely caused by escape sequences (like \\033) being mangled during JSON encoding.\n'
+                            f'\n*** MANDATORY: Stop using str_replace for this file. '
+                            f'Use open_file to read the current full content, then use write_file to rewrite the ENTIRE file with your changes applied. ***'
+                            f'{diagnostic}'
+                        )
+                    else:
+                        return (
+                            f'Error: Could not find a match for old_str in {file_path} '
+                            f'(attempt {fail_count}/3 before escalation to write_file). '
+                            f'Best fuzzy score was {score:.1%} (threshold: {FUZZY_MATCH_THRESHOLD:.0%}). '
+                            f'Searched for: {search_preview!r}'
+                            f'{diagnostic}\n'
+                            f'Re-open the file with open_file and copy the EXACT text you want to replace.'
+                        )
 
         # --- PERFORM REPLACEMENT ---
         # Verify uniqueness of matched_text in the content (for fuzzy/normalized matches)
@@ -248,6 +291,13 @@ class StrReplaceTool(BaseTool):
                 )
 
         new_content = content.replace(matched_text, new_str, 1)
+
+        # Verify the replacement actually changed something
+        if new_content == content:
+            return (
+                f'Warning: Replacement produced identical content in {file_path}. '
+                f'The old_str and new_str may be equivalent after matching. No changes written.'
+            )
 
         try:
             with open(abs_path, 'w', encoding='utf-8') as f:

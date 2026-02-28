@@ -57,6 +57,9 @@ TOOL_DESC_EDIT_IMAGE = _load('tool_desc_edit_image.txt')
 TOOL_DESC_GENERATE_SCENE_WITH_CHARACTERS = _load('tool_desc_character_scene.txt')
 # === VISION TOOLS (vLLM-backed) ===
 TOOL_DESC_ANALYZE_IMAGE = _load('tool_desc_analyze_image.txt')
+# === SELF-MODIFICATION TOOLS ===
+TOOL_DESC_RESTART_AEON = _load('tool_desc_restart_aeon.txt')
+TOOL_DESC_PREPARE_FOR_PRINTIFY = _load('tool_desc_prepare_for_printify.txt')
 
 # =============================================================================
 # CONTEXT SECTIONS

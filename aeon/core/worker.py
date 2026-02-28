@@ -25,9 +25,9 @@ from .prompts import (
 C_RED = '\033[91m'
 C_YELLOW = '\033[93m'
 C_CYAN = '\033[96m'
-C_GREEN = '\033[92m'
+C_GREEN = '\033[95m'
 C_RESET = '\033[0m'
-C_BLUE = '\033[94m'
+C_BLUE = '\033[96m'
 
 
 class Worker:
@@ -60,6 +60,8 @@ class Worker:
         self.docker_directives = DOCKER_DIRECTIVES
         self.important_reminders = IMPORTANT_REMINDERS
         self.max_history_tokens = 30000
+        self.current_objective = None
+        self.model_name = None  # Set by main.py for restart persistence
 
     def _init_debug_logging(self):
         """Initialize debug logging once per worker instance."""
@@ -197,7 +199,52 @@ class Worker:
         self._recent_commands.clear()
         self._recent_outputs.clear()
 
+    def serialize_state(self) -> dict:
+        """Serialize worker state for persistence across restarts."""
+        return {
+            'memories': dict(self.memories),
+            'current_plan': self.current_plan,
+            'action_log': list(self.action_log),
+            'objective': self.current_objective or '',
+        }
+
+    def restore_state(self, state: dict):
+        """Restore worker state from a previous serialization (used after restart)."""
+        self.memories = state.get('memories', {})
+        self.action_log = state.get('action_log', [])
+        reason = state.get('reason', 'code changes')
+
+        # Append a clear record that the restart happened
+        self.action_log.append(
+            f'[RESTART COMPLETED]\n'
+            f'- Reason: {reason}\n'
+            f'- pip install: SUCCESS\n'
+            f'- Process relaunch: SUCCESS\n'
+            f'- State restore: SUCCESS (memories, action log preserved)\n'
+            f'- Result: Agent is NOW running the updated code. The restart is DONE.'
+        )
+
+        # Override the plan - the old plan is stale and will cause loops
+        self.current_plan = (
+            f'Restart completed successfully. The agent is now running with updated code ({reason}). '
+            f'Next steps: verify the changes work as expected, then proceed with or complete the objective. '
+            f'DO NOT call restart_aeon again unless you make additional NEW code changes.'
+        )
+
+        # Set last_observation with very explicit language to prevent re-restart loops
+        self.last_observation = (
+            f'=== RESTART COMPLETE ===\n'
+            f'The agent process has been SUCCESSFULLY restarted. Details:\n'
+            f'- Code changes applied: {reason}\n'
+            f'- The updated code is NOW ACTIVE in this running process.\n'
+            f'- All persistent memories and action history have been restored.\n'
+            f'\n'
+            f'CRITICAL: The restart is FINISHED. Do NOT call restart_aeon again.\n'
+            f'Your code changes are ALREADY LIVE. Proceed with verifying them or completing the task.'
+        )
+
     def _save_objective(self, objective: str):
+        self.current_objective = objective
         try:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             entry = f"[{timestamp}] OBJECTIVE UPDATE:\n{objective}\n{'-'*40}\n"
@@ -257,7 +304,7 @@ class Worker:
     # --- MAIN LOOP ---
     def run(self, objective: str, max_iterations: Optional[int] = None, step_callback: Optional[Callable[[int, int, str], None]] = None, terminal_tools: List[str] = None):
         if terminal_tools is None:
-            terminal_tools = ['task_complete']
+            terminal_tools = ['task_complete', 'restart_aeon']
 
         self.logger.info("Starting Execution for: %s", objective)
         self._save_objective(objective)
