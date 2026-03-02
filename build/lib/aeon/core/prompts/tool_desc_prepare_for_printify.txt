@@ -1,0 +1,25 @@
+A tool to prepare images for print-on-demand services like Printify. This tool performs comprehensive image preprocessing including: background removal, transparency handling, edge trimming, resolution scaling, and DPI adjustment.
+
+**Use this tool when:**
+- User wants to remove backgrounds from images
+- User needs images prepared for t-shirt printing or similar print-on-demand services
+- User wants to trim transparent edges from images
+- User needs to resize images to specific dimensions
+- User needs to adjust image DPI for print quality
+
+**Parameters:**
+- input_path (str, required): Path to the input image file
+- output_path (str, required): Path where the processed image will be saved
+- background_removal (bool, optional, default=True): Whether to remove the background
+- target_width (int, optional): Target width in pixels (maintains aspect ratio if only one dimension specified)
+- target_height (int, optional): Target height in pixels (maintains aspect ratio if only one dimension specified)
+- dpi (int, optional, default=300): Target DPI for print quality
+- trim_transparent_edges (bool, optional, default=True): Whether to trim transparent edges after background removal
+- output_format (str, optional, default='PNG'): Output format ('PNG' for transparency, 'JPG' for opaque)
+- watermark_text (str, optional): Optional watermark text to add to the image
+
+**Returns:**
+A string describing the processing results, including output file path, final dimensions, and any warnings or errors encountered.
+
+**Example usage:**
+"prepare_for_printify(input_path='product.png', output_path='product_printify.png', background_removal=True, target_width=4500, dpi=300, trim_transparent_edges=True)"

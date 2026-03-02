@@ -1,0 +1,4 @@
+Collapses a tool category (and all its subcategories) to free context space. Use this when you no longer need the specialized tools in a category. Collapsed tools are hidden from your context but remain callable if needed. Collapsing helps prevent context rot on long tasks.
+Schema:
+  category_path (str, required): The slash-separated path of the category to collapse (e.g., "image_tools").
+Example: {"tool_name": "collapse_tool_category", "parameters": {"category_path": "image_tools"}}

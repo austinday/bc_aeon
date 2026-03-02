@@ -1,0 +1,12 @@
+CRITICAL: MUST USE THIS TOOL when the user asks to generate an image featuring specific consistent characters based on reference images. This uses the PuLID adapter to enforce facial identity.
+IMPORTANT RULES FOR THE PROMPT:
+1. PuLID only copies the FACE. The text prompt MUST fully describe the character's clothing, body type, and hair.
+2. The base model does not know custom character names from the filenames. Do not just prompt "John and Sarah". You MUST describe them physically (e.g., "A tall muscular man with black hair on the left, and a blonde woman in a red jacket on the right").
+3. The positions described in the text prompt MUST match the 'position' parameter assigned to each character's image.
+Schema:
+  prompt (str, required): The detailed visual description of the scene, including physical descriptions of the characters and their outfits.
+  characters (list of dicts, required): A list defining the characters to inject. Each dict must contain:
+    - reference_image_path (str, required): Path to the image file defining the character's face.
+    - position (str, optional, default="global"): Where the character is located in the scene ("global", "left", "right", "center").
+  output_path (str, required): Path to save the final generated image.
+Example: {"tool_name": "generate_scene_with_characters", "parameters": {"prompt": "A man with short black hair in a grey suit on the left, and a woman in a red dress on the right, standing in an alleyway", "characters": [{"reference_image_path": "hero.png", "position": "left"}, {"reference_image_path": "villain.png", "position": "right"}], "output_path": "scene.png"}}

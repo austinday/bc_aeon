@@ -1,0 +1,7 @@
+**OBJECTIVE**
+{objective}
+Above is your objective. If unclear, ambiguous, or conversational, use "get_user_input" tool to clarify before proceeding. 
+
+*** FINAL FORMATTING REMINDER ***
+You MUST output a valid JSON object.
+CRITICAL: You MUST use the `__BLOCK_N__` placeholder system for ANY multi-line code, quotes, or complex strings. DO NOT try to write raw code/JSON inside the action JSON values! Put the "__BLOCK_N__" string in the JSON, and put the actual code below the JSON.
