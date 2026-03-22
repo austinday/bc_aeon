@@ -51,12 +51,9 @@ aeon/scripts/__init__.py
 aeon/scripts/clear_gpu.sh
 aeon/scripts/start_brain.sh
 aeon/scripts/start_comfyui.sh
-aeon/scripts/start_minimax_m25_q5_light.sh
+aeon/scripts/start_nemotron_120b_q8.sh
 aeon/scripts/start_qwen35_vl_35b.sh
 aeon/scripts/start_qwen3_coder_q8.sh
-aeon/scripts/start_qwen_122b_q5_max.sh
-aeon/scripts/start_qwen_122b_q8_lite.sh
-aeon/scripts/start_qwen_27b_q8.sh
 aeon/scripts/start_vllm.sh
 aeon/services/__init__.py
 aeon/tools/__init__.py

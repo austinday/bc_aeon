@@ -1,38 +1,39 @@
 #!/bin/bash
 # =============================================================================
-# Start llama.cpp server for MiniMax-M2.5-Q5_K_S GGUF (LIGHT mode)
-# Offloads all layers to GPU to prevent system RAM swapping. Fits on ~1.5 GPUs.
-# GPU0 maxed, GPU1 partially loaded.
+# Start llama.cpp server for NVIDIA-Nemotron-3-Super-120B-A12B Q8_0
+# GPU0 completely filled with model + context, remainder on GPU1
 # =============================================================================
 set -e
 
-CONTAINER_NAME='aeon_minimax_m25_q5_light'
+CONTAINER_NAME='aeon_nemotron_120b_q8'
 IMAGE_NAME='aeon_llamacpp:latest'
-PORT=8014
-MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/MiniMax-M2.5"
+PORT=8005
+MODELS_DIR="$HOME/bc_aeon/aeon_models/gguf_models/NVIDIA-Nemotron-3-Super-120B-A12B"
 
 # Tunable parameters
-N_GPU_LAYERS=${NGL:-999}         # Offload all to GPU
-PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot
-CTX_SIZE=${CTX:-65536}           # 64k context
-BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
-# tensor-split: 58,42 shifts more layers to GPU0 utilizing the freed context VRAM.
-TENSOR_SPLIT=${TSPLIT:-58,42}
-QUANT="Q5_K_S"
+N_GPU_LAYERS=${NGL:-999}
+PARALLEL_SLOTS=${PARALLEL:-1}
+CTX_SIZE=${CTX:-262144}
+BATCH_SIZE=${BATCH:-4096}
+# tensor-split: Heavily bias towards GPU 0 (e.g., 75,25) to fill it up first
+TENSOR_SPLIT=${TSPLIT:-75,25}
+QUANT="Q8_0"
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
 
-MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "${QUANT}" | sort | head -1 | sed 's|^\./||')
+# Note: Nemotron-3-Super-120B Q8_0 is split into multiple files (00001-of-00004.gguf etc.)
+# llama.cpp only needs the first file, it will automatically load the rest.
+MODEL_FILE=$(cd "${MODELS_DIR}" 2>/dev/null && find . -name "*.gguf" | grep -i "${QUANT}" | grep -i "00001" | sort | head -1 | sed 's|^\./||')
 if [ -z "$MODEL_FILE" ]; then
-    echo "[MiniMax-M2.5-${QUANT}-Light] ERROR: No .gguf files matching ${QUANT} found in ${MODELS_DIR}"
+    echo "[Nemotron-120B] ERROR: No .gguf files matching ${QUANT} (part 1) found in ${MODELS_DIR}"
     exit 1
 fi
 
-echo "[MiniMax-M2.5-${QUANT}-Light] Using model file: ${MODEL_FILE}"
-echo "[MiniMax-M2.5-${QUANT}-Light] Checking for existing container..."
+echo "[Nemotron-120B] Using model file: ${MODEL_FILE}"
+echo "[Nemotron-120B] Checking for existing container..."
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "[MiniMax-M2.5-${QUANT}-Light] Container already running. Checking health..."
+        echo "[Nemotron-120B] Container already running. Checking health..."
         count=0
         while true; do
             HC=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null || echo "000")
@@ -40,22 +41,22 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
             sleep 2
             count=$((count+1))
             if [ $count -ge 10 ]; then
-                echo "[MiniMax-M2.5-${QUANT}-Light] Running but unhealthy (HTTP $HC). Restarting..."
+                echo "[Nemotron-120B] Running but unhealthy (HTTP $HC). Restarting..."
                 docker rm -f $CONTAINER_NAME >/dev/null 2>&1
                 break
             fi
         done
         if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null)" = "200" ]; then
-            echo "[MiniMax-M2.5-${QUANT}-Light] Already running and healthy on port $PORT."
+            echo "[Nemotron-120B] Already running and healthy on port $PORT."
             exit 0
         fi
     else
-        echo "[MiniMax-M2.5-${QUANT}-Light] Removing stopped container..."
+        echo "[Nemotron-120B] Removing stopped container..."
         docker rm -f $CONTAINER_NAME >/dev/null 2>&1
     fi
 fi
 
-echo "[MiniMax-M2.5-${QUANT}-Light] Starting llama.cpp server..."
+echo "[Nemotron-120B] Starting llama.cpp server..."
 
 docker run -d \
     --name $CONTAINER_NAME \
@@ -64,6 +65,8 @@ docker run -d \
     -v "${MODELS_DIR}:/models:ro" \
     --shm-size=16g \
     --ulimit memlock=-1 \
+    --memory="200g" \
+    --memory-swap="200g" \
     $IMAGE_NAME \
     --model "/models/${MODEL_FILE}" \
     --split-mode layer \
@@ -82,11 +85,11 @@ docker run -d \
     --mlock \
     --no-mmap
 
-echo "[MiniMax-M2.5-${QUANT}-Light] Waiting for server to load model (this may take several minutes)..."
+echo "[Nemotron-120B] Waiting for server to load model (this may take several minutes)..."
 count=0
 while true; do
     if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        echo "[MiniMax-M2.5-${QUANT}-Light] ERROR: Container crashed during model loading!"
+        echo "[Nemotron-120B] ERROR: Container crashed during model loading!"
         echo "--- Container Logs ---"
         docker logs --tail 40 $CONTAINER_NAME
         echo "---"
@@ -97,14 +100,14 @@ while true; do
     sleep 5
     count=$((count+1))
     if [ $count -ge 120 ]; then
-        echo "[MiniMax-M2.5-${QUANT}-Light] ERROR: Server did not become healthy within 10 minutes."
+        echo "[Nemotron-120B] ERROR: Server did not become healthy within 10 minutes."
         docker logs $CONTAINER_NAME --tail 30
         exit 1
     fi
     if [ $((count % 6)) -eq 0 ]; then
         elapsed=$((count * 5))
-        echo "[MiniMax-M2.5-${QUANT}-Light] Still loading... (${elapsed}s)"
+        echo "[Nemotron-120B] Still loading... (${elapsed}s)"
     fi
 done
 
-echo "[MiniMax-M2.5-${QUANT}-Light] Server ready on port $PORT."
+echo "[Nemotron-120B] Server ready on port $PORT."

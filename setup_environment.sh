@@ -24,7 +24,7 @@ fi
 log_step "PHASE 1: Build Docker images (layer cache makes unchanged builds fast)"
 
 # Stop any running containers that depend on these images
-for cname in aeon_qwen122b_lite aeon_qwen122b_max; do
+for cname in aeon_nemotron_120b_q8; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
         log_step "Stopping stale container: $cname"
         docker rm -f "$cname" >/dev/null 2>&1 || true
@@ -46,49 +46,53 @@ else
 fi
 
 # =============================================================================
-# PHASE 5: Qwen3.5-122B-A10B GGUF (llama.cpp served)
+# PHASE 5: NVIDIA-Nemotron-3-Super-120B-A12B GGUF (llama.cpp served)
 # =============================================================================
-QWEN_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3.5-122B-A10B"
+NEMOTRON_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/NVIDIA-Nemotron-3-Super-120B-A12B"
 
-log_step "PHASE 5: Download Qwen3.5-122B-A10B GGUF model shards"
-mkdir -p "$QWEN_GGUF_DIR"
+log_step "PHASE 5: Download NVIDIA-Nemotron-3-Super-120B-A12B GGUF model shards"
+mkdir -p "$NEMOTRON_GGUF_DIR"
 
-if [[ -f "$QWEN_GGUF_DIR/.download_complete" ]]; then
-    log_step "Qwen GGUF already downloaded, skipping."
+if [[ -f "$NEMOTRON_GGUF_DIR/.download_complete" ]]; then
+    log_step "Nemotron GGUF already downloaded, skipping."
 else
-    QWEN_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen_XXXXXX.py)
-    cat > "$QWEN_DL_SCRIPT" << 'PYEOF'
+    NEMOTRON_DL_SCRIPT=$(mktemp /tmp/aeon_dl_nemotron_XXXXXX.py)
+    cat > "$NEMOTRON_DL_SCRIPT" << 'PYEOF'
 import os, sys
 from huggingface_hub import hf_hub_download, list_repo_files
 
-REPO = "unsloth/Qwen3.5-122B-A10B-GGUF"
+REPO = "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF"
 TARGET = "/models"
-MODELS_TO_DOWNLOAD = ["Q8_0", "Q5_K_S"]
+PREFIX = "Q8_0"
 
 print(f"Listing files in {REPO}...", flush=True)
-all_files = list_repo_files(REPO)
+try:
+    all_files = list_repo_files(REPO)
+except Exception as e:
+    print(f"Failed to list repo: {e}")
+    sys.exit(1)
 
-for prefix in MODELS_TO_DOWNLOAD:
-    print(f"\nProcessing {prefix}...", flush=True)
-    shards = sorted([f for f in all_files if prefix in f and f.endswith(".gguf")])
-    print(f"Found {len(shards)} shard(s):", flush=True)
-    for s in shards:
-        print(f"  {s}", flush=True)
+print(f"\nProcessing {PREFIX}...", flush=True)
+shards = sorted([f for f in all_files if PREFIX in f and f.endswith(".gguf")])
+print(f"Found {len(shards)} shard(s):", flush=True)
+for s in shards:
+    print(f"  {s}", flush=True)
 
-    if not shards:
-        print(f"ERROR: No matching GGUF shards found in repo for {prefix}!", flush=True)
+if not shards:
+    print(f"ERROR: No matching GGUF shards found in repo for {PREFIX}!", flush=True)
+    sys.exit(1)
+
+all_done = True
+for i, shard in enumerate(shards, 1):
+    dest = os.path.join(TARGET, shard)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000_000:
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
         continue
-
-    all_done = True
-    for i, shard in enumerate(shards, 1):
-        dest = os.path.join(TARGET, shard)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000_000:
-            sz = os.path.getsize(dest) / (1024**3)
-            print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
-            continue
-        all_done = False
-        print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
+    all_done = False
+    print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
+    try:
         hf_hub_download(
             repo_id=REPO,
             filename=shard,
@@ -96,11 +100,14 @@ for prefix in MODELS_TO_DOWNLOAD:
         )
         sz = os.path.getsize(dest) / (1024**3)
         print(f"  Done: {sz:.1f}GB", flush=True)
+    except Exception as e:
+        print(f"Failed to download {shard}: {e}")
+        sys.exit(1)
 
-    if all_done:
-        print(f"All {prefix} shards already present and valid.", flush=True)
-    else:
-        print(f"All {prefix} shards downloaded successfully.", flush=True)
+if all_done:
+    print(f"All {PREFIX} shards already present and valid.", flush=True)
+else:
+    print(f"All {PREFIX} shards downloaded successfully.", flush=True)
 PYEOF
 
     TTY_FLAG=""
@@ -108,21 +115,21 @@ PYEOF
     docker run --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
-        -v "$QWEN_GGUF_DIR:/models" \
-        -v "$QWEN_DL_SCRIPT:/download.py:ro" \
+        -v "$NEMOTRON_GGUF_DIR:/models" \
+        -v "$NEMOTRON_DL_SCRIPT:/download.py:ro" \
         aeon_downloader:latest \
         python3 /download.py
 
     DL_EXIT=$?
-    rm -f "$QWEN_DL_SCRIPT"
+    rm -f "$NEMOTRON_DL_SCRIPT"
     if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: Qwen GGUF download failed (exit code $DL_EXIT)"
+        log_step "ERROR: Nemotron GGUF download failed (exit code $DL_EXIT)"
         exit 1
     fi
 
-    touch "$QWEN_GGUF_DIR/.download_complete"
+    touch "$NEMOTRON_GGUF_DIR/.download_complete"
 fi
-chown -R $(id -u):$(id -g) "$QWEN_GGUF_DIR" 2>/dev/null || true
+chown -R $(id -u):$(id -g) "$NEMOTRON_GGUF_DIR" 2>/dev/null || true
 log_step "PHASE 5 complete."
 
 # =============================================================================
@@ -212,142 +219,6 @@ chown -R $(id -u):$(id -g) "$QWEN3_CODER_GGUF_DIR" 2>/dev/null || true
 log_step "PHASE 5.5 complete."
 
 # =============================================================================
-# PHASE 5.6: MiniMax-M2.5 GGUF — Q5_K_S (llama.cpp served)
-# =============================================================================
-MINIMAX_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/MiniMax-M2.5"
-log_step "PHASE 5.6: Download MiniMax-M2.5 GGUF model shards (Q5_K_S)"
-mkdir -p "$MINIMAX_GGUF_DIR"
-
-if [[ -f "$MINIMAX_GGUF_DIR/.download_complete_v2" ]]; then
-    log_step "MiniMax GGUF already downloaded, skipping."
-else
-    MINIMAX_DL_SCRIPT=$(mktemp /tmp/aeon_dl_minimax_XXXXXX.py)
-    cat > "$MINIMAX_DL_SCRIPT" << 'PYEOF'
-import os, sys
-from huggingface_hub import hf_hub_download, list_repo_files
-
-REPO = "unsloth/MiniMax-M2.5-GGUF"
-TARGET = "/models"
-PREFIXES = ["Q5_K_S"]
-
-print(f"Listing files in {REPO}...", flush=True)
-try:
-    all_files = list_repo_files(REPO)
-except Exception as e:
-    print(f"Failed to list repo: {e}")
-    sys.exit(1)
-
-for PREFIX in PREFIXES:
-    print(f"\nProcessing {PREFIX}...", flush=True)
-    shards = sorted([f for f in all_files if PREFIX in f and f.endswith(".gguf")])
-    print(f"Found {len(shards)} shard(s):", flush=True)
-    for s in shards:
-        print(f"  {s}", flush=True)
-
-    if not shards:
-        print(f"ERROR: No matching GGUF shards found in repo for {PREFIX}!", flush=True)
-        sys.exit(1)
-
-    all_done = True
-    for i, shard in enumerate(shards, 1):
-        dest = os.path.join(TARGET, shard)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if os.path.exists(dest) and os.path.getsize(dest) > 100_000_000:
-            sz = os.path.getsize(dest) / (1024**3)
-            print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
-            continue
-        all_done = False
-        print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
-        try:
-            hf_hub_download(
-                repo_id=REPO,
-                filename=shard,
-                local_dir=TARGET,
-            )
-            sz = os.path.getsize(dest) / (1024**3)
-            print(f"  Done: {sz:.1f}GB", flush=True)
-        except Exception as e:
-            print(f"Failed to download {shard}: {e}")
-            sys.exit(1)
-
-    if all_done:
-        print(f"All {PREFIX} shards already present and valid.", flush=True)
-    else:
-        print(f"All {PREFIX} shards downloaded successfully.", flush=True)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$MINIMAX_GGUF_DIR:/models" \
-        -v "$MINIMAX_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-
-    DL_EXIT=$?
-    rm -f "$MINIMAX_DL_SCRIPT"
-    if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: MiniMax GGUF download failed (exit code $DL_EXIT)"
-        exit 1
-    fi
-
-    touch "$MINIMAX_GGUF_DIR/.download_complete_v2"
-fi
-chown -R $(id -u):$(id -g) "$MINIMAX_GGUF_DIR" 2>/dev/null || true
-log_step "PHASE 5.6 complete."
-
-# =============================================================================
-# PHASE 5.8: Qwen3.5-27B-GGUF (Q8_K_XL)
-# =============================================================================
-QWEN27B_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3.5-27B"
-log_step "PHASE 5.8: Download Qwen3.5-27B GGUF model"
-mkdir -p "$QWEN27B_GGUF_DIR"
-
-if [[ -f "$QWEN27B_GGUF_DIR/.download_complete" ]]; then
-    log_step "Qwen3.5-27B GGUF already downloaded, skipping."
-else
-    QWEN27B_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen27b_XXXXXX.py)
-    cat > "$QWEN27B_DL_SCRIPT" << 'PYEOF'
-import os, sys
-from huggingface_hub import hf_hub_download
-
-REPO = "unsloth/Qwen3.5-27B-GGUF"
-TARGET = "/models"
-FILENAME = "Qwen3.5-27B-UD-Q8_K_XL.gguf"
-
-print(f"Downloading {FILENAME} from {REPO}...", flush=True)
-try:
-    hf_hub_download(repo_id=REPO, filename=FILENAME, local_dir=TARGET)
-    print("Download complete.")
-except Exception as e:
-    print(f"Error downloading {FILENAME}: {e}")
-    sys.exit(1)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$QWEN27B_GGUF_DIR:/models" \
-        -v "$QWEN27B_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-
-    DL_EXIT=$?
-    rm -f "$QWEN27B_DL_SCRIPT"
-    if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: Qwen3.5-27B GGUF download failed"
-        exit 1
-    fi
-    touch "$QWEN27B_GGUF_DIR/.download_complete"
-fi
-chown -R $(id -u):$(id -g) "$QWEN27B_GGUF_DIR" 2>/dev/null || true
-log_step "PHASE 5.8 complete."
-
-# =============================================================================
 # PHASE 5.7: Qwen3.5-35B-A3B GGUF (Vision-Language Model for llama.cpp)
 # =============================================================================
 QWEN3_VL_DIR="$PROJECT_ROOT/aeon_models/vl_models/Qwen3.5-35B-A3B-GGUF"
@@ -418,18 +289,15 @@ chown -R $(id -u):$(id -g) "$QWEN3_VL_DIR" 2>/dev/null || true
 log_step "PHASE 5.7 complete."
 
 # =============================================================================
-# PHASE 6: Build llama.cpp server Docker image (for GGUF model serving)
-# =============================================================================
-# =============================================================================
 # PHASE 5.9: Build prepare_for_printify Docker image (print-on-demand preprocessing)
 # =============================================================================
 log_step "PHASE 5.9: Build bananacoconut-preprocessor Docker image for printify preprocessing"
 
-BANANA_COCONUT_DIR=\"$PROJECT_ROOT/../bananaCoconut\"
-mkdir -p \"$BANANA_COCONUT_DIR\"
+BANANA_COCONUT_DIR="$PROJECT_ROOT/../bananaCoconut"
+mkdir -p "$BANANA_COCONUT_DIR"
 
 # Write the preprocessing script
-cat > \"$BANANA_COCONUT_DIR/complete_printify_preprocess.py\" << 'PYEOF'
+cat > "$BANANA_COCONUT_DIR/complete_printify_preprocess.py" << 'PYEOF'
 import argparse
 import os
 import sys
@@ -442,11 +310,11 @@ try:
     REMBG_AVAILABLE = True
 except ImportError:
     REMBG_AVAILABLE = False
-    print(\"WARNING: rembg not available. Background removal will be skipped.\")
+    print("WARNING: rembg not available. Background removal will be skipped.")
 
 def process_image(input_path: str, output_path: str, args):
-    \"\"\"Process a single image through the pipeline.\"\"\"
-    print(f\"Processing: {input_path}\")
+    """Process a single image through the pipeline."""
+    print(f"Processing: {input_path}")
     
     try:
         # Open image
@@ -471,11 +339,11 @@ def process_image(input_path: str, output_path: str, args):
                 new_h = args.target_height
             
             img = img.resize((new_w, new_h), Image.LANCZOS)
-            print(f\"  Resized to {new_w}x{new_h}\")
+            print(f"  Resized to {new_w}x{new_h}")
         
         # Stage 2: Background removal
         if args.background_removal and REMBG_AVAILABLE:
-            print(\"  Removing background...\")
+            print("  Removing background...")
             img_bytes = io.BytesIO()
             img.save(img_bytes, format='PNG')
             img_bytes.seek(0)
@@ -487,22 +355,22 @@ def process_image(input_path: str, output_path: str, args):
                     img = Image.open(io.BytesIO(img))
                     if img.mode != 'RGBA':
                         img = img.convert('RGBA')
-                    print(f\"  Background removed using {model}\")
+                    print(f"  Background removed using {model}")
                     break
                 except Exception as e:
-                    print(f\"    Model {model} failed: {e}\")
+                    print(f"    Model {model} failed: {e}")
                     continue
             else:
-                print(\"  WARNING: All background removal models failed\")
+                print("  WARNING: All background removal models failed")
         
         # Stage 3: Trim transparent edges
         if args.trim_transparent_edges:
-            print(\"  Trimming transparent edges...\")
+            print("  Trimming transparent edges...")
             img = trim_transparent_edges(img)
         
         # Stage 4: Add watermark if specified
         if args.watermark_text:
-            print(f\"  Adding watermark: {args.watermark_text}\")
+            print(f"  Adding watermark: {args.watermark_text}")
             img = add_watermark(img, args.watermark_text)
         
         # Stage 5: Save with correct DPI and format
@@ -527,17 +395,17 @@ def process_image(input_path: str, output_path: str, args):
             save_kwargs['quality'] = 95
         
         img.save(output_path, **save_kwargs)
-        print(f\"  Saved to {output_path} ({img.size[0]}x{img.size[1]}, {args.dpi} DPI)\")
+        print(f"  Saved to {output_path} ({img.size[0]}x{img.size[1]}, {args.dpi} DPI)")
         
         return True
         
     except Exception as e:
-        print(f\"  ERROR: {type(e).__name__}: {e}\")
+        print(f"  ERROR: {type(e).__name__}: {e}")
         return False
 
 
 def trim_transparent_edges(img: Image.Image) -> Image.Image:
-    \"\"\"Trim transparent edges from an RGBA image.\"\"\"
+    """Trim transparent edges from an RGBA image."""
     if img.mode != 'RGBA':
         return img
     
@@ -556,7 +424,7 @@ def trim_transparent_edges(img: Image.Image) -> Image.Image:
 
 
 def add_watermark(img: Image.Image, text: str) -> Image.Image:
-    \"\"\"Add a watermark text to the image.\"\"\"
+    """Add a watermark text to the image."""
     from PIL import ImageDraw, ImageFont
     
     # Create a copy to draw on
@@ -564,7 +432,7 @@ def add_watermark(img: Image.Image, text: str) -> Image.Image:
     
     # Try to load a font, fall back to default
     try:
-        font = ImageFont.truetype(\"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\", 24)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
     except:
         font = ImageFont.load_default()
     
@@ -622,19 +490,19 @@ def main():
     images = [f for f in input_dir.iterdir() if f.suffix.lower() in image_extensions]
     
     if not images:
-        print(f\"No images found in {input_dir}\")
+        print(f"No images found in {input_dir}")
         return
     
-    print(f\"Found {len(images)} images to process\")
+    print(f"Found {len(images)} images to process")
     
     # Process each image
     success_count = 0
     for img_path in images:
-        output_path = output_dir / f\"{img_path.stem}_processed.{args.output_format.lower()}\"
+        output_path = output_dir / f"{img_path.stem}_processed.{args.output_format.lower()}"
         if process_image(str(img_path), str(output_path), args):
             success_count += 1
     
-    print(f\"\\nCompleted: {success_count}/{len(images)} images processed successfully\")
+    print(f"\nCompleted: {success_count}/{len(images)} images processed successfully")
 
 
 if __name__ == '__main__':
@@ -642,7 +510,7 @@ if __name__ == '__main__':
 PYEOF
 
 # Write the Dockerfile
-cat > \"$BANANA_COCONUT_DIR/Dockerfile\" << 'EOF'
+cat > "$BANANA_COCONUT_DIR/Dockerfile" << 'EOF'
 FROM python:3.10-slim
 
 # Install system dependencies
@@ -665,24 +533,23 @@ RUN pip install --no-cache-dir \
 COPY complete_printify_preprocess.py /app/
 
 # Default command
-CMD [\"python\", \"complete_printify_preprocess.py\"]
+CMD ["python", "complete_printify_preprocess.py"]
 EOF
 
 # Build the Docker image
 if ! docker image inspect bananacoconut-preprocessor:latest >/dev/null 2>&1; then
-    log_step \"Building bananacoconut-preprocessor:latest...\"
-    docker build -t bananacoconut-preprocessor:latest \"$BANANA_COCONUT_DIR\"
-    log_step \"bananacoconut-preprocessor:latest built successfully.\"
+    log_step "Building bananacoconut-preprocessor:latest..."
+    docker build -t bananacoconut-preprocessor:latest "$BANANA_COCONUT_DIR"
+    log_step "bananacoconut-preprocessor:latest built successfully."
 else
-    log_step \"bananacoconut-preprocessor:latest already exists, skipping build.\"
+    log_step "bananacoconut-preprocessor:latest already exists, skipping build."
 fi
 
-log_step \"PHASE 5.9 complete.\"
+log_step "PHASE 5.9 complete."
 
-log_step \"PHASE 6: Build aeon_llamacpp:latest Docker image\"
+log_step "PHASE 6: Build aeon_llamacpp:latest Docker image"
 log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take 5-10 min on first build)..."
 docker build -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
-log_step "aeon_llamacpp:latest built successfully."
 log_step "aeon_llamacpp:latest built successfully."
 
 # Build ComfyUI Docker image (for FLUX image generation tool)
@@ -786,5 +653,5 @@ fi
 chown -R $(id -u):$(id -g) "$PULID_MODELS_DIR" "$CLIP_DIR" "$INSIGHTFACE_DIR" 2>/dev/null || true
 log_step "PHASE 8 complete."
 
-log_step "Setup complete. Models in $QWEN_GGUF_DIR, $MINIMAX_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN3_VL_DIR"
+log_step "Setup complete. Models in $NEMOTRON_GGUF_DIR, $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN3_VL_DIR"
 log_step "NOTE: To remove old BF16 Qwen3-VL model (if present): rm -rf $PROJECT_ROOT/aeon_models/vl_models/Qwen3-VL-32B-Instruct"
