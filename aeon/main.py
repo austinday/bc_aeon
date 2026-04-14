@@ -62,37 +62,37 @@ CLOUD_MODELS = [
 # =============================================================================
 LLAMACPP_MODELS = [
     {
-        'model': 'Qwen3.5-27B-Instruct-Uncensored-Q8_0',
-        'family': 'Qwen3.5',
-        'label': 'Qwen3.5-27B-Uncensored (Q8_0) | GPU0: 100%, GPU1: 0%      | ~65 t/s | 128k ctx | Abliterated: Yes | Local/llama.cpp',
+        'model': 'NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0',
+        'family': 'Nemotron',
+        'label': 'Nemotron-3-Super-120B MoE (Q8_0)  | GPU0: 100%, GPU1: rem  | ~45 t/s | 256k ctx | Abliterated: No  | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8005/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_qwen35_27b',
-        'start_script': 'start_qwen35_27b.sh',
+        'context_limit': 262144,
+        'container_name': 'aeon_nemotron_120b_q8',
+        'start_script': 'start_nemotron_120b_q8.sh',
         'health_port': 8005,
-    },
-    {
-        'model': 'Gemma-4-31B-it-abliterated-Q8_0',
-        'family': 'Gemma4',
-        'label': 'Gemma-4-31B-Abliterated (Q8_0)| GPU0: 100%, GPU1: 0%      | ~55 t/s | 128k ctx | Abliterated: Yes | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8006/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_gemma4_31b',
-        'start_script': 'start_gemma4_31b.sh',
-        'health_port': 8006,
     },
     {
         'model': 'Qwen3-Coder-Next-Abliterated-Q8_0',
         'family': 'Qwen3-Coder',
-        'label': 'Qwen3-Coder-Next (Q8_0)         | GPU0: 100%, GPU1: 0%      | ~59 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
+        'label': 'Qwen3-Coder-Next (Q8_0)         | GPU0: 100%, GPU1: 0%     | ~59 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8007/v1',
         'context_limit': 262144,
         'container_name': 'aeon_qwen3_coder_q8',
         'start_script': 'start_qwen3_coder_q8.sh',
         'health_port': 8007,
+    },
+    {
+        'model': 'Gemma-4-31B-Speculative-Q8_0',
+        'family': 'Gemma-4',
+        'label': 'Gemma-4-31B + E2B Draft (Q8_0)  | GPU0: 100%, GPU1: 0%     | ~45 t/s | 16k ctx  | Abliterated: Yes | Local/llama.cpp',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8008/v1',
+        'context_limit': 16384,
+        'container_name': 'aeon_gemma4_speculative',
+        'start_script': 'start_gemma4_speculative.sh',
+        'health_port': 8008,
     },
 ]
 
@@ -369,7 +369,7 @@ def build_model_menu(local_models):
             'model': m,
             'provider': 'local',
             'context_limit': 128000,
-            'label': f'{m:<31} | GPU0: 100%, GPU1: 0%      | ~?? t/s | 128k ctx | Abliterated: ?   | Local/Ollama',
+            'label': f'{m:<31} | GPU0: 100%, GPU1: 0%     | ~?? t/s | 128k ctx | Abliterated: ?   | Local/Ollama',
         })
         
     last_family = None
