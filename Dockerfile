@@ -1,10 +1,10 @@
 # 1. DEFINE BUILD ARGUMENTS
-ARG CUDA_VERSION=12.1.1
-ARG CUDNN_VERSION=8
-ARG UBUNTU_VERSION=22.04
+ARG CUDA_VERSION=13.1.1
+ARG CUDNN_VERSION=9
+ARG UBUNTU_VERSION=24.04
 ARG PYTHON_VERSION_MAJOR=3
 ARG PYTHON_VERSION_MINOR=10
-ARG PYTORCH_CUDA_SUFFIX=cu121
+ARG PYTORCH_CUDA_SUFFIX=cu130
 
 # 2. START FROM THE OFFICIAL NVIDIA BASE
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn${CUDNN_VERSION}-devel-ubuntu${UBUNTU_VERSION}
@@ -45,7 +45,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 # 7. PYTHON CORE & SCIENTIFIC LIBS (Parallelized via uv)
 # Note: We use --system to install into the system python environment
-RUN uv pip install --system --no-cache-dir --upgrade pip setuptools wheel twine poetry black flake8 isort mypy jupyter notebook ipykernel ipywidgets cython numba numba pybind11 numba numexpr numba \
+RUN uv pip install --system --no-cache-dir --upgrade pip setuptools wheel twine poetry black flake8 isort mypy jupyter notebook ipykernel ipywidgets cython numba pybind11 numexpr \
  numpy scipy matplotlib pandas scikit-learn tqdm pydantic beautifulsoup4 lxml polars pyarrow zarr lmdb duckdb psycopg2-binary redis pillow opencv-python-headless \
  pytest pytest-cov pytest-mock
 

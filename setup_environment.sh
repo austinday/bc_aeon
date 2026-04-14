@@ -24,7 +24,7 @@ fi
 log_step "PHASE 1: Build Docker images (layer cache makes unchanged builds fast)"
 
 # Stop any running containers that depend on these images
-for cname in aeon_nemotron_120b_q8; do
+for cname in aeon_qwen35_27b aeon_gemma4_31b; do
     if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
         log_step "Stopping stale container: $cname"
         docker rm -f "$cname" >/dev/null 2>&1 || true
@@ -46,22 +46,22 @@ else
 fi
 
 # =============================================================================
-# PHASE 5: NVIDIA-Nemotron-3-Super-120B-A12B GGUF (llama.cpp served)
+# PHASE 5.1: Qwen3.5-27B-Instruct-Uncensored (llama.cpp served)
 # =============================================================================
-NEMOTRON_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/NVIDIA-Nemotron-3-Super-120B-A12B"
+QWEN35_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3.5-27B-Instruct-Uncensored"
 
-log_step "PHASE 5: Download NVIDIA-Nemotron-3-Super-120B-A12B GGUF model shards"
-mkdir -p "$NEMOTRON_GGUF_DIR"
+log_step "PHASE 5.1: Download Qwen3.5-27B-Instruct-Uncensored GGUF model shards"
+mkdir -p "$QWEN35_GGUF_DIR"
 
-if [[ -f "$NEMOTRON_GGUF_DIR/.download_complete" ]]; then
-    log_step "Nemotron GGUF already downloaded, skipping."
+if [[ -f "$QWEN35_GGUF_DIR/.download_complete" ]]; then
+    log_step "Qwen3.5-27B GGUF already downloaded, skipping."
 else
-    NEMOTRON_DL_SCRIPT=$(mktemp /tmp/aeon_dl_nemotron_XXXXXX.py)
-    cat > "$NEMOTRON_DL_SCRIPT" << 'PYEOF'
+    QWEN35_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen35_XXXXXX.py)
+    cat > "$QWEN35_DL_SCRIPT" << 'PYEOF'
 import os, sys
 from huggingface_hub import hf_hub_download, list_repo_files
 
-REPO = "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF"
+REPO = "n0ctyx/Qwen3.5-27B-Instruct-Uncensored"
 TARGET = "/models"
 PREFIX = "Q8_0"
 
@@ -115,22 +115,109 @@ PYEOF
     docker run --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
-        -v "$NEMOTRON_GGUF_DIR:/models" \
-        -v "$NEMOTRON_DL_SCRIPT:/download.py:ro" \
+        -v "$QWEN35_GGUF_DIR:/models" \
+        -v "$QWEN35_DL_SCRIPT:/download.py:ro" \
         aeon_downloader:latest \
         python3 /download.py
 
     DL_EXIT=$?
-    rm -f "$NEMOTRON_DL_SCRIPT"
+    rm -f "$QWEN35_DL_SCRIPT"
     if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: Nemotron GGUF download failed (exit code $DL_EXIT)"
+        log_step "ERROR: Qwen3.5-27B GGUF download failed (exit code $DL_EXIT)"
         exit 1
     fi
 
-    touch "$NEMOTRON_GGUF_DIR/.download_complete"
+    touch "$QWEN35_GGUF_DIR/.download_complete"
 fi
-chown -R $(id -u):$(id -g) "$NEMOTRON_GGUF_DIR" 2>/dev/null || true
-log_step "PHASE 5 complete."
+chown -R $(id -u):$(id -g) "$QWEN35_GGUF_DIR" 2>/dev/null || true
+log_step "PHASE 5.1 complete."
+
+# =============================================================================
+# PHASE 5.2: Gemma-4-31B-it-abliterated (llama.cpp served)
+# =============================================================================
+GEMMA4_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Gemma-4-31B-it-abliterated"
+
+log_step "PHASE 5.2: Download Gemma-4-31B-it-abliterated GGUF model shards"
+mkdir -p "$GEMMA4_GGUF_DIR"
+
+if [[ -f "$GEMMA4_GGUF_DIR/.download_complete" ]]; then
+    log_step "Gemma-4-31B GGUF already downloaded, skipping."
+else
+    GEMMA4_DL_SCRIPT=$(mktemp /tmp/aeon_dl_gemma4_XXXXXX.py)
+    cat > "$GEMMA4_DL_SCRIPT" << 'PYEOF'
+import os, sys
+from huggingface_hub import hf_hub_download, list_repo_files
+
+REPO = "paperscarecrow/Gemma-4-31B-it-abliterated"
+TARGET = "/models"
+PREFIX = "Q8_0"
+
+print(f"Listing files in {REPO}...", flush=True)
+try:
+    all_files = list_repo_files(REPO)
+except Exception as e:
+    print(f"Failed to list repo: {e}")
+    sys.exit(1)
+
+print(f"\nProcessing {PREFIX}...", flush=True)
+shards = sorted([f for f in all_files if PREFIX in f and f.endswith(".gguf")])
+print(f"Found {len(shards)} shard(s):", flush=True)
+for s in shards:
+    print(f"  {s}", flush=True)
+
+if not shards:
+    print(f"ERROR: No matching GGUF shards found in repo for {PREFIX}!", flush=True)
+    sys.exit(1)
+
+all_done = True
+for i, shard in enumerate(shards, 1):
+    dest = os.path.join(TARGET, shard)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000_000:
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
+        continue
+    all_done = False
+    print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
+    try:
+        hf_hub_download(
+            repo_id=REPO,
+            filename=shard,
+            local_dir=TARGET,
+        )
+        sz = os.path.getsize(dest) / (1024**3)
+        print(f"  Done: {sz:.1f}GB", flush=True)
+    except Exception as e:
+        print(f"Failed to download {shard}: {e}")
+        sys.exit(1)
+
+if all_done:
+    print(f"All {PREFIX} shards already present and valid.", flush=True)
+else:
+    print(f"All {PREFIX} shards downloaded successfully.", flush=True)
+PYEOF
+
+    TTY_FLAG=""
+    if [ -t 0 ]; then TTY_FLAG="-t"; fi
+    docker run --rm $TTY_FLAG \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$GEMMA4_GGUF_DIR:/models" \
+        -v "$GEMMA4_DL_SCRIPT:/download.py:ro" \
+        aeon_downloader:latest \
+        python3 /download.py
+
+    DL_EXIT=$?
+    rm -f "$GEMMA4_DL_SCRIPT"
+    if [[ $DL_EXIT -ne 0 ]]; then
+        log_step "ERROR: Gemma-4-31B GGUF download failed (exit code $DL_EXIT)"
+        exit 1
+    fi
+
+    touch "$GEMMA4_GGUF_DIR/.download_complete"
+fi
+chown -R $(id -u):$(id -g) "$GEMMA4_GGUF_DIR" 2>/dev/null || true
+log_step "PHASE 5.2 complete."
 
 # =============================================================================
 # PHASE 5.5: Qwen3-Coder-Next-Abliterated-Q8_0 (llama.cpp served)
@@ -653,5 +740,5 @@ fi
 chown -R $(id -u):$(id -g) "$PULID_MODELS_DIR" "$CLIP_DIR" "$INSIGHTFACE_DIR" 2>/dev/null || true
 log_step "PHASE 8 complete."
 
-log_step "Setup complete. Models in $NEMOTRON_GGUF_DIR, $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN3_VL_DIR"
+log_step "Setup complete. Models in $QWEN35_GGUF_DIR, $GEMMA4_GGUF_DIR, $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN3_VL_DIR"
 log_step "NOTE: To remove old BF16 Qwen3-VL model (if present): rm -rf $PROJECT_ROOT/aeon_models/vl_models/Qwen3-VL-32B-Instruct"
