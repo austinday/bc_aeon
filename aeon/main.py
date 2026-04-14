@@ -62,15 +62,15 @@ CLOUD_MODELS = [
 # =============================================================================
 LLAMACPP_MODELS = [
     {
-        'model': 'NVIDIA-Nemotron-3-Super-120B-A12B-Q8_0',
-        'family': 'Nemotron',
-        'label': 'Nemotron-3-Super-120B MoE (Q8_0)  | GPU0: 100%, GPU1: rem  | ~45 t/s | 256k ctx | Abliterated: No  | Local/llama.cpp',
+        'model': 'Qwen3.5-27B-Speculative-Q8_0',
+        'family': 'Qwen3.5',
+        'label': 'Qwen3.5-27B + 2B Draft (Q8_0)   | GPU0: 100%, GPU1: 0%     | ~?? t/s | 32k ctx  | Abliterated: Yes | Local/llama.cpp',
         'provider': 'llamacpp',
-        'base_url': 'http://localhost:8005/v1',
-        'context_limit': 262144,
-        'container_name': 'aeon_nemotron_120b_q8',
-        'start_script': 'start_nemotron_120b_q8.sh',
-        'health_port': 8005,
+        'base_url': 'http://localhost:8009/v1',
+        'context_limit': 32768,
+        'container_name': 'aeon_qwen35_27b_speculative',
+        'start_script': 'start_qwen35_27b_speculative.sh',
+        'health_port': 8009,
     },
     {
         'model': 'Qwen3-Coder-Next-Abliterated-Q8_0',
