@@ -93,20 +93,21 @@ class GenerateImageTool(BaseTool):
                 "1": {
                     "class_type": "UnetLoaderGGUF",
                     "inputs": {
-                        "unet_name": "flux2-dev-Q4_K_S.gguf"
+                        "unet_name": "FHDR_ComfyUI-Q8_0.gguf"
                     }
                 },
                 "2": {
-                    "class_type": "CLIPLoader",
+                    "class_type": "DualCLIPLoader",
                     "inputs": {
-                        "clip_name": "mistral_3_small_flux2_fp8.safetensors",
-                        "type": "flux2"
+                        "clip_name1": "clip_l.safetensors",
+                        "clip_name2": "t5xxl_fp8_e4m3fn.safetensors",
+                        "type": "flux"
                     }
                 },
                 "3": {
                     "class_type": "VAELoader",
                     "inputs": {
-                        "vae_name": "flux2-vae.safetensors"
+                        "vae_name": "ae.safetensors"
                     }
                 },
                 "4": {
@@ -154,8 +155,9 @@ class GenerateImageTool(BaseTool):
                     }
                 },
                 "9": {
-                    "class_type": "PreviewImage",
+                    "class_type": "SaveImage",
                     "inputs": {
+                        "filename_prefix": "Aeon",
                         "images": ["8", 0]
                     }
                 }
@@ -207,8 +209,8 @@ class GenerateImageTool(BaseTool):
             # Unregister and check if we are the last active user
             remaining_users = self._manage_registry('unregister')
             if remaining_users == 0:
-                print(f"{self.C_CYAN}Last agent finished. Releasing GPU memory (stopping ComfyUI)...{self.C_RESET}")
-                subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f"{self.C_CYAN}Last agent finished. (Container deletion disabled for debugging)...{self.C_RESET}")
+                # subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 print(f"{self.C_CYAN}Image complete. Leaving ComfyUI running for {remaining_users} other active agent(s)...{self.C_RESET}")
 
@@ -309,9 +311,9 @@ class EditImageTool(BaseTool):
             uploaded_filename = upload_res.json()["name"]
 
             workflow = {
-                "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "flux2-dev-Q4_K_S.gguf"}},
-                "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "mistral_3_small_flux2_fp8.safetensors", "type": "flux2"}},
-                "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
+                "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "FHDR_ComfyUI-Q8_0.gguf"}},
+                "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "clip_l.safetensors", "clip_name2": "t5xxl_fp8_e4m3fn.safetensors", "type": "flux"}},
+                "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
                 "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
                 "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["2", 0]}},
                 "10": {"class_type": "LoadImage", "inputs": {"image": uploaded_filename}},
@@ -332,7 +334,13 @@ class EditImageTool(BaseTool):
                     }
                 },
                 "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
-                "9": {"class_type": "PreviewImage", "inputs": {"images": ["8", 0]}}
+                "9": {
+                    "class_type": "SaveImage",
+                    "inputs": {
+                        "filename_prefix": "Aeon_Edit",
+                        "images": ["8", 0]
+                    }
+                }
             }
 
             print(f"{self.C_CYAN}Submitting image edit workflow to ComfyUI...{self.C_RESET}")

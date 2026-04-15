@@ -1,4 +1,0 @@
-Removes a key from your persistent memory. Use this to clean up stale or incorrect information.
-Schema:
-  key (str, required): The name of the memory to forget.
-Example: {"tool_name": "forget", "parameters": {"key": "db_password"}}

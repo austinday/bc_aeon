@@ -1,4 +1,0 @@
-Closes a file, removing it from context. Use this when the contents of a file is no longer helpful for doing the next steps. Close files as a troubleshooting step to prevent context rot. 
-Schema:
-  file_path (str, required): Path of the file to close.
-Example: {"tool_name": "close_file", "parameters": {"file_path": "src/main.py"}}

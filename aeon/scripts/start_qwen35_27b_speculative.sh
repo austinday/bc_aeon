@@ -28,7 +28,7 @@ fi
 # Tunable parameters
 N_GPU_LAYERS=${NGL:-99}          # Fit both models in VRAM
 PARALLEL_SLOTS=${PARALLEL:-1}    # Keep at 1 for max single-batch speed
-CTX_SIZE=${CTX:-32768}           # 32k context
+CTX_SIZE=${CTX:-262144}          # 256k context
 BATCH_SIZE=${BATCH:-4096}
 DRAFT_MAX=${DRAFT_MAX:-5}        # Number of tokens the draft model guesses at once
 
@@ -56,6 +56,8 @@ docker run -d \
   --batch-size ${BATCH_SIZE} \
   --threads ${PHYSICAL_CORES} \
   --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
   --host 0.0.0.0 \
   --port 8001 \
   --metrics \
@@ -69,6 +71,11 @@ echo "[Qwen3.5-27B-Spec] Waiting for both models to load into VRAM..."
 
 count=0
 while true; do
+    if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo "[Qwen3.5-27B-Spec] ERROR: Container crashed! llama.cpp rejected the arguments or OOMed."
+        docker logs $CONTAINER_NAME --tail 30
+        exit 1
+    fi
     HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT}/health 2>/dev/null || echo "000")
     if [ "$HTTP_CODE" = "200" ]; then break; fi
     sleep 2

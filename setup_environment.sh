@@ -23,14 +23,6 @@ fi
 
 log_step "PHASE 1: Build Docker images (layer cache makes unchanged builds fast)"
 
-# Stop any running containers that depend on these images
-for cname in aeon_qwen35_27b_speculative aeon_gemma4_speculative; do
-    if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
-        log_step "Stopping stale container: $cname"
-        docker rm -f "$cname" >/dev/null 2>&1 || true
-    fi
-done
-
 if ! docker image inspect aeon_downloader:latest >/dev/null 2>&1; then
     log_step "Building aeon_downloader:latest..."
     cat > "$PROJECT_ROOT/Dockerfile.downloader" << 'EOF'
@@ -491,7 +483,6 @@ def process_image(input_path: str, output_path: str, args):
         print(f"  ERROR: {type(e).__name__}: {e}")
         return False
 
-
 def trim_transparent_edges(img: Image.Image) -> Image.Image:
     """Trim transparent edges from an RGBA image."""
     if img.mode != 'RGBA':
@@ -509,7 +500,6 @@ def trim_transparent_edges(img: Image.Image) -> Image.Image:
     
     # Crop to bounding box
     return img.crop(bbox)
-
 
 def add_watermark(img: Image.Image, text: str) -> Image.Image:
     """Add a watermark text to the image."""
@@ -544,7 +534,6 @@ def add_watermark(img: Image.Image, text: str) -> Image.Image:
     draw.text((x, y), text, fill=(255, 255, 255, 255), font=font)
     
     return img
-
 
 def main():
     parser = argparse.ArgumentParser(description='Printify Image Preprocessing Pipeline')
@@ -591,7 +580,6 @@ def main():
             success_count += 1
     
     print(f"\\nCompleted: {success_count}/{len(images)} images processed successfully")
-
 
 if __name__ == '__main__':
     main()
@@ -663,14 +651,17 @@ else
 import os, sys
 from huggingface_hub import hf_hub_download
 
-print('Downloading Flux 2 Dev UNet GGUF...', flush=True)
-hf_hub_download(repo_id='unsloth/FLUX.2-dev-GGUF', filename='flux2-dev-Q4_K_S.gguf', local_dir='/models/unet')
+print('Downloading FHDR UNet GGUF...', flush=True)
+hf_hub_download(repo_id='kpsss34/FHDR_Uncensored', filename='FHDR_ComfyUI-Q8_0.gguf', local_dir='/models/unet')
 
-print('Downloading Flux 2 VAE...', flush=True)
-hf_hub_download(repo_id='Comfy-Org/flux2-dev', filename='split_files/vae/flux2-vae.safetensors', local_dir='/models')
+print('Downloading FLUX.1 VAE...', flush=True)
+hf_hub_download(repo_id='black-forest-labs/FLUX.1-dev', filename='aeon_vae.safetensors', local_dir='/models/vae')
 
-print('Downloading FLUX.2 Mistral text encoder...', flush=True)
-hf_hub_download(repo_id='Comfy-Org/flux2-dev', filename='split_files/text_encoders/mistral_3_small_flux2_fp8.safetensors', local_dir='/models')
+print('Downloading FLUX.1 CLIP-L...', flush=True)
+hf_hub_download(repo_id='comfyanonymous/flux_text_encoders', filename='clip_l.safetensors', local_dir='/models/text_encoders')
+
+print('Downloading FLUX.1 T5XXL FP8...', flush=True)
+hf_hub_download(repo_id='comfyanonymous/flux_text_encoders', filename='t5xxl_fp8_e4m3fn.safetensors', local_dir='/models/text_encoders')
 
 print('Downloads complete!', flush=True)
 PYEOF
