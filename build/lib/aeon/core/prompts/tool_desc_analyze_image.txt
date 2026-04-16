@@ -1,0 +1,6 @@
+CRITICAL: MUST USE THIS TOOL for ANY image understanding, analysis, or visual question-answering request. Whenever the user asks you to look at, describe, judge, evaluate, or answer questions about an existing image, you MUST call this tool. Do NOT write your own Python scripts for image analysis when this tool exists.
+Analyzes an image using the Qwen3.5-35B-A3B vision-language model and returns a text answer to the prompt.
+Schema:
+  image_path (str, required): The absolute or relative file path of the image to analyze.
+  prompt (str, required): The question or instruction about the image (e.g., 'Describe this image in detail', 'Are there any AI artifacts?', 'What color is the background?').
+Example: {"tool_name": "analyze_image", "parameters": {"image_path": "output/scene.png", "prompt": "Does this image have any AI-generated artifacts? Rate the overall quality."}}

@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="/home/aday/bc_aeon"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AEON_HOME="${AEON_HOME:-$HOME/.aeon}"
 HF_TOKEN_FILE="/home/aday/huggingface_access_token.txt"
 
 log_step() {
@@ -40,7 +41,7 @@ fi
 # =============================================================================
 # PHASE 5.1: Qwen3.5-27B-Uncensored + 2B Draft (llama.cpp served)
 # =============================================================================
-QWEN35_27B_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3.5-27B"
+QWEN35_27B_DIR="$AEON_HOME/models/gguf_models/Qwen3.5-27B"
 log_step "PHASE 5.1: Download Qwen3.5-27B-Uncensored and 2B Draft GGUFs"
 mkdir -p "$QWEN35_27B_DIR"
 
@@ -132,7 +133,7 @@ log_step "PHASE 5.1 complete."
 # =============================================================================
 # PHASE 5.5: Qwen3-Coder-Next-Abliterated-Q8_0 (llama.cpp served)
 # =============================================================================
-QWEN3_CODER_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Qwen3-Coder-Next-Abliterated"
+QWEN3_CODER_GGUF_DIR="$AEON_HOME/models/gguf_models/Qwen3-Coder-Next-Abliterated"
 log_step "PHASE 5.5: Download Qwen3-Coder-Next-Abliterated-Q8_0 GGUF model shards"
 mkdir -p "$QWEN3_CODER_GGUF_DIR"
 
@@ -218,7 +219,7 @@ log_step "PHASE 5.5 complete."
 # =============================================================================
 # PHASE 5.6: Gemma-4-31B + E2B Draft Models
 # =============================================================================
-GEMMA4_GGUF_DIR="$PROJECT_ROOT/aeon_models/gguf_models/Gemma-4"
+GEMMA4_GGUF_DIR="$AEON_HOME/models/gguf_models/Gemma-4"
 log_step "PHASE 5.6: Download Gemma 4 31B and E2B Draft GGUFs"
 mkdir -p "$GEMMA4_GGUF_DIR"
 
@@ -301,7 +302,7 @@ log_step "PHASE 5.6 complete."
 # =============================================================================
 # PHASE 5.7: Qwen3.5-35B-A3B GGUF (Vision-Language Model for llama.cpp)
 # =============================================================================
-QWEN3_VL_DIR="$PROJECT_ROOT/aeon_models/vl_models/Qwen3.5-35B-A3B-GGUF"
+QWEN3_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.5-35B-A3B-GGUF"
 log_step "PHASE 5.7: Download Qwen3.5-35B-A3B GGUF for vision analysis tool"
 mkdir -p "$QWEN3_VL_DIR"
 
@@ -637,7 +638,7 @@ log_step "aeon_comfyui:latest built successfully."
 # =============================================================================
 # PHASE 7: ComfyUI Models (FLUX)
 # =============================================================================
-COMFY_MODELS_DIR="$PROJECT_ROOT/aeon_models/comfyui"
+COMFY_MODELS_DIR="$AEON_HOME/models/comfyui"
 log_step "PHASE 7: Download FLUX GGUF models and encoders for ComfyUI"
 mkdir -p "$COMFY_MODELS_DIR/unet"
 mkdir -p "$COMFY_MODELS_DIR/text_encoders"
@@ -655,7 +656,7 @@ print('Downloading FHDR UNet GGUF...', flush=True)
 hf_hub_download(repo_id='kpsss34/FHDR_Uncensored', filename='FHDR_ComfyUI-Q8_0.gguf', local_dir='/models/unet')
 
 print('Downloading FLUX.1 VAE...', flush=True)
-hf_hub_download(repo_id='black-forest-labs/FLUX.1-dev', filename='aeon_vae.safetensors', local_dir='/models/vae')
+hf_hub_download(repo_id='black-forest-labs/FLUX.1-schnell', filename='ae.safetensors', local_dir='/models/vae')
 
 print('Downloading FLUX.1 CLIP-L...', flush=True)
 hf_hub_download(repo_id='comfyanonymous/flux_text_encoders', filename='clip_l.safetensors', local_dir='/models/text_encoders')
@@ -691,9 +692,9 @@ log_step "PHASE 7 complete."
 # =============================================================================
 # PHASE 8: PuLID FLUX Models (Consistent Characters)
 # =============================================================================
-PULID_MODELS_DIR="$PROJECT_ROOT/aeon_models/comfyui/pulid"
-CLIP_DIR="$PROJECT_ROOT/aeon_models/comfyui/clip"
-INSIGHTFACE_DIR="$PROJECT_ROOT/aeon_models/comfyui/insightface"
+PULID_MODELS_DIR="$AEON_HOME/models/comfyui/pulid"
+CLIP_DIR="$AEON_HOME/models/comfyui/clip"
+INSIGHTFACE_DIR="$AEON_HOME/models/comfyui/insightface"
 
 log_step "PHASE 8: Download PuLID Flux and Face models"
 mkdir -p "$PULID_MODELS_DIR" "$CLIP_DIR" "$INSIGHTFACE_DIR"
@@ -721,16 +722,16 @@ PYEOF
     docker run --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
-        -v "$PROJECT_ROOT/aeon_models/comfyui:/models" \
+        -v "$AEON_HOME/models/comfyui:/models" \
         -v "$PULID_DL_SCRIPT:/download.py:ro" \
         aeon_downloader:latest \
         python3 /download.py
         
     rm -f "$PULID_DL_SCRIPT"
-    docker run --rm -v "$PROJECT_ROOT/aeon_models/comfyui:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models/pulid /models/clip /models/insightface || true
+    docker run --rm -v "$AEON_HOME/models/comfyui:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models/pulid /models/clip /models/insightface || true
     touch "$PULID_MODELS_DIR/.download_complete"
 fi
 log_step "PHASE 8 complete."
 
 log_step "Setup complete. Models in $QWEN35_27B_DIR, $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN3_VL_DIR, $GEMMA4_GGUF_DIR"
-log_step "NOTE: To remove old BF16 Qwen3-VL model (if present): rm -rf $PROJECT_ROOT/aeon_models/vl_models/Qwen3-VL-32B-Instruct"
+log_step "NOTE: To remove old BF16 Qwen3-VL model (if present): rm -rf $AEON_HOME/models/vl_models/Qwen3-VL-32B-Instruct"
