@@ -52,8 +52,8 @@ aeon/scripts/start_brain.sh
 aeon/scripts/start_comfyui.sh
 aeon/scripts/start_gemma4_31b.sh
 aeon/scripts/start_gemma4_speculative.sh
-aeon/scripts/start_qwen35_27b_speculative.sh
-aeon/scripts/start_qwen35_vl_35b.sh
+aeon/scripts/start_qwen36_35b.sh
+aeon/scripts/start_qwen36_vl_35b.sh
 aeon/scripts/start_qwen3_coder_q8.sh
 aeon/scripts/start_vllm.sh
 aeon/services/__init__.py

@@ -62,14 +62,14 @@ CLOUD_MODELS = [
 # =============================================================================
 LLAMACPP_MODELS = [
     {
-        'model': 'Qwen3.5-27B-Speculative-Q8_0',
-        'family': 'Qwen3.5',
-        'label': 'Qwen3.5-27B + 2B Draft (Q8_0)   | GPU0: 100%, GPU1: 0%     | ~?? t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
+        'model': 'Qwen3.6-35B-A3B-Uncensored',
+        'family': 'Qwen3.6',
+        'label': 'Qwen3.6-35B-A3B-Uncensored      | GPU0: 100%, GPU1: 0%     | ~?? t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8009/v1',
         'context_limit': 262144,
-        'container_name': 'aeon_qwen35_27b_speculative',
-        'start_script': 'start_qwen35_27b_speculative.sh',
+        'container_name': 'aeon_qwen36_35b',
+        'start_script': 'start_qwen36_35b.sh',
         'health_port': 8009,
     },
     {

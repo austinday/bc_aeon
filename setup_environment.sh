@@ -39,98 +39,6 @@ else
 fi
 
 # =============================================================================
-# PHASE 5.1: Qwen3.5-27B-Uncensored + 2B Draft (llama.cpp served)
-# =============================================================================
-QWEN35_27B_DIR="$AEON_HOME/models/gguf_models/Qwen3.5-27B"
-log_step "PHASE 5.1: Download Qwen3.5-27B-Uncensored and 2B Draft GGUFs"
-mkdir -p "$QWEN35_27B_DIR"
-
-if [[ -f "$QWEN35_27B_DIR/.download_complete" ]]; then
-    log_step "Qwen3.5 27B Speculative models already downloaded, skipping."
-else
-    QWEN35_27B_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen35_27b_XXXXXX.py)
-    cat > "$QWEN35_27B_DL_SCRIPT" << 'PYEOF'
-import os, sys
-from huggingface_hub import hf_hub_download, list_repo_files
-
-TARGET = "/models"
-# 1. Target Model: Qwen3.5-27B-Instruct-Uncensored (Q8_0)
-target_repo = "n0ctyx/Qwen3.5-27B-Instruct-Uncensored"
-target_prefix = "Q8_0"
-
-print(f"Listing files in {target_repo}...", flush=True)
-try:
-    all_target_files = list_repo_files(target_repo)
-except Exception as e:
-    print(f"Failed to list repo: {e}")
-    sys.exit(1)
-
-# Case insensitive search
-target_shards = sorted([f for f in all_target_files if target_prefix.lower() in f.lower() and f.endswith(".gguf")])
-if not target_shards:
-    print(f"ERROR: Could not find target model matching {target_prefix} in {target_repo}!", flush=True)
-    sys.exit(1)
-
-for shard in target_shards:
-    dest = os.path.join(TARGET, shard)
-    if os.path.exists(dest) and os.path.getsize(dest) > 100_000_000:
-        print(f"[{shard}] already exists, skipping.", flush=True)
-        continue
-    print(f"Downloading {shard} from {target_repo}...", flush=True)
-    try:
-        hf_hub_download(repo_id=target_repo, filename=shard, local_dir=TARGET)
-    except Exception as e:
-        print(f"ERROR: Failed to download {shard}: {e}")
-        sys.exit(1)
-
-# 2. Draft Model: Huihui-Qwen3.5-2B-abliterated-i1-GGUF (Q4_K_M)
-draft_repo = "mradermacher/Huihui-Qwen3.5-2B-abliterated-i1-GGUF"
-print(f"Listing files in {draft_repo}...", flush=True)
-try:
-    all_draft_files = list_repo_files(draft_repo)
-except Exception as e:
-    print(f"Failed to list repo: {e}")
-    sys.exit(1)
-
-draft_file = next((f for f in all_draft_files if "q4_k_m" in f.lower() and f.endswith(".gguf")), None)
-if draft_file:
-    dest = os.path.join(TARGET, draft_file)
-    if os.path.exists(dest) and os.path.getsize(dest) > 100_000_000:
-        print(f"[{draft_file}] already exists, skipping.", flush=True)
-    else:
-        print(f"Downloading {draft_file} from {draft_repo}...", flush=True)
-        try:
-            hf_hub_download(repo_id=draft_repo, filename=draft_file, local_dir=TARGET)
-        except Exception as e:
-            print(f"ERROR: Failed to download {draft_file}: {e}")
-            sys.exit(1)
-
-print("All Qwen3.5-27B Speculative files downloaded successfully.", flush=True)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --network=host --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$QWEN35_27B_DIR:/models" \
-        -v "$QWEN35_27B_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-
-    DL_EXIT=$?
-    rm -f "$QWEN35_27B_DL_SCRIPT"
-    if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: Qwen3.5-27B Speculative download failed (exit code $DL_EXIT)"
-        exit 1
-    fi
-
-    docker run --rm -v "$QWEN35_27B_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
-    touch "$QWEN35_27B_DIR/.download_complete"
-fi
-log_step "PHASE 5.1 complete."
-
-# =============================================================================
 # PHASE 5.5: Qwen3-Coder-Next-Abliterated-Q8_0 (llama.cpp served)
 # =============================================================================
 QWEN3_CODER_GGUF_DIR="$AEON_HOME/models/gguf_models/Qwen3-Coder-Next-Abliterated"
@@ -300,21 +208,21 @@ fi
 log_step "PHASE 5.6 complete."
 
 # =============================================================================
-# PHASE 5.7: Qwen3.5-35B-A3B GGUF (Vision-Language Model for llama.cpp)
+# PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF (Vision & Primary LLM for llama.cpp)
 # =============================================================================
-QWEN3_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.5-35B-A3B-GGUF"
-log_step "PHASE 5.7: Download Qwen3.5-35B-A3B GGUF for vision analysis tool"
-mkdir -p "$QWEN3_VL_DIR"
+QWEN36_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
+log_step "PHASE 5.7: Download Qwen3.6-35B-A3B GGUF for vision analysis tool and primary LLM"
+mkdir -p "$QWEN36_VL_DIR"
 
-if [[ -f "$QWEN3_VL_DIR/.download_complete" ]]; then
-    log_step "Qwen3.5-35B-A3B GGUF already downloaded, skipping."
+if [[ -f "$QWEN36_VL_DIR/.download_complete" ]]; then
+    log_step "Qwen3.6-35B-A3B GGUF already downloaded, skipping."
 else
-    QWEN3_VL_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen3_vl_XXXXXX.py)
-    cat > "$QWEN3_VL_DL_SCRIPT" << 'PYEOF'
+    QWEN36_VL_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen3_vl_XXXXXX.py)
+    cat > "$QWEN36_VL_DL_SCRIPT" << 'PYEOF'
 import os, sys
 from huggingface_hub import hf_hub_download, list_repo_files
 
-REPO = 'unsloth/Qwen3.5-35B-A3B-GGUF'
+REPO = 'HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive'
 TARGET = '/models'
 
 print(f'Listing files in {REPO}...', flush=True)
@@ -326,7 +234,7 @@ except Exception as e:
     sys.exit(1)
 
 FILES = [
-    'Qwen3.5-35B-A3B-UD-Q8_K_XL.gguf',
+    'Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf',
 ]
 if mmproj_file:
     FILES.append(mmproj_file)
@@ -352,20 +260,20 @@ PYEOF
     docker run --network=host --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
-        -v "$QWEN3_VL_DIR:/models" \
-        -v "$QWEN3_VL_DL_SCRIPT:/download.py:ro" \
+        -v "$QWEN36_VL_DIR:/models" \
+        -v "$QWEN36_VL_DL_SCRIPT:/download.py:ro" \
         aeon_downloader:latest \
         python3 /download.py
 
     DL_EXIT=$?
-    rm -f "$QWEN3_VL_DL_SCRIPT"
+    rm -f "$QWEN36_VL_DL_SCRIPT"
     if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: Qwen3-VL GGUF download failed (exit code $DL_EXIT)"
+        log_step "ERROR: Qwen3.6 GGUF download failed (exit code $DL_EXIT)"
         exit 1
     fi
 
-    docker run --rm -v "$QWEN3_VL_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
-    touch "$QWEN3_VL_DIR/.download_complete"
+    docker run --rm -v "$QWEN36_VL_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
+    touch "$QWEN36_VL_DIR/.download_complete"
 fi
 log_step "PHASE 5.7 complete."
 
@@ -533,5 +441,5 @@ PYEOF
 fi
 log_step "PHASE 8 complete."
 
-log_step "Setup complete. Models in $QWEN35_27B_DIR, $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN3_VL_DIR, $GEMMA4_GGUF_DIR"
-log_step "NOTE: To remove old BF16 Qwen3-VL model (if present): rm -rf $AEON_HOME/models/vl_models/Qwen3-VL-32B-Instruct"
+log_step "Setup complete. Models in $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN36_VL_DIR, $GEMMA4_GGUF_DIR"
+log_step "NOTE: To remove old models (if present), you may want to clean up $AEON_HOME/models/vl_models/Qwen3.5-35B-A3B-GGUF or $AEON_HOME/models/gguf_models/Qwen3.5-27B"
