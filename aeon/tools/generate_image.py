@@ -218,7 +218,7 @@ class GenerateImageTool(BaseTool):
 
 
 class EditImageTool(BaseTool):
-    """A tool to edit images using FLUX GGUF via a local ComfyUI instance."""
+    """A tool to edit images using Qwen-Image-Edit GGUF via a local ComfyUI instance."""
     def __init__(self):
         super().__init__(
             name="edit_image",
@@ -315,19 +315,19 @@ class EditImageTool(BaseTool):
             uploaded_filename = upload_res.json()["name"]
 
             workflow = {
-                "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "FHDR_ComfyUI-Q8_0.gguf"}},
-                "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "clip_l.safetensors", "clip_name2": "t5xxl_fp8_e4m3fn.safetensors", "type": "flux"}},
-                "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
-                "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
-                "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["2", 0]}},
+                "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf"}},
+                "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors", "type": "qwen_image"}},
+                "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
                 "10": {"class_type": "LoadImage", "inputs": {"image": uploaded_filename}},
+                "4": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"prompt": prompt, "clip": ["2", 0], "vae": ["3", 0], "image1": ["10", 0]}},
+                "5": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"prompt": "", "clip": ["2", 0], "vae": ["3", 0], "image1": ["10", 0]}},
                 "11": {"class_type": "VAEEncode", "inputs": {"pixels": ["10", 0], "vae": ["3", 0]}},
                 "7": {
                     "class_type": "KSampler",
                     "inputs": {
                         "seed": random.randint(1, 0xffffffffffffffff),
-                        "steps": 25,
-                        "cfg": 1.0,
+                        "steps": 8,
+                        "cfg": 4.0,
                         "sampler_name": "euler",
                         "scheduler": "simple",
                         "denoise": denoise,

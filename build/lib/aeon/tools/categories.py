@@ -28,11 +28,10 @@ TOP_LEVEL_TOOLS = {
 # When expanded, subcategories and/or tool descriptions become visible.
 TOOL_CATEGORIES = {
     'image_tools': {
-        'description': 'AI image generation, editing, analysis, character scenes, and print preprocessing (FLUX/ComfyUI, Qwen3.5 vision)',
+        'description': 'AI image generation, editing, analysis, and print preprocessing (FLUX/ComfyUI, Qwen3.5 vision)',
         'tools': [
             'generate_image',
             'edit_image',
-            'generate_scene_with_characters',
             'analyze_image',
             'prepare_for_printify',
         ],

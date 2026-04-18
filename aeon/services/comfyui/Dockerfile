@@ -18,7 +18,7 @@ WORKDIR /workspace/ComfyUI/custom_nodes/ComfyUI-GGUF
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 RUN sed -i 's/except ImportError:/except Exception:/' __init__.py
-RUN sed -i 's/from custom_nodes\\.ComfyUI_GGUF\\./from ./g' nodes.py
+RUN sed -i 's/from custom_nodes\.ComfyUI_GGUF\./from ./g' nodes.py
 
 WORKDIR /workspace/ComfyUI
 CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"]

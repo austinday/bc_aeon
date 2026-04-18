@@ -26,7 +26,6 @@ aeon/core/prompts/primary_agent_instructions.txt
 aeon/core/prompts/summarize_text_prompt.txt
 aeon/core/prompts/think_tool_prompt.txt
 aeon/core/prompts/tool_desc_analyze_image.txt
-aeon/core/prompts/tool_desc_character_scene.txt
 aeon/core/prompts/tool_desc_close_file.txt
 aeon/core/prompts/tool_desc_collapse_category.txt
 aeon/core/prompts/tool_desc_edit_image.txt
@@ -62,7 +61,6 @@ aeon/tools/__init__.py
 aeon/tools/base.py
 aeon/tools/categories.py
 aeon/tools/category_tools.py
-aeon/tools/character_image.py
 aeon/tools/communication.py
 aeon/tools/file_io.py
 aeon/tools/generate_image.py

@@ -56,7 +56,6 @@ TOOL_DESC_FORGET = _load('tool_desc_forget.txt')
 # === GENERATIVE TOOLS (ComfyUI-backed) ===
 TOOL_DESC_GENERATE_IMAGE = _load('tool_desc_generate_image.txt')
 TOOL_DESC_EDIT_IMAGE = _load('tool_desc_edit_image.txt')
-TOOL_DESC_GENERATE_SCENE_WITH_CHARACTERS = _load('tool_desc_character_scene.txt')
 # === VISION TOOLS (vLLM-backed) ===
 TOOL_DESC_ANALYZE_IMAGE = _load('tool_desc_analyze_image.txt')
 # === SELF-MODIFICATION TOOLS ===

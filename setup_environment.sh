@@ -32,7 +32,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir "huggingface_hub[cli]"
 EOF
-    docker build -t aeon_downloader:latest -f "$PROJECT_ROOT/Dockerfile.downloader" "$PROJECT_ROOT"
+    docker build --network=host -t aeon_downloader:latest -f "$PROJECT_ROOT/Dockerfile.downloader" "$PROJECT_ROOT"
     rm -f "$PROJECT_ROOT/Dockerfile.downloader"
 else
     log_step "aeon_downloader:latest image already exists, skipping build."
@@ -110,7 +110,7 @@ PYEOF
 
     TTY_FLAG=""
     if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --rm $TTY_FLAG \
+    docker run --network=host --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
         -v "$QWEN35_27B_DIR:/models" \
@@ -196,7 +196,7 @@ PYEOF
 
     TTY_FLAG=""
     if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --rm $TTY_FLAG \
+    docker run --network=host --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
         -v "$QWEN3_CODER_GGUF_DIR:/models" \
@@ -279,7 +279,7 @@ PYEOF
 
     TTY_FLAG=""
     if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --rm $TTY_FLAG \
+    docker run --network=host --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
         -v "$GEMMA4_GGUF_DIR:/models" \
@@ -349,7 +349,7 @@ PYEOF
 
     TTY_FLAG=""
     if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --rm $TTY_FLAG \
+    docker run --network=host --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
         -v "$QWEN3_VL_DIR:/models" \
@@ -369,270 +369,15 @@ PYEOF
 fi
 log_step "PHASE 5.7 complete."
 
-# =============================================================================
-# PHASE 5.9: Build prepare_for_printify Docker image (print-on-demand preprocessing)
-# =============================================================================
-log_step "PHASE 5.9: Build bananacoconut-preprocessor Docker image for printify preprocessing"
-
-BANANA_COCONUT_DIR="$PROJECT_ROOT/../bananaCoconut"
-mkdir -p "$BANANA_COCONUT_DIR"
-
-# Write the preprocessing script
-cat > "$BANANA_COCONUT_DIR/complete_printify_preprocess.py" << 'PYEOF'
-import argparse
-import os
-import sys
-from pathlib import Path
-from PIL import Image
-import io
-
-try:
-    from rembg import remove
-    REMBG_AVAILABLE = True
-except ImportError:
-    REMBG_AVAILABLE = False
-    print("WARNING: rembg not available. Background removal will be skipped.")
-
-def process_image(input_path: str, output_path: str, args):
-    """Process a single image through the pipeline."""
-    print(f"Processing: {input_path}")
-    
-    try:
-        # Open image
-        img = Image.open(input_path)
-        
-        # Convert to RGBA for transparency support
-        if img.mode != 'RGBA':
-            img = img.convert('RGBA')
-        
-        # Stage 1: Resize if specified
-        if args.target_width or args.target_height:
-            orig_w, orig_h = img.size
-            if args.target_width and args.target_height:
-                new_w, new_h = args.target_width, args.target_height
-            elif args.target_width:
-                scale = args.target_width / orig_w
-                new_w = args.target_width
-                new_h = int(orig_h * scale)
-            else:
-                scale = args.target_height / orig_h
-                new_w = int(orig_w * scale)
-                new_h = args.target_height
-            
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            print(f"  Resized to {new_w}x{new_h}")
-        
-        # Stage 2: Background removal
-        if args.background_removal and REMBG_AVAILABLE:
-            print("  Removing background...")
-            img_bytes = io.BytesIO()
-            img.save(img_bytes, format='PNG')
-            img_bytes.seek(0)
-            
-            # Try multiple models if first fails
-            for model in ['u2net', 'u2netp', 'silueta']:
-                try:
-                    img = remove(img_bytes.read(), model_name=model)
-                    img = Image.open(io.BytesIO(img))
-                    if img.mode != 'RGBA':
-                        img = img.convert('RGBA')
-                    print(f"  Background removed using {model}")
-                    break
-                except Exception as e:
-                    print(f"    Model {model} failed: {e}")
-                    continue
-            else:
-                print("  WARNING: All background removal models failed")
-        
-        # Stage 3: Trim transparent edges
-        if args.trim_transparent_edges:
-            print("  Trimming transparent edges...")
-            img = trim_transparent_edges(img)
-        
-        # Stage 4: Add watermark if specified
-        if args.watermark_text:
-            print(f"  Adding watermark: {args.watermark_text}")
-            img = add_watermark(img, args.watermark_text)
-        
-        # Stage 5: Save with correct DPI and format
-        output_format = args.output_format.upper()
-        if output_format == 'JPG' or output_format == 'JPEG':
-            # Convert to RGB for JPG
-            if img.mode == 'RGBA':
-                # Create white background
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[3])
-                img = background
-        
-        # Ensure output directory exists
-        os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
-        
-        # Save with DPI
-        save_kwargs = {'dpi': (args.dpi, args.dpi)}
-        if output_format in ['PNG', 'TIFF']:
-            save_kwargs['format'] = output_format
-        elif output_format in ['JPG', 'JPEG']:
-            save_kwargs['format'] = 'JPEG'
-            save_kwargs['quality'] = 95
-        
-        img.save(output_path, **save_kwargs)
-        print(f"  Saved to {output_path} ({img.size[0]}x{img.size[1]}, {args.dpi} DPI)")
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ERROR: {type(e).__name__}: {e}")
-        return False
-
-def trim_transparent_edges(img: Image.Image) -> Image.Image:
-    """Trim transparent edges from an RGBA image."""
-    if img.mode != 'RGBA':
-        return img
-    
-    # Get alpha channel
-    alpha = img.split()[3]
-    
-    # Find bounding box of non-transparent pixels
-    bbox = alpha.getbbox()
-    
-    if bbox is None:
-        # All transparent, return empty image
-        return Image.new('RGBA', (1, 1), (0, 0, 0, 0))
-    
-    # Crop to bounding box
-    return img.crop(bbox)
-
-def add_watermark(img: Image.Image, text: str) -> Image.Image:
-    """Add a watermark text to the image."""
-    from PIL import ImageDraw, ImageFont
-    
-    # Create a copy to draw on
-    img = img.copy()
-    
-    # Try to load a font, fall back to default
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
-    except:
-        font = ImageFont.load_default()
-    
-    draw = ImageDraw.Draw(img)
-    
-    # Get text bounding box
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-    
-    # Position in bottom-right corner with padding
-    padding = 10
-    x = img.size[0] - text_width - padding
-    y = img.size[1] - text_height - padding
-    
-    # Draw semi-transparent background for text
-    background_bbox = (x - 5, y - 5, x + text_width + 5, y + text_height + 5)
-    draw.rectangle(background_bbox, fill=(0, 0, 0, 128))
-    
-    # Draw text
-    draw.text((x, y), text, fill=(255, 255, 255, 255), font=font)
-    
-    return img
-
-def main():
-    parser = argparse.ArgumentParser(description='Printify Image Preprocessing Pipeline')
-    parser.add_argument('--input_dir', required=True, help='Input directory')
-    parser.add_argument('--output_dir', required=True, help='Output directory')
-    parser.add_argument('--background_removal', action='store_true', default=True, help='Remove background')
-    parser.add_argument('--no_background_removal', action='store_true', help='Disable background removal')
-    parser.add_argument('--target_width', type=int, help='Target width in pixels')
-    parser.add_argument('--target_height', type=int, help='Target height in pixels')
-    parser.add_argument('--dpi', type=int, default=300, help='Output DPI')
-    parser.add_argument('--trim_transparent_edges', action='store_true', default=True, help='Trim transparent edges')
-    parser.add_argument('--no_trim', action='store_true', help='Disable edge trimming')
-    parser.add_argument('--output_format', default='PNG', help='Output format (PNG/JPG)')
-    parser.add_argument('--watermark_text', type=str, help='Watermark text to add')
-    parser.add_argument('--max_workers', type=int, default=2, help='Max parallel workers')
-    
-    args = parser.parse_args()
-    
-    # Override flags
-    if args.no_background_removal:
-        args.background_removal = False
-    if args.no_trim:
-        args.trim_transparent_edges = False
-    
-    input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Find all images
-    image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp'}
-    images = [f for f in input_dir.iterdir() if f.suffix.lower() in image_extensions]
-    
-    if not images:
-        print(f"No images found in {input_dir}")
-        return
-    
-    print(f"Found {len(images)} images to process")
-    
-    # Process each image
-    success_count = 0
-    for img_path in images:
-        output_path = output_dir / f"{img_path.stem}_processed.{args.output_format.lower()}"
-        if process_image(str(img_path), str(output_path), args):
-            success_count += 1
-    
-    print(f"\\nCompleted: {success_count}/{len(images)} images processed successfully")
-
-if __name__ == '__main__':
-    main()
-PYEOF
-
-# Write the Dockerfile
-cat > "$BANANA_COCONUT_DIR/Dockerfile" << 'EOF'
-FROM python:3.10-slim
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
-    fonts-dejavu \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set working directory
-WORKDIR /app
-
-# Install Python dependencies
-RUN pip install --no-cache-dir \
-    Pillow \
-    rembg[cpu] \
-    onnxruntime
-
-# Copy preprocessing script
-COPY complete_printify_preprocess.py /app/
-
-# Default command
-CMD ["python", "complete_printify_preprocess.py"]
-EOF
-
-# Build the Docker image
-if ! docker image inspect bananacoconut-preprocessor:latest >/dev/null 2>&1; then
-    log_step "Building bananacoconut-preprocessor:latest..."
-    docker build -t bananacoconut-preprocessor:latest "$BANANA_COCONUT_DIR"
-    log_step "bananacoconut-preprocessor:latest built successfully."
-else
-    log_step "bananacoconut-preprocessor:latest already exists, skipping build."
-fi
-
-log_step "PHASE 5.9 complete."
-
 log_step "PHASE 6: Build aeon_llamacpp:latest Docker image"
 log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take 5-10 min on first build)..."
-docker build -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
+docker build --network=host -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
 log_step "aeon_llamacpp:latest built successfully."
 
 # Build ComfyUI Docker image (for FLUX image generation tool)
 log_step "PHASE 6b: Build aeon_comfyui:latest Docker image"
 log_step "Building aeon_comfyui:latest (installs PyTorch + ComfyUI + GGUF plugin, may take 5-10 min on first build)..."
-docker build -t aeon_comfyui:latest -f "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
+docker build --network=host --no-cache -t aeon_comfyui:latest -f "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
 log_step "aeon_comfyui:latest built successfully."
 
 # =============================================================================
@@ -669,7 +414,7 @@ PYEOF
 
     TTY_FLAG=""
     if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --rm $TTY_FLAG \
+    docker run --network=host --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
         -v "$COMFY_MODELS_DIR:/models" \
@@ -688,6 +433,61 @@ PYEOF
     touch "$COMFY_MODELS_DIR/.download_complete"
 fi
 log_step "PHASE 7 complete."
+
+# =============================================================================
+# PHASE 7.5: Qwen-Image-Edit-2511 (ComfyUI Edit Models)
+# =============================================================================
+log_step "PHASE 7.5: Download Qwen-Image-Edit-2511 models"
+
+# Explicitly re-declare the directory to prevent empty variable evaluation
+COMFY_MODELS_DIR="${AEON_HOME:-$HOME/.aeon}/models/comfyui"
+mkdir -p "$COMFY_MODELS_DIR/unet" "$COMFY_MODELS_DIR/text_encoders" "$COMFY_MODELS_DIR/vae"
+
+if [ -f "$COMFY_MODELS_DIR/unet/.qwen_edit_download_complete" ]; then
+    log_step "Qwen-Image-Edit models already downloaded, skipping."
+else
+    QWEN_EDIT_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen_edit_XXXXXX.py)
+    cat > "$QWEN_EDIT_DL_SCRIPT" << 'PYEOF'
+import os, sys, shutil
+from huggingface_hub import hf_hub_download
+
+print('Downloading Qwen-Rapid-NSFW-v23_Q8_0.gguf...', flush=True)
+hf_hub_download(repo_id='Arunk25/Qwen-Image-Edit-Rapid-AIO-GGUF', filename='v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf', local_dir='/models/unet')
+
+print('Downloading Qwen VAE...', flush=True)
+vae_path = hf_hub_download(repo_id='Comfy-Org/Qwen-Image_ComfyUI', filename='split_files/vae/qwen_image_vae.safetensors', local_dir='/tmp/dl')
+os.makedirs('/models/vae', exist_ok=True)
+shutil.copy(vae_path, '/models/vae/qwen_image_vae.safetensors')
+
+print('Downloading Qwen Text Encoder...', flush=True)
+te_path = hf_hub_download(repo_id='Comfy-Org/Qwen-Image_ComfyUI', filename='split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors', local_dir='/tmp/dl')
+os.makedirs('/models/text_encoders', exist_ok=True)
+shutil.copy(te_path, '/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors')
+
+print('Qwen Image Edit downloads complete!', flush=True)
+PYEOF
+
+    TTY_FLAG=""
+    if [ -t 0 ]; then TTY_FLAG="-t"; fi
+    docker run --network=host --rm $TTY_FLAG \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$COMFY_MODELS_DIR:/models" \
+        -v "$QWEN_EDIT_DL_SCRIPT:/download.py:ro" \
+        aeon_downloader:latest \
+        python3 /download.py
+
+    DL_EXIT=$?
+    rm -f "$QWEN_EDIT_DL_SCRIPT"
+    if [ $DL_EXIT -ne 0 ]; then
+        log_step "ERROR: Qwen-Image-Edit download failed (exit code $DL_EXIT)"
+        exit 1
+    fi
+
+    docker run --rm -v "$COMFY_MODELS_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
+    touch "$COMFY_MODELS_DIR/unet/.qwen_edit_download_complete"
+fi
+log_step "PHASE 7.5 complete."
 
 # =============================================================================
 # PHASE 8: PuLID FLUX Models (Consistent Characters)
@@ -719,7 +519,7 @@ PYEOF
 
     TTY_FLAG=""
     if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --rm $TTY_FLAG \
+    docker run --network=host --rm $TTY_FLAG \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
         -v "$AEON_HOME/models/comfyui:/models" \
