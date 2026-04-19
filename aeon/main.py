@@ -5,8 +5,8 @@ from aeon.core.llm import LLMClient
 from aeon.tools.loader import load_tools_from_directory
 
 LOCK_FILE_PATH = "/tmp/aeon_runtime.lock"
-RESTART_STATE_PATH = "/tmp/aeon_restart_state.json"
-RESTART_BACKUP_PATH = "/tmp/aeon_restart_backup.tar.gz"
+RESTART_STATE_PATH = f"/tmp/aeon_restart_state_{os.getpid()}.json"
+RESTART_BACKUP_PATH = f"/tmp/aeon_restart_backup_{os.getpid()}.tar.gz"
 STARTUP_LOCK_PATH = "/tmp/aeon_brain_startup.lock"
 MODEL_REGISTRY_PATH = "/tmp/aeon_model_registry.json"
 MODEL_REGISTRY_LOCK_PATH = "/tmp/aeon_model_registry.lock"
@@ -158,34 +158,45 @@ def cleanup_transient_tools():
         subprocess.run("docker ps -a -q --filter 'name=aeon_research' --filter 'name=aeon_vision' | xargs -r docker rm -f", 
                        shell=True, stderr=subprocess.DEVNULL, timeout=5)
         
-        # Safely evaluate ComfyUI cleanup using its registry
+        # Safely evaluate container cleanup using registry
         import fcntl
-        registry_path = "/tmp/aeon_comfyui_registry.json"
-        lock_path = "/tmp/aeon_comfyui_registry.lock"
         my_pid = os.getpid()
         
-        try:
-            with open(lock_path, 'w') as lock_fd:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                if os.path.exists(registry_path):
-                    with open(registry_path, 'r') as f:
-                        active_pids = json.load(f)
-                    
-                    # Check if any *other* agents are alive and using it
-                    other_alive_pids = []
-                    for p in active_pids:
-                        if p == my_pid: continue
-                        try:
-                            os.kill(p, 0)
-                            other_alive_pids.append(p)
-                        except OSError:
-                            pass
-                            
-                    if not other_alive_pids:
-                        subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stderr=subprocess.DEVNULL)
-        except:
-            pass # Fallback: let the tool handle its own cleanup next time
-            
+        def _safe_cleanup(registry_path, lock_path, container_name, cleanup_callback=None):
+            try:
+                with open(lock_path, 'w') as lock_fd:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    if os.path.exists(registry_path):
+                        with open(registry_path, 'r') as f:
+                            active_pids = json.load(f)
+                        
+                        other_alive_pids = []
+                        for p in active_pids:
+                            if p == my_pid: continue
+                            try:
+                                os.kill(p, 0)
+                                other_alive_pids.append(p)
+                            except OSError:
+                                pass
+                                
+                        if cleanup_callback:
+                            cleanup_callback()
+                                
+                        if not other_alive_pids:
+                            subprocess.run(["docker", "rm", "-f", container_name], stderr=subprocess.DEVNULL)
+            except:
+                pass
+        
+        _safe_cleanup("/tmp/aeon_comfyui_registry.json", "/tmp/aeon_comfyui_registry.lock", "aeon_comfyui")
+        
+        def _close_browser_session():
+            try:
+                requests.post("http://localhost:8030/close_session", json={"session_id": str(my_pid)}, timeout=2)
+            except:
+                pass
+                
+        _safe_cleanup("/tmp/aeon_browser_registry.json", "/tmp/aeon_browser_registry.lock", "aeon_browser", _close_browser_session)
+        
     except Exception as e:
         print(f"[WARN] Cleanup timed out or failed: {e}")
 

@@ -17,7 +17,5 @@ RUN pip install --no-cache-dir \
     onnxruntime
 
 # Copy preprocessing script
-COPY complete_printify_preprocess.py /app/
 
 # Default command
-CMD ["python", "complete_printify_preprocess.py"]

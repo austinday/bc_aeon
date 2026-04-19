@@ -33,7 +33,13 @@ TOOL_CATEGORIES = {
             'generate_image',
             'edit_image',
             'analyze_image',
-            'prepare_for_printify',
+        ],
+    },
+    'web_browser': {
+        'description': 'Undetected web browsing, DOM extraction, and Set-of-Mark interaction',
+        'tools': [
+            'browser_navigate',
+            'browser_interact',
         ],
     },
 }

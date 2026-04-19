@@ -441,5 +441,18 @@ PYEOF
 fi
 log_step "PHASE 8 complete."
 
+# =============================================================================
+# PHASE 9: Web Browser Service (Playwright)
+# =============================================================================
+log_step "PHASE 9: Build aeon_browser_service:latest Docker image"
+if ! docker image inspect aeon_browser_service:latest >/dev/null 2>&1; then
+    log_step "Building aeon_browser_service:latest (Headless Playwright + stealth)..."
+    docker build --network=host --no-cache -t aeon_browser_service:latest -f "$PROJECT_ROOT/aeon/services/browser/Dockerfile" "$PROJECT_ROOT/aeon/services/browser/"
+    log_step "aeon_browser_service:latest built successfully."
+else
+    log_step "aeon_browser_service:latest already built, skipping."
+fi
+log_step "PHASE 9 complete."
+
 log_step "Setup complete. Models in $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN36_VL_DIR, $GEMMA4_GGUF_DIR"
 log_step "NOTE: To remove old models (if present), you may want to clean up $AEON_HOME/models/vl_models/Qwen3.5-35B-A3B-GGUF or $AEON_HOME/models/gguf_models/Qwen3.5-27B"

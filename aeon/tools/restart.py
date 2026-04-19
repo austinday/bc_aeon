@@ -3,7 +3,7 @@ import json
 from .base import BaseTool
 from ..core.prompts import TOOL_DESC_RESTART_AEON
 
-RESTART_STATE_PATH = '/tmp/aeon_restart_state.json'
+RESTART_STATE_PATH = f'/tmp/aeon_restart_state_{os.getpid()}.json'
 
 
 class RestartAeonTool(BaseTool):

@@ -26,6 +26,8 @@ aeon/core/prompts/primary_agent_instructions.txt
 aeon/core/prompts/summarize_text_prompt.txt
 aeon/core/prompts/think_tool_prompt.txt
 aeon/core/prompts/tool_desc_analyze_image.txt
+aeon/core/prompts/tool_desc_browser_interact.txt
+aeon/core/prompts/tool_desc_browser_navigate.txt
 aeon/core/prompts/tool_desc_close_file.txt
 aeon/core/prompts/tool_desc_collapse_category.txt
 aeon/core/prompts/tool_desc_edit_image.txt
@@ -35,7 +37,6 @@ aeon/core/prompts/tool_desc_generate_image.txt
 aeon/core/prompts/tool_desc_get_user_input.txt
 aeon/core/prompts/tool_desc_memorize.txt
 aeon/core/prompts/tool_desc_open_file.txt
-aeon/core/prompts/tool_desc_prepare_for_printify.txt
 aeon/core/prompts/tool_desc_restart_aeon.txt
 aeon/core/prompts/tool_desc_run_command.txt
 aeon/core/prompts/tool_desc_say_to_user.txt
@@ -49,6 +50,7 @@ aeon/llamacpp/__init__.py
 aeon/scripts/__init__.py
 aeon/scripts/clear_gpu.sh
 aeon/scripts/start_brain.sh
+aeon/scripts/start_browser.sh
 aeon/scripts/start_comfyui.sh
 aeon/scripts/start_gemma4_31b.sh
 aeon/scripts/start_gemma4_speculative.sh
@@ -59,6 +61,7 @@ aeon/scripts/start_vllm.sh
 aeon/services/__init__.py
 aeon/tools/__init__.py
 aeon/tools/base.py
+aeon/tools/browser.py
 aeon/tools/categories.py
 aeon/tools/category_tools.py
 aeon/tools/communication.py
@@ -66,7 +69,6 @@ aeon/tools/file_io.py
 aeon/tools/generate_image.py
 aeon/tools/loader.py
 aeon/tools/memory.py
-aeon/tools/prepare_for_printify.py
 aeon/tools/restart.py
 aeon/tools/search.py
 aeon/tools/system.py
