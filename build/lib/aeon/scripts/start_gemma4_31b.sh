@@ -12,8 +12,8 @@ MODELS_DIR="$AEON_HOME/models/gguf_models/Gemma-4-31B-it-abliterated"
 
 # Tunable parameters
 N_GPU_LAYERS=${NGL:-99}          # Fits entirely in VRAM
-PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot maximizes VRAM for model layers
-CTX_SIZE=${CTX:-131072}          # 128k context
+PARALLEL_SLOTS=${PARALLEL:-5}    # 5 slots for increased throughput
+CTX_SIZE=${CTX:-262144}          # 256k context
 BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)

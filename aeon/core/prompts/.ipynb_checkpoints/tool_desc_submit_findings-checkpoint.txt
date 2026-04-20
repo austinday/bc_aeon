@@ -1,1 +1,0 @@
-Submit your final research findings and EXIT. Params: `summary` (str), `details` (str).

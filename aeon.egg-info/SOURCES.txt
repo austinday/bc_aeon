@@ -89,3 +89,6 @@ aeon/tools/analyzers/handlers/sequence.py
 aeon/tools/analyzers/handlers/tabular.py
 aeon/tools/analyzers/handlers/text.py
 aeon/tools/analyzers/handlers/utility.py
+tests/test_browser.py
+tests/test_sub_agent_termination.py
+tests/test_sub_agents.py

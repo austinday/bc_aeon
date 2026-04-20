@@ -21,7 +21,7 @@ class SpawnSubAgent(BaseTool):
 
     @property
     def output_dir(self):
-        return Path(os.getcwd()) / "aeon_output" / "sub_agents"
+        return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
 
     def execute(self, objective: str, model_name: str = None):
         # Check limit
@@ -93,11 +93,12 @@ class GetSubAgentReport(BaseTool):
             name="get_sub_agent_report",
             description="Checks a sub-agent's progress. If COMPLETED, returns the final findings. If RUNNING, analyzes its recent logs to provide a synthesized progress report."
         )
+        self.worker = worker
         self.llm_client = llm_client
 
     @property
     def output_dir(self):
-        return Path(os.getcwd()) / "aeon_output" / "sub_agents"
+        return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
 
     def execute(self, agent_id: str, specific_question: str = None):
         agent_dir = self.output_dir / agent_id
@@ -110,6 +111,8 @@ class GetSubAgentReport(BaseTool):
         status = "UNKNOWN"
         if status_path.exists():
             status = status_path.read_text().strip()
+        elif output_path.exists():
+            status = "COMPLETED"
             
         report = f"Agent {agent_id} Status: {status}"
         
@@ -168,10 +171,11 @@ class KillSubAgent(BaseTool):
             name="kill_sub_agent",
             description="Kills a running sub-agent by Agent ID. Use when a sub-agent is taking too long, is stuck, or its result is no longer relevant."
         )
+        self.worker = worker
 
     @property
     def output_dir(self):
-        return Path(os.getcwd()) / "aeon_output" / "sub_agents"
+        return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
 
     def execute(self, agent_id: str):
         agent_dir = self.output_dir / agent_id

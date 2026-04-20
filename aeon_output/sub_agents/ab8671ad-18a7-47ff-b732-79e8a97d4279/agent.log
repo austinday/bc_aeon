@@ -1,5 +1,0 @@
-[2026-04-19 11:15:42] Initializing sub-agent ab8671ad-18a7-47ff-b732-79e8a97d4279...
-[2026-04-19 11:15:42] Changed working directory to workspace: /home/aday/bc_aeon/aeon_output/sub_agents/ab8671ad-18a7-47ff-b732-79e8a97d4279/workspace
-[2026-04-19 11:15:42] Workspace set to read-only.
-[2026-04-19 11:15:42] Starting execution of objective: Task 5: Should succeed after kill
-[2026-04-19 11:16:54] Task completed successfully.

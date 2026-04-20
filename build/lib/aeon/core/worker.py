@@ -3,6 +3,7 @@ import re
 import time
 import sys
 import os
+import uuid
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -54,6 +55,7 @@ class Worker:
         self._recent_outputs = []   # Corresponding outputs for loop detection
         self.expanded_categories = set()  # Tracks which tool categories are currently expanded
         self.notified_sub_agents = set()  # Tracks which sub-agent terminal states have been alerted to the main agent
+        self.instance_id = str(uuid.uuid4())[:8]  # Unique ID for this Aeon run instance
         self.MAX_REPEAT_WINDOW = 5  # How many recent commands to track
         self.REPEAT_THRESHOLD = 2   # How many identical commands before warning
 
@@ -122,6 +124,7 @@ class Worker:
 
     def register_tools(self, tools_list: List[Any]):
         for tool in tools_list:
+            tool.worker = self
             self.tools[tool.name] = tool
 
     def update_open_file(self, path: str, content: str):
@@ -270,6 +273,7 @@ class Worker:
             'objective': self.current_objective or '',
             'expanded_categories': list(self.expanded_categories),
             'notified_sub_agents': list(self.notified_sub_agents),
+            'instance_id': self.instance_id,
         }
 
     def restore_state(self, state: dict):
@@ -404,7 +408,7 @@ class Worker:
 
                 # --- BACKGROUND AGENT TERMINAL UI ---
                 active_agents = []
-                sub_agent_dir = Path(os.getcwd()) / "aeon_output" / "sub_agents"
+                sub_agent_dir = Path(os.getcwd()) / "aeon_output" / self.instance_id / "sub_agents"
                 if sub_agent_dir.exists():
                     for agent_dir in sub_agent_dir.iterdir():
                         if agent_dir.is_dir() and (agent_dir / "status.txt").exists():
@@ -419,7 +423,7 @@ class Worker:
                     self.action_log = self.action_log[-10:]
 
                 # --- SUB-AGENT NOTIFICATION CHECK ---
-                sub_agent_dir = Path("/home/aday/bc_aeon/aeon_output/sub_agents")
+                sub_agent_dir = Path(os.getcwd()) / "aeon_output" / self.instance_id / "sub_agents"
                 if sub_agent_dir.exists():
                     for agent_dir in sub_agent_dir.iterdir():
                         if agent_dir.is_dir():
@@ -432,6 +436,11 @@ class Worker:
                                         notification = f"\n[SYSTEM ALERT] Sub-agent {agent_dir.name} has transitioned to status: {status}. Use get_sub_agent_report to review its findings."
                                         self.last_observation += notification
                                         self.notified_sub_agents.add(state_key)
+                                        # Cleanup status file now that agent has been notified
+                                        try:
+                                            status_path.unlink()
+                                        except Exception as e:
+                                            self.logger.error(f"Failed to cleanup status file {status_path}: {e}")
 
                 # Sync open files before building context
                 self._sync_open_files()

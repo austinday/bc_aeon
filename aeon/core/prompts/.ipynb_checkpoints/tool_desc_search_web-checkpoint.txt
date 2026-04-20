@@ -1,1 +1,0 @@
-Web search. Use for external info/docs, current information, or inspiration when stuck. Params: `query` (str). Example: `{"tool_name": "search_web", "parameters": {"query": "python singleton pattern"}}`

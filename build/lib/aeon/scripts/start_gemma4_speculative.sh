@@ -23,7 +23,7 @@ fi
 
 # Tunable parameters
 N_GPU_LAYERS=${NGL:-99}          # Fit both models in VRAM
-PARALLEL_SLOTS=${PARALLEL:-1}    # Keep at 1 for max single-batch speed
+PARALLEL_SLOTS=${PARALLEL:-5}    # 5 slots for increased throughput
 CTX_SIZE=${CTX:-262144}          # 256k context
 BATCH_SIZE=${BATCH:-4096}
 DRAFT_MAX=${DRAFT_MAX:-5}        # Number of tokens the draft model guesses at once

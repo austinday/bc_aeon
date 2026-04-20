@@ -1,4 +1,0 @@
-Opens a file so its contents will be available in context next iteration. File contents are kept up to date, so changes to files will be reflected immediately and kept in context until closed. No need to re-open files. 
-Schema:
-  file_path (str, required): Path to the file to open. Relative or absolute.
-Example: {"tool_name": "open_file", "parameters": {"file_path": "src/main.py"}}

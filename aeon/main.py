@@ -592,6 +592,35 @@ class SessionManager:
         print("[SESSION] Cleanup complete.")
 
 
+def terminate_all_sub_agents():
+    """Find and terminate all running sub-agents using their pid.txt files."""
+    print("[RESTART] Terminating all active sub-agents...")
+    sub_agents_dir = Path("aeon_output/sub_agents")
+    if not sub_agents_dir.exists():
+        print("[RESTART] No sub-agents directory found. Skipping.")
+        return
+
+    terminated_count = 0
+    for agent_dir in sub_agents_dir.iterdir():
+        if agent_dir.is_dir():
+            pid_file = agent_dir / "pid.txt"
+            status_file = agent_dir / "status.txt"
+            if pid_file.exists():
+                try:
+                    pid_str = pid_file.read_text().strip()
+                    if pid_str:
+                        pid = int(pid_str)
+                        os.kill(pid, signal.SIGKILL)
+                        terminated_count += 1
+                except (ValueError, ProcessLookupError, PermissionError):
+                    pass
+            if status_file.exists():
+                try:
+                    status_file.write_text("KILLED")
+                except:
+                    pass
+    print(f"[RESTART] Terminated {terminated_count} sub-agents.")
+
 def _restore_backup(aeon_code_dir, backup_exists):
     """Restore the aeon source directory from the tarball backup."""
     import tarfile
@@ -641,6 +670,8 @@ def _execute_restart(session, worker=None):
     """
     if not os.path.exists(RESTART_STATE_PATH):
         return
+
+    terminate_all_sub_agents()
 
     import shutil
     import tarfile
