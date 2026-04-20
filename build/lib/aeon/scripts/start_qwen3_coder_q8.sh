@@ -56,7 +56,7 @@ echo "[Qwen3-Coder-Q8] Starting llama.cpp server..."
 
 docker run -d \
     --name $CONTAINER_NAME \
-    --gpus '"device=0"' \
+  --gpus '"device=0"' \
     -p ${PORT}:8001 \
     -v "${MODELS_DIR}:/models:ro" \
     --shm-size=16g \

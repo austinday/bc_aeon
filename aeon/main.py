@@ -844,6 +844,7 @@ def cli():
         llm_client = LLMClient(strong_config=strong_config, weak_config=weak_config)
         worker = Worker(llm_client=llm_client, debug_mode=args.debug)
         worker.model_name = strong_config['model']
+        worker.model_config = strong_config
         deps = {'llm_client': llm_client, 'worker': worker}
         tools = load_tools_from_directory("aeon.tools", dependencies=deps)
         worker.register_tools(tools)

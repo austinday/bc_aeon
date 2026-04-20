@@ -53,6 +53,7 @@ class Worker:
         self._recent_commands = []  # Rolling window for loop detection
         self._recent_outputs = []   # Corresponding outputs for loop detection
         self.expanded_categories = set()  # Tracks which tool categories are currently expanded
+        self.notified_sub_agents = set()  # Tracks which sub-agent terminal states have been alerted to the main agent
         self.MAX_REPEAT_WINDOW = 5  # How many recent commands to track
         self.REPEAT_THRESHOLD = 2   # How many identical commands before warning
 
@@ -258,6 +259,7 @@ class Worker:
         self._recent_commands.clear()
         self._recent_outputs.clear()
         self.expanded_categories.clear()
+        self.notified_sub_agents.clear()
 
     def serialize_state(self) -> dict:
         """Serialize worker state for persistence across restarts."""
@@ -267,6 +269,7 @@ class Worker:
             'action_log': list(self.action_log),
             'objective': self.current_objective or '',
             'expanded_categories': list(self.expanded_categories),
+            'notified_sub_agents': list(self.notified_sub_agents),
         }
 
     def restore_state(self, state: dict):
@@ -274,6 +277,7 @@ class Worker:
         self.memories = state.get('memories', {})
         self.action_log = state.get('action_log', [])
         self.expanded_categories = set(state.get('expanded_categories', []))
+        self.notified_sub_agents = set(state.get('notified_sub_agents', []))
         reason = state.get('reason', 'code changes')
 
         # Append a clear record that the restart happened
@@ -398,10 +402,36 @@ class Worker:
 
                 self.print_func(f"\n{C_BLUE}{'='*60}\n ITERATION {iteration}\n{'='*60}{C_RESET}")
 
+                # --- BACKGROUND AGENT TERMINAL UI ---
+                active_agents = []
+                sub_agent_dir = Path(os.getcwd()) / "aeon_output" / "sub_agents"
+                if sub_agent_dir.exists():
+                    for agent_dir in sub_agent_dir.iterdir():
+                        if agent_dir.is_dir() and (agent_dir / "status.txt").exists():
+                            if (agent_dir / "status.txt").read_text().strip() == "RUNNING":
+                                active_agents.append(agent_dir.name[:8])
+                if active_agents:
+                    self.print_func(f"\033[90m[Background] Active sub-agents ({len(active_agents)}): {', '.join(active_agents)}\033[0m")
+
                 # Enforce strict 10-iteration limit on the action log
                 if len(self.action_log) > 10:
                     self.print_func(f"{C_CYAN}Truncating action log to last 10 iterations to preserve context focus...{C_RESET}")
                     self.action_log = self.action_log[-10:]
+
+                # --- SUB-AGENT NOTIFICATION CHECK ---
+                sub_agent_dir = Path("/home/aday/bc_aeon/aeon_output/sub_agents")
+                if sub_agent_dir.exists():
+                    for agent_dir in sub_agent_dir.iterdir():
+                        if agent_dir.is_dir():
+                            status_path = agent_dir / "status.txt"
+                            if status_path.exists():
+                                status = status_path.read_text().strip()
+                                if status in ["COMPLETED", "FAILED", "KILLED"]:
+                                    state_key = f"{agent_dir.name}_{status}"
+                                    if state_key not in self.notified_sub_agents:
+                                        notification = f"\n[SYSTEM ALERT] Sub-agent {agent_dir.name} has transitioned to status: {status}. Use get_sub_agent_report to review its findings."
+                                        self.last_observation += notification
+                                        self.notified_sub_agents.add(state_key)
 
                 # Sync open files before building context
                 self._sync_open_files()
@@ -487,6 +517,7 @@ class Worker:
 
                 combined_summary_parts = []
                 actions_taken_str = []
+                full_actions_taken_str = []
                 user_input_handled = False
 
                 if len(actions) > 15:
@@ -507,8 +538,10 @@ class Worker:
 
                     self.print_func(f"{C_YELLOW}Executing (Step {idx+1}):{C_RESET} {tool_name} {params}")
                     
-                    action_desc = f"{tool_name}({str(params)[:40]}...)" if params else f"{tool_name}()"
-                    actions_taken_str.append(action_desc)
+                    full_action_desc = f"{tool_name}({params})" if params else f"{tool_name}()"
+                    display_action_desc = f"{tool_name}({str(params)[:40]}...)" if params else f"{tool_name}()"
+                    actions_taken_str.append(display_action_desc)
+                    full_actions_taken_str.append(full_action_desc)
 
                     if tool_name in terminal_tools:
                         try:
@@ -616,7 +649,7 @@ class Worker:
 
                 # --- LOOP DETECTION ---
                 # Build a fingerprint of the commands executed this iteration
-                cmd_fingerprint = "|".join(actions_taken_str)
+                cmd_fingerprint = "|".join(full_actions_taken_str)
                 output_fingerprint = raw_output.strip()[:2000]  # First 2k chars for comparison
                 self._recent_commands.append(cmd_fingerprint)
                 self._recent_outputs.append(output_fingerprint)

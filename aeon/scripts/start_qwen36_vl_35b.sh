@@ -61,7 +61,7 @@ fi
 
 docker run -d \
     --name $CONTAINER_NAME \
-    --gpus "device=${GPU_ID}" \
+  --gpus '"device=0"' \
     -v "${MODELS_DIR}:/models:ro" \
     -p ${PORT}:8080 \
     --ipc=host \

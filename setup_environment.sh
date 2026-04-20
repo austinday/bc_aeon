@@ -6,6 +6,14 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AEON_HOME="${AEON_HOME:-$HOME/.aeon}"
 HF_TOKEN_FILE="/home/aday/huggingface_access_token.txt"
 
+DOCKER_CACHE_FLAG=""
+for arg in "$@"; do
+    if [ "$arg" == "--force" ]; then
+        DOCKER_CACHE_FLAG="--no-cache"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FORCE MODE ENABLED: Docker builds will use --no-cache"
+    fi
+done
+
 log_step() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
@@ -32,7 +40,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir "huggingface_hub[cli]"
 EOF
-    docker build --network=host -t aeon_downloader:latest -f "$PROJECT_ROOT/Dockerfile.downloader" "$PROJECT_ROOT"
+    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_downloader:latest -f "$PROJECT_ROOT/Dockerfile.downloader" "$PROJECT_ROOT"
     rm -f "$PROJECT_ROOT/Dockerfile.downloader"
 else
     log_step "aeon_downloader:latest image already exists, skipping build."
@@ -279,13 +287,13 @@ log_step "PHASE 5.7 complete."
 
 log_step "PHASE 6: Build aeon_llamacpp:latest Docker image"
 log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take 5-10 min on first build)..."
-docker build --network=host -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
+docker build --network=host $DOCKER_CACHE_FLAG -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
 log_step "aeon_llamacpp:latest built successfully."
 
 # Build ComfyUI Docker image (for FLUX image generation tool)
 log_step "PHASE 6b: Build aeon_comfyui:latest Docker image"
 log_step "Building aeon_comfyui:latest (installs PyTorch + ComfyUI + GGUF plugin, may take 5-10 min on first build)..."
-docker build --network=host --no-cache -t aeon_comfyui:latest -f "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
+docker build --network=host $DOCKER_CACHE_FLAG -t aeon_comfyui:latest -f "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
 log_step "aeon_comfyui:latest built successfully."
 
 # =============================================================================
@@ -447,7 +455,7 @@ log_step "PHASE 8 complete."
 log_step "PHASE 9: Build aeon_browser_service:latest Docker image"
 if ! docker image inspect aeon_browser_service:latest >/dev/null 2>&1; then
     log_step "Building aeon_browser_service:latest (Headless Playwright + stealth)..."
-    docker build --network=host --no-cache -t aeon_browser_service:latest -f "$PROJECT_ROOT/aeon/services/browser/Dockerfile" "$PROJECT_ROOT/aeon/services/browser/"
+    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_browser_service:latest -f "$PROJECT_ROOT/aeon/services/browser/Dockerfile" "$PROJECT_ROOT/aeon/services/browser/"
     log_step "aeon_browser_service:latest built successfully."
 else
     log_step "aeon_browser_service:latest already built, skipping."

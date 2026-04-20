@@ -14,7 +14,7 @@ MODEL_FILE="Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"
 
 # Tunable parameters
 N_GPU_LAYERS=${NGL:-99}          # Fits entirely in VRAM
-PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot maximizes VRAM for model layers
+PARALLEL_SLOTS=${PARALLEL:-5}    # 5 slots for increased throughput
 CTX_SIZE=${CTX:-262144}          # 256k context
 BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
 
@@ -56,7 +56,7 @@ echo "[Qwen3.6-35B] Starting llama.cpp server..."
 
 docker run -d \
     --name $CONTAINER_NAME \
-    --gpus '"device=0"' \
+  --gpus '"device=0"' \
     -p ${PORT}:8001 \
     -v "${MODELS_DIR}:/models:ro" \
     --shm-size=16g \

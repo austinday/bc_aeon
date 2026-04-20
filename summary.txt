@@ -1,0 +1,14 @@
+# Project Summary: Loop Detection Fix
+
+## Bug Description
+The loop detection mechanism in `aeon/core/worker.py` was using a truncated version of the action description (`display_action_desc`) to create fingerprints for detecting repeated commands. When tool parameters were long (exceeding 40 characters) and differed only after the truncation limit, the fingerprints were identical, causing the agent to falsely detect a loop and trigger a loop warning.
+
+## Solution
+Modified `aeon/core/worker.py` to use the `full_action_desc` (which contains the complete tool parameters) for the `cmd_fingerprint` used in loop detection. The truncated `display_action_desc` is still used for the action log and LLM context to preserve token space, but the actual detection logic now operates on the full, precise command.
+
+## Verification
+Created and ran a reproduction script `scripts/repro_loop_bug.py` which performed two tests:
+1. **False Positive Test**: Ran the same tool multiple times with different long arguments. Verified that NO loop was detected.
+2. **True Positive Test**: Ran the same tool multiple times with identical arguments. Verified that a loop WAS correctly detected.
+
+Both tests passed successfully.

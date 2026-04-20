@@ -12,8 +12,8 @@ MODELS_DIR="$AEON_HOME/models/gguf_models/Gemma-4-31B-it-abliterated"
 
 # Tunable parameters
 N_GPU_LAYERS=${NGL:-99}          # Fits entirely in VRAM
-PARALLEL_SLOTS=${PARALLEL:-1}    # Single slot maximizes VRAM for model layers
-CTX_SIZE=${CTX:-131072}          # 128k context
+PARALLEL_SLOTS=${PARALLEL:-5}    # 5 slots for increased throughput
+CTX_SIZE=${CTX:-262144}          # 256k context
 BATCH_SIZE=${BATCH:-4096}        # Prompt processing batch size
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
@@ -56,7 +56,7 @@ echo "[Gemma4-31B-Q8] Starting llama.cpp server..."
 
 docker run -d \
     --name $CONTAINER_NAME \
-    --gpus '"device=0"' \
+  --gpus '"device=0"' \
     -p ${PORT}:8001 \
     -v "${MODELS_DIR}:/models:ro" \
     --shm-size=16g \

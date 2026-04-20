@@ -22,7 +22,7 @@ echo "Starting vLLM for $MODEL_NAME on GPU $GPU_ID (Port $PORT)..."
 
 docker run -d \
   --name aeon_vllm \
-  --gpus "device=$GPU_ID" \
+  --gpus '"device=0"' \
   -v "$MODELS_DIR:/models" \
   -p $PORT:8000 \
   --ipc=host \

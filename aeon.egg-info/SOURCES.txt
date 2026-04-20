@@ -58,6 +58,7 @@ aeon/scripts/start_qwen36_35b.sh
 aeon/scripts/start_qwen36_vl_35b.sh
 aeon/scripts/start_qwen3_coder_q8.sh
 aeon/scripts/start_vllm.sh
+aeon/scripts/sub_agent_wrapper.py
 aeon/services/__init__.py
 aeon/tools/__init__.py
 aeon/tools/base.py
@@ -71,6 +72,7 @@ aeon/tools/loader.py
 aeon/tools/memory.py
 aeon/tools/restart.py
 aeon/tools/search.py
+aeon/tools/sub_agent.py
 aeon/tools/system.py
 aeon/tools/vision.py
 aeon/tools/analyzers/__init__.py
