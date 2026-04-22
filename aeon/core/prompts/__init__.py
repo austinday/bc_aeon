@@ -53,6 +53,10 @@ TOOL_DESC_TASK_COMPLETE = _load('tool_desc_task_complete.txt')
 TOOL_DESC_GET_USER_INPUT = _load('tool_desc_get_user_input.txt')
 TOOL_DESC_MEMORIZE = _load('tool_desc_memorize.txt')
 TOOL_DESC_FORGET = _load('tool_desc_forget.txt')
+# === SUB-AGENT TOOLS ===
+TOOL_DESC_SPAWN_SUB_AGENT = _load('tool_desc_spawn_sub_agent.txt')
+TOOL_DESC_GET_SUB_AGENT_REPORT = _load('tool_desc_get_sub_agent_report.txt')
+TOOL_DESC_KILL_SUB_AGENT = _load('tool_desc_kill_sub_agent.txt')
 # === GENERATIVE TOOLS (ComfyUI-backed) ===
 TOOL_DESC_GENERATE_IMAGE = _load('tool_desc_generate_image.txt')
 TOOL_DESC_EDIT_IMAGE = _load('tool_desc_edit_image.txt')

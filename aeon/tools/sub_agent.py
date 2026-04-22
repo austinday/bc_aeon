@@ -8,12 +8,17 @@ import copy
 import re
 from pathlib import Path
 from aeon.tools.base import BaseTool
+from ..core.prompts import (
+    TOOL_DESC_SPAWN_SUB_AGENT,
+    TOOL_DESC_GET_SUB_AGENT_REPORT,
+    TOOL_DESC_KILL_SUB_AGENT
+)
 
 class SpawnSubAgent(BaseTool):
     def __init__(self, worker=None, llm_client=None):
         super().__init__(
             name="spawn_sub_agent",
-            description="Spawns a heavy background sub-agent for COMPLEX, LONG-RUNNING, INDEPENDENT tasks ONLY (e.g., massive web scraping, training models). NEVER use this for simple scripts, basic math, or quick commands—do those yourself using write_file and run_command. Max 5 concurrent agents. The system alerts you when they finish. Do not poll them."
+            description=TOOL_DESC_SPAWN_SUB_AGENT
         )
         self.worker = worker
         self.llm_client = llm_client
@@ -91,7 +96,7 @@ class GetSubAgentReport(BaseTool):
     def __init__(self, worker=None, llm_client=None):
         super().__init__(
             name="get_sub_agent_report",
-            description="Checks a sub-agent's progress. If COMPLETED, returns the final findings. If RUNNING, analyzes its recent logs to provide a synthesized progress report."
+            description=TOOL_DESC_GET_SUB_AGENT_REPORT
         )
         self.worker = worker
         self.llm_client = llm_client
@@ -169,7 +174,7 @@ class KillSubAgent(BaseTool):
     def __init__(self, worker=None, llm_client=None):
         super().__init__(
             name="kill_sub_agent",
-            description="Kills a running sub-agent by Agent ID. Use when a sub-agent is taking too long, is stuck, or its result is no longer relevant."
+            description=TOOL_DESC_KILL_SUB_AGENT
         )
         self.worker = worker
 
