@@ -96,7 +96,8 @@ class GetSubAgentReport(BaseTool):
     def __init__(self, worker=None, llm_client=None):
         super().__init__(
             name="get_sub_agent_report",
-            description=TOOL_DESC_GET_SUB_AGENT_REPORT
+            description=TOOL_DESC_GET_SUB_AGENT_REPORT,
+            underlying_model=llm_client.utility_model if llm_client else None
         )
         self.worker = worker
         self.llm_client = llm_client

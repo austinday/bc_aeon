@@ -16,9 +16,10 @@ class BaseTool(ABC):
     C_BLUE = '\033[94m'
     C_RESET = '\033[0m'
 
-    def __init__(self, name: str, description: str):
+    def __init__(self, name: str, description: str, underlying_model: str = None):
         self.name = name
         self.description = description
+        self.underlying_model = underlying_model
 
     @abstractmethod
     def execute(self, *args, **kwargs):

@@ -68,9 +68,15 @@ def load_tools_from_directory(
             categorized = get_all_categorized_tools()
             loaded_names = {t.name for t in found_tools}
             
+            def _get_model_str(tool_name):
+                t = next((x for x in found_tools if x.name == tool_name), None)
+                if t and getattr(t, 'underlying_model', None):
+                    return f" \033[90m[{t.underlying_model}]\033[0m"
+                return ""
+
             for t in sorted(found_tools, key=lambda x: x.name):
                 if t.name in TOP_LEVEL_TOOLS or t.name not in categorized:
-                    print(f"  - {t.name}")
+                    print(f"  - {t.name}{_get_model_str(t.name)}")
             
             def _print_category(categories, depth=1):
                 indent = "  " * depth
@@ -80,7 +86,7 @@ def load_tools_from_directory(
                     if cat_tools or has_subcats:
                         print(f"{indent}- {name}/")
                         for tool_name in cat_tools:
-                            print(f"{indent}  - {tool_name}")
+                            print(f"{indent}  - {tool_name}{_get_model_str(tool_name)}")
                         if has_subcats:
                             _print_category(cat['subcategories'], depth + 1)
             
@@ -88,6 +94,7 @@ def load_tools_from_directory(
                 _print_category(TOOL_CATEGORIES)
         except Exception:
             for t in found_tools:
-                print(f"  - {t.name}")
+                model_str = f" \033[90m[{t.underlying_model}]\033[0m" if getattr(t, 'underlying_model', None) else ""
+                print(f"  - {t.name}{model_str}")
 
     return found_tools

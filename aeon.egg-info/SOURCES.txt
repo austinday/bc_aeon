@@ -34,13 +34,17 @@ aeon/core/prompts/tool_desc_edit_image.txt
 aeon/core/prompts/tool_desc_expand_category.txt
 aeon/core/prompts/tool_desc_forget.txt
 aeon/core/prompts/tool_desc_generate_image.txt
+aeon/core/prompts/tool_desc_generate_video.txt
+aeon/core/prompts/tool_desc_get_sub_agent_report.txt
 aeon/core/prompts/tool_desc_get_user_input.txt
+aeon/core/prompts/tool_desc_kill_sub_agent.txt
 aeon/core/prompts/tool_desc_memorize.txt
 aeon/core/prompts/tool_desc_open_file.txt
 aeon/core/prompts/tool_desc_restart_aeon.txt
 aeon/core/prompts/tool_desc_run_command.txt
 aeon/core/prompts/tool_desc_say_to_user.txt
 aeon/core/prompts/tool_desc_search_web.txt
+aeon/core/prompts/tool_desc_spawn_sub_agent.txt
 aeon/core/prompts/tool_desc_str_replace.txt
 aeon/core/prompts/tool_desc_task_complete.txt
 aeon/core/prompts/tool_desc_think.txt
@@ -68,6 +72,7 @@ aeon/tools/category_tools.py
 aeon/tools/communication.py
 aeon/tools/file_io.py
 aeon/tools/generate_image.py
+aeon/tools/generate_video.py
 aeon/tools/loader.py
 aeon/tools/memory.py
 aeon/tools/restart.py

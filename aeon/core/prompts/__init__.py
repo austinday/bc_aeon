@@ -60,6 +60,7 @@ TOOL_DESC_KILL_SUB_AGENT = _load('tool_desc_kill_sub_agent.txt')
 # === GENERATIVE TOOLS (ComfyUI-backed) ===
 TOOL_DESC_GENERATE_IMAGE = _load('tool_desc_generate_image.txt')
 TOOL_DESC_EDIT_IMAGE = _load('tool_desc_edit_image.txt')
+TOOL_DESC_GENERATE_VIDEO = _load('tool_desc_generate_video.txt')
 # === VISION TOOLS (vLLM-backed) ===
 TOOL_DESC_ANALYZE_IMAGE = _load('tool_desc_analyze_image.txt')
 # === WEB BROWSER TOOLS ===

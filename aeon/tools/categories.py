@@ -35,6 +35,12 @@ TOOL_CATEGORIES = {
             'analyze_image',
         ],
     },
+    'video_tools': {
+        'description': 'AI video generation and editing tools (LTX-2.3 via ComfyUI)',
+        'tools': [
+            'generate_video',
+        ],
+    },
     'web_browser': {
         'description': 'Undetected web browsing, DOM extraction, and Set-of-Mark interaction',
         'tools': [

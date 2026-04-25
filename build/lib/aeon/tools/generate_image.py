@@ -12,7 +12,8 @@ class GenerateImageTool(BaseTool):
     def __init__(self):
         super().__init__(
             name="generate_image",
-            description=TOOL_DESC_GENERATE_IMAGE
+            description=TOOL_DESC_GENERATE_IMAGE,
+            underlying_model='FLUX.2 GGUF'
         )
         self.comfy_url = "http://localhost:8188"
 
@@ -222,7 +223,8 @@ class EditImageTool(BaseTool):
     def __init__(self):
         super().__init__(
             name="edit_image",
-            description=TOOL_DESC_EDIT_IMAGE
+            description=TOOL_DESC_EDIT_IMAGE,
+            underlying_model='Qwen-Image-Edit-Rapid'
         )
         self.comfy_url = "http://localhost:8188"
 

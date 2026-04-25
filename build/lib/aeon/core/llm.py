@@ -32,12 +32,14 @@ class VertexAIClient:
         self._token_expiry = 0
 
     def get_access_token(self):
-        if self._cached_token and time.time() < self._token_expiry - 300:
+        # Cache for only 5 minutes. gcloud print-access-token returns the
+        # currently active token, which may not have a full hour remaining.
+        if self._cached_token and time.time() < self._token_expiry:
             return self._cached_token
         try:
             token = subprocess.check_output(['gcloud', 'auth', 'print-access-token'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
             self._cached_token = token
-            self._token_expiry = time.time() + 3600
+            self._token_expiry = time.time() + 300
             return token
         except subprocess.CalledProcessError:
             print(f'\n{C_YELLOW}Error: Failed to get access token via gcloud.{C_RESET}')
@@ -342,7 +344,7 @@ class LLMClient:
 
         This handles the failure mode where the model puts delimiters AND content
         inside the JSON string instead of using the two-part system. For example:
-            "content": "<<BLOCK_1>>\\n#!/usr/bin/env python3\\nimport os\\n<<<END_BLOCK_1>>>"
+            "content": "<<BLOCK_1>>\n#!/usr/bin/env python3\nimport os\n<<<END_BLOCK_1>>>"
 
         Returns the extracted content, or None if no inline embedding detected.
         """
@@ -409,6 +411,8 @@ class LLMClient:
                 key = f'BLOCK_{num}'
                 if key in blocks:
                     return blocks[key]
+                else:
+                    raise ValueError(f"Missing content block! You placed '{stripped}' in the JSON, but forgot to provide the '--- BEGIN BLOCK_{num} ---' section after the JSON.")
 
             # --- Tier 2: Inline fallback ---
             # Only fires if the value has newlines and mentions BLOCK
@@ -481,6 +485,16 @@ class LLMClient:
             except Exception as e:
                 self._log_to_debug("PRIMARY_AGENT_ERR", self.primary_model, current_prompt, str(e))
                 self.logger.error(f"Primary Agent LLM call failed: {e}")
+                
+                # Auto-invalidate cached token on authentication failures
+                if "401" in str(e) and isinstance(self.primary_client, VertexAIClient):
+                    self.primary_client._cached_token = None
+                    self.primary_client._token_expiry = 0
+                
+                last_error = f"API Error: {str(e)}"
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
                 raise
 
         error_msg = f"Primary Agent failed after {max_retries} attempts. Last error: {last_error}"

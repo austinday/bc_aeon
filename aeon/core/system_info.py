@@ -9,7 +9,7 @@ STARTUP_DIR = os.getcwd()
 # ===========================================================================
 # Project Tree Configuration (ported from bc_llm_tools/read.py)
 # ===========================================================================
-HARD_IGNORE = {'.git', '.DS_Store'}
+HARD_IGNORE = {'.git', '.DS_Store', '.previous_objective.txt'}
 SOFT_IGNORE = {
     '__pycache__', 'node_modules', 'venv', '.venv', '.ipynb_checkpoints',
     '.vscode', '.idea', 'dist', 'site-packages', '.tox', '.mypy_cache',

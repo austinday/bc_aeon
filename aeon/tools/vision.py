@@ -21,7 +21,8 @@ class AnalyzeImageTool(BaseTool):
     def __init__(self):
         super().__init__(
             name='analyze_image',
-            description=TOOL_DESC_ANALYZE_IMAGE
+            description=TOOL_DESC_ANALYZE_IMAGE,
+            underlying_model='Qwen3.6-35B-A3B-VL'
         )
         self.vllm_url = f'http://localhost:{self.VLLM_PORT}'
 

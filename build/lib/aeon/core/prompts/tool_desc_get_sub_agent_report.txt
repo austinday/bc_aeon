@@ -1,0 +1,1 @@
+Checks a sub-agent's progress. If COMPLETED, returns the final findings. If RUNNING, analyzes its recent logs to provide a synthesized progress report.

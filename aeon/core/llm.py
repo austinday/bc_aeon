@@ -7,6 +7,8 @@ import json
 import re
 import subprocess
 import requests
+import google.auth
+import google.auth.transport.requests
 from datetime import datetime
 from typing import Dict, Optional
 sys.setrecursionlimit(2000)
@@ -28,21 +30,18 @@ class VertexAIClient:
         self.project_id = project_id
         self.model_id = model_id
         self.chat = self.Chat(self)
-        self._cached_token = None
-        self._token_expiry = 0
+        try:
+            self.credentials, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+        except Exception as e:
+            print(f'\n{C_YELLOW}Error: Failed to load Google Application Default Credentials: {e}{C_RESET}')
+            print(f'{C_YELLOW}Please authenticate by running: gcloud auth application-default login{C_RESET}')
+            sys.exit(1)
 
     def get_access_token(self):
-        if self._cached_token and time.time() < self._token_expiry - 300:
-            return self._cached_token
-        try:
-            token = subprocess.check_output(['gcloud', 'auth', 'print-access-token'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
-            self._cached_token = token
-            self._token_expiry = time.time() + 3600
-            return token
-        except subprocess.CalledProcessError:
-            print(f'\n{C_YELLOW}Error: Failed to get access token via gcloud.{C_RESET}')
-            print(f'{C_YELLOW}Please authenticate by running: gcloud auth login{C_RESET}')
-            sys.exit(1)
+        if not self.credentials.valid:
+            request = google.auth.transport.requests.Request()
+            self.credentials.refresh(request)
+        return self.credentials.token
 
     class Chat:
         def __init__(self, parent):
@@ -168,7 +167,7 @@ class LLMClient:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             header = (
                 f"\n\n\n{'#'*100}\n"
-                f"# TYPE:       {m_type}\n"
+                f"# TYPE:        {m_type}\n"
                 f"# TIMESTAMP: {timestamp}\n"
                 f"# ITERATION: {self.current_iteration}\n"
                 f"# MODEL:      {m_name}\n"
@@ -342,7 +341,7 @@ class LLMClient:
 
         This handles the failure mode where the model puts delimiters AND content
         inside the JSON string instead of using the two-part system. For example:
-            "content": "<<BLOCK_1>>\\n#!/usr/bin/env python3\\nimport os\\n<<<END_BLOCK_1>>>"
+            "content": "<<BLOCK_1>>\n#!/usr/bin/env python3\nimport os\n<<<END_BLOCK_1>>>"
 
         Returns the extracted content, or None if no inline embedding detected.
         """
@@ -409,6 +408,8 @@ class LLMClient:
                 key = f'BLOCK_{num}'
                 if key in blocks:
                     return blocks[key]
+                else:
+                    raise ValueError(f"Missing content block! You placed '{stripped}' in the JSON, but forgot to provide the '--- BEGIN BLOCK_{num} ---' section after the JSON.")
 
             # --- Tier 2: Inline fallback ---
             # Only fires if the value has newlines and mentions BLOCK
@@ -481,6 +482,19 @@ class LLMClient:
             except Exception as e:
                 self._log_to_debug("PRIMARY_AGENT_ERR", self.primary_model, current_prompt, str(e))
                 self.logger.error(f"Primary Agent LLM call failed: {e}")
+                
+                # Force token refresh on authentication failures
+                if "401" in str(e) and isinstance(self.primary_client, VertexAIClient):
+                    try:
+                        import google.auth.transport.requests
+                        self.primary_client.credentials.refresh(google.auth.transport.requests.Request())
+                    except Exception:
+                        pass
+                
+                last_error = f"API Error: {str(e)}"
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
                 raise
 
         error_msg = f"Primary Agent failed after {max_retries} attempts. Last error: {last_error}"

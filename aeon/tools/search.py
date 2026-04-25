@@ -9,7 +9,8 @@ class SearchWebTool(BaseTool):
     def __init__(self, llm_client: LLMClient):
         super().__init__(
             name="search_web",
-            description=TOOL_DESC_SEARCH_WEB
+            description=TOOL_DESC_SEARCH_WEB,
+            underlying_model=llm_client.utility_model if llm_client else None
         )
         self.llm_client = llm_client
         self.tavily_client = None

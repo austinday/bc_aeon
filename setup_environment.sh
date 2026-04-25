@@ -462,5 +462,61 @@ else
 fi
 log_step "PHASE 9 complete."
 
+# =============================================================================
+# PHASE 10: LTX-2.3 Video Generation Models
+# =============================================================================
+log_step "PHASE 10: Download LTX-2.3 Video Models"
+LTX_MODELS_DIR="${AEON_HOME:-$HOME/.aeon}/models/comfyui"
+
+if [[ -f "$LTX_MODELS_DIR/unet/.ltx_download_complete" ]]; then
+    log_step "LTX-2.3 models already downloaded, skipping."
+else
+    LTX_DL_SCRIPT=$(mktemp /tmp/aeon_dl_ltx_XXXXXX.py)
+    cat > "$LTX_DL_SCRIPT" << 'PYEOF'
+import os, sys, shutil
+from huggingface_hub import hf_hub_download
+
+print('Downloading LTX-2.3 GGUF...', flush=True)
+hf_hub_download(repo_id='unsloth/LTX-2.3-GGUF', filename='ltx-2.3-22b-dev-F16.gguf', local_dir='/models/unet')
+
+print('Downloading LTX-2.3 VAE...', flush=True)
+hf_hub_download(repo_id='unsloth/LTX-2.3-GGUF', filename='vae/ltx-2.3-22b-dev_video_vae.safetensors', local_dir='/models/vae')
+
+print('Downloading LTX-2.3 Text Encoders & Gemma 3 GGUF...', flush=True)
+hf_hub_download(repo_id='unsloth/LTX-2.3-GGUF', filename='text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors', local_dir='/models')
+hf_hub_download(repo_id='unsloth/gemma-3-12b-it-qat-GGUF', filename='gemma-3-12b-it-qat-UD-Q4_K_XL.gguf', local_dir='/models/text_encoders')
+hf_hub_download(repo_id='unsloth/gemma-3-12b-it-qat-GGUF', filename='mmproj-BF16.gguf', local_dir='/models/text_encoders')
+
+print('Downloading Gemma Tokenizer (workaround for ComfyUI-GGUF bug)...', flush=True)
+try:
+    tok_path = hf_hub_download(repo_id='philschmid/gemma-tokenizer', filename='tokenizer.model')
+    shutil.copy(tok_path, '/models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.model')
+except Exception as e:
+    print(f"Failed to download tokenizer: {e}", flush=True)
+
+print('LTX-2.3 downloads complete!', flush=True)
+PYEOF
+
+    TTY_FLAG=""
+    if [ -t 0 ]; then TTY_FLAG="-t"; fi
+    docker run --network=host --rm $TTY_FLAG \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$LTX_MODELS_DIR:/models" \
+        -v "$LTX_DL_SCRIPT:/download.py:ro" \
+        aeon_downloader:latest \
+        python3 /download.py
+
+    DL_EXIT=$?
+    rm -f "$LTX_DL_SCRIPT"
+    if [ $DL_EXIT -ne 0 ]; then
+        log_step "ERROR: LTX-2.3 download failed (exit code $DL_EXIT)"
+        exit 1
+    fi
+    docker run --rm -v "$LTX_MODELS_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
+    touch "$LTX_MODELS_DIR/unet/.ltx_download_complete"
+fi
+log_step "PHASE 10 complete."
+
 log_step "Setup complete. Models in $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN36_VL_DIR, $GEMMA4_GGUF_DIR"
 log_step "NOTE: To remove old models (if present), you may want to clean up $AEON_HOME/models/vl_models/Qwen3.5-35B-A3B-GGUF or $AEON_HOME/models/gguf_models/Qwen3.5-27B"
