@@ -7,6 +7,8 @@ import json
 import re
 import subprocess
 import requests
+import google.auth
+import google.auth.transport.requests
 from datetime import datetime
 from typing import Dict, Optional
 sys.setrecursionlimit(2000)
@@ -28,23 +30,18 @@ class VertexAIClient:
         self.project_id = project_id
         self.model_id = model_id
         self.chat = self.Chat(self)
-        self._cached_token = None
-        self._token_expiry = 0
+        try:
+            self.credentials, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+        except Exception as e:
+            print(f'\n{C_YELLOW}Error: Failed to load Google Application Default Credentials: {e}{C_RESET}')
+            print(f'{C_YELLOW}Please authenticate by running: gcloud auth application-default login{C_RESET}')
+            sys.exit(1)
 
     def get_access_token(self):
-        # Cache for only 5 minutes. gcloud print-access-token returns the
-        # currently active token, which may not have a full hour remaining.
-        if self._cached_token and time.time() < self._token_expiry:
-            return self._cached_token
-        try:
-            token = subprocess.check_output(['gcloud', 'auth', 'print-access-token'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
-            self._cached_token = token
-            self._token_expiry = time.time() + 300
-            return token
-        except subprocess.CalledProcessError:
-            print(f'\n{C_YELLOW}Error: Failed to get access token via gcloud.{C_RESET}')
-            print(f'{C_YELLOW}Please authenticate by running: gcloud auth login{C_RESET}')
-            sys.exit(1)
+        if not self.credentials.valid:
+            request = google.auth.transport.requests.Request()
+            self.credentials.refresh(request)
+        return self.credentials.token
 
     class Chat:
         def __init__(self, parent):
@@ -170,7 +167,7 @@ class LLMClient:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             header = (
                 f"\n\n\n{'#'*100}\n"
-                f"# TYPE:       {m_type}\n"
+                f"# TYPE:        {m_type}\n"
                 f"# TIMESTAMP: {timestamp}\n"
                 f"# ITERATION: {self.current_iteration}\n"
                 f"# MODEL:      {m_name}\n"
@@ -486,10 +483,13 @@ class LLMClient:
                 self._log_to_debug("PRIMARY_AGENT_ERR", self.primary_model, current_prompt, str(e))
                 self.logger.error(f"Primary Agent LLM call failed: {e}")
                 
-                # Auto-invalidate cached token on authentication failures
+                # Force token refresh on authentication failures
                 if "401" in str(e) and isinstance(self.primary_client, VertexAIClient):
-                    self.primary_client._cached_token = None
-                    self.primary_client._token_expiry = 0
+                    try:
+                        import google.auth.transport.requests
+                        self.primary_client.credentials.refresh(google.auth.transport.requests.Request())
+                    except Exception:
+                        pass
                 
                 last_error = f"API Error: {str(e)}"
                 if attempt < max_retries - 1:
