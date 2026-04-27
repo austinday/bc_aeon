@@ -448,7 +448,7 @@ class LLMClient:
             self.logger.warning(f"JSON repair failed: {e}")
             return None
 
-    def get_primary_agent_response(self, prompt: str, max_retries: int = 3) -> str:
+    def get_primary_agent_response(self, prompt: str, max_retries: int = 3, diagnostic_str: Optional[str] = None) -> str:
         """Get combined reasoning and action from the Primary Agent (Strong Model)."""
         current_prompt = prompt
         last_error = None
@@ -525,6 +525,12 @@ class LLMClient:
                                 if self.debug_path:
                                     print(f"{C_YELLOW}[LLM] Fixer Agent repair failed. Falling back to primary retry loop...{C_RESET}")
                     # --------------------------------------
+
+                    if diagnostic_str:
+                        print(f"\n{C_YELLOW}--- CONTEXT ROT DIAGNOSTIC ---{C_RESET}")
+                        print(f"{C_YELLOW}JSON formatting error detected (Attempt {attempt + 1}). Breakdown of current context window:{C_RESET}")
+                        print(f"{C_YELLOW}{diagnostic_str}{C_RESET}")
+                        print(f"{C_YELLOW}------------------------------{C_RESET}\n")
 
                     if attempt < max_retries - 1:
                         current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output a valid JSON object containing 'thought' and 'actions'. \nCRITICAL: JSON values must be static strings. Do not put Python operations (like '+' or '*') or complex escape characters inside the JSON. For multi-line or complex strings, use content blocks (--- BEGIN BLOCK_N --- ... --- END BLOCK_N ---)."

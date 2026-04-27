@@ -324,7 +324,7 @@ class Worker:
             self.logger.error(f"Failed to save objective to file: {e}")
 
     def _build_primary_agent_context(self, tool_list_str: str, system_specs: str,
-                               memories_str: str, objective: str, open_files_str: str) -> str:
+                                     memories_str: str, objective: str, open_files_str: str) -> str:
         """Build the full context prompt for the Primary Agent."""
         reminders_section = f"**IMPORTANT REMINDERS**\n{self.important_reminders}\n\n" if self.important_reminders.strip() else ""
 
@@ -458,6 +458,22 @@ class Worker:
 
                 # Context overflow warning
                 prompt_tokens = estimate_tokens(prompt)
+                
+                # --- Context Diagnostic Breakdown ---
+                breakdown = [
+                    f"Directives: ~{estimate_tokens(self.base_directives + self.docker_directives + PRIMARY_AGENT_INSTRUCTIONS)} tokens",
+                    f"Tools: ~{estimate_tokens(tool_list_str)} tokens",
+                    f"Memories: ~{estimate_tokens(memories_str)} tokens",
+                    f"Attempt Log: ~{estimate_tokens(self._format_attempt_log())} tokens",
+                    f"State & Plan: ~{estimate_tokens(system_specs + self.current_plan + self.last_observation)} tokens",
+                    f"Open Files Total: ~{estimate_tokens(open_files_str)} tokens",
+                ]
+                if self.open_files:
+                    for path, content in self.open_files.items():
+                        breakdown.append(f"  - {os.path.basename(path)}: ~{estimate_tokens(content)} tokens")
+                diagnostic_str = "\n".join(breakdown)
+                # ------------------------------------
+
                 ctx_limit = self.llm_client.context_limit
                 if prompt_tokens > ctx_limit * 0.85:
                     pct = prompt_tokens / ctx_limit * 100
@@ -468,7 +484,7 @@ class Worker:
                 self.print_func("Thinking (Primary Agent)...")
 
                 # === PRIMARY AGENT CALL ===
-                response_str = self.llm_client.get_primary_agent_response(prompt=prompt)
+                response_str = self.llm_client.get_primary_agent_response(prompt=prompt, diagnostic_str=diagnostic_str)
                 if self.debug_mode:
                     self.print_func(f"{C_YELLOW}[DEBUG] Primary Agent Raw Output:\n{response_str}{C_RESET}")
 
