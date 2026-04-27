@@ -87,7 +87,7 @@ Follow this procedure:
 12) ANTI-LOOPING: 
 
 - NEVER run the same command twice in a row expecting different results. 
-- NEVER run 'ls' to see files, all project files are represented in your project overview in your context. If it's not there, it doesn't exist. If it is, you can see its contents fully using the open_file tool. - - NEVER 'inspect' 'verify' or 'examine', just do the next step given the information you have.
+- NEVER run 'ls' to see files, all project files are represented in your project overview in your context. If it's not there, it doesn't exist. If it is, you can see its contents fully using the open_file tool. - NEVER 'inspect' 'verify' or 'examine' without moving forward in the same iteration, do the next step given the information you have.
 
 13) NATIVE TOOLS FIRST: 
 

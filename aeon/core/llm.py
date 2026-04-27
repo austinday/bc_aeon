@@ -421,6 +421,33 @@ class LLMClient:
             return obj
         return obj
 
+    def _repair_json(self, raw_string: str, error_msg: str) -> Optional[str]:
+        """Attempt to use the isolated utility model to fix malformed JSON."""
+        prompt = (
+            "You are a strict JSON repair parsing system. Your only job is to take a malformed JSON string and output valid JSON.\n"
+            "Instructions:\n"
+            "1. The user will provide a string that was supposed to be a JSON object containing an AI's action plan.\n"
+            "2. The AI improperly escaped quotes or newlines inside a string value (usually inside 'content', 'patch', or 'command').\n"
+            "3. Extract the keys and values and format them into perfectly escaped, valid JSON.\n"
+            "4. DO NOT change any of the underlying code, intent, or logic. Only fix the JSON syntax.\n"
+            "5. Output ONLY the valid JSON object. No markdown, no explanations.\n\n"
+            "Malformed Input:\n"
+            f"{raw_string}"
+        )
+        
+        try:
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0
+            )
+            content = resp.choices[0].message.content
+            self._log_to_debug("JSON_REPAIR", self.utility_model, prompt, content)
+            return self._clean_json_response(content)
+        except Exception as e:
+            self.logger.warning(f"JSON repair failed: {e}")
+            return None
+
     def get_primary_agent_response(self, prompt: str, max_retries: int = 3) -> str:
         """Get combined reasoning and action from the Primary Agent (Strong Model)."""
         current_prompt = prompt
@@ -475,6 +502,29 @@ class LLMClient:
                 except (json.JSONDecodeError, ValueError) as e:
                     last_error = f"JSON validation error: {str(e)}"
                     self.logger.warning(f"Primary Agent attempt {attempt + 1}/{max_retries} failed: {last_error}")
+
+                    # --- ISOLATED FIXER AGENT INJECTION ---
+                    is_decode_error = isinstance(e, json.JSONDecodeError) or "Expecting" in str(e) or "Unterminated" in str(e)
+                    is_empty_error = "Empty JSON" in str(e)
+                    
+                    if is_decode_error and not is_empty_error:
+                        if self.debug_path:
+                            print(f"{C_YELLOW}[LLM] Malformed JSON detected. Routing to Fixer Agent ({self.utility_model})...{C_RESET}")
+                        
+                        repaired_json_str = self._repair_json(json_str, str(e))
+                        if repaired_json_str:
+                            try:
+                                parsed = json.loads(repaired_json_str)
+                                if parsed and 'actions' in parsed:
+                                    parsed = self._substitute_blocks(parsed, blocks)
+                                    if self.debug_path:
+                                        print(f"{C_YELLOW}[LLM] Fixer Agent successfully repaired the JSON.{C_RESET}")
+                                    return json.dumps(parsed)
+                            except (json.JSONDecodeError, ValueError) as repair_err:
+                                self.logger.warning(f"Fixer Agent failed to produce valid JSON: {repair_err}")
+                                if self.debug_path:
+                                    print(f"{C_YELLOW}[LLM] Fixer Agent repair failed. Falling back to primary retry loop...{C_RESET}")
+                    # --------------------------------------
 
                     if attempt < max_retries - 1:
                         current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output a valid JSON object containing 'thought' and 'actions'. \nCRITICAL: JSON values must be static strings. Do not put Python operations (like '+' or '*') or complex escape characters inside the JSON. For multi-line or complex strings, use content blocks (--- BEGIN BLOCK_N --- ... --- END BLOCK_N ---)."
