@@ -66,6 +66,7 @@ launch_node() {
       --n-gpu-layers 99 \
       --parallel ${PARALLEL} \
       --ctx-size ${CTX} \
+      --ctx-size-draft ${CTX} \
       --batch-size 4096 \
       --threads ${CORES_PER_NODE} \
       --flash-attn on \
@@ -81,11 +82,11 @@ launch_node() {
 
 # --- NODE 0: High-Capacity (Maxes out 96GB) ---
 # ~31GB Model + ~60GB KV Cache
-launch_node $NODE0_NAME 0 $NODE0_PORT 262144 12
+launch_node $NODE0_NAME 0 $NODE0_PORT 262144 1
 
 # --- NODE 1: Low-Capacity (Restricts to ~48GB) ---
 # ~31GB Model + ~15GB KV Cache (Leaves ~50GB free for other tools)
-launch_node $NODE1_NAME 1 $NODE1_PORT 32768 4
+launch_node $NODE1_NAME 1 $NODE1_PORT 65536 1
 
 # --- Nginx Intelligent Load Balancer ---
 echo "[Gemma-4-Cluster] Configuring Nginx Content-Length Router..."
@@ -106,9 +107,8 @@ http {
             # Default: Route to either node based on current load
             set $backend http://cluster_all;
             
-            # If payload is >= 100,000 bytes (6+ digits), it's a massive context (~25k+ tokens).
-            # Force it to GPU0 to prevent OOM/truncation on GPU1.
-            if ($http_content_length ~ "^\d{6,}$") {
+            # Context size routing: payload >= 200k bytes (~50k+ tokens) forced to GPU0 (256k ctx)
+            if ($http_content_length ~ "^([2-9]\d{5}|\d{7,})$") {
                 set $backend http://cluster_large;
             }
             

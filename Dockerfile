@@ -1,6 +1,6 @@
 # 1. DEFINE BUILD ARGUMENTS
 ARG CUDA_VERSION=13.1.1
-ARG CUDNN_VERSION=9
+ARG CUDNN_VERSION=""
 ARG UBUNTU_VERSION=24.04
 ARG PYTHON_VERSION_MAJOR=3
 ARG PYTHON_VERSION_MINOR=10
@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y \
  python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}-dev \
  python-is-python3 \
  git curl wget vim htop unzip jq build-essential pkg-config cmake \
- libgl1-mesa-glx libglib2.0-0 libpq-dev \
+ libgl1 libglib2.0-0 libpq-dev \
  libpango-1.0-0 libcairo2 libgdk-pixbuf2.0-0 \
  nvtop \
  && rm -rf /var/lib/apt/lists/*
@@ -45,25 +45,25 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 # 7. PYTHON CORE & SCIENTIFIC LIBS (Parallelized via uv)
 # Note: We use --system to install into the system python environment
-RUN uv pip install --system --no-cache-dir --upgrade pip setuptools wheel twine poetry black flake8 isort mypy jupyter notebook ipykernel ipywidgets cython numba pybind11 numexpr \
+RUN uv pip install --system --break-system-packages --no-cache-dir --upgrade pip setuptools wheel twine poetry black flake8 isort mypy jupyter notebook ipykernel ipywidgets cython numba pybind11 numexpr \
  numpy scipy matplotlib pandas scikit-learn tqdm pydantic beautifulsoup4 lxml polars pyarrow zarr lmdb duckdb psycopg2-binary redis pillow opencv-python-headless \
  pytest pytest-cov pytest-mock
 
 # 8. DL & ML (Resolves wheels better to avoid build failures)
-RUN uv pip install --system --no-cache-dir \
+RUN uv pip install --system --break-system-packages --no-cache-dir \
  blinker wandb deepspeed lightning[extra] \
  "transformers>=4.46.0" "accelerate>=0.26.0" \
  datasets "huggingface_hub[cli]" \
  xgboost lightgbm mlflow tensorboard timm
 
 # 9. OTHER LIBS
-RUN uv pip install --system --no-cache-dir \
+RUN uv pip install --system --break-system-packages --no-cache-dir \
  biopython pysam pybedtools scikit-bio pyro-ppl pymc statsmodels sympy pysr qutip "ray[all]" "dask[complete]" dask-cuda pyspark \
  google-cloud-storage google-cloud-bigquery google-cloud-aiplatform google-cloud-pubsub gcsfs \
  seaborn plotly logomaker python-pptx WeasyPrint Jinja2 nbconvert fastapi uvicorn[standard] httpx streamlit gradio flask aiohttp
 
 # 10. PYTORCH
-RUN uv pip install --system --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_SUFFIX}
+RUN uv pip install --system --break-system-packages --no-cache-dir "torch>=2.4.0" torchvision torchaudio --index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_SUFFIX}
 
 # 11. CLEANUP
 WORKDIR /workspace

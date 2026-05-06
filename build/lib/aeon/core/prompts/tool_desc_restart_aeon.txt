@@ -5,7 +5,7 @@ WHEN TO USE:
 - You must have already made your code changes using the normal write_file or str_replace tools before calling this.
 
 CRITICAL RULES:
-1. Save ALL important context to persistent memory (memory_update) BEFORE calling this tool. Open files will NOT be preserved across restart.
+1. Save ALL important context to persistent memory (memorize) BEFORE calling this tool. Open files will NOT be preserved across restart.
 2. The aeon_code_dir parameter MUST point to the root of the Aeon source tree (the directory containing setup.py).
 3. After restart, you will resume with the same objective. Verify your code changes took effect.
 4. Do NOT call this tool unless you have actually changed files in the Aeon source tree. It is pointless otherwise.

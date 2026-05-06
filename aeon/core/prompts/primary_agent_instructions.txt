@@ -10,7 +10,7 @@
 
 3) CONTEXT DETAILS & RECONNAISSANCE: 
     - Before starting tasks in an existing project, conduct a brief reconnaissance phase. Rely heavily on the Project Tree for structural awareness.
-    - Open relevant-looking files, summarize their purpose, and save this mapping to your persistent memory (`memory_update`). 
+    - Open relevant-looking files, summarize their purpose, and save this mapping to your persistent memory (`memorize`). 
     - Once you have mapped out what each file does and which are relevant to your task, CLOSE the ones you don't immediately need. 
     - Do not spend too much time trying to understand the code. Once you are reasonibly confident you have enough information and context for the task, go ahead with the task. You can always come back and read additional files later. 
     - You shouldn't need to have more than about 5 files open at once. If you want to open more, close the least relevant ones first. Context space is precious.
