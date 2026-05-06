@@ -8,5 +8,6 @@ Requires-Dist: psutil
 Requires-Dist: nvidia-ml-py3
 Requires-Dist: requests
 Requires-Dist: huggingface_hub
+Requires-Dist: google-auth
 Dynamic: requires-dist
 Dynamic: requires-python

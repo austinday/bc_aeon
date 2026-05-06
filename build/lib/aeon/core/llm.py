@@ -160,36 +160,8 @@ class LLMClient:
         self.current_iteration = iteration
 
     def _log_to_debug(self, m_type, m_name, prompt, resp):
-        """Log LLM interaction to debug file with high visibility."""
-        if not self.debug_path:
-            return
-        try:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            header = (
-                f"\n\n\n{'#'*100}\n"
-                f"# TYPE:        {m_type}\n"
-                f"# TIMESTAMP: {timestamp}\n"
-                f"# ITERATION: {self.current_iteration}\n"
-                f"# MODEL:      {m_name}\n"
-                f"{'#'*100}\n"
-            )
-            prompt_block = (
-                f"\n{'>'*40} PROMPT {'>'*40}\n"
-                f"{str(prompt)}\n"
-                f"{'<'*40} END PROMPT {'<'*36}\n"
-            )
-            response_block = (
-                f"\n{'>'*40} RESPONSE {'>'*38}\n"
-                f"{str(resp)}\n"
-                f"{'<'*40} END RESPONSE {'<'*34}\n"
-            )
-            with open(self.debug_path, "a", encoding="utf-8") as f:
-                f.write(header)
-                f.write(prompt_block)
-                f.write(response_block)
-                f.write("\n" + "-"*100 + "\n")
-        except Exception as e:
-            self.logger.warning(f"Failed to write to debug log: {e}")
+        """Legacy debug logger - removed to prevent log flooding."""
+        pass
 
     def _clean_json_response(self, content: str) -> str:
         """Clean LLM response to extract JSON, handling common LLM formatting quirks."""
@@ -383,7 +355,7 @@ class LLMClient:
 
         return None
 
-    def _substitute_blocks(self, obj, blocks: dict):
+    def _substitute_blocks(self, obj, blocks: dict, missing_blocks: list = None):
         """Recursively substitute __BLOCK_N__ placeholders in parsed JSON.
 
         Three-tier resolution:
@@ -391,10 +363,13 @@ class LLMClient:
         2. Inline-embedded delimiters (Qwen failure mode)   ->  extract from string value
         3. Neither                                          ->  leave unchanged
         """
+        if missing_blocks is None:
+            missing_blocks = []
+
         if isinstance(obj, dict):
-            return {k: self._substitute_blocks(v, blocks) for k, v in obj.items()}
+            return {k: self._substitute_blocks(v, blocks, missing_blocks) for k, v in obj.items()}
         elif isinstance(obj, list):
-            return [self._substitute_blocks(item, blocks) for item in obj]
+            return [self._substitute_blocks(item, blocks, missing_blocks) for item in obj]
         elif isinstance(obj, str):
             stripped = obj.strip()
 
@@ -409,7 +384,9 @@ class LLMClient:
                 if key in blocks:
                     return blocks[key]
                 else:
-                    raise ValueError(f"Missing content block! You placed '{stripped}' in the JSON, but forgot to provide the '--- BEGIN BLOCK_{num} ---' section after the JSON.")
+                    if key not in missing_blocks:
+                        missing_blocks.append(key)
+                    return obj  # Return placeholder untouched for now
 
             # --- Tier 2: Inline fallback ---
             # Only fires if the value has newlines and mentions BLOCK
@@ -420,6 +397,42 @@ class LLMClient:
 
             return obj
         return obj
+
+    def _recover_missing_block(self, missing_key: str, parsed_json: dict, original_prompt: str) -> Optional[str]:
+        """Deploy a surgical LLM call to recover a specific missing code block."""
+        intent = parsed_json.get('intent', 'Unknown intent')
+        
+        recovery_prompt = (
+            f"{original_prompt}\n\n"
+            f"=================================================\n"
+            f"SYSTEM RECOVERY ALERT:\n"
+            f"You previously decided on the following intent: '{intent}'.\n"
+            f"However, you forgot to provide the code for {missing_key}.\n\n"
+            f"Your ONLY task is to write the exact, raw code/text that belongs in {missing_key}.\n"
+            f"DO NOT wrap it in JSON. DO NOT write a thought process. DO NOT write markdown fences.\n"
+            f"Output ONLY the content that should replace the {missing_key} placeholder."
+        )
+        
+        try:
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
+                messages=[{"role": "user", "content": recovery_prompt}],
+                temperature=0.1
+            )
+            content = resp.choices[0].message.content.strip()
+            
+            if content.startswith("```") and content.endswith("```"):
+                lines = content.split("\n")
+                if len(lines) >= 3:
+                    content = "\n".join(lines[1:-1])
+                else:
+                    content = content.strip("`")
+                    
+            self._log_to_debug("BLOCK_RECOVERY", self.utility_model, recovery_prompt, content)
+            return content
+        except Exception as e:
+            self.logger.warning(f"Block recovery failed for {missing_key}: {e}")
+            return None
 
     def _repair_json(self, raw_string: str, error_msg: str) -> Optional[str]:
         """Attempt to use the isolated utility model to fix malformed JSON."""
@@ -494,7 +507,27 @@ class LLMClient:
                         raise ValueError("JSON missing required 'actions' field.")
 
                     # Step 4: Substitute content blocks into parsed JSON
-                    parsed = self._substitute_blocks(parsed, blocks)
+                    missing_blocks = []
+                    parsed = self._substitute_blocks(parsed, blocks, missing_blocks)
+                    
+                    # --- TARGETED BLOCK RECOVERY ---
+                    if missing_blocks:
+                        if self.debug_path:
+                            print(f"{C_YELLOW}[LLM] Missing blocks detected: {missing_blocks}. Initiating recovery...{C_RESET}")
+                        
+                        for mb in missing_blocks:
+                            recovered_text = self._recover_missing_block(mb, parsed, current_prompt)
+                            if recovered_text:
+                                blocks[mb] = recovered_text
+                            else:
+                                raise ValueError(f"Failed to surgically recover missing {mb}.")
+                        
+                        # Run substitution one more time now that we have the blocks
+                        missing_blocks.clear()
+                        parsed = self._substitute_blocks(parsed, blocks, missing_blocks)
+                        if missing_blocks:
+                            raise ValueError(f"Still missing blocks after recovery: {missing_blocks}")
+
                     if blocks and self.debug_path:
                         print(f"{C_YELLOW}[LLM] Substituted {len(blocks)} content block(s){C_RESET}")
 

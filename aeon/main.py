@@ -86,13 +86,26 @@ LLAMACPP_MODELS = [
     {
         'model': 'Gemma-4-31B-Speculative-Q8_0',
         'family': 'Gemma-4',
-        'label': 'Gemma-4-31B + E2B Draft (Q8_0)  | GPU0: 100%, GPU1: 0%     | ~45 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
+        'label': 'Gemma-4-31B Native MTP Cluster  | GPU0: 96GB, GPU1: 48GB   | ~80 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
         'provider': 'llamacpp',
         'base_url': 'http://localhost:8008/v1',
         'context_limit': 262144,
-        'container_name': 'aeon_gemma4_speculative',
+        'container_name': 'aeon_gemma_lb',
+        'additional_containers': ['aeon_gemma4_node0', 'aeon_gemma4_node1'],
         'start_script': 'start_gemma4_speculative.sh',
         'health_port': 8008,
+    },
+    {
+        'model': 'Gemma-4-31B-vLLM-Speculative',
+        'family': 'Gemma-4',
+        'label': 'Gemma-4-31B vLLM MTP Cluster    | GPU0: 96GB, GPU1: 48GB   | ~120 t/s| 256k ctx | Abliterated: No  | Local/vLLM',
+        'provider': 'vllm',
+        'base_url': 'http://localhost:8010/v1',
+        'context_limit': 262144,
+        'container_name': 'aeon_gemma_vllm_lb',
+        'additional_containers': ['aeon_gemma4_vllm_node0', 'aeon_gemma4_vllm_node1'],
+        'start_script': 'start_gemma4_vllm_speculative.sh',
+        'health_port': 8010,
     },
 ]
 
@@ -205,8 +218,8 @@ def cleanup_transient_tools():
 # =============================================================================
 
 def is_llamacpp_model(config):
-    """Check if a model config is a llama.cpp-served model."""
-    return config and config.get('provider') == 'llamacpp'
+    """Check if a model config is a container-served model (llama.cpp or vLLM)."""
+    return config and config.get('provider') in ['llamacpp', 'vllm']
 
 def get_llamacpp_config(model_name):
     """Find llama.cpp model config by name."""
@@ -246,15 +259,15 @@ def start_llamacpp_server(config):
     return True
 
 def stop_llamacpp_server(config):
-    """Stop the llama.cpp server container."""
-    container_name = config['container_name']
-    print(f"[LLAMACPP] Stopping {container_name}...")
-    try:
-        subprocess.run(['docker', 'stop', container_name], capture_output=True, timeout=30)
-        subprocess.run(['docker', 'rm', container_name], capture_output=True, timeout=10)
-        print(f"[LLAMACPP] {container_name} stopped and removed.")
-    except Exception as e:
-        print(f"[WARN] Failed to stop {container_name}: {e}")
+    """Stop the llama.cpp server container(s)."""
+    containers = [config['container_name']] + config.get('additional_containers', [])
+    for container_name in containers:
+        print(f"[LLAMACPP] Stopping {container_name}...")
+        try:
+            subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+            print(f"[LLAMACPP] {container_name} stopped and removed.")
+        except Exception as e:
+            print(f"[WARN] Failed to stop {container_name}: {e}")
 
 def unload_local_brain():
     print("[SYSTEM] Last agent exiting. Releasing Brain VRAM...")
@@ -292,6 +305,14 @@ def _cleanup_stale_pids(registry):
 def _pid_exists(pid):
     try:
         os.kill(pid, 0)
+        # Explicitly check for zombies (Z state) in Linux
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                stat_content = f.read().split()
+                if len(stat_content) > 2 and stat_content[2] == 'Z':
+                    return False
+        except FileNotFoundError:
+            return False
         return True
     except OSError:
         return False
@@ -318,19 +339,22 @@ def register_models_for_agent(models):
         with open(MODEL_REGISTRY_PATH, 'w') as f:
             json.dump(registry, f, indent=2)
     for model in orphaned:
-        print(f"[SYSTEM] Unloading orphaned model {model}...")
-        requests.post("http://localhost:8000/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
+        lcfg = get_llamacpp_config(model)
+        if lcfg:
+            print(f"[SYSTEM] Stopping orphaned llama.cpp cluster for {model}...")
+            stop_llamacpp_server(lcfg)
+        else:
+            print(f"[SYSTEM] Unloading orphaned Ollama model {model}...")
+            try:
+                requests.post("http://localhost:8000/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
+            except: pass
 
 def unregister_models_for_agent(models):
-    """Unregister this agent's PID and unload Ollama models with no remaining users.
-    Note: llama.cpp container lifecycle is handled separately in SessionManager.exit().
-    """
+    """Unregister this agent's PID and unload models with no remaining users."""
     if not models:
         return
     pid = os.getpid()
     to_unload = []
-    # Determine which models are llama.cpp (don't try Ollama unload for them)
-    llamacpp_model_names = {m['model'] for m in LLAMACPP_MODELS}
     with open(MODEL_REGISTRY_LOCK_PATH, 'w') as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
@@ -353,15 +377,17 @@ def unregister_models_for_agent(models):
                     print(f"[REGISTRY] Model '{model}' still has {len(registry[model])} user(s)")
         with open(MODEL_REGISTRY_PATH, 'w') as f:
             json.dump(registry, f, indent=2)
-    for model in to_unload:
-        if model in llamacpp_model_names:
-            print(f"[SYSTEM] Skipping Ollama unload for llama.cpp model '{model}' (container lifecycle handled separately).")
-            continue
-        print(f"[SYSTEM] Unloading {model}...")
-        try:
-            requests.post("http://localhost:8000/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
-        except Exception as e:
-            print(f"[WARN] Failed to unload {model}: {e}")
+    for model in set(to_unload):
+        lcfg = get_llamacpp_config(model)
+        if lcfg:
+            print(f"[SYSTEM] Stopping llama.cpp cluster for {model}...")
+            stop_llamacpp_server(lcfg)
+        else:
+            print(f"[SYSTEM] Unloading Ollama model {model}...")
+            try:
+                requests.post("http://localhost:8000/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
+            except Exception as e:
+                print(f"[WARN] Failed to unload {model}: {e}")
 
 def get_ollama_models():
     try:
@@ -547,79 +573,76 @@ class SessionManager:
             return
         self._cleanup_done = True
         
-        print("[SESSION] Exiting...")
-        
-        cleanup_transient_tools()
-        
-        if self._models_used:
-            # Check which llamacpp models will have zero users after unregister
-            llamacpp_to_stop = []
-            for lcfg in self._llamacpp_configs:
-                model_name = lcfg['model']
-                # Peek at registry to see if we're the last user
-                try:
-                    with open(MODEL_REGISTRY_LOCK_PATH, 'w') as lock_fd:
-                        fcntl.flock(lock_fd, fcntl.LOCK_SH)
-                        registry = json.load(open(MODEL_REGISTRY_PATH)) if os.path.exists(MODEL_REGISTRY_PATH) else {}
-                        pids = registry.get(model_name, [])
-                        alive_pids = [p for p in pids if _pid_exists(p) and p != os.getpid()]
-                        if not alive_pids:
-                            llamacpp_to_stop.append(lcfg)
-                except:
-                    pass  # If we can't check, unregister will handle it
-
-            unregister_models_for_agent(self._models_used)
+        # Shield cleanup from Ctrl+C to guarantee VRAM release
+        import signal
+        try:
+            old_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except Exception:
+            old_sigint = None
             
-            # Stop llama.cpp containers that have no remaining users
-            for lcfg in llamacpp_to_stop:
-                stop_llamacpp_server(lcfg)
-        
-        if self.runtime_lock:
-            try:
-                fcntl.flock(self.runtime_lock, fcntl.LOCK_UN)
-                self.runtime_lock.close()
-            except Exception as e:
-                print(f"[WARN] Session cleanup error: {e}")
-        
-        if self.startup_lock:
-            try:
-                self.startup_lock.close()
-            except: pass
-        
-        if self._original_sigterm:
-            signal.signal(signal.SIGTERM, self._original_sigterm)
-        
-        print("[SESSION] Cleanup complete.")
+        try:
+            print("[SESSION] Exiting... (Ctrl+C disabled during cleanup)")
+            
+            terminate_all_sub_agents()
+            cleanup_transient_tools()
+            
+            if self._models_used:
+                unregister_models_for_agent(self._models_used)
+            
+            if self.runtime_lock:
+                try:
+                    fcntl.flock(self.runtime_lock, fcntl.LOCK_UN)
+                    self.runtime_lock.close()
+                except Exception as e:
+                    print(f"[WARN] Session cleanup error: {e}")
+            
+            if self.startup_lock:
+                try:
+                    self.startup_lock.close()
+                except: pass
+            
+            if self._original_sigterm:
+                signal.signal(signal.SIGTERM, self._original_sigterm)
+                
+        finally:
+            if old_sigint:
+                signal.signal(signal.SIGINT, old_sigint)
+            print("[SESSION] Cleanup complete.")
 
 
 def terminate_all_sub_agents():
     """Find and terminate all running sub-agents using their pid.txt files."""
-    print("[RESTART] Terminating all active sub-agents...")
-    sub_agents_dir = Path("aeon_output/sub_agents")
-    if not sub_agents_dir.exists():
-        print("[RESTART] No sub-agents directory found. Skipping.")
+    print("[SYSTEM] Terminating all active sub-agents...")
+    output_dir = Path("aeon_output")
+    if not output_dir.exists():
+        print("[SYSTEM] No sub-agents directory found. Skipping.")
         return
 
     terminated_count = 0
-    for agent_dir in sub_agents_dir.iterdir():
-        if agent_dir.is_dir():
-            pid_file = agent_dir / "pid.txt"
-            status_file = agent_dir / "status.txt"
-            if pid_file.exists():
-                try:
-                    pid_str = pid_file.read_text().strip()
-                    if pid_str:
-                        pid = int(pid_str)
-                        os.kill(pid, signal.SIGKILL)
-                        terminated_count += 1
-                except (ValueError, ProcessLookupError, PermissionError):
-                    pass
+    for pid_file in output_dir.rglob("pid.txt"):
+        if "sub_agents" in pid_file.parts:
+            try:
+                pid_str = pid_file.read_text().strip()
+                if pid_str:
+                    pid = int(pid_str)
+                    os.kill(pid, signal.SIGKILL)
+                    try:
+                        os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass
+                    terminated_count += 1
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+            
+            status_file = pid_file.parent / "status.txt"
             if status_file.exists():
                 try:
                     status_file.write_text("KILLED")
                 except:
                     pass
-    print(f"[RESTART] Terminated {terminated_count} sub-agents.")
+    if terminated_count > 0:
+        print(f"[SYSTEM] Terminated {terminated_count} sub-agents.")
 
 def _restore_backup(aeon_code_dir, backup_exists):
     """Restore the aeon source directory from the tarball backup."""
@@ -869,9 +892,9 @@ def cli():
     print(f"[CONFIG] Model: {strong_config['model']} ({strong_config['provider']})")
 
     session = SessionManager()
-    session.enter(strong_config=strong_config, weak_config=weak_config, skip_warmup=args.no_warmup)
 
     try:
+        session.enter(strong_config=strong_config, weak_config=weak_config, skip_warmup=args.no_warmup)
         llm_client = LLMClient(strong_config=strong_config, weak_config=weak_config)
         worker = Worker(llm_client=llm_client, debug_mode=args.debug)
         worker.model_name = strong_config['model']
@@ -907,7 +930,7 @@ def cli():
             while obj:
                 worker.run(obj)
                 obj = _execute_restart(session, worker)
-        
+
         while True:
             try:
                 obj = input("> ")

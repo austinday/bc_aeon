@@ -285,16 +285,82 @@ PYEOF
 fi
 log_step "PHASE 5.7 complete."
 
-log_step "PHASE 6: Build aeon_llamacpp:latest Docker image"
-log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take 5-10 min on first build)..."
-docker build --network=host $DOCKER_CACHE_FLAG -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
-log_step "aeon_llamacpp:latest built successfully."
+# =============================================================================
+# PHASE 6: Build aeon_vllm:latest Docker image (Moved UP for use in 6.5)
+# =============================================================================
+log_step "PHASE 6: Build aeon_vllm:latest Docker image"
+if ! docker image inspect aeon_vllm:latest >/dev/null 2>&1; then
+    log_step "Building aeon_vllm:latest..."
+    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_vllm:latest -f "$PROJECT_ROOT/aeon/services/vllm/Dockerfile" "$PROJECT_ROOT/aeon/services/vllm/"
+    log_step "aeon_vllm:latest built successfully."
+else
+    log_step "aeon_vllm:latest already built, skipping."
+fi
+
+# =============================================================================
+# PHASE 6.5: Gemma-4-31B Native Download
+# =============================================================================
+GEMMA4_VLLM_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
+log_step "PHASE 6.5: Download Gemma 4 31B (Native MTP removes the need for assistant draft models)"
+mkdir -p "$GEMMA4_VLLM_DIR"
+
+if [[ -f "$AEON_HOME/models/.vllm_gemma4_download_complete" ]]; then
+    log_step "Gemma 4 vLLM models already downloaded, skipping."
+else
+    GEMMA4_VLLM_DL_SCRIPT=$(mktemp /tmp/aeon_dl_gemma4_vllm_XXXXXX.py)
+    cat > "$GEMMA4_VLLM_DL_SCRIPT" << 'PYEOF'
+import os, sys
+from huggingface_hub import snapshot_download
+
+TARGET_REPO = "google/gemma-4-31b-it"
+
+print(f"Downloading {TARGET_REPO}...", flush=True)
+snapshot_download(repo_id=TARGET_REPO, ignore_patterns=["*.msgpack", "*.h5", "*.pt"])
+
+print("Download complete!", flush=True)
+PYEOF
+
+    TTY_FLAG=""
+    if [ -t 0 ]; then TTY_FLAG="-t"; fi
+    docker run --network=host --rm $TTY_FLAG --entrypoint python3 \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$GEMMA4_VLLM_DIR:/root/.cache/huggingface" \
+        -v "$GEMMA4_VLLM_DL_SCRIPT:/download.py:ro" \
+        aeon_vllm:latest \
+        /download.py
+
+    DL_EXIT=$?
+    rm -f "$GEMMA4_VLLM_DL_SCRIPT"
+    if [[ $DL_EXIT -ne 0 ]]; then
+        log_step "ERROR: Gemma 4 vLLM download failed (exit code $DL_EXIT)"
+        exit 1
+    fi
+
+    # Fix permissions
+    docker run --rm --entrypoint chown -v "$GEMMA4_VLLM_DIR:/root/.cache/huggingface" aeon_downloader:latest -R $(id -u):$(id -g) /root/.cache/huggingface || true
+    touch "$AEON_HOME/models/.vllm_gemma4_download_complete"
+fi
+log_step "PHASE 6.5 complete."
+
+log_step "PHASE 6.8: Build aeon_llamacpp:latest Docker image"
+if ! docker image inspect aeon_llamacpp:latest >/dev/null 2>&1; then
+    log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take 5-10 min on first build)..."
+    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
+    log_step "aeon_llamacpp:latest built successfully."
+else
+    log_step "aeon_llamacpp:latest already built, skipping."
+fi
 
 # Build ComfyUI Docker image (for FLUX image generation tool)
-log_step "PHASE 6b: Build aeon_comfyui:latest Docker image"
-log_step "Building aeon_comfyui:latest (installs PyTorch + ComfyUI + GGUF plugin, may take 5-10 min on first build)..."
-docker build --network=host $DOCKER_CACHE_FLAG -t aeon_comfyui:latest -f "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
-log_step "aeon_comfyui:latest built successfully."
+log_step "PHASE 6.9: Build aeon_comfyui:latest Docker image"
+if ! docker image inspect aeon_comfyui:latest >/dev/null 2>&1; then
+    log_step "Building aeon_comfyui:latest (installs PyTorch + ComfyUI + GGUF plugin, may take 5-10 min on first build)..."
+    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_comfyui:latest -f "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
+    log_step "aeon_comfyui:latest built successfully."
+else
+    log_step "aeon_comfyui:latest already built, skipping."
+fi
 
 # =============================================================================
 # PHASE 7: ComfyUI Models (FLUX)
@@ -518,5 +584,5 @@ PYEOF
 fi
 log_step "PHASE 10 complete."
 
-log_step "Setup complete. Models in $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN36_VL_DIR, $GEMMA4_GGUF_DIR"
+log_step "Setup complete. Models in $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN36_VL_DIR, $GEMMA4_VLLM_DIR"
 log_step "NOTE: To remove old models (if present), you may want to clean up $AEON_HOME/models/vl_models/Qwen3.5-35B-A3B-GGUF or $AEON_HOME/models/gguf_models/Qwen3.5-27B"

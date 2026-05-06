@@ -21,10 +21,16 @@ RUN pip install --no-cache-dir --break-system-packages \
     torch torchvision torchaudio \
     --extra-index-url https://download.pytorch.org/whl/cu130
 
-# Install vLLM and vision dependencies
+# Install vLLM and vision dependencies. We drop llmcompressor as native MTP requires no manual drafts.
 RUN pip install --no-cache-dir --break-system-packages \
     vllm \
-    qwen-vl-utils
+    qwen-vl-utils \
+    accelerate
+
+RUN pip install --no-cache-dir --break-system-packages --upgrade --no-deps \
+    "git+https://github.com/huggingface/transformers.git" \
+    "huggingface_hub>=0.24.0" \
+    "tokenizers>=0.22.0,<=0.23.0"
 
 # Verify CUDA works at build time (will fail if base image is wrong)
 RUN python3 -c "import torch; print('PyTorch CUDA:', torch.version.cuda); assert torch.cuda.is_available() or True, 'Build check only'"

@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--output_dir", required=True, help="Path to the read-write output directory")
     parser.add_argument("--max_iterations", type=int, default=20, help="Max iterations for the sub-agent")
     parser.add_argument("--read_only", action="store_true", help="Mount workspace as read-only")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
     output_path = Path(args.output_dir) / "output.json"
@@ -39,8 +40,11 @@ def main():
         
         llm_client = LLMClient(strong_config=config, weak_config=config)
         
+        from aeon.main import register_models_for_agent, unregister_models_for_agent
+        register_models_for_agent([config.get('model')])
+
         deps = {'llm_client': llm_client}
-        worker = Worker(llm_client=llm_client, debug_mode=True)
+        worker = Worker(llm_client=llm_client, debug_mode=args.debug)
         
         tools = load_tools_from_directory("aeon.tools", dependencies=deps)
         worker.register_tools(tools)
@@ -80,6 +84,9 @@ def main():
             f.write("COMPLETED")
             
         log("Task completed successfully.")
+        
+        from aeon.main import unregister_models_for_agent
+        unregister_models_for_agent([config.get('model')])
 
     except Exception as e:
         log(f"CRITICAL ERROR: {str(e)}")
@@ -93,6 +100,9 @@ def main():
         }
         with open(output_path, "w") as f:
             json.dump(error_report, f, indent=2)
+            
+        from aeon.main import unregister_models_for_agent
+        unregister_models_for_agent([config.get('model')])
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -27,7 +27,8 @@ setup(
         "psutil",
         "nvidia-ml-py3",
         "requests",
-        "huggingface_hub"
+        "huggingface_hub",
+        "google-auth"
     ],
     entry_points={
         "console_scripts": [

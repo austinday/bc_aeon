@@ -6,6 +6,8 @@ import subprocess
 import time
 import copy
 import re
+import ctypes
+import signal
 from pathlib import Path
 from aeon.tools.base import BaseTool
 from ..core.prompts import (
@@ -65,11 +67,19 @@ class SpawnSubAgent(BaseTool):
             "--output_dir", str(agent_dir),
             "--max_iterations", "20"
         ]
+        if getattr(self.worker, 'debug_mode', False):
+            cmd.append("--debug")
         
+        def set_pdeathsig():
+            try:
+                ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)
+            except Exception:
+                pass
+
         # Redirect stdout/stderr directly to the log file to prevent OS pipe buffer deadlocks
         log_file_path = agent_dir / "agent.log"
         log_fd = open(log_file_path, "a")
-        process = subprocess.Popen(cmd, stdout=log_fd, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(cmd, stdout=log_fd, stderr=subprocess.STDOUT, preexec_fn=set_pdeathsig)
         
         # Save PID
         with open(agent_dir / "pid.txt", "w") as f:

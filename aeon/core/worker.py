@@ -58,6 +58,7 @@ class Worker:
         self.instance_id = str(uuid.uuid4())[:8]  # Unique ID for this Aeon run instance
         self.MAX_REPEAT_WINDOW = 5  # How many recent commands to track
         self.REPEAT_THRESHOLD = 2   # How many identical commands before warning
+        self.effective_iterations = 0
 
         # Load directives from central prompts module
         self.base_directives = CORE_DIRECTIVES
@@ -72,9 +73,8 @@ class Worker:
         if self._debug_initialized:
             return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        debug_path = Path.home() / f"aeon_debug_{ts}.log"
-        self.llm_client.set_debug_path(debug_path)
-        self.print_func(f"{C_YELLOW}Debug logging enabled: {debug_path}{C_RESET}")
+        self.debug_path = Path.home() / f"aeon_debug_{ts}.log"
+        self.print_func(f"{C_YELLOW}Debug logging enabled: {self.debug_path}{C_RESET}")
         self._debug_initialized = True
 
     def _sync_open_files(self):
@@ -263,6 +263,7 @@ class Worker:
         self._recent_outputs.clear()
         self.expanded_categories.clear()
         self.notified_sub_agents.clear()
+        self.effective_iterations = 0
 
     def serialize_state(self) -> dict:
         """Serialize worker state for persistence across restarts."""
@@ -456,6 +457,13 @@ class Worker:
                     tool_list_str, system_specs, memories_str, objective, open_files_str
                 )
 
+                if max_iterations is not None:
+                    rem_iters = max_iterations - self.effective_iterations
+                    prompt += f"\n\nSYSTEM REMINDER: You have {rem_iters} effective iterations remaining to complete this task. Plan accordingly."
+                    if rem_iters <= 0:
+                        self.print_func(f"{C_RED}Iteration budget exhausted. Forcing termination.{C_RESET}")
+                        self.last_observation = "SYSTEM ALERT: Iteration budget exhausted. You MUST use 'task_complete' to report your final status."
+
                 # Context overflow warning
                 prompt_tokens = estimate_tokens(prompt)
                 
@@ -502,6 +510,14 @@ class Worker:
                 updated_plan = response_data.get("updated_plan")
                 actions = response_data.get("actions", [])
 
+                if self.debug_mode and hasattr(self, 'debug_path'):
+                    try:
+                        with open(self.debug_path, "a", encoding="utf-8") as f:
+                            safe_plan = str(updated_plan).replace('\n', ' ')[:150]
+                            f.write(f"[Iter {iteration}] Summary: {previous_result_summary[:100]}... | Thought: {thought[:100]}... | Intent: {intent} | Plan: {safe_plan}\n")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to write to debug file: {e}")
+
                 if updated_plan:
                     if isinstance(updated_plan, list):
                         self.current_plan = "\n".join(updated_plan)
@@ -525,6 +541,8 @@ class Worker:
                     self.print_func(f"{C_RED}No actions returned by agent.{C_RESET}")
                     self.last_observation = "Error: You returned an empty action list. You must take at least one action."
                     continue
+                
+                self.effective_iterations += 1
 
                 # Resolve pending iteration state now that we have the summary
                 if self.pending_iteration_state:
@@ -762,4 +780,4 @@ class Worker:
 
                 except (KeyboardInterrupt, EOFError):
                     self.print_func(f"\n{C_RED}Forced Exit.{C_RESET}")
-                    break
+                    raise KeyboardInterrupt

@@ -4,3 +4,4 @@ psutil
 nvidia-ml-py3
 requests
 huggingface_hub
+google-auth
