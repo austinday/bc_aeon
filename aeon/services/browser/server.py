@@ -66,6 +66,7 @@ class GotoRequest(BaseModel):
 async def navigate(req: GotoRequest):
     try:
         page = await get_or_create_session(req.session_id, req.tab_id)
+        await page.bring_to_front()  # CRITICAL: Bring the tab to the foreground
         await page.goto(req.url, wait_until='domcontentloaded', timeout=15000)
         await asyncio.sleep(2)
         return await extract_page_state(page)
@@ -84,6 +85,8 @@ class InteractRequest(BaseModel):
 async def interact(req: InteractRequest):
     try:
         page = await get_or_create_session(req.session_id, req.tab_id)
+        await page.bring_to_front()  # CRITICAL: Bring the tab to the foreground before interacting
+        
         if req.action == 'scroll_down':
             await page.mouse.wheel(0, 800)
         elif req.action == 'scroll_up':
