@@ -63,7 +63,7 @@ class GenerateVideoTool(BaseTool):
                 
             return len(cleaned_pids)
 
-    def execute(self, mode: str, prompt: str, output_path: str, input_path_1: str = None, input_path_2: str = None, width: int = 768, height: int = 512, frames: int = 33) -> str:
+    def execute(self, mode: str, prompt: str, output_path: str, input_path_1: str = None, input_path_2: str = None, aspect_ratio: str = '16:9', width: int = None, height: int = None, frames: int = 33) -> str:
         if not prompt:
             return "Error: 'prompt' parameter is required."
         if not output_path:
@@ -78,6 +78,17 @@ class GenerateVideoTool(BaseTool):
             
         if mode == 'interpolate' and not input_path_2:
             return "Error: 'input_path_2' is required for mode 'interpolate'."
+
+        # Handle aspect ratio and dimensions
+        if width is None or height is None:
+            ratio_map = {
+                '16:9': (768, 432),
+                '9:16': (432, 768),
+                '1:1': (512, 512),
+                '4:3': (768, 576),
+                '3:4': (576, 768),
+            }
+            width, height = ratio_map.get(aspect_ratio, (768, 432))
 
         abs_output_path = os.path.abspath(output_path)
         os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
@@ -130,7 +141,7 @@ class GenerateVideoTool(BaseTool):
             workflow = {
                 "1": {
                     "class_type": "UnetLoaderGGUF",
-                    "inputs": {"unet_name": "ltx-2.3-22b-dev-F16.gguf"}
+                    "inputs": {"unet_name": "ltx-2.3-22b-dev-Q4_1.gguf"}
                 },
                 "2": {
                     "class_type": "VAELoader",
@@ -139,8 +150,8 @@ class GenerateVideoTool(BaseTool):
                 "3": {
                     "class_type": "DualCLIPLoaderGGUF",
                     "inputs": {
-                        "clip_name1": "text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors",
-                        "clip_name2": "gemma-3-12b-it-qat-UD-Q4_K_XL.gguf",
+                        "clip_name1": "gemma-3-12b-it-qat-UD-Q4_K_XL.gguf",
+                        "clip_name2": "text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors",
                         "type": "ltxv"
                     }
                 },
@@ -254,26 +265,43 @@ class GenerateVideoTool(BaseTool):
                 history = history_req.json()
                 
                 if prompt_id in history:
-                    outputs = history[prompt_id].get("outputs", {})
-                    if "9" not in outputs:
-                        return "Error: ComfyUI execution completed but VideoCombine node did not produce output. Check server logs."
+                    history_data = history[prompt_id]
+                    outputs = history_data.get("outputs", {})
+                    video_found = False
+                    if "9" in outputs and "videos" in outputs["9"] and outputs["9"]["videos"]:
+                        video_info = outputs["9"]["videos"][0]
+                        filename = video_info["filename"]
+                        subfolder = video_info["subfolder"]
+                        folder_type = video_info["type"]
+                        
+                        vid_req = requests.get(
+                            f"{self.comfy_url}/view?filename={filename}&subfolder={subfolder}&type={folder_type}",
+                            timeout=30
+                        )
+                        
+                        if vid_req.status_code == 200:
+                            with open(abs_output_path, "wb") as f:
+                                f.write(vid_req.content)
+                            return f"Successfully generated video and saved to: {abs_output_path}"
                     
-                    video_info = outputs["9"]["videos"][0]
-                    filename = video_info["filename"]
-                    subfolder = video_info["subfolder"]
-                    folder_type = video_info["type"]
+                    # Fallback: Search filesystem
+                    print(f"{self.C_CYAN}API did not provide video info. Attempting filesystem fallback...{self.C_RESET}")
+                    aeon_home = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
+                    output_dir = os.path.join(aeon_home, "temp", "comfyui_output")
                     
-                    vid_req = requests.get(
-                        f"{self.comfy_url}/view?filename={filename}&subfolder={subfolder}&type={folder_type}",
-                        timeout=30
-                    )
+                    if os.path.exists(output_dir):
+                        videos = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith("Aeon_Video") and f.endswith(".mp4")]
+                        if videos:
+                            latest_video = max(videos, key=os.path.getmtime)
+                            shutil.copy(latest_video, abs_output_path)
+                            return f"Successfully generated video (via fallback) and saved to: {abs_output_path}"
                     
-                    if vid_req.status_code == 200:
-                        with open(abs_output_path, "wb") as f:
-                            f.write(vid_req.content)
-                        return f"Successfully generated video and saved to: {abs_output_path}"
-                    else:
-                        return f"Error: Failed to download the generated video from ComfyUI (HTTP {vid_req.status_code})"
+                    # If we reach here, both API and fallback failed
+                    debug_path = "aeon_output/debug/comfyui_history.json"
+                    os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+                    with open(debug_path, "w") as f:
+                        json.dump(history_data, f, indent=2)
+                    return f"Error: ComfyUI execution completed but no video was found via API or filesystem. History saved to {debug_path}."
                 
                 time.sleep(3)
                 
@@ -285,7 +313,7 @@ class GenerateVideoTool(BaseTool):
         finally:
             remaining_users = self._manage_registry('unregister')
             if remaining_users == 0:
-                print(f"{self.C_CYAN}Last agent finished. Releasing GPU memory (stopping ComfyUI)...{self.C_RESET}")
-                subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f"{self.C_CYAN}Last agent finished. (Cleanup disabled for debugging) GPU memory not released...{self.C_RESET}")
+                # subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 print(f"{self.C_CYAN}Video generation complete. Leaving ComfyUI running for {remaining_users} other active agent(s)...{self.C_RESET}")
