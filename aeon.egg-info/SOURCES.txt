@@ -26,6 +26,7 @@ aeon/core/prompts/primary_agent_instructions.txt
 aeon/core/prompts/summarize_text_prompt.txt
 aeon/core/prompts/think_tool_prompt.txt
 aeon/core/prompts/tool_desc_analyze_image.txt
+aeon/core/prompts/tool_desc_browser_close_tab.txt
 aeon/core/prompts/tool_desc_browser_interact.txt
 aeon/core/prompts/tool_desc_browser_navigate.txt
 aeon/core/prompts/tool_desc_close_file.txt

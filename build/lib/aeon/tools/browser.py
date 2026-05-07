@@ -10,7 +10,8 @@ from .base import BaseTool
 from .vision import AnalyzeImageTool
 from ..core.prompts import (
     TOOL_DESC_BROWSER_NAVIGATE,
-    TOOL_DESC_BROWSER_INTERACT
+    TOOL_DESC_BROWSER_INTERACT,
+    TOOL_DESC_BROWSER_CLOSE_TAB
 )
 
 BROWSER_API_URL = "http://localhost:8030"
@@ -85,12 +86,12 @@ def ensure_browser_running():
     subprocess.run(["bash", script_path], check=True)
     return True
 
-def process_browser_response(data, action_desc, session_id):
+def process_browser_response(data, action_desc, session_id, tab_id):
     if data.get("status") == "error":
         return f"Browser Error during {action_desc}: {data.get('msg')}"
         
-    # Save screenshots in isolated folders per session to avoid overwrites
-    output_dir = os.path.expanduser(f"~/.aeon/temp/browser_output_{session_id}")
+    # Save screenshots in isolated folders per session and tab to avoid overwrites
+    output_dir = os.path.expanduser(f"~/.aeon/temp/browser_output_{session_id}_{tab_id}")
     os.makedirs(output_dir, exist_ok=True)
     
     clean_path = os.path.join(output_dir, "clean.jpg")
@@ -128,7 +129,7 @@ def process_browser_response(data, action_desc, session_id):
         vision_analysis = f"Vision analysis failed: {e}"
     
     result = (
-        f"--- BROWSER ACTION SUCCESS: {action_desc} ---\n\n"
+        f"--- BROWSER ACTION SUCCESS: {action_desc} (Tab: '{tab_id}') ---\n\n"
         f"--- VISUAL LAYOUT ANALYSIS (from Qwen-VL) ---\n"
         f"{vision_analysis}\n\n"
         f"--- VISIBLE TEXT (MARKDOWN) ---\n"
@@ -145,28 +146,28 @@ class BrowserNavigateTool(BaseTool):
     def __init__(self, worker=None):
         super().__init__(name="browser_navigate", description=TOOL_DESC_BROWSER_NAVIGATE)
         
-    def execute(self, url: str) -> str:
+    def execute(self, url: str, tab_id: str = "default") -> str:
         if not url.startswith("http"):
             url = "https://" + url
         try:
             ensure_browser_running()
             session_id = str(os.getpid())
-            resp = requests.post(f"{BROWSER_API_URL}/navigate", json={"url": url, "session_id": session_id}, timeout=60)
+            resp = requests.post(f"{BROWSER_API_URL}/navigate", json={"url": url, "session_id": session_id, "tab_id": tab_id}, timeout=60)
             if resp.status_code != 200:
                 return f"HTTP Error {resp.status_code} from browser API: {resp.text}"
-            return process_browser_response(resp.json(), f"Navigated to {url}", session_id)
+            return process_browser_response(resp.json(), f"Navigated to {url}", session_id, tab_id)
         except Exception as e:
-            return self.format_error_message(e, f"navigating to {url}")
+            return self.format_error_message(e, f"navigating to {url} in tab '{tab_id}'")
 
 class BrowserInteractTool(BaseTool):
     def __init__(self, worker=None):
         super().__init__(name="browser_interact", description=TOOL_DESC_BROWSER_INTERACT)
         
-    def execute(self, action: str, element_id: int = None, text: str = None, expected_text: str = None) -> str:
+    def execute(self, action: str, element_id: int = None, text: str = None, expected_text: str = None, tab_id: str = "default") -> str:
         try:
             ensure_browser_running()
             session_id = str(os.getpid())
-            payload = {"action": action, "session_id": session_id}
+            payload = {"action": action, "session_id": session_id, "tab_id": tab_id}
             if element_id is not None:
                 payload["element_id"] = element_id
             if text is not None:
@@ -177,6 +178,21 @@ class BrowserInteractTool(BaseTool):
             resp = requests.post(f"{BROWSER_API_URL}/interact", json=payload, timeout=60)
             if resp.status_code != 200:
                 return f"HTTP Error {resp.status_code} from browser API: {resp.text}"
-            return process_browser_response(resp.json(), f"Action '{action}' on ID {element_id}", session_id)
+            return process_browser_response(resp.json(), f"Action '{action}' on ID {element_id}", session_id, tab_id)
         except Exception as e:
-            return self.format_error_message(e, f"performing {action} on element {element_id}")
+            return self.format_error_message(e, f"performing {action} on element {element_id} in tab '{tab_id}'")
+
+class BrowserCloseTabTool(BaseTool):
+    def __init__(self, worker=None):
+        super().__init__(name="browser_close_tab", description=TOOL_DESC_BROWSER_CLOSE_TAB)
+        
+    def execute(self, tab_id: str) -> str:
+        try:
+            ensure_browser_running()
+            session_id = str(os.getpid())
+            resp = requests.post(f"{BROWSER_API_URL}/close_tab", json={"session_id": session_id, "tab_id": tab_id}, timeout=10)
+            if resp.status_code != 200:
+                return f"HTTP Error {resp.status_code} from browser API: {resp.text}"
+            return f"Successfully closed tab: {tab_id}"
+        except Exception as e:
+            return self.format_error_message(e, f"closing tab {tab_id}")

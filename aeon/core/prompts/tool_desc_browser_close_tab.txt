@@ -1,0 +1,4 @@
+Closes a specific browser tab. Use this to clean up resources when you are completely finished with a tab.
+Schema:
+  tab_id (str, required): The unique name of the tab you want to close (e.g., 'gmail').
+Example: {"tool_name": "browser_close_tab", "parameters": {"tab_id": "gmail"}}

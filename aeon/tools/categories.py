@@ -46,6 +46,7 @@ TOOL_CATEGORIES = {
         'tools': [
             'browser_navigate',
             'browser_interact',
+            'browser_close_tab',
         ],
     },
 }

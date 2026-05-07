@@ -10,7 +10,7 @@ from camoufox.async_api import AsyncCamoufox
 print("Imports loaded. Initializing FastAPI...", flush=True)
 app = FastAPI()
 browser_instance = None
-sessions = {}  # session_id -> {"page": page}
+sessions = {}  # session_id_tab_id -> {"page": page}
 
 @app.on_event("startup")
 async def startup():
@@ -37,9 +37,10 @@ async def shutdown():
     if browser_instance:
         await browser_instance.__aexit__(None, None, None)
 
-async def get_or_create_session(session_id: str):
+async def get_or_create_session(session_id: str, tab_id: str):
     global browser_instance, sessions
-    if session_id not in sessions:
+    key = f"{session_id}_{tab_id}"
+    if key not in sessions:
         page = await browser_instance.new_page()
         await page.set_viewport_size({"width": 1920, "height": 1080})
         
@@ -53,17 +54,18 @@ async def get_or_create_session(session_id: str):
             });
         """)
         
-        sessions[session_id] = {"page": page}
-    return sessions[session_id]["page"]
+        sessions[key] = {"page": page}
+    return sessions[key]["page"]
 
 class GotoRequest(BaseModel):
     url: str
     session_id: str
+    tab_id: str = "default"
 
 @app.post("/navigate")
 async def navigate(req: GotoRequest):
     try:
-        page = await get_or_create_session(req.session_id)
+        page = await get_or_create_session(req.session_id, req.tab_id)
         await page.goto(req.url, wait_until='domcontentloaded', timeout=15000)
         await asyncio.sleep(2)
         return await extract_page_state(page)
@@ -76,11 +78,12 @@ class InteractRequest(BaseModel):
     text: str = None
     expected_text: str = None
     session_id: str
+    tab_id: str = "default"
 
 @app.post("/interact")
 async def interact(req: InteractRequest):
     try:
-        page = await get_or_create_session(req.session_id)
+        page = await get_or_create_session(req.session_id, req.tab_id)
         if req.action == 'scroll_down':
             await page.mouse.wheel(0, 800)
         elif req.action == 'scroll_up':
@@ -121,18 +124,35 @@ async def interact(req: InteractRequest):
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
+class CloseTabRequest(BaseModel):
+    session_id: str
+    tab_id: str
+
+@app.post("/close_tab")
+async def close_tab(req: CloseTabRequest):
+    global sessions
+    key = f"{req.session_id}_{req.tab_id}"
+    if key in sessions:
+        try:
+            await sessions[key]["page"].close()
+        except:
+            pass
+        del sessions[key]
+    return {"status": "ok"}
+
 class CloseSessionRequest(BaseModel):
     session_id: str
 
 @app.post("/close_session")
 async def close_session(req: CloseSessionRequest):
     global sessions
-    if req.session_id in sessions:
+    keys_to_delete = [k for k in sessions.keys() if k.startswith(f"{req.session_id}_")]
+    for k in keys_to_delete:
         try:
-            await sessions[req.session_id]["page"].close()
+            await sessions[k]["page"].close()
         except:
             pass
-        del sessions[req.session_id]
+        del sessions[k]
     return {"status": "ok"}
 
 async def extract_page_state(page):
