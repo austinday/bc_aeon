@@ -155,9 +155,10 @@ class Worker:
         """Collect directives from currently expanded categories and all active tools
         (top-level tools + tools in expanded categories)."""
         from aeon.tools.categories import (
-            TOOL_CATEGORIES, TOP_LEVEL_TOOLS, 
-            get_all_categorized_tools, get_tools_in_category, get_category_at_path
+            TOP_LEVEL_TOOLS, 
+            get_all_categorized_tools, get_tools_in_category
         )
+        from aeon.core.prompts.manager import load_cat_prompt, load_tool_prompt
         
         active_directives = []
         categorized = get_all_categorized_tools()
@@ -173,32 +174,28 @@ class Worker:
         for cat_path in self.expanded_categories:
             active_tool_names.update(get_tools_in_category(cat_path))
             
-        # 1. Directives from active tools
-        for name in active_tool_names:
-            if name in self.tools:
-                tool = self.tools[name]
-                if tool.directives:
-                    active_directives.extend(tool.directives)
+        # Process tools in alphabetical order for consistency
+        for name in sorted(active_tool_names):
+            tool_directives = load_tool_prompt(name)
+            if tool_directives:
+                for d in tool_directives:
+                    active_directives.append(f"- {name}: {d}")
+            else:
+                active_directives.append(f"- {name}: ")
         
-        # 2. Directives from expanded categories
-        from aeon.core.prompts.manager import load_cat_prompt
-        for cat_path in self.expanded_categories:
+        # Process expanded categories in alphabetical order
+        for cat_path in sorted(self.expanded_categories):
             cat_directives = load_cat_prompt(cat_path)
             if cat_directives:
-                active_directives.extend(cat_directives)
-        
-        # Deduplicate while preserving order
-        seen = set()
-        unique_directives = []
-        for d in active_directives:
-            if d not in seen:
-                unique_directives.append(d)
-                seen.add(d)
-        
-        if not unique_directives:
+                for d in cat_directives:
+                    active_directives.append(f"- {cat_path}: {d}")
+            else:
+                active_directives.append(f"- {cat_path}: ")
+            
+        if not active_directives:
             return ""
             
-        return "\n".join([f"- {d}" for d in unique_directives])
+        return "\n".join(active_directives)
 
     def _get_tools_description(self) -> str:
         """Build tool descriptions with category-aware rendering.
