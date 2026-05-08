@@ -1,1 +1,0 @@
-Kills a running sub-agent by Agent ID. Use when a sub-agent is taking too long, is stuck, or its result is no longer relevant.

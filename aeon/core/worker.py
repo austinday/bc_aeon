@@ -35,6 +35,12 @@ class Worker:
     def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False):
         self.llm_client = llm_client
         self.tools = {tool.name: tool for tool in tools} if tools else {}
+        
+        # Ensure prompt files exist for all tools and categories
+        from aeon.core.prompts.manager import ensure_prompt_files
+        from aeon.tools.categories import get_all_category_paths
+        ensure_prompt_files(list(self.tools.keys()), get_all_category_paths())
+        
         self.logger = get_logger()
         self.print_func = print_func
         self.debug_mode = debug_mode
@@ -145,6 +151,55 @@ class Worker:
         abs_path = os.path.abspath(path)
         return abs_path in self.open_files or path in self.open_files
 
+    def _get_active_tool_directives(self) -> str:
+        """Collect directives from currently expanded categories and all active tools
+        (top-level tools + tools in expanded categories)."""
+        from aeon.tools.categories import (
+            TOOL_CATEGORIES, TOP_LEVEL_TOOLS, 
+            get_all_categorized_tools, get_tools_in_category, get_category_at_path
+        )
+        
+        active_directives = []
+        categorized = get_all_categorized_tools()
+        
+        # Determine which tools are currently "active" (visible)
+        active_tool_names = set(TOP_LEVEL_TOOLS)
+        # Add tools that are not categorized at all
+        for name in self.tools:
+            if name not in categorized:
+                active_tool_names.add(name)
+        
+        # Add tools in expanded categories
+        for cat_path in self.expanded_categories:
+            active_tool_names.update(get_tools_in_category(cat_path))
+            
+        # 1. Directives from active tools
+        for name in active_tool_names:
+            if name in self.tools:
+                tool = self.tools[name]
+                if tool.directives:
+                    active_directives.extend(tool.directives)
+        
+        # 2. Directives from expanded categories
+        from aeon.core.prompts.manager import load_cat_prompt
+        for cat_path in self.expanded_categories:
+            cat_directives = load_cat_prompt(cat_path)
+            if cat_directives:
+                active_directives.extend(cat_directives)
+        
+        # Deduplicate while preserving order
+        seen = set()
+        unique_directives = []
+        for d in active_directives:
+            if d not in seen:
+                unique_directives.append(d)
+                seen.add(d)
+        
+        if not unique_directives:
+            return ""
+            
+        return "\n".join([f"- {d}" for d in unique_directives])
+
     def _get_tools_description(self) -> str:
         """Build tool descriptions with category-aware rendering.
 
@@ -156,7 +211,6 @@ class Worker:
             TOOL_CATEGORIES, TOP_LEVEL_TOOLS,
             get_all_categorized_tools,
         )
-
         categorized = get_all_categorized_tools()
 
         # Part 1: Top-level tools (always visible with full descriptions)
@@ -325,7 +379,8 @@ class Worker:
             self.logger.error(f"Failed to save objective to file: {e}")
 
     def _build_primary_agent_context(self, tool_list_str: str, system_specs: str,
-                                     memories_str: str, objective: str, open_files_str: str) -> str:
+                                     memories_str: str, objective: str, open_files_str: str,
+                                     active_tool_directives: str) -> str:
         """Build the full context prompt for the Primary Agent."""
         reminders_section = f"**IMPORTANT REMINDERS**\n{self.important_reminders}\n\n" if self.important_reminders.strip() else ""
 
@@ -337,9 +392,11 @@ class Worker:
 
 {self.docker_directives}
 
+**OPEN TOOL DIRECTIVES**
+{active_tool_directives if active_tool_directives else 'None'}
+
 {tools_text}
-{reminders_section}
-**PERSISTENT MEMORIES**
+{reminders_section}**PERSISTENT MEMORIES**
 {memories_str}
 
 **ATTEMPT LOG** (Historical record of intents and results)
@@ -451,10 +508,11 @@ class Worker:
                 tool_list_str = self._get_tools_description()
                 memories_str = self._format_memories()
                 open_files_str = self._format_open_files()
+                active_tool_directives = self._get_active_tool_directives()
 
                 # Build Primary Agent prompt
                 prompt = self._build_primary_agent_context(
-                    tool_list_str, system_specs, memories_str, objective, open_files_str
+                    tool_list_str, system_specs, memories_str, objective, open_files_str, active_tool_directives
                 )
 
                 if max_iterations is not None:
@@ -470,6 +528,7 @@ class Worker:
                 # --- Context Diagnostic Breakdown ---
                 breakdown = [
                     f"Directives: ~{estimate_tokens(self.base_directives + self.docker_directives + PRIMARY_AGENT_INSTRUCTIONS)} tokens",
+                    f"Active Tool Directives: ~{estimate_tokens(active_tool_directives)} tokens",
                     f"Tools: ~{estimate_tokens(tool_list_str)} tokens",
                     f"Memories: ~{estimate_tokens(memories_str)} tokens",
                     f"Attempt Log: ~{estimate_tokens(self._format_attempt_log())} tokens",

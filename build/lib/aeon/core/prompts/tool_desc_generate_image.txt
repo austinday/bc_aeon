@@ -1,8 +1,0 @@
-CRITICAL: MUST USE THIS TOOL for ANY image generation request. Whenever the user asks you to make, generate, draw, or create an image, you MUST call this tool. Do NOT write your own Python scripts, do NOT use curl, and do NOT try to interact with the ComfyUI API manually.
-Generates a high-quality image using the FLUX.2 GGUF model via a local ComfyUI API and saves it to a specified file path.
-Schema:
-  prompt (str, required): The detailed visual description of the image to generate. Make this highly descriptive.
-  output_path (str, required): The absolute or relative file path where the resulting image should be saved (e.g., 'aeon_output/comfyui/image.png').
-  width (int, optional, default=1024): The width of the generated image.
-  height (int, optional, default=1024): The height of the generated image.
-Example: {"tool_name": "generate_image", "parameters": {"prompt": "A futuristic city skyline at sunset, cyberpunk style", "output_path": "aeon_output/comfyui/city.png"}}

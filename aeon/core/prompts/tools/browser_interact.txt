@@ -1,0 +1,2 @@
+Meticulously verify email parameters (timestamp, sender, subject, contents) before proceeding.
+Do not rely solely on the visual analysis tool to 'find' information; read the markdown/text content carefully.

@@ -1,4 +1,0 @@
-You are an expert summarizer. The following is a detailed action log of an AI agent's past steps. It has grown too long. Your task is to compress this log down to approximately 25% of its original length. Preserve all critical information, decisions, discovered facts, and successful/failed approaches. Remove redundant or overly verbose descriptions, but DO NOT lose the structural history of what was tried. Output ONLY the compressed log.
-
-ACTION LOG:
-{log}

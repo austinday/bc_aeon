@@ -1,0 +1,1 @@
+Category-level directive: Always use a fresh tab for new searches.

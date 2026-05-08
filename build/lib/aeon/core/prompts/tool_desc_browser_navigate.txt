@@ -1,5 +1,0 @@
-Navigates to a URL using a stealth browser. Returns the visible text (markdown), a list of interactive elements with assigned IDs, and saves screenshots of the page. You can manage multiple tabs by providing a custom tab_id.
-Schema:
-  url (str, required): The full URL to navigate to (e.g., 'https://en.wikipedia.org').
-  tab_id (str, optional, default="default"): A unique name for this browser tab (e.g., 'quora', 'gmail'). Use different tab_ids to keep multiple pages open simultaneously without losing state.
-Example: {"tool_name": "browser_navigate", "parameters": {"url": "https://news.ycombinator.com", "tab_id": "hackernews"}}

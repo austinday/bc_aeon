@@ -16,10 +16,17 @@ class BaseTool(ABC):
     C_BLUE = '\033[94m'
     C_RESET = '\033[0m'
 
-    def __init__(self, name: str, description: str, underlying_model: str = None):
+    def __init__(self, name: str, description: str, underlying_model: str = None, directives: list = None):
         self.name = name
         self.description = description
         self.underlying_model = underlying_model
+        
+        # Load directives from manager if not explicitly provided
+        if directives is None:
+            from aeon.core.prompts.manager import load_tool_prompt
+            self.directives = load_tool_prompt(name)
+        else:
+            self.directives = directives
 
     @abstractmethod
     def execute(self, *args, **kwargs):

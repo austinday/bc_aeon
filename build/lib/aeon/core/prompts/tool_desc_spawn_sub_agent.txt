@@ -1,1 +1,0 @@
-Spawns a heavy background sub-agent for COMPLEX, LONG-RUNNING, INDEPENDENT tasks ONLY (e.g., massive web scraping, training models). NEVER use this for simple scripts, basic math, or quick commands—do those yourself using write_file and run_command. Max 5 concurrent agents. Only use when you need 2+ sub-agents. The system alerts you when they finish. Do not poll them.

@@ -1,0 +1,2 @@
+- Only close a tab when you are certain its purpose has been fulfilled and no further information is needed from it.
+- Ensure any critical data, URLs, or content from the tab has been extracted and saved to persistent memory before closing.

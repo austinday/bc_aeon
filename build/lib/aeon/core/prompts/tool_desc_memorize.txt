@@ -1,5 +1,0 @@
-Saves a key-value pair to your persistent memory. Use this to remember important details like paths, credentials, and decisions across your entire session.
-Schema:
-  key (str, required): The name of the memory.
-  value (str, required): The information to save (can be a descriptive sentence).
-Example: {"tool_name": "memorize", "parameters": {"key": "db_password", "value": "supersecret123"}}

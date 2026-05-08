@@ -1,4 +1,0 @@
-Expands a tool category to reveal the tools or subcategories within it. Use this when your task might benefit from specialized tools (e.g., image generation, vision analysis, self-modification) that are not in your default tool list. Expanding a category makes its tools visible and callable with full descriptions.
-Schema:
-  category_path (str, required): The slash-separated path of the category to expand (e.g., "image_tools"). Check the TOOL CATEGORIES section to see available paths.
-Example: {"tool_name": "expand_tool_category", "parameters": {"category_path": "image_tools"}}
