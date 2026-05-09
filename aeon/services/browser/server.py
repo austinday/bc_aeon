@@ -62,6 +62,20 @@ class GotoRequest(BaseModel):
     session_id: str
     tab_id: str = "default"
 
+class SwitchTabRequest(BaseModel):
+    session_id: str
+    tab_id: str
+
+@app.post("/switch_tab")
+async def switch_tab(req: SwitchTabRequest):
+    try:
+        page = await get_or_create_session(req.session_id, req.tab_id)
+        await page.bring_to_front()
+        await asyncio.sleep(1)
+        return await extract_page_state(page)
+    except Exception as e:
+        return {"status": "error", "msg": str(e)}
+
 @app.post("/navigate")
 async def navigate(req: GotoRequest):
     try:

@@ -1,1 +1,12 @@
-Category-level directive: Always use a fresh tab for new searches.
+Category-level directive for Web Browser tools:
+
+1. TAB MANAGEMENT:
+   - Use 'browser_navigate' to open a new URL or explicitly reload a page.
+   - Use 'browser_switch_tab' to return to an existing tab while preserving its current state (e.g., form data, scroll position). 
+   - CRITICAL: Never use 'browser_navigate' to return to a tab you were previously using if you need to maintain the page state; this will trigger a reload and lose unsaved information.
+   - Always use a fresh, unique tab_id for new, unrelated searches or tasks to avoid cross-contamination.
+
+2. INTERACTION:
+   - Always analyze the visual layout and the interactive elements list before acting.
+   - Use 'browser_interact' for clicks, typing, and scrolling.
+   - Verify the result of an interaction by examining the new page state returned.

@@ -11,7 +11,8 @@ from .vision import AnalyzeImageTool
 from ..core.prompts import (
     TOOL_DESC_BROWSER_NAVIGATE,
     TOOL_DESC_BROWSER_INTERACT,
-    TOOL_DESC_BROWSER_CLOSE_TAB
+    TOOL_DESC_BROWSER_CLOSE_TAB,
+    TOOL_DESC_BROWSER_SWITCH_TAB
 )
 
 BROWSER_API_URL = "http://localhost:8030"
@@ -196,3 +197,18 @@ class BrowserCloseTabTool(BaseTool):
             return f"Successfully closed tab: {tab_id}"
         except Exception as e:
             return self.format_error_message(e, f"closing tab {tab_id}")
+
+class BrowserSwitchTabTool(BaseTool):
+    def __init__(self, worker=None):
+        super().__init__(name="browser_switch_tab", description=TOOL_DESC_BROWSER_SWITCH_TAB)
+        
+    def execute(self, tab_id: str = "default") -> str:
+        try:
+            ensure_browser_running()
+            session_id = str(os.getpid())
+            resp = requests.post(f"{BROWSER_API_URL}/switch_tab", json={"session_id": session_id, "tab_id": tab_id}, timeout=60)
+            if resp.status_code != 200:
+                return f"HTTP Error {resp.status_code} from browser API: {resp.text}"
+            return process_browser_response(resp.json(), f"Switched to tab '{tab_id}'", session_id, tab_id)
+        except Exception as e:
+            return self.format_error_message(e, f"switching to tab {tab_id}")

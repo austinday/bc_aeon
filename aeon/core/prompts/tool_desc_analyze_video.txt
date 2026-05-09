@@ -1,0 +1,5 @@
+Analyzes a video file and answers questions about its content using Gemma 4.
+Schema:
+  video_path (str, required): Path to the .mp4 video file.
+  prompt (str, required): The question or instruction (e.g., 'What happens in the first 5 seconds?', 'Is the character consistent?').
+Example: {"tool_name": "analyze_video", "parameters": {"video_path": "scene.mp4", "prompt": "Describe the camera movement."}}
