@@ -1,0 +1,6 @@
+Switch to an already open browser tab without reloading the page. 
+
+CRITICAL: Use this tool instead of 'browser_navigate' when returning to a tab you have already used. 'browser_switch_tab' preserves the current state of the page (e.g., text typed into forms, scroll position, and session state), whereas 'browser_navigate' will reload the URL and cause any unsaved state to be lost.
+
+Parameters:
+- tab_id: The unique identifier for the tab you wish to switch to.

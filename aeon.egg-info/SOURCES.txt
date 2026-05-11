@@ -31,6 +31,7 @@ aeon/core/prompts/tool_desc_analyze_video.txt
 aeon/core/prompts/tool_desc_browser_close_tab.txt
 aeon/core/prompts/tool_desc_browser_interact.txt
 aeon/core/prompts/tool_desc_browser_navigate.txt
+aeon/core/prompts/tool_desc_browser_switch_tab.txt
 aeon/core/prompts/tool_desc_close_file.txt
 aeon/core/prompts/tool_desc_collapse_category.txt
 aeon/core/prompts/tool_desc_edit_image.txt

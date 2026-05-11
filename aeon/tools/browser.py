@@ -43,6 +43,7 @@ def _print_image_to_terminal(image_bytes, target_width=80):
     except Exception as e:
         print(f"Failed to render image to terminal: {e}")
 
+
 def _manage_browser_registry():
     """Register the current agent PID as an active user of the browser service."""
     registry_path = "/tmp/aeon_browser_registry.json"

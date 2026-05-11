@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import List
 
 # Define the base prompts directory
-PROMPTS_DIR = Path("aeon/core/prompts")
+PROMPTS_DIR = Path(__file__).parent
 TOOLS_PROMPTS_DIR = PROMPTS_DIR / "tools"
 CATS_PROMPTS_DIR = PROMPTS_DIR / "categories"
 

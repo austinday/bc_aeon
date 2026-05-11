@@ -274,7 +274,7 @@ class Worker:
             return "No memories recorded yet."
         return "\n".join([f"{k}: {v}" for k, v in self.memories.items()])
 
-    def _truncate_output(self, text: str, max_chars: int = 10000) -> str:
+    def _truncate_output(self, text: str, max_chars: int = 50000) -> str:
         """Deterministic head+tail truncation. Prioritizes tail (where errors appear)."""
         if len(text) <= max_chars:
             return text

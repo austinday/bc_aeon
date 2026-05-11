@@ -10,7 +10,8 @@ from camoufox.async_api import AsyncCamoufox
 print("Imports loaded. Initializing FastAPI...", flush=True)
 app = FastAPI()
 browser_instance = None
-sessions = {}  # session_id_tab_id -> {"page": page}
+contexts = {}  # session_id -> context
+tabs = {}       # session_id_tab_id -> page
 
 @app.on_event("startup")
 async def startup():
@@ -38,10 +39,15 @@ async def shutdown():
         await browser_instance.__aexit__(None, None, None)
 
 async def get_or_create_session(session_id: str, tab_id: str):
-    global browser_instance, sessions
+    global browser_instance, contexts, tabs
+    
+    if session_id not in contexts:
+        # device_scale_factor=2 simulates a high-DPI (Retina) display, doubling screenshot resolution
+        contexts[session_id] = await browser_instance.new_context(device_scale_factor=2)
+    
     key = f"{session_id}_{tab_id}"
-    if key not in sessions:
-        page = await browser_instance.new_page()
+    if key not in tabs:
+        page = await contexts[session_id].new_page()
         await page.set_viewport_size({"width": 1920, "height": 1080})
         
         # ROBUST LAYOUT ENFORCEMENT: Force CSS reset to prevent massive left-margins 
@@ -54,8 +60,8 @@ async def get_or_create_session(session_id: str, tab_id: str):
             });
         """)
         
-        sessions[key] = {"page": page}
-    return sessions[key]["page"]
+        tabs[key] = page
+    return tabs[key]
 
 class GotoRequest(BaseModel):
     url: str
@@ -147,14 +153,24 @@ class CloseTabRequest(BaseModel):
 
 @app.post("/close_tab")
 async def close_tab(req: CloseTabRequest):
-    global sessions
+    global contexts, tabs
     key = f"{req.session_id}_{req.tab_id}"
-    if key in sessions:
+    if key in tabs:
         try:
-            await sessions[key]["page"].close()
+            await tabs[key].close()
         except:
             pass
-        del sessions[key]
+        del tabs[key]
+    
+    # Clean up context if no tabs left for this session
+    if not any(k.startswith(f"{req.session_id}_") for k in tabs.keys()):
+        if req.session_id in contexts:
+            try:
+                await contexts[req.session_id].close()
+            except:
+                pass
+            del contexts[req.session_id]
+            
     return {"status": "ok"}
 
 class CloseSessionRequest(BaseModel):
@@ -162,19 +178,27 @@ class CloseSessionRequest(BaseModel):
 
 @app.post("/close_session")
 async def close_session(req: CloseSessionRequest):
-    global sessions
-    keys_to_delete = [k for k in sessions.keys() if k.startswith(f"{req.session_id}_")]
+    global contexts, tabs
+    keys_to_delete = [k for k in tabs.keys() if k.startswith(f"{req.session_id}_")]
     for k in keys_to_delete:
         try:
-            await sessions[k]["page"].close()
+            await tabs[k].close()
         except:
             pass
-        del sessions[k]
+        del tabs[k]
+    
+    if req.session_id in contexts:
+        try:
+            await contexts[req.session_id].close()
+        except:
+            pass
+        del contexts[req.session_id]
+        
     return {"status": "ok"}
 
 async def extract_page_state(page):
     # Take clean screenshot
-    clean_bytes = await page.screenshot(type='jpeg', quality=80)
+    clean_bytes = await page.screenshot(type='jpeg', quality=95)
     
     # Inject Set-of-Mark (SOM) script using a Python RAW string (r''') to prevent \n evaluation
     elements = await page.evaluate(r'''() => {
@@ -259,7 +283,7 @@ async def extract_page_state(page):
         return elements;
     }''')
     
-    overlay_bytes = await page.screenshot(type='jpeg', quality=80)
+    overlay_bytes = await page.screenshot(type='jpeg', quality=95)
     
     # Extract visible markdown text
     markdown = await page.evaluate('() => document.body.innerText')

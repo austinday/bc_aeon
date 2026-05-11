@@ -110,7 +110,7 @@ class AnalyzeImageTool(BaseTool):
 
             # Start server if not running
             if not self._check_health():
-                print(f'{self.C_CYAN}Starting Qwen3.6 vision server (loading Q8_K_P GGUF via llama.cpp)...{self.C_RESET}')
+
                 script_path = os.path.abspath(
                     os.path.join(os.path.dirname(__file__), '..', 'scripts', 'start_qwen36_vl_35b.sh')
                 )
@@ -120,19 +120,14 @@ class AnalyzeImageTool(BaseTool):
                 if res.returncode != 0:
                     return f'Error starting vision server: {res.stderr}'
 
-                print(f'{self.C_CYAN}Waiting for vision server to become healthy...{self.C_RESET}')
                 for attempt in range(60):  # Up to 3 minutes for Q8 GGUF loading
                     if self._check_health():
                         break
                     time.sleep(3)
-                    if attempt % 5 == 0 and attempt > 0:
-                        elapsed = attempt * 3
-                        print(f'{self.C_CYAN}Still loading model... ({elapsed}s){self.C_RESET}')
                 else:
                     return 'Error: Vision server failed to become healthy after 3 minutes. Check: docker logs aeon_qwen36_vl'
 
             # Load and encode image
-            print(f'{self.C_CYAN}Encoding image for analysis...{self.C_RESET}')
             try:
                 b64_image, mime_type = self._load_and_encode_image(abs_image_path)
             except Exception as e:
@@ -157,7 +152,7 @@ class AnalyzeImageTool(BaseTool):
                 }
             ]
 
-            print(f'{self.C_CYAN}Sending image to Qwen3.6-35B for analysis...{self.C_RESET}')
+
             resp = requests.post(
                 f'{self.vllm_url}/v1/chat/completions',
                 json={
@@ -178,12 +173,18 @@ class AnalyzeImageTool(BaseTool):
             except (KeyError, IndexError):
                 return f'Error: Unexpected response format from vision server: {json.dumps(result)[:500]}'
 
-            # Strip Qwen thinking tags if present
-            import re
-            answer = re.sub(r'<think>.*?</think>\s*', '', answer, flags=re.DOTALL).strip()
+            # Keep the full output, including thinking tags, as requested by the user.
+            answer = answer.strip()
 
-            print(f'{self.C_GREEN}Vision analysis complete.{self.C_RESET}')
-            return answer
+            full_output = (
+                f"Prompt: {prompt}\n"
+                f"Image: {abs_image_path}\n"
+                f"Analysis:\n{answer}"
+            )
+            print(f'{self.C_GREEN}--- Vision Analysis ---')
+            print(full_output)
+            print(f'-----------------------{self.C_RESET}')
+            return full_output
 
         except Exception as e:
             return self.format_error_message(e, 'analyzing image via Qwen3.6-35B', 'checking vision server logs (docker logs aeon_qwen36_vl)')
@@ -191,7 +192,4 @@ class AnalyzeImageTool(BaseTool):
         finally:
             remaining_users = self._manage_registry('unregister')
             if remaining_users == 0:
-                print(f'{self.C_CYAN}Last agent finished vision task. Releasing GPU memory (stopping vision server)...{self.C_RESET}')
                 subprocess.run(['docker', 'rm', '-f', 'aeon_qwen36_vl'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                print(f'{self.C_CYAN}Vision analysis complete. Leaving server running for {remaining_users} other active agent(s)...{self.C_RESET}')
