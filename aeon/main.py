@@ -73,17 +73,6 @@ LLAMACPP_MODELS = [
         'health_port': 8009,
     },
     {
-        'model': 'Qwen3-Coder-Next-Abliterated-Q8_0',
-        'family': 'Qwen3-Coder',
-        'label': 'Qwen3-Coder-Next (Q8_0)         | GPU0: 100%, GPU1: 0%     | ~59 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8007/v1',
-        'context_limit': 262144,
-        'container_name': 'aeon_qwen3_coder_q8',
-        'start_script': 'start_qwen3_coder_q8.sh',
-        'health_port': 8007,
-    },
-    {
         'model': 'Gemma-4-31B-Speculative-Q8_0',
         'family': 'Gemma-4',
         'label': 'Gemma-4-31B Native MTP Cluster  | GPU0: 96GB, GPU1: 48GB   | ~80 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
@@ -94,18 +83,6 @@ LLAMACPP_MODELS = [
         'additional_containers': ['aeon_gemma4_node0', 'aeon_gemma4_node1'],
         'start_script': 'start_gemma4_speculative.sh',
         'health_port': 8008,
-    },
-    {
-        'model': 'Gemma-4-31B-vLLM-Speculative',
-        'family': 'Gemma-4',
-        'label': 'Gemma-4-31B vLLM MTP Cluster    | GPU0: 96GB, GPU1: 48GB   | ~120 t/s| 256k ctx | Abliterated: No  | Local/vLLM',
-        'provider': 'vllm',
-        'base_url': 'http://localhost:8010/v1',
-        'context_limit': 262144,
-        'container_name': 'aeon_gemma_vllm_lb',
-        'additional_containers': ['aeon_gemma4_vllm_node0', 'aeon_gemma4_vllm_node1'],
-        'start_script': 'start_gemma4_vllm_speculative.sh',
-        'health_port': 8010,
     },
 ]
 

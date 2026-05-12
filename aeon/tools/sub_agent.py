@@ -51,9 +51,9 @@ class SpawnSubAgent(BaseTool):
         model_cfg = getattr(self.worker, 'model_config', None)
         if not model_cfg:
             model_cfg = {
-                "model": model_name or "Qwen3-Coder-Next-Abliterated-Q8_0",
+                "model": model_name or "Qwen3.6-35B-A3B-Uncensored",
                 "provider": "llamacpp",
-                "base_url": "http://localhost:8007/v1",
+                "base_url": "http://localhost:8009/v1",
                 "context_limit": 262144
             }
 

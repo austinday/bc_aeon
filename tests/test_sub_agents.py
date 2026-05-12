@@ -28,7 +28,7 @@ def test_sub_agents():
     print("1. Spawning 3 sub-agents...")
     agent_ids = []
     for i in range(1, 4):
-        result = spawn_tool.execute(f"Task {i}: Count to 100 and save to count_{i}.txt", "Qwen3-Coder-Next-Abliterated-Q8_0")
+        result = spawn_tool.execute(f"Task {i}: Count to 100 and save to count_{i}.txt", "Qwen3.6-35B-A3B-Uncensored")
         print(f"   Spawn {i}: {result}")
         if "Agent ID:" in result:
             agent_id = result.split("Agent ID: ")[1].split(".")[0]
@@ -37,7 +37,7 @@ def test_sub_agents():
     
     # 2. Test limit enforcement (should fail)
     print("\n2. Testing limit enforcement (should fail)...")
-    result = spawn_tool.execute("Task 4: Should fail due to limit", "Qwen3-Coder-Next-Abliterated-Q8_0")
+    result = spawn_tool.execute("Task 4: Should fail due to limit", "Qwen3.6-35B-A3B-Uncensored")
     print(f"   Spawn 4: {result}")
     
     # 3. Check reports
@@ -57,7 +57,7 @@ def test_sub_agents():
     
     # 5. Spawn after kill (should succeed)
     print("\n5. Spawning after kill (should succeed)...")
-    result = spawn_tool.execute("Task 5: Should succeed after kill", "Qwen3-Coder-Next-Abliterated-Q8_0")
+    result = spawn_tool.execute("Task 5: Should succeed after kill", "Qwen3.6-35B-A3B-Uncensored")
     print(f"   Spawn 5: {result}")
     
     print("\n=== All tests passed! ===")

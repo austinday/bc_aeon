@@ -85,12 +85,6 @@ EOF
 build_image "aeon_downloader:latest" "$PROJECT_ROOT/Dockerfile.downloader" "$PROJECT_ROOT"
 rm -f "$PROJECT_ROOT/Dockerfile.downloader"
 
-log_step "PHASE 5.5: Qwen3-Coder-Next-Abliterated-Q8_0"
-QWEN3_CODER_GGUF_DIR="$AEON_HOME/models/gguf_models/Qwen3-Coder-Next-Abliterated"
-mkdir -p "$QWEN3_CODER_GGUF_DIR"
-CMD="hf download bartowski/huihui-ai_Qwen3-Coder-Next-abliterated-GGUF --include '*Q8_0*gguf' --local-dir /models"
-run_downloader "$QWEN3_CODER_GGUF_DIR/.setup_state" "$SETUP_VERSION:qwen3-coder-q8_0" "$QWEN3_CODER_GGUF_DIR:/models" "$CMD"
-
 log_step "PHASE 5.6: Gemma-4-31B + E2B Draft Models"
 GEMMA4_GGUF_DIR="$AEON_HOME/models/gguf_models/Gemma-4"
 mkdir -p "$GEMMA4_GGUF_DIR"
@@ -107,12 +101,6 @@ run_downloader "$QWEN36_VL_DIR/.setup_state" "$SETUP_VERSION:qwen36-vl-q8_k_p" "
 
 log_step "PHASE 6: Build aeon_vllm:latest Docker image"
 build_image "aeon_vllm:latest" "$PROJECT_ROOT/aeon/services/vllm/Dockerfile" "$PROJECT_ROOT/aeon/services/vllm/"
-
-log_step "PHASE 6.5: Gemma-4-31B Native Download (vLLM MTP)"
-GEMMA4_VLLM_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
-mkdir -p "$GEMMA4_VLLM_DIR"
-CMD="hf download google/gemma-4-31b-it --exclude '*.msgpack' '*.h5' '*.pt'"
-run_downloader "$AEON_HOME/models/.vllm_gemma4_setup_state" "$SETUP_VERSION:vllm_gemma4" "$GEMMA4_VLLM_DIR:/root/.cache/huggingface" "$CMD"
 
 log_step "PHASE 6.8: Build aeon_llamacpp:latest Docker image"
 build_image "aeon_llamacpp:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
