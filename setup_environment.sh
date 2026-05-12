@@ -5,6 +5,7 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AEON_HOME="${AEON_HOME:-$HOME/.aeon}"
 HF_TOKEN_FILE="/home/aday/huggingface_access_token.txt"
+SETUP_VERSION="v2"
 
 DOCKER_CACHE_FLAG=""
 for arg in "$@"; do
@@ -30,559 +31,135 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
     exit 1
 fi
 
-log_step "PHASE 1: Build Docker images (layer cache makes unchanged builds fast)"
+build_image() {
+    local img_name=$1
+    local dockerfile=$2
+    local context=$3
+    log_step "Building/Verifying $img_name (Docker cache will handle unchanged layers)..."
+    docker build --network=host $DOCKER_CACHE_FLAG -t "$img_name" -f "$dockerfile" "$context"
+}
 
-if ! docker image inspect aeon_downloader:latest >/dev/null 2>&1; then
-    log_step "Building aeon_downloader:latest..."
-    cat > "$PROJECT_ROOT/Dockerfile.downloader" << 'EOF'
+run_downloader() {
+    local state_file="$1"
+    local state_val="$2"
+    local vol_map="$3"
+    local cmd="$4"
+
+    if [[ -f "$state_file" ]] && [[ "$(cat "$state_file")" == "$state_val" ]]; then
+        log_step "Skipping download (already up-to-date): $(basename "$state_file")"
+        return 0
+    fi
+
+    log_step "Running downloader for $state_val..."
+
+    local tty_flag=""
+    if [ -t 0 ]; then tty_flag="-t"; fi
+
+    docker run --network=host --rm $tty_flag \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$vol_map" \
+        aeon_downloader:latest \
+        bash -c "$cmd"
+
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        log_step "ERROR: Download failed (exit code $exit_code)"
+        exit 1
+    fi
+
+    # Fix permissions to match host user
+    local vol_mount="${vol_map##*:}"
+    docker run --rm -v "$vol_map" aeon_downloader:latest chown -R $(id -u):$(id -g) "$vol_mount" || true
+
+    echo "$state_val" > "$state_file"
+}
+
+log_step "PHASE 1: Build aeon_downloader"
+cat > "$PROJECT_ROOT/Dockerfile.downloader" << 'EOF'
 FROM python:3.12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir "huggingface_hub[cli]"
 EOF
-    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_downloader:latest -f "$PROJECT_ROOT/Dockerfile.downloader" "$PROJECT_ROOT"
-    rm -f "$PROJECT_ROOT/Dockerfile.downloader"
-else
-    log_step "aeon_downloader:latest image already exists, skipping build."
-fi
+build_image "aeon_downloader:latest" "$PROJECT_ROOT/Dockerfile.downloader" "$PROJECT_ROOT"
+rm -f "$PROJECT_ROOT/Dockerfile.downloader"
 
-# =============================================================================
-# PHASE 5.5: Qwen3-Coder-Next-Abliterated-Q8_0 (llama.cpp served)
-# =============================================================================
+log_step "PHASE 5.5: Qwen3-Coder-Next-Abliterated-Q8_0"
 QWEN3_CODER_GGUF_DIR="$AEON_HOME/models/gguf_models/Qwen3-Coder-Next-Abliterated"
-log_step "PHASE 5.5: Download Qwen3-Coder-Next-Abliterated-Q8_0 GGUF model shards"
 mkdir -p "$QWEN3_CODER_GGUF_DIR"
+CMD="hf download bartowski/huihui-ai_Qwen3-Coder-Next-abliterated-GGUF --include '*Q8_0*gguf' --local-dir /models"
+run_downloader "$QWEN3_CODER_GGUF_DIR/.setup_state" "$SETUP_VERSION:qwen3-coder-q8_0" "$QWEN3_CODER_GGUF_DIR:/models" "$CMD"
 
-if [[ -f "$QWEN3_CODER_GGUF_DIR/.download_complete" ]]; then
-    log_step "Qwen3 Coder GGUF already downloaded, skipping."
-else
-    QWEN3_CODER_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen3_coder_XXXXXX.py)
-    cat > "$QWEN3_CODER_DL_SCRIPT" << 'PYEOF'
-import os, sys
-from huggingface_hub import hf_hub_download, list_repo_files
-
-REPO = "bartowski/huihui-ai_Qwen3-Coder-Next-abliterated-GGUF"
-TARGET = "/models"
-PREFIX = "Q8_0"
-
-print(f"Listing files in {REPO}...", flush=True)
-try:
-    all_files = list_repo_files(REPO)
-except Exception as e:
-    print(f"Failed to list repo: {e}")
-    sys.exit(1)
-
-print(f"\nProcessing {PREFIX}...", flush=True)
-shards = sorted([f for f in all_files if PREFIX in f and f.endswith(".gguf")])
-print(f"Found {len(shards)} shard(s):", flush=True)
-for s in shards:
-    print(f"  {s}", flush=True)
-
-if not shards:
-    print(f"ERROR: No matching GGUF shards found in repo for {PREFIX}!", flush=True)
-    sys.exit(1)
-
-all_done = True
-for i, shard in enumerate(shards, 1):
-    dest = os.path.join(TARGET, shard)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000_000:
-        sz = os.path.getsize(dest) / (1024**3)
-        print(f"[{i}/{len(shards)}] {os.path.basename(shard)} already exists ({sz:.1f}GB), skipping.", flush=True)
-        continue
-    all_done = False
-    print(f"[{i}/{len(shards)}] Downloading {shard}...", flush=True)
-    try:
-        hf_hub_download(
-            repo_id=REPO,
-            filename=shard,
-            local_dir=TARGET,
-        )
-        sz = os.path.getsize(dest) / (1024**3)
-        print(f"  Done: {sz:.1f}GB", flush=True)
-    except Exception as e:
-        print(f"Failed to download {shard}: {e}")
-        sys.exit(1)
-
-if all_done:
-    print(f"All {PREFIX} shards already present and valid.", flush=True)
-else:
-    print(f"All {PREFIX} shards downloaded successfully.", flush=True)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --network=host --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$QWEN3_CODER_GGUF_DIR:/models" \
-        -v "$QWEN3_CODER_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-
-    DL_EXIT=$?
-    rm -f "$QWEN3_CODER_DL_SCRIPT"
-    if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: Qwen3 Coder GGUF download failed (exit code $DL_EXIT)"
-        exit 1
-    fi
-
-    docker run --rm -v "$QWEN3_CODER_GGUF_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
-    touch "$QWEN3_CODER_GGUF_DIR/.download_complete"
-fi
-log_step "PHASE 5.5 complete."
-
-# =============================================================================
-# PHASE 5.6: Gemma-4-31B + E2B Draft Models
-# =============================================================================
+log_step "PHASE 5.6: Gemma-4-31B + E2B Draft Models"
 GEMMA4_GGUF_DIR="$AEON_HOME/models/gguf_models/Gemma-4"
-log_step "PHASE 5.6: Download Gemma 4 31B and E2B Draft GGUFs"
 mkdir -p "$GEMMA4_GGUF_DIR"
+CMD="hf download paperscarecrow/Gemma-4-31B-it-abliterated gemma-4-31b-abliterated-Q8_0.gguf --local-dir /models && \
+     hf download mradermacher/gemma-4-E2B-it-heretic-i1-GGUF --include '*Q4_K_M*.gguf' --local-dir /models"
+run_downloader "$GEMMA4_GGUF_DIR/.setup_state" "$SETUP_VERSION:gemma4-q8_0-e2b-draft" "$GEMMA4_GGUF_DIR:/models" "$CMD"
 
-if [[ -f "$GEMMA4_GGUF_DIR/.download_complete" ]]; then
-    log_step "Gemma 4 models already downloaded, skipping."
-else
-    GEMMA4_DL_SCRIPT=$(mktemp /tmp/aeon_dl_gemma4_XXXXXX.py)
-    cat > "$GEMMA4_DL_SCRIPT" << 'PYEOF'
-import os, sys
-from huggingface_hub import hf_hub_download, list_repo_files
-
-TARGET = "/models"
-
-# 1. Target Model: 31B Abliterated Q8_0
-target_repo = "paperscarecrow/Gemma-4-31B-it-abliterated"
-target_file = "gemma-4-31b-abliterated-Q8_0.gguf"
-
-# 2. Draft Model: E2B Heretic i1-Q4_K_M
-draft_repo = "mradermacher/gemma-4-E2B-it-heretic-i1-GGUF"
-print(f"Listing files in {draft_repo}...", flush=True)
-try:
-    repo_files = list_repo_files(draft_repo)
-except Exception as e:
-    print(f"ERROR: Failed to list repo {draft_repo}: {e}")
-    sys.exit(1)
-
-draft_file = next((f for f in repo_files if "Q4_K_M" in f and f.endswith(".gguf")), None)
-if not draft_file:
-    print(f"ERROR: Could not find Q4_K_M file in {draft_repo}!", flush=True)
-    sys.exit(1)
-
-downloads = [
-    (target_repo, target_file),
-    (draft_repo, draft_file)
-]
-
-for repo, fname in downloads:
-    dest = os.path.join(TARGET, fname)
-    if os.path.exists(dest) and os.path.getsize(dest) > 100_000_000:
-        print(f"[{fname}] already exists, skipping.", flush=True)
-        continue
-        
-    print(f"Downloading {fname} from {repo}...", flush=True)
-    try:
-        hf_hub_download(
-            repo_id=repo,
-            filename=fname,
-            local_dir=TARGET,
-        )
-        print(f"  Done: {fname}", flush=True)
-    except Exception as e:
-        print(f"ERROR: Failed to download {fname}: {e}")
-        sys.exit(1)
-
-print("All Gemma 4 files downloaded successfully.", flush=True)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --network=host --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$GEMMA4_GGUF_DIR:/models" \
-        -v "$GEMMA4_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-
-    DL_EXIT=$?
-    rm -f "$GEMMA4_DL_SCRIPT"
-    if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: Gemma 4 download failed (exit code $DL_EXIT)"
-        exit 1
-    fi
-
-    docker run --rm -v "$GEMMA4_GGUF_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
-    touch "$GEMMA4_GGUF_DIR/.download_complete"
-fi
-log_step "PHASE 5.6 complete."
-
-# =============================================================================
-# PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF (Vision & Primary LLM for llama.cpp)
-# =============================================================================
+log_step "PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF"
 QWEN36_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
-log_step "PHASE 5.7: Download Qwen3.6-35B-A3B GGUF for vision analysis tool and primary LLM"
 mkdir -p "$QWEN36_VL_DIR"
+CMD="hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf --local-dir /models && \
+     hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*mmproj*.gguf' --local-dir /models"
+run_downloader "$QWEN36_VL_DIR/.setup_state" "$SETUP_VERSION:qwen36-vl-q8_k_p" "$QWEN36_VL_DIR:/models" "$CMD"
 
-if [[ -f "$QWEN36_VL_DIR/.download_complete" ]]; then
-    log_step "Qwen3.6-35B-A3B GGUF already downloaded, skipping."
-else
-    QWEN36_VL_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen3_vl_XXXXXX.py)
-    cat > "$QWEN36_VL_DL_SCRIPT" << 'PYEOF'
-import os, sys
-from huggingface_hub import hf_hub_download, list_repo_files
-
-REPO = 'HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive'
-TARGET = '/models'
-
-print(f'Listing files in {REPO}...', flush=True)
-try:
-    repo_files = list_repo_files(REPO)
-    mmproj_file = next((f for f in repo_files if f.startswith('mmproj') and f.endswith('.gguf')), None)
-except Exception as e:
-    print(f'ERROR: {e}')
-    sys.exit(1)
-
-FILES = [
-    'Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf',
-]
-if mmproj_file:
-    FILES.append(mmproj_file)
-
-for fname in FILES:
-    print(f'Downloading {fname} from {REPO}...', flush=True)
-    try:
-        hf_hub_download(
-            repo_id=REPO,
-            filename=fname,
-            local_dir=TARGET,
-        )
-        print(f'  -> {fname} complete.', flush=True)
-    except Exception as e:
-        print(f'ERROR: Failed to download {fname}: {e}', flush=True)
-        sys.exit(1)
-
-print('All files downloaded successfully!', flush=True)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --network=host --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$QWEN36_VL_DIR:/models" \
-        -v "$QWEN36_VL_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-
-    DL_EXIT=$?
-    rm -f "$QWEN36_VL_DL_SCRIPT"
-    if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: Qwen3.6 GGUF download failed (exit code $DL_EXIT)"
-        exit 1
-    fi
-
-    docker run --rm -v "$QWEN36_VL_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
-    touch "$QWEN36_VL_DIR/.download_complete"
-fi
-log_step "PHASE 5.7 complete."
-
-# =============================================================================
-# PHASE 6: Build aeon_vllm:latest Docker image (Moved UP for use in 6.5)
-# =============================================================================
 log_step "PHASE 6: Build aeon_vllm:latest Docker image"
-if ! docker image inspect aeon_vllm:latest >/dev/null 2>&1; then
-    log_step "Building aeon_vllm:latest..."
-    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_vllm:latest -f "$PROJECT_ROOT/aeon/services/vllm/Dockerfile" "$PROJECT_ROOT/aeon/services/vllm/"
-    log_step "aeon_vllm:latest built successfully."
-else
-    log_step "aeon_vllm:latest already built, skipping."
-fi
+build_image "aeon_vllm:latest" "$PROJECT_ROOT/aeon/services/vllm/Dockerfile" "$PROJECT_ROOT/aeon/services/vllm/"
 
-# =============================================================================
-# PHASE 6.5: Gemma-4-31B Native Download
-# =============================================================================
+log_step "PHASE 6.5: Gemma-4-31B Native Download (vLLM MTP)"
 GEMMA4_VLLM_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
-log_step "PHASE 6.5: Download Gemma 4 31B (Native MTP removes the need for assistant draft models)"
 mkdir -p "$GEMMA4_VLLM_DIR"
-
-if [[ -f "$AEON_HOME/models/.vllm_gemma4_download_complete" ]]; then
-    log_step "Gemma 4 vLLM models already downloaded, skipping."
-else
-    GEMMA4_VLLM_DL_SCRIPT=$(mktemp /tmp/aeon_dl_gemma4_vllm_XXXXXX.py)
-    cat > "$GEMMA4_VLLM_DL_SCRIPT" << 'PYEOF'
-import os, sys
-from huggingface_hub import snapshot_download
-
-TARGET_REPO = "google/gemma-4-31b-it"
-
-print(f"Downloading {TARGET_REPO}...", flush=True)
-snapshot_download(repo_id=TARGET_REPO, ignore_patterns=["*.msgpack", "*.h5", "*.pt"])
-
-print("Download complete!", flush=True)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --network=host --rm $TTY_FLAG --entrypoint python3 \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$GEMMA4_VLLM_DIR:/root/.cache/huggingface" \
-        -v "$GEMMA4_VLLM_DL_SCRIPT:/download.py:ro" \
-        aeon_vllm:latest \
-        /download.py
-
-    DL_EXIT=$?
-    rm -f "$GEMMA4_VLLM_DL_SCRIPT"
-    if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: Gemma 4 vLLM download failed (exit code $DL_EXIT)"
-        exit 1
-    fi
-
-    # Fix permissions
-    docker run --rm --entrypoint chown -v "$GEMMA4_VLLM_DIR:/root/.cache/huggingface" aeon_downloader:latest -R $(id -u):$(id -g) /root/.cache/huggingface || true
-    touch "$AEON_HOME/models/.vllm_gemma4_download_complete"
-fi
-log_step "PHASE 6.5 complete."
+CMD="hf download google/gemma-4-31b-it --exclude '*.msgpack' '*.h5' '*.pt'"
+run_downloader "$AEON_HOME/models/.vllm_gemma4_setup_state" "$SETUP_VERSION:vllm_gemma4" "$GEMMA4_VLLM_DIR:/root/.cache/huggingface" "$CMD"
 
 log_step "PHASE 6.8: Build aeon_llamacpp:latest Docker image"
-if ! docker image inspect aeon_llamacpp:latest >/dev/null 2>&1; then
-    log_step "Building aeon_llamacpp:latest (compiling llama.cpp with CUDA, may take 5-10 min on first build)..."
-    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_llamacpp:latest -f "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
-    log_step "aeon_llamacpp:latest built successfully."
-else
-    log_step "aeon_llamacpp:latest already built, skipping."
-fi
+build_image "aeon_llamacpp:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
 
-# Build ComfyUI Docker image (for FLUX image generation tool)
 log_step "PHASE 6.9: Build aeon_comfyui:latest Docker image"
-if ! docker image inspect aeon_comfyui:latest >/dev/null 2>&1; then
-    log_step "Building aeon_comfyui:latest (installs PyTorch + ComfyUI + GGUF plugin, may take 5-10 min on first build)..."
-    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_comfyui:latest -f "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
-    log_step "aeon_comfyui:latest built successfully."
-else
-    log_step "aeon_comfyui:latest already built, skipping."
-fi
+build_image "aeon_comfyui:latest" "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
 
-# =============================================================================
-# PHASE 7: ComfyUI Models (FLUX)
-# =============================================================================
+log_step "PHASE 7: ComfyUI Models (FLUX)"
 COMFY_MODELS_DIR="$AEON_HOME/models/comfyui"
-log_step "PHASE 7: Download FLUX GGUF models and encoders for ComfyUI"
-mkdir -p "$COMFY_MODELS_DIR/unet"
-mkdir -p "$COMFY_MODELS_DIR/text_encoders"
-mkdir -p "$COMFY_MODELS_DIR/vae"
-
-if [[ -f "$COMFY_MODELS_DIR/.download_complete" ]]; then
-    log_step "FLUX models already downloaded, skipping."
-else
-    FLUX_DL_SCRIPT=$(mktemp /tmp/aeon_dl_flux_XXXXXX.py)
-    cat > "$FLUX_DL_SCRIPT" << 'PYEOF'
-import os, sys
-from huggingface_hub import hf_hub_download
-
-print('Downloading FHDR UNet GGUF...', flush=True)
-hf_hub_download(repo_id='kpsss34/FHDR_Uncensored', filename='FHDR_ComfyUI-Q8_0.gguf', local_dir='/models/unet')
-
-print('Downloading FLUX.1 VAE...', flush=True)
-hf_hub_download(repo_id='black-forest-labs/FLUX.1-schnell', filename='ae.safetensors', local_dir='/models/vae')
-
-print('Downloading FLUX.1 CLIP-L...', flush=True)
-hf_hub_download(repo_id='comfyanonymous/flux_text_encoders', filename='clip_l.safetensors', local_dir='/models/text_encoders')
-
-print('Downloading FLUX.1 T5XXL FP8...', flush=True)
-hf_hub_download(repo_id='comfyanonymous/flux_text_encoders', filename='t5xxl_fp8_e4m3fn.safetensors', local_dir='/models/text_encoders')
-
-print('Downloads complete!', flush=True)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --network=host --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$COMFY_MODELS_DIR:/models" \
-        -v "$FLUX_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-
-    DL_EXIT=$?
-    rm -f "$FLUX_DL_SCRIPT"
-    if [[ $DL_EXIT -ne 0 ]]; then
-        log_step "ERROR: FLUX download failed (exit code $DL_EXIT)"
-        exit 1
-    fi
-
-    docker run --rm -v "$COMFY_MODELS_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
-    touch "$COMFY_MODELS_DIR/.download_complete"
-fi
-log_step "PHASE 7 complete."
-
-# =============================================================================
-# PHASE 7.5: Qwen-Image-Edit-2511 (ComfyUI Edit Models)
-# =============================================================================
-log_step "PHASE 7.5: Download Qwen-Image-Edit-2511 models"
-
-# Explicitly re-declare the directory to prevent empty variable evaluation
-COMFY_MODELS_DIR="${AEON_HOME:-$HOME/.aeon}/models/comfyui"
 mkdir -p "$COMFY_MODELS_DIR/unet" "$COMFY_MODELS_DIR/text_encoders" "$COMFY_MODELS_DIR/vae"
+CMD="hf download kpsss34/FHDR_Uncensored FHDR_ComfyUI-Q8_0.gguf --local-dir /models/unet && \
+     hf download black-forest-labs/FLUX.1-schnell ae.safetensors --local-dir /models/vae && \
+     hf download comfyanonymous/flux_text_encoders clip_l.safetensors --local-dir /models/text_encoders && \
+     hf download comfyanonymous/flux_text_encoders t5xxl_fp8_e4m3fn.safetensors --local-dir /models/text_encoders"
+run_downloader "$COMFY_MODELS_DIR/.flux_setup_state" "$SETUP_VERSION:flux_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
 
-if [ -f "$COMFY_MODELS_DIR/unet/.qwen_edit_download_complete" ]; then
-    log_step "Qwen-Image-Edit models already downloaded, skipping."
-else
-    QWEN_EDIT_DL_SCRIPT=$(mktemp /tmp/aeon_dl_qwen_edit_XXXXXX.py)
-    cat > "$QWEN_EDIT_DL_SCRIPT" << 'PYEOF'
-import os, sys, shutil
-from huggingface_hub import hf_hub_download
+log_step "PHASE 7.5: Qwen-Image-Edit-2511 (ComfyUI Edit Models)"
+CMD="hf download Arunk25/Qwen-Image-Edit-Rapid-AIO-GGUF v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf --local-dir /models/unet && \
+     hf download Comfy-Org/Qwen-Image_ComfyUI split_files/vae/qwen_image_vae.safetensors --local-dir /models/tmp && \
+     mv /models/tmp/split_files/vae/qwen_image_vae.safetensors /models/vae/ && \
+     hf download Comfy-Org/Qwen-Image_ComfyUI split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors --local-dir /models/tmp && \
+     mv /models/tmp/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors /models/text_encoders/ && \
+     rm -rf /models/tmp"
+run_downloader "$COMFY_MODELS_DIR/.qwen_edit_setup_state" "$SETUP_VERSION:qwen_edit_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
 
-print('Downloading Qwen-Rapid-NSFW-v23_Q8_0.gguf...', flush=True)
-hf_hub_download(repo_id='Arunk25/Qwen-Image-Edit-Rapid-AIO-GGUF', filename='v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf', local_dir='/models/unet')
-
-print('Downloading Qwen VAE...', flush=True)
-vae_path = hf_hub_download(repo_id='Comfy-Org/Qwen-Image_ComfyUI', filename='split_files/vae/qwen_image_vae.safetensors', local_dir='/tmp/dl')
-os.makedirs('/models/vae', exist_ok=True)
-shutil.copy(vae_path, '/models/vae/qwen_image_vae.safetensors')
-
-print('Downloading Qwen Text Encoder...', flush=True)
-te_path = hf_hub_download(repo_id='Comfy-Org/Qwen-Image_ComfyUI', filename='split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors', local_dir='/tmp/dl')
-os.makedirs('/models/text_encoders', exist_ok=True)
-shutil.copy(te_path, '/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors')
-
-print('Qwen Image Edit downloads complete!', flush=True)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --network=host --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$COMFY_MODELS_DIR:/models" \
-        -v "$QWEN_EDIT_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-
-    DL_EXIT=$?
-    rm -f "$QWEN_EDIT_DL_SCRIPT"
-    if [ $DL_EXIT -ne 0 ]; then
-        log_step "ERROR: Qwen-Image-Edit download failed (exit code $DL_EXIT)"
-        exit 1
-    fi
-
-    docker run --rm -v "$COMFY_MODELS_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
-    touch "$COMFY_MODELS_DIR/unet/.qwen_edit_download_complete"
-fi
-log_step "PHASE 7.5 complete."
-
-# =============================================================================
-# PHASE 8: PuLID FLUX Models (Consistent Characters)
-# =============================================================================
-PULID_MODELS_DIR="$AEON_HOME/models/comfyui/pulid"
-CLIP_DIR="$AEON_HOME/models/comfyui/clip"
-INSIGHTFACE_DIR="$AEON_HOME/models/comfyui/insightface"
-
-log_step "PHASE 8: Download PuLID Flux and Face models"
+log_step "PHASE 8: PuLID FLUX Models (Consistent Characters)"
+PULID_MODELS_DIR="$COMFY_MODELS_DIR/pulid"
+CLIP_DIR="$COMFY_MODELS_DIR/clip"
+INSIGHTFACE_DIR="$COMFY_MODELS_DIR/insightface"
 mkdir -p "$PULID_MODELS_DIR" "$CLIP_DIR" "$INSIGHTFACE_DIR"
+CMD="hf download guozinan/PuLID pulid_flux_v0.9.0.safetensors --local-dir /models/pulid && \
+     hf download QuanSun/EVA-CLIP EVA02_CLIP_L_336_psz14_s6B.pt --local-dir /models/clip && \
+     hf download kidyu/antelopev2-for-InstantID-ComfyUI --local-dir /models/insightface/models/antelopev2"
+run_downloader "$COMFY_MODELS_DIR/.pulid_setup_state" "$SETUP_VERSION:pulid_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
 
-if [[ -f "$PULID_MODELS_DIR/.download_complete" ]]; then
-    log_step "PuLID models already downloaded, skipping."
-else
-    PULID_DL_SCRIPT=$(mktemp /tmp/aeon_dl_pulid_XXXXXX.py)
-    cat > "$PULID_DL_SCRIPT" << 'PYEOF'
-import os
-from huggingface_hub import hf_hub_download, snapshot_download
-
-print('Downloading PuLID Flux...', flush=True)
-hf_hub_download(repo_id='guozinan/PuLID', filename='pulid_flux_v0.9.0.safetensors', local_dir='/models/pulid')
-
-print('Downloading EvaCLIP...', flush=True)
-hf_hub_download(repo_id='QuanSun/EVA-CLIP', filename='EVA02_CLIP_L_336_psz14_s6B.pt', local_dir='/models/clip')
-
-print('Downloading AntelopeV2 (InsightFace)...', flush=True)
-snapshot_download(repo_id='kidyu/antelopev2-for-InstantID-ComfyUI', local_dir='/models/insightface/models/antelopev2')
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --network=host --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$AEON_HOME/models/comfyui:/models" \
-        -v "$PULID_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-        
-    rm -f "$PULID_DL_SCRIPT"
-    docker run --rm -v "$AEON_HOME/models/comfyui:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models/pulid /models/clip /models/insightface || true
-    touch "$PULID_MODELS_DIR/.download_complete"
-fi
-log_step "PHASE 8 complete."
-
-# =============================================================================
-# PHASE 9: Web Browser Service (Playwright)
-# =============================================================================
 log_step "PHASE 9: Build aeon_browser_service:latest Docker image"
-if ! docker image inspect aeon_browser_service:latest >/dev/null 2>&1; then
-    log_step "Building aeon_browser_service:latest (Headless Playwright + stealth)..."
-    docker build --network=host $DOCKER_CACHE_FLAG -t aeon_browser_service:latest -f "$PROJECT_ROOT/aeon/services/browser/Dockerfile" "$PROJECT_ROOT/aeon/services/browser/"
-    log_step "aeon_browser_service:latest built successfully."
-else
-    log_step "aeon_browser_service:latest already built, skipping."
-fi
-log_step "PHASE 9 complete."
+build_image "aeon_browser_service:latest" "$PROJECT_ROOT/aeon/services/browser/Dockerfile" "$PROJECT_ROOT/aeon/services/browser/"
 
-# =============================================================================
-# PHASE 10: LTX-2.3 Video Generation Models
-# =============================================================================
-log_step "PHASE 10: Download LTX-2.3 Video Models"
-LTX_MODELS_DIR="${AEON_HOME:-$HOME/.aeon}/models/comfyui"
+log_step "PHASE 10: LTX-2.3 Video Generation Models"
+CMD="hf download unsloth/LTX-2.3-GGUF ltx-2.3-22b-dev-F16.gguf --local-dir /models/unet && \
+     hf download unsloth/LTX-2.3-GGUF vae/ltx-2.3-22b-dev_video_vae.safetensors --local-dir /models/vae && \
+     hf download unsloth/LTX-2.3-GGUF text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors --local-dir /models/text_encoders && \
+     hf download unsloth/gemma-3-12b-it-qat-GGUF gemma-3-12b-it-qat-UD-Q4_K_XL.gguf --local-dir /models/text_encoders && \
+     hf download unsloth/gemma-3-12b-it-qat-GGUF mmproj-BF16.gguf --local-dir /models/text_encoders && \
+     hf download unsloth/gemma-3-12b-it-FP8-Dynamic tokenizer.model --local-dir /models/tmp && \
+     mv /models/tmp/tokenizer.model /models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.model && \
+     rm -rf /models/tmp"
+run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
 
-if [[ -f "$LTX_MODELS_DIR/unet/.ltx_download_complete" ]]; then
-    log_step "LTX-2.3 models already downloaded, skipping."
-else
-    LTX_DL_SCRIPT=$(mktemp /tmp/aeon_dl_ltx_XXXXXX.py)
-    cat > "$LTX_DL_SCRIPT" << 'PYEOF'
-import os, sys, shutil
-from huggingface_hub import hf_hub_download
-
-print('Downloading LTX-2.3 GGUF...', flush=True)
-hf_hub_download(repo_id='unsloth/LTX-2.3-GGUF', filename='ltx-2.3-22b-dev-F16.gguf', local_dir='/models/unet')
-
-print('Downloading LTX-2.3 VAE...', flush=True)
-hf_hub_download(repo_id='unsloth/LTX-2.3-GGUF', filename='vae/ltx-2.3-22b-dev_video_vae.safetensors', local_dir='/models/vae')
-
-print('Downloading LTX-2.3 Text Encoders & Gemma 3 GGUF...', flush=True)
-hf_hub_download(repo_id='unsloth/LTX-2.3-GGUF', filename='text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors', local_dir='/models')
-hf_hub_download(repo_id='unsloth/gemma-3-12b-it-qat-GGUF', filename='gemma-3-12b-it-qat-UD-Q4_K_XL.gguf', local_dir='/models/text_encoders')
-hf_hub_download(repo_id='unsloth/gemma-3-12b-it-qat-GGUF', filename='mmproj-BF16.gguf', local_dir='/models/text_encoders')
-
-print('Downloading Gemma Tokenizer (workaround for ComfyUI-GGUF bug)...', flush=True)
-try:
-    tok_path = hf_hub_download(repo_id='philschmid/gemma-tokenizer', filename='tokenizer.model')
-    shutil.copy(tok_path, '/models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.model')
-except Exception as e:
-    print(f"Failed to download tokenizer: {e}", flush=True)
-
-print('LTX-2.3 downloads complete!', flush=True)
-PYEOF
-
-    TTY_FLAG=""
-    if [ -t 0 ]; then TTY_FLAG="-t"; fi
-    docker run --network=host --rm $TTY_FLAG \
-        -e HF_TOKEN="$HF_TOKEN" \
-        -e PYTHONUNBUFFERED=1 \
-        -v "$LTX_MODELS_DIR:/models" \
-        -v "$LTX_DL_SCRIPT:/download.py:ro" \
-        aeon_downloader:latest \
-        python3 /download.py
-
-    DL_EXIT=$?
-    rm -f "$LTX_DL_SCRIPT"
-    if [ $DL_EXIT -ne 0 ]; then
-        log_step "ERROR: LTX-2.3 download failed (exit code $DL_EXIT)"
-        exit 1
-    fi
-    docker run --rm -v "$LTX_MODELS_DIR:/models" aeon_downloader:latest chown -R $(id -u):$(id -g) /models || true
-    touch "$LTX_MODELS_DIR/unet/.ltx_download_complete"
-fi
-log_step "PHASE 10 complete."
-
-log_step "Setup complete. Models in $QWEN3_CODER_GGUF_DIR, $COMFY_MODELS_DIR, $QWEN36_VL_DIR, $GEMMA4_VLLM_DIR"
-log_step "NOTE: To remove old models (if present), you may want to clean up $AEON_HOME/models/vl_models/Qwen3.5-35B-A3B-GGUF or $AEON_HOME/models/gguf_models/Qwen3.5-27B"
+log_step "Setup complete! All Dockerfiles will automatically rebuild if changed, and partial downloads will automatically resume."
