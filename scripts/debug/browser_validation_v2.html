@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Aeon Browser Comprehensive Validation</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; line-height: 1.6; }
+        .section { border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; border-radius: 8px; }
+        .status { font-weight: bold; color: blue; }
+        .hidden { display: none; }
+        .off-screen { margin-left: 2000px; }
+    </style>
+</head>
+<body>
+    <h1>Aeon Browser Comprehensive Validation</h1>
+
+    <div class="section">
+        <h2>1. Dropdown & State</h2>
+        <label for="fruit-select">Choose a fruit:</label>
+        <select id="fruit-select" onchange="document.getElementById('fruit-status').innerText = this.value">
+            <option value="None">--Please choose--</option>
+            <option value="Apple">Apple</option>
+            <option value="Banana">Banana</option>
+            <option value="Cherry">Cherry</option>
+        </select>
+        <p>Selected Fruit: <span id="fruit-status" class="status">None</span></p>
+    </div>
+
+    <div class="section">
+        <h2>2. Text Input & Form</h2>
+        <input type="text" id="name-input" placeholder="Enter your name">
+        <button id="submit-btn" onclick="document.getElementById('greeting').innerText = 'Hello, ' + document.getElementById('name-input').value + '!'">Submit</button>
+        <p id="greeting" class="status"></p>
+    </div>
+
+    <div class="section">
+        <h2>3. Popup Management</h2>
+        <button id="popup-1-btn" onclick="window.open('about:blank', '_blank', 'width=200,height=200')">Open Popup 1</button>
+        <button id="popup-2-btn" onclick="window.open('about:blank', '_blank', 'width=200,height=200')">Open Popup 2</button>
+        <button id="popup-multi-btn" onclick="for(i=0; i<3; i++) window.open('about:blank', '_blank', 'width=100,height=100')">Open 3 Popups</button>
+    </div>
+
+    <div class="section">
+        <h2>4. Safety Lock & Edge Cases</h2>
+        <button id="safety-btn">Safety Lock Test Button</button>
+        <p>This button is used to test if the server rejects clicks with wrong expected text.</p>
+        
+        <div style="height: 1500px;">Scroll down to find the hidden element...</div>
+        <button id="bottom-btn">I am at the bottom!</button>
+    </div>
+
+    <div class="section">
+        <h2>5. Viewport/Off-screen</h2>
+        <div class="off-screen">
+            <button id="offscreen-btn">I am off-screen!</button>
+        </div>
+    </div>
+
+</body>
+</html>

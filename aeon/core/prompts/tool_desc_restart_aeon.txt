@@ -7,7 +7,7 @@ WHEN TO USE:
 CRITICAL RULES:
 1. Save ALL important context to persistent memory (memorize) BEFORE calling this tool. Open files will NOT be preserved across restart.
 2. The aeon_code_dir parameter MUST point to the root of the Aeon source tree (the directory containing setup.py).
-3. After restart, you will resume with the same objective. Verify your code changes took effect.
+3. After restart, you will resume with the same objective. You MUST now perform a live test by actually calling the modified tool or triggering the modified logic to prove it works in the agent's operational context. This is the only acceptable final validation for self-modifications.
 4. Do NOT call this tool unless you have actually changed files in the Aeon source tree. It is pointless otherwise.
 
 Schema:

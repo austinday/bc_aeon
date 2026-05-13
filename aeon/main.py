@@ -84,17 +84,6 @@ LLAMACPP_MODELS = [
         'start_script': 'start_gemma4_mtp.sh',
         'health_port': 8013,
     },
-    {
-        'model': 'Gemma-4-31B-Speculative-Q8_0',        'family': 'Gemma-4',
-        'label': 'Gemma-4-31B Native MTP Cluster  | GPU0: 96GB, GPU1: 48GB   | ~80 t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8008/v1',
-        'context_limit': 262144,
-        'container_name': 'aeon_gemma_lb',
-        'additional_containers': ['aeon_gemma4_node0', 'aeon_gemma4_node1'],
-        'start_script': 'start_gemma4_speculative.sh',
-        'health_port': 8008,
-    },
 ]
 
 def is_container_running(name):

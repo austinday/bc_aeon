@@ -1,0 +1,20 @@
+Interact with a specific element on the current webpage.
+
+CRITICAL: You MUST use the 'element_id' provided in the list of interactive elements.
+NEVER use CSS selectors, XPaths, or any other identifier.
+The 'element_id' is the integer found in the red bounding boxes of the overlay image and the accompanying elements list.
+
+SAFETY LOCK: To prevent clicking the wrong element due to visual hallucinations, you are strongly encouraged to provide the 'expected_text' parameter. The system will verify that the element's actual text matches your expectation before performing the action. If they do not match, the action will be aborted to prevent errors.
+
+Parameters:
+- action: The action to perform. Supported values:
+    - 'click': Clicks the element.
+    - 'type': Types the provided 'text' into the element.
+    - 'hover': Hovers the mouse over the element.
+    - 'enter': Presses the Enter key on the element.
+    - 'select': Selects an option from a dropdown. Use the 'text' parameter to specify the label of the option to select. If 'text' is omitted, the first option will be selected.
+    - 'scroll_down': Scrolls the page down.
+    - 'scroll_up': Scrolls the page up.
+- element_id: (Required for most actions) The integer ID of the target element.
+- text: (Required for 'type' and 'select') The text to enter into the field or the label of the option to select.
+- expected_text: (Highly Recommended) The text you expect the element to contain. Used as a safety check before clicking or typing.

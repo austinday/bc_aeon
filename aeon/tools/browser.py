@@ -15,7 +15,7 @@ from ..core.prompts import (
     TOOL_DESC_BROWSER_SWITCH_TAB
 )
 
-BROWSER_API_URL = "http://localhost:8030"
+BROWSER_API_URL = "http://localhost:8000"
 
 def _print_image_to_terminal(image_bytes, target_width=80):
     """Renders an image directly in the terminal using ANSI truecolor and half-block characters."""
@@ -130,8 +130,12 @@ def process_browser_response(data, action_desc, session_id, tab_id):
     except Exception as e:
         vision_analysis = f"Vision analysis failed: {e}"
     
+    open_tabs = data.get("open_tabs", [])
+    open_tabs_str = ", ".join(open_tabs) if open_tabs else tab_id
+
     result = (
-        f"--- BROWSER ACTION SUCCESS: {action_desc} (Tab: '{tab_id}') ---\n\n"
+        f"--- BROWSER ACTION SUCCESS: {action_desc} (Tab: '{tab_id}') ---\n"
+        f"Open Tabs: [{open_tabs_str}]\n\n"
         f"--- VISUAL LAYOUT ANALYSIS (from Qwen-VL) ---\n"
         f"{vision_analysis}\n\n"
         f"--- VISIBLE TEXT (MARKDOWN) ---\n"
@@ -149,7 +153,7 @@ class BrowserNavigateTool(BaseTool):
         super().__init__(name="browser_navigate", description=TOOL_DESC_BROWSER_NAVIGATE)
         
     def execute(self, url: str, tab_id: str = "default") -> str:
-        if not url.startswith("http"):
+        if not any(url.startswith(scheme) for scheme in ["http://", "https://", "data:", "file://"]):
             url = "https://" + url
         try:
             ensure_browser_running()

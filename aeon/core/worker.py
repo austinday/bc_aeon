@@ -56,15 +56,21 @@ class Worker:
         self.memories = {}  # Key-value persistent memory
         self.last_observation = "None."
         self.action_log = []  # Persistent factual record of attempts (intents + results)
+        self.open_files_mtime = {}  # Tracks last modified time of open files to avoid redundant reads
         self.pending_iteration_state = None # Holds intent/actions while awaiting result
         self._recent_commands = []  # Rolling window for loop detection
         self._recent_outputs = []   # Corresponding outputs for loop detection
         self.expanded_categories = set()  # Tracks which tool categories are currently expanded
         self.notified_sub_agents = set()  # Tracks which sub-agent terminal states have been alerted to the main agent
+        self.open_files_access_order = []  # Tracks order of file access for LRU suggestions
+        self.recent_intents = deque(maxlen=3)  # Tracks recent intents for loop detection
+        self.prev_prompt_tokens = 0  # Tracks context size of previous iteration for growth metrics
+        self.action_log_summary = ""  # Non-destructive summary of older action log entries
         self.instance_id = str(uuid.uuid4())[:8]  # Unique ID for this Aeon run instance
         self.MAX_REPEAT_WINDOW = 5  # How many recent commands to track
         self.REPEAT_THRESHOLD = 2   # How many identical commands before warning
         self.effective_iterations = 0
+        self.prompt_cache = {}  # Cache for tool and category directives to avoid disk I/O
 
         # Load directives from central prompts module
         self.base_directives = CORE_DIRECTIVES
@@ -83,16 +89,25 @@ class Worker:
         self.print_func(f"{C_YELLOW}Debug logging enabled: {self.debug_path}{C_RESET}")
         self._debug_initialized = True
 
-    def _sync_open_files(self):
-        """Synchronize open_files cache with disk state."""
+    def _sync_open_files(self, max_content_len: int = 250000):
+        """Synchronize open_files cache with disk state using mtime to avoid redundant reads."""
         from aeon.tools.analyzers import FileAnalyzer
         paths = list(self.open_files.keys())
         for path in paths:
             if not os.path.exists(path):
                 del self.open_files[path]
+                if path in self.open_files_mtime:
+                    del self.open_files_mtime[path]
                 self.logger.info(f"Removed deleted file from context: {path}")
                 continue
             try:
+                current_mtime = os.path.getmtime(path)
+                if self.open_files_mtime.get(path) == current_mtime:
+                    # We only skip if the content is already within the current limit.
+                    # If the limit decreased, we might need to re-sync to truncate.
+                    if len(self.open_files.get(path, "")) <= max_content_len:
+                        continue
+                
                 analyzer = FileAnalyzer(path)
                 result = analyzer.analyze()
                 summary_type = result.get('summary_type', '')
@@ -120,11 +135,14 @@ class Worker:
                             parts.append(f'{key}: {value}')
                     content = '\n'.join(parts)
 
-                if len(content) > 250000:
-                    content = f"File '{path}' content is too large ({len(content):,} chars) to open directly. Limit is 250,000 chars. Use a script to analyze this file."
+                if len(content) > max_content_len:
+                    content = f"File '{path}' content is too large ({len(content):,} chars) to open directly. Limit is {max_content_len:,} chars. Use a script to analyze this file."
 
                 if self.open_files[path] != content:
                     self.open_files[path] = content
+                
+                # Update mtime cache after successful sync
+                self.open_files_mtime[path] = current_mtime
             except Exception as e:
                 self.logger.error(f"Error syncing file {path}: {e}")
 
@@ -136,14 +154,29 @@ class Worker:
     def update_open_file(self, path: str, content: str):
         abs_path = os.path.abspath(path)
         self.open_files[abs_path] = content
+        
+        # LRU Update: Move to end of list (most recent)
+        if abs_path in self.open_files_access_order:
+            self.open_files_access_order.remove(abs_path)
+        self.open_files_access_order.append(abs_path)
+        
+        try:
+            self.open_files_mtime[abs_path] = os.path.getmtime(abs_path)
+        except OSError:
+            pass
 
     def close_file(self, path: str) -> bool:
         abs_path = os.path.abspath(path)
+        target = None
         if abs_path in self.open_files:
-            del self.open_files[abs_path]
-            return True
-        if path in self.open_files:
-            del self.open_files[path]
+            target = abs_path
+        elif path in self.open_files:
+            target = path
+        
+        if target:
+            del self.open_files[target]
+            if target in self.open_files_access_order:
+                self.open_files_access_order.remove(target)
             return True
         return False
 
@@ -176,27 +209,22 @@ class Worker:
             
         # Process tools in alphabetical order for consistency
         for name in sorted(active_tool_names):
-            tool_directives = load_tool_prompt(name)
-            if tool_directives:
-                for d in tool_directives:
-                    active_directives.append(f"- {name}: {d}")
-            else:
-                active_directives.append(f"- {name}: ")
+            if name not in self.prompt_cache:
+                self.prompt_cache[name] = load_tool_prompt(name)
+            tool_directives = self.prompt_cache[name]
+            for d in tool_directives:
+                active_directives.append(f"- {name}: {d}")
         
         # Process expanded categories in alphabetical order
         for cat_path in sorted(self.expanded_categories):
-            cat_directives = load_cat_prompt(cat_path)
-            if cat_directives:
-                for d in cat_directives:
-                    active_directives.append(f"- {cat_path}: {d}")
-            else:
-                active_directives.append(f"- {cat_path}: ")
-            
+            if cat_path not in self.prompt_cache:
+                self.prompt_cache[cat_path] = load_cat_prompt(cat_path)
+            cat_directives = self.prompt_cache[cat_path]
+            for d in cat_directives:
+                active_directives.append(f"- {cat_path}: {d}")            
         if not active_directives:
-            return ""
-            
+            return ""            
         return "\n".join(active_directives)
-
     def _get_tools_description(self) -> str:
         """Build tool descriptions with category-aware rendering.
 
@@ -260,8 +288,8 @@ class Worker:
 
         return lines
 
-    def _format_open_files(self) -> str:
-        self._sync_open_files()
+    def _format_open_files(self, max_content_len: int = 250000) -> str:
+        self._sync_open_files(max_content_len=max_content_len)
         if not self.open_files:
             return "No files currently open."
         out = []
@@ -272,7 +300,17 @@ class Worker:
     def _format_memories(self) -> str:
         if not self.memories:
             return "No memories recorded yet."
-        return "\n".join([f"{k}: {v}" for k, v in self.memories.items()])
+        
+        formatted = []
+        for k, v in self.memories.items():
+            if isinstance(v, dict):
+                val = v.get('value', '')
+                cat = v.get('category', 'general')
+                ts = v.get('timestamp', 'unknown')
+                formatted.append(f"[{cat}] {k}: {val} (Saved: {ts})")
+            else:
+                formatted.append(f"{k}: {v}")
+        return "\n".join(formatted)
 
     def _truncate_output(self, text: str, max_chars: int = 50000) -> str:
         """Deterministic head+tail truncation. Prioritizes tail (where errors appear)."""
@@ -288,14 +326,42 @@ class Worker:
         )
 
     def _format_attempt_log(self) -> str:
-        """Format the persistent attempt log (intents + results)."""
+        """Format the full, uncompressed attempt log."""
         if not self.action_log and not self.pending_iteration_state:
             return "(No actions taken yet.)"
         
-        lines = []
-        for entry in self.action_log:
-            lines.append(entry)
+        lines = list(self.action_log)
+        if self.pending_iteration_state:
+            p = self.pending_iteration_state
+            actions_str = ", ".join(p['actions'])
+            lines.append(f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {actions_str}\n- Result: (Pending...)")
             
+        return "\n\n".join(lines)
+
+    def _get_compressed_attempt_log(self, pressure: str = "Low") -> str:
+        """Return a version of the action log suitable for the prompt (summary + recent).
+        Adjusts the number of retained recent entries based on context pressure.
+        """
+        if not self.action_log and not self.pending_iteration_state:
+            return "(No actions taken yet.)"
+        
+        # If log is small, just return full format
+        full_log = self._format_attempt_log()
+        if estimate_tokens(full_log) < 12000:
+            return full_log
+        
+        # Dynamic window for recent entries based on pressure
+        # Low: 12, Moderate: 8, High: 5, Critical: 3
+        recent_map = {"Low": 12, "Moderate": 8, "High": 5, "CRITICAL": 3}
+        recent_count = recent_map.get(pressure, 10)
+        recent_entries = self.action_log[-recent_count:]
+        
+        lines = []
+        if self.action_log_summary:
+            lines.append(f"[HISTORICAL SUMMARY]\n{self.action_log_summary}")
+        
+        lines.extend(recent_entries)
+        
         if self.pending_iteration_state:
             p = self.pending_iteration_state
             actions_str = ", ".join(p['actions'])
@@ -322,18 +388,28 @@ class Worker:
             'memories': dict(self.memories),
             'current_plan': self.current_plan,
             'action_log': list(self.action_log),
+            'action_log_summary': self.action_log_summary,
             'objective': self.current_objective or '',
             'expanded_categories': list(self.expanded_categories),
             'notified_sub_agents': list(self.notified_sub_agents),
             'instance_id': self.instance_id,
+            'open_files_list': list(self.open_files.keys()),
+            'open_files_access_order': list(self.open_files_access_order),
         }
 
     def restore_state(self, state: dict):
         """Restore worker state from a previous serialization (used after restart)."""
         self.memories = state.get('memories', {})
         self.action_log = state.get('action_log', [])
+        self.action_log_summary = state.get('action_log_summary', "")
         self.expanded_categories = set(state.get('expanded_categories', []))
         self.notified_sub_agents = set(state.get('notified_sub_agents', []))
+        self.open_files_access_order = state.get('open_files_access_order', [])
+        
+        # Restore the list of open files (placeholders will be synced to actual content by _sync_open_files)
+        open_files_list = state.get('open_files_list', [])
+        for path in open_files_list:
+            self.open_files[path] = "Restoring from state..."
         reason = state.get('reason', 'code changes')
 
         # Append a clear record that the restart happened
@@ -377,13 +453,15 @@ class Worker:
 
     def _build_primary_agent_context(self, tool_list_str: str, system_specs: str,
                                      memories_str: str, objective: str, open_files_str: str,
-                                     active_tool_directives: str) -> str:
+                                     active_tool_directives: str, attempt_log_str: str,
+                                     context_diagnostics: str = "") -> str:
         """Build the full context prompt for the Primary Agent."""
         reminders_section = f"**IMPORTANT REMINDERS**\n{self.important_reminders}\n\n" if self.important_reminders.strip() else ""
 
         tools_text = TOOLS_SECTION.format(tools=tool_list_str)
         objective_text = OBJECTIVE_SECTION.format(objective=objective)
-        attempt_log_str = self._format_attempt_log()
+
+        diag_section = f"\n**CONTEXT DIAGNOSTICS**\n{context_diagnostics}\n" if context_diagnostics else ""
 
         return f"""{self.base_directives}
 
@@ -400,7 +478,7 @@ class Worker:
 {attempt_log_str}
 
 {system_specs}
-
+{diag_section}
 **CURRENT PLAN**
 {self.current_plan}
 
@@ -442,6 +520,7 @@ class Worker:
 
         while True:
             try:
+                iter_start_time = time.time()
                 iteration += 1
                 self.llm_client.set_iteration(iteration)
 
@@ -472,10 +551,17 @@ class Worker:
                 if active_agents:
                     self.print_func(f"\033[90m[Background] Active sub-agents ({len(active_agents)}): {', '.join(active_agents)}\033[0m")
 
-                # Enforce strict 10-iteration limit on the action log
-                if len(self.action_log) > 10:
-                    self.print_func(f"{C_CYAN}Truncating action log to last 10 iterations to preserve context focus...{C_RESET}")
-                    self.action_log = self.action_log[-10:]
+                # Non-destructive action log compression to preserve context focus
+                full_log_str = self._format_attempt_log()
+                if estimate_tokens(full_log_str) > 12000:
+                    # Only re-compress if we have enough new entries to justify it (e.g., 5 new entries)
+                    # or if no summary exists yet.
+                    if not self.action_log_summary or len(self.action_log) % 5 == 0:
+                        self.print_func(f"{C_CYAN}Updating action log summary to preserve context focus...{C_RESET}")
+                        recent_count = 10
+                        older_history = self.action_log[:-recent_count] if len(self.action_log) > recent_count else self.action_log
+                        log_text = "\n\n".join(older_history)
+                        self.action_log_summary = self.llm_client.compress_action_log(log_text)
 
                 # --- SUB-AGENT NOTIFICATION CHECK ---
                 sub_agent_dir = Path(os.getcwd()) / "aeon_output" / self.instance_id / "sub_agents"
@@ -497,51 +583,118 @@ class Worker:
                                         except Exception as e:
                                             self.logger.error(f"Failed to cleanup status file {status_path}: {e}")
 
-                # Sync open files before building context
-                self._sync_open_files()
-
-                # Gather context components
-                system_specs = get_runtime_info()
+                # --- PRE-PROMPT CONTEXT ANALYSIS ---
+                # We estimate the prompt size first to determine pressure and dynamic limits
+                # This allows us to pass diagnostics and adjust log size BEFORE the LLM call.
+                
+                # Initial rough estimate of the prompt without the action log and open files
+                base_ctx_est = estimate_tokens(
+                    self.base_directives + self.docker_directives + PRIMARY_AGENT_INSTRUCTIONS + 
+                    self.current_plan + self.last_observation + objective
+                )
+                # Add estimates for other components
                 tool_list_str = self._get_tools_description()
-                memories_str = self._format_memories()
-                open_files_str = self._format_open_files()
                 active_tool_directives = self._get_active_tool_directives()
+                memories_str = self._format_memories()
+                # We use a default limit for the initial estimation
+                open_files_str = self._format_open_files(max_content_len=250000)
+                
+                est_total = (
+                    base_ctx_est + 
+                    estimate_tokens(tool_list_str) + 
+                    estimate_tokens(active_tool_directives) + 
+                    estimate_tokens(memories_str) + 
+                    estimate_tokens(open_files_str) + 
+                    12000 # Buffer for action log
+                )
+                
+                ctx_limit = self.llm_client.context_limit
+                pressure_pct = (est_total / ctx_limit) * 100
+                if pressure_pct < 50: pressure = "Low"
+                elif pressure_pct < 80: pressure = "Moderate"
+                elif pressure_pct < 95: pressure = "High"
+                else: pressure = "CRITICAL"
 
-                # Build Primary Agent prompt
+                # Determine dynamic truncation limit based on context pressure
+                if pressure == "Low": dyn_limit = 100000
+                elif pressure == "Moderate": dyn_limit = 50000
+                elif pressure == "High": dyn_limit = 20000
+                else: dyn_limit = 10000
+
+                # Re-format open files using the actual dynamic limit determined by pressure
+                open_files_str = self._format_open_files(max_content_len=dyn_limit)
+
+                # Gather final context components
+                system_specs = get_runtime_info()
+                attempt_log_str = self._get_compressed_attempt_log(pressure=pressure)
+
+                # Automatic Memory Compression: Trigger if pressure is high and memories are significant
+                if pressure in ["High", "CRITICAL"] and estimate_tokens(memories_str) > 2000:
+                    self.print_func(f"{C_CYAN}Context pressure is {pressure}. Compressing memories to save space...{C_RESET}")
+                    compressed_mems = self.llm_client.compress_memories(memories_str)
+                    if compressed_mems:
+                        self.memories = compressed_mems
+                        memories_str = self._format_memories() # Update string for the current prompt
+                        self.print_func(f"{C_GREEN}Memories compressed successfully.{C_RESET}")
+
+                # Build the prompt, including diagnostics if pressure is elevated
+                # This empowers the agent to proactively close files or summarize.
+                diagnostic_str = ""
+                if pressure != "Low":
+                    breakdown = [
+                        f"Context Pressure: {pressure} ({pressure_pct:.1f}%)",
+                        f"Estimated Context: ~{est_total} / {ctx_limit} tokens",
+                        f"Directives: ~{estimate_tokens(self.base_directives + self.docker_directives + PRIMARY_AGENT_INSTRUCTIONS)} tokens",
+                        f"Active Tool Directives: ~{estimate_tokens(active_tool_directives)} tokens",
+                        f"Tools: ~{estimate_tokens(tool_list_str)} tokens",
+                        f"Memories: ~{estimate_tokens(memories_str)} tokens",
+                        f"Attempt Log: ~{estimate_tokens(attempt_log_str)} tokens",
+                        f"Open Files Total: ~{estimate_tokens(open_files_str)} tokens",
+                    ]
+                    if self.open_files:
+                        for path, content in self.open_files.items():
+                            breakdown.append(f"  - {os.path.basename(path)}: ~{estimate_tokens(content)} tokens")
+                    diagnostic_str = "\n".join(breakdown)
+
                 prompt = self._build_primary_agent_context(
-                    tool_list_str, system_specs, memories_str, objective, open_files_str, active_tool_directives
+                    tool_list_str, system_specs, memories_str, objective, open_files_str, 
+                    active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str
                 )
 
                 if max_iterations is not None:
                     rem_iters = max_iterations - self.effective_iterations
                     prompt += f"\n\nSYSTEM REMINDER: You have {rem_iters} effective iterations remaining to complete this task. Plan accordingly."
                     if rem_iters <= 0:
-                        self.print_func(f"{C_RED}Iteration budget exhausted. Forcing termination.{C_RESET}")
+                        self.print_func(f"{C_RED}Iteration budget exhausted. Forcing final report.{C_RESET}")
                         self.last_observation = "SYSTEM ALERT: Iteration budget exhausted. You MUST use 'task_complete' to report your final status."
 
-                # Context overflow warning
+                # Final token count and growth tracking
                 prompt_tokens = estimate_tokens(prompt)
-                
-                # --- Context Diagnostic Breakdown ---
-                breakdown = [
-                    f"Directives: ~{estimate_tokens(self.base_directives + self.docker_directives + PRIMARY_AGENT_INSTRUCTIONS)} tokens",
-                    f"Active Tool Directives: ~{estimate_tokens(active_tool_directives)} tokens",
-                    f"Tools: ~{estimate_tokens(tool_list_str)} tokens",
-                    f"Memories: ~{estimate_tokens(memories_str)} tokens",
-                    f"Attempt Log: ~{estimate_tokens(self._format_attempt_log())} tokens",
-                    f"State & Plan: ~{estimate_tokens(system_specs + self.current_plan + self.last_observation)} tokens",
-                    f"Open Files Total: ~{estimate_tokens(open_files_str)} tokens",
-                ]
-                if self.open_files:
-                    for path, content in self.open_files.items():
-                        breakdown.append(f"  - {os.path.basename(path)}: ~{estimate_tokens(content)} tokens")
-                diagnostic_str = "\n".join(breakdown)
-                # ------------------------------------
+                growth = prompt_tokens - self.prev_prompt_tokens
+                growth_str = f"{growth:+} tokens" if self.prev_prompt_tokens > 0 else "N/A (first iter)"
+                self.prev_prompt_tokens = prompt_tokens
 
-                ctx_limit = self.llm_client.context_limit
                 if prompt_tokens > ctx_limit * 0.85:
                     pct = prompt_tokens / ctx_limit * 100
                     self.print_func(f"{C_RED}WARNING: Prompt is ~{prompt_tokens} tokens ({pct:.0f}% of {ctx_limit} context limit). Close files or context will be truncated!{C_RESET}")
+                    
+                    # Size-aware LRU closing suggestions: prioritize old AND large files
+                    if self.open_files_access_order:
+                        scored_files = []
+                        for idx, path in enumerate(self.open_files_access_order):
+                            size = len(self.open_files.get(path, ""))
+                            score = size / (idx + 1)
+                            scored_files.append((score, path))
+                        
+                        scored_files.sort(key=lambda x: x[0], reverse=True)
+                        top_candidates = [p for s, p in scored_files[:2]]
+                        suggestions = ", ".join([os.path.basename(p) for p in top_candidates])
+                        
+                        # Inject suggestion into diagnostics so the agent sees it
+                        if diagnostic_str:
+                            diagnostic_str += f"\nSUGGESTION: Consider closing old/large files: {suggestions}"
+                        self.print_func(f"{C_YELLOW}Suggestion: Consider closing old/large files: {suggestions}{C_RESET}")
+
                     if prompt_tokens > ctx_limit * 0.95:
                         raise RuntimeError(f"Context limit exceeded ({prompt_tokens} > {ctx_limit * 0.95} limit). Throwing error as requested.")
 
@@ -725,7 +878,9 @@ class Worker:
                             raw_result = f"Tool Execution Error: {type(e).__name__}: {e}"
 
                         result_str = str(raw_result)
-                        combined_summary_parts.append(f"Action {idx+1} ({tool_name}):\n{result_str}")
+                        # Truncate individual action output using a fraction of the dynamic limit
+                        truncated_result = self._truncate_output(result_str, max_chars=dyn_limit // 5)
+                        combined_summary_parts.append(f"Action {idx+1} ({tool_name}):\n{truncated_result}")
 
                         # Stop chain on command failure so the agent can react immediately
                         is_fail = "COMMAND FAILED" in result_str or result_str.strip().startswith("Error:")
@@ -741,7 +896,8 @@ class Worker:
                     raw_output = "No actions produced output."
                 else:
                     raw_output = "\n\n".join(combined_summary_parts)
-                    raw_output = self._truncate_output(raw_output)
+                    # Use the dynamic limit based on context pressure
+                    raw_output = self._truncate_output(raw_output, max_chars=dyn_limit)
 
                 actions_list = ", ".join(actions_taken_str) if actions_taken_str else "none"
                 self.last_observation = f"Actions: [{actions_list}]\nOutput:\n{raw_output}"
@@ -785,6 +941,9 @@ class Worker:
                     'intent': intent,
                     'actions': actions_taken_str
                 }
+
+                iter_duration = time.time() - iter_start_time
+                self.print_func(f"{C_CYAN}Iteration {iteration} completed in {iter_duration:.2f}s{C_RESET}")
 
             except Exception as e:
                 self.print_func(f"\n{C_RED}CRITICAL ERROR IN ITERATION: {e}{C_RESET}")

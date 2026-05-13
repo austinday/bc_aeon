@@ -1,12 +1,23 @@
 Category-level directive for Web Browser tools:
 
-1. TAB MANAGEMENT:
-   - Use 'browser_navigate' to open a new URL or explicitly reload a page.
-   - Use 'browser_switch_tab' to return to an existing tab while preserving its current state (e.g., form data, scroll position). 
-   - CRITICAL: Never use 'browser_navigate' to return to a tab you were previously using if you need to maintain the page state; this will trigger a reload and lose unsaved information.
-   - Always use a fresh, unique tab_id for new, unrelated searches or tasks to avoid cross-contamination.
+1. STRATEGIC APPROACH:
+- VISUAL-FIRST: Always prioritize the 'Overlay' screenshot and the 'Interactive Elements' list. Use the visual mapping provided by the VLM to identify the correct `element_id`.
+- HUMAN-LIKE BEHAVIOR: Interact with the page as a human would. Avoid rapid-fire requests. If a page is slow to load, allow time for the DOM to stabilize.
+- STATE AWARENESS: Keep track of which tab contains which information. Use `tab_id` to organize your workspace.
 
-2. INTERACTION:
-   - Always analyze the visual layout and the interactive elements list before acting.
-   - Use 'browser_interact' for clicks, typing, and scrolling.
-   - Verify the result of an interaction by examining the new page state returned.
+2. TAB MANAGEMENT:
+- Use 'browser_navigate' to open a new URL or explicitly reload a page.
+- Use 'browser_switch_tab' to return to an existing tab while preserving its current state (e.g., form data, scroll position, session state).
+- CRITICAL: Never use 'browser_navigate' to return to a tab you were previously using if you need to maintain the page state; this will trigger a reload and lose unsaved information.
+- Always use a fresh, unique `tab_id` for new, unrelated searches or tasks to avoid cross-contamination.
+- POPUP DETECTION: Monitor the `open_tabs` list in the server response. If a new tab (e.g., `popup_1`) appears after an interaction, it likely contains a popup window (like an OAuth login). Use `browser_switch_tab` to interact with it.
+
+3. INTERACTION GUIDELINES:
+- VALIDATION: When clicking critical elements, use the `expected_text` parameter in 'browser_interact' to prevent clicking the wrong element due to VLM hallucinations.
+- SCROLLING: Use 'scroll_down' or 'scroll_up' to bring elements into the viewport before attempting to interact with them.
+- TYPING: Use 'type' for input fields and 'enter' to submit forms if no submit button is visible.
+- DROPDOWNS: Use the `select` action in 'browser_interact' to choose options from `<select>` elements. Provide the label or value of the option in the `text` parameter.
+
+4. ERROR RECOVERY:
+- If an element is not found or a click fails, first scroll to see if the element moved.
+- If the page layout changes unexpectedly, re-analyze the visual layout before attempting the next action.

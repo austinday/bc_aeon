@@ -1,2 +1,10 @@
-Meticulously verify email parameters (timestamp, sender, subject, contents) before proceeding.
-Do not rely solely on the visual analysis tool to 'find' information; read the markdown/text content carefully.
+Navigate the browser to a specific URL.
+
+Parameters:
+- url: The full URL to visit (e.g., 'https://www.google.com').
+- tab_id: The unique identifier for the tab. Use a new tab_id for new tasks to avoid state contamination.
+
+Guidelines:
+1. Use this tool to start a new search or visit a specific page.
+2. If you are returning to a page you already opened, use 'browser_switch_tab' instead to preserve the page state (scroll position, form data).
+3. After navigating, always analyze the visual layout and the interactive elements list before taking the next action.

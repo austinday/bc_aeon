@@ -34,14 +34,14 @@ class RunCommandTool(BaseTool):
                 wrapped_command,
                 shell=True,
                 executable="/bin/bash",
+                stdin=subprocess.DEVNULL,  # Instantly crash interactive prompts
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
                 errors='replace',
                 bufsize=1
-            )
-            
+            )            
             while True:
                 if effective_timeout and (time.time() - start_time > effective_timeout):
                     process.kill()

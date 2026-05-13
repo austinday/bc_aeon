@@ -1,4 +1,7 @@
-Removes a key from your persistent memory. Use this to clean up stale or incorrect information.
+Removes a specific key from your persistent memory. Use this to actively prune stale information, outdated plans, or temporary notes that are no longer relevant to prevent context clutter.
+
 Schema:
-  key (str, required): The name of the memory to forget.
-Example: {"tool_name": "forget", "parameters": {"key": "db_password"}}
+key (str, required): The name of the memory to forget.
+category (str, optional): The category the memory belongs to. Providing the category ensures the correct item is removed if keys are duplicated across categories.
+
+Example: {"tool_name": "forget", "parameters": {"key": "temp_debug_path", "category": "general"}}

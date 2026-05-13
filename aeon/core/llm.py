@@ -19,6 +19,7 @@ from .prompts import (
     COMPRESS_ACTION_LOG_PROMPT,
     ANALYZE_INTERRUPTION_PROMPT,
     SUMMARIZE_TEXT_PROMPT,
+    COMPRESS_MEMORIES_PROMPT,
 )
 
 # ANSI Colors for debug printing
@@ -133,6 +134,7 @@ class LLMClient:
             raise ValueError("weak_config is required. Select a model at startup or provide --weak flag.")
 
         # Primary model (strong) - used for the main agent loop
+        self.primary_provider = strong_config['provider']
         self.primary_client = self._create_client(strong_config)
         self.primary_model = strong_config['model']
 
@@ -471,6 +473,38 @@ class LLMClient:
             self.logger.warning(f"JSON repair failed: {e}")
             return None
 
+    def _handle_connection_error(self, error):
+        """Handle API connection errors with exponential backoff and GPU recovery check."""
+        self.logger.warning(f"Connection error detected: {error}. Entering recovery mode (max 10m)...")
+        
+        start_time = time.time()
+        delay = 1
+        max_total_wait = 600 
+        max_delay = 60
+        
+        while (time.time() - start_time) < max_total_wait:
+            self.logger.info(f"Waiting {delay}s before checking for GPU/Server recovery...")
+            time.sleep(delay)
+            
+            try:
+                if isinstance(self.primary_client, VertexAIClient):
+                    # Vertex AI check: try a minimal call
+                    self.primary_client.Chat(self.primary_client).Completions(self.primary_client).create(
+                        model=self.primary_model, messages=[{"role": "user", "content": "hi"}], temperature=0
+                    )
+                else:
+                    # OpenAI-compatible client check: list models
+                    self.primary_client.models.list()
+                
+                self.logger.info("GPU/Server recovery detected! Resuming agent...")
+                return True
+            except Exception as e:
+                self.logger.warning(f"Recovery check failed: {e}")
+                delay = min(delay * 2, max_delay)
+        
+        self.logger.error("Recovery timed out after 10 minutes.")
+        return False
+
     def get_primary_agent_response(self, prompt: str, max_retries: int = 3, diagnostic_str: Optional[str] = None) -> str:
         """Get combined reasoning and action from the Primary Agent (Strong Model)."""
         current_prompt = prompt
@@ -611,6 +645,10 @@ class LLMClient:
                     if attempt < max_retries - 1:
                         current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output a valid JSON object containing 'thought' and 'actions'. \nCRITICAL: JSON values must be static strings. Do not put Python operations (like '+' or '*') or complex escape characters inside the JSON. For multi-line or complex strings, use content blocks (--- BEGIN BLOCK_N --- ... --- END BLOCK_N ---)."
 
+            except (openai.APIConnectionError, openai.InternalServerError, requests.exceptions.ConnectionError) as e:
+                if self._handle_connection_error(e):
+                    continue # Recovery successful, retry the request
+                raise
             except Exception as e:
                 self._log_to_debug("PRIMARY_AGENT_ERR", self.primary_model, current_prompt, str(e))
                 self.logger.error(f"Primary Agent LLM call failed: {e}")
@@ -653,6 +691,24 @@ class LLMClient:
         except Exception as e:
             self.logger.warning(f"Action log compression failed: {e}")
             return log_text
+
+    def compress_memories(self, memories_text: str) -> Dict:
+        """Compresses the persistent memories using the utility model and returns a dictionary."""
+        prompt = COMPRESS_MEMORIES_PROMPT.format(memories=memories_text)
+        try:
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            content = resp.choices[0].message.content
+            self._log_to_debug("COMPRESS_MEMORIES", self.utility_model, prompt, content)
+            
+            cleaned = self._clean_json_response(content)
+            return json.loads(cleaned)
+        except Exception as e:
+            self.logger.warning(f"Memory compression failed: {e}")
+            return {}
 
     def analyze_interruption(self, obj, inp) -> Dict:
         """Analyze user interruption to classify intent."""

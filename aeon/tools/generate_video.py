@@ -63,6 +63,37 @@ class GenerateVideoTool(BaseTool):
                 
             return len(cleaned_pids)
 
+    def _extract_last_frame(self, video_path: str) -> str:
+        """Extracts the last frame of a video and saves it as a JPG."""
+        import subprocess
+        import os
+        
+        cwd = os.getcwd()
+        abs_video_path = os.path.abspath(video_path)
+        last_frame_path = os.path.abspath(os.path.join(os.path.dirname(abs_video_path), "last_frame_temp.jpg"))
+        
+        # Use ffmpeg to get the last frame
+        # -sseof -1 seeks to 1 second before the end
+        # -update 1 ensures only one frame is saved
+        cmd = [
+            "docker", "run", "--rm", 
+            "-v", f"{cwd}:/app", 
+            "-w", "/app",
+            "mwader/static-ffmpeg", 
+            "-i", f"/app/{os.path.relpath(abs_video_path, cwd)}", 
+            "-sseof", "-0.1", 
+            "-update", "1", 
+            "-q:v", "2", 
+            f"/app/{os.path.relpath(last_frame_path, cwd)}"
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            return last_frame_path
+        except subprocess.CalledProcessError as e:
+            print(f"Error extracting last frame: {e.stderr.decode()}")
+            return None
+
     def execute(self, mode: str, prompt: str, output_path: str, input_path_1: str = None, input_path_2: str = None, aspect_ratio: str = '16:9', width: int = None, height: int = None, frames: int = 33) -> str:
         if not prompt:
             return "Error: 'prompt' parameter is required."
@@ -143,6 +174,14 @@ class GenerateVideoTool(BaseTool):
                     "class_type": "UnetLoaderGGUF",
                     "inputs": {"unet_name": "ltx-2.3-22b-dev-Q4_1.gguf"}
                 },
+                "1_1": {
+                    "class_type": "ModelSamplingLTXV",
+                    "inputs": {
+                        "model": ["1", 0],
+                        "max_shift": 2.05,
+                        "base_shift": 0.95
+                    }
+                },
                 "2": {
                     "class_type": "VAELoader",
                     "inputs": {"vae_name": "vae/ltx-2.3-22b-dev_video_vae.safetensors"}
@@ -165,7 +204,7 @@ class GenerateVideoTool(BaseTool):
                 "5": {
                     "class_type": "CLIPTextEncode",
                     "inputs": {
-                        "text": "worst quality, inconsistent, blurry, deformed, mutated",
+                        "text": "worst quality, inconsistent, blurry, deformed, mutated, inconsistent motion, jittery, distorted, static, slideshow",
                         "clip": ["3", 0]
                     }
                 },
@@ -173,12 +212,12 @@ class GenerateVideoTool(BaseTool):
                     "class_type": "KSampler",
                     "inputs": {
                         "seed": random.randint(1, 0xffffffffffffffff),
-                        "steps": 25,
-                        "cfg": 3.0,
+                        "steps": 30,
+                        "cfg": 5.0,
                         "sampler_name": "euler",
-                        "scheduler": "normal",
+                        "scheduler": "simple",
                         "denoise": 1.0,
-                        "model": ["1", 0],
+                        "model": ["1_1", 0],
                         "positive": ["4", 0],
                         "negative": ["5", 0],
                         "latent_image": ["6", 0]
@@ -205,8 +244,8 @@ class GenerateVideoTool(BaseTool):
             # Inject latents based on mode
             if mode == 'text_to_video':
                 workflow["6"] = {
-                    "class_type": "EmptyLatentImage",
-                    "inputs": {"batch_size": frames, "width": width, "height": height}
+                    "class_type": "EmptyLTXVLatentVideo",
+                    "inputs": {"width": width, "height": height, "length": frames, "batch_size": 1}
                 }
             
             elif mode == 'image_to_video':
@@ -223,8 +262,8 @@ class GenerateVideoTool(BaseTool):
                     "inputs": {
                         "samples_from": ["11", 0],
                         "samples_to": {
-                            "class_type": "EmptyLatentImage", 
-                            "inputs": {"batch_size": frames, "width": width, "height": height}
+                            "class_type": "EmptyLTXVLatentVideo", 
+                            "inputs": {"width": width, "height": height, "length": frames, "batch_size": 1}
                         },
                         "x": 0, "y": 0, "feather": 0
                     }
@@ -240,7 +279,7 @@ class GenerateVideoTool(BaseTool):
                     "class_type": "VAEEncode",
                     "inputs": {"pixels": ["10", 0], "vae": ["2", 0]}
                 }
-                workflow["6"] = {"class_type": "LatentComposite", "inputs": {"samples_from": ["11", 0], "samples_to": {"class_type": "EmptyLatentImage", "inputs": {"batch_size": frames * 2, "width": width, "height": height}}, "x": 0, "y": 0, "feather": 0}}
+                workflow["6"] = {"class_type": "LatentComposite", "inputs": {"samples_from": ["11", 0], "samples_to": {"class_type": "EmptyLTXVLatentVideo", "inputs": {"width": width, "height": height, "length": frames * 2, "batch_size": 1}}, "x": 0, "y": 0, "feather": 0}}
                 workflow["7"]["inputs"]["denoise"] = 0.85
                 
             elif mode == 'interpolate':

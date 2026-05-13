@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Browser Tool Validation Page</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .test-section { margin-bottom: 30px; padding: 15px; border: 1px solid #ccc; }
+    </style>
+</head>
+<body>
+    <h1>Browser Tool Validation Page</h1>
+
+    <div class="test-section">
+        <h2>Dropdown Test</h2>
+        <label for="fruit-select">Choose a fruit:</label>
+        <select id="fruit-select" name="fruits">
+            <option value="">--Please choose an option--</option>
+            <option value="apple">Apple</option>
+            <option value="banana">Banana</option>
+            <option value="cherry">Cherry</option>
+        </select>
+        <p id="selection-result">No fruit selected</p>
+    </div>
+
+    <div class="test-section">
+        <h2>Popup Test</h2>
+        <button id="popup-btn" onclick="openPopup()">Open Popup Window</button>
+        <p>Click the button to open a new window. The browser server should detect this as a new tab.</p>
+    </div>
+
+    <script>
+        document.getElementById('fruit-select').addEventListener('change', function() {
+            document.getElementById('selection-result').innerText = 'Selected: ' + this.value;
+        });
+
+        function openPopup() {
+            window.open('about:blank', 'popupWindow', 'width=600,height=400');
+            // Since about:blank might be tricky, let's use a simple data URI or a known page
+            // But for tracking purposes, any window.open should trigger the 'page' event.
+        }
+    </script>
+</body>
+</html>

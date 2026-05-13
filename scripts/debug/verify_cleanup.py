@@ -4,7 +4,7 @@ import fcntl
 from aeon.main import register_models_for_agent, unregister_models_for_agent, MODEL_REGISTRY_PATH
 
 def main():
-    model_name = "Gemma-4-31B-Speculative-Q8_0"
+    model_name = "Gemma-4-31B-MTP-Q8_0"
     
     print(f"--- Initial Registry State ---")
     if os.path.exists(MODEL_REGISTRY_PATH):

@@ -1,5 +1,10 @@
-Saves a key-value pair to your persistent memory. Use this to remember important details like paths, credentials, and decisions across your entire session.
+Saves a key-value pair to your persistent memory. Use this to remember important details, intermediate instructions, summaries of key findings, and long-term plans across your session. 
+
+Organize memories using categories (e.g., 'plan', 'credentials', 'summary', 'context') to keep your memory structured and easy to prune.
+
 Schema:
-  key (str, required): The name of the memory.
-  value (str, required): The information to save (can be a descriptive sentence).
-Example: {"tool_name": "memorize", "parameters": {"key": "db_password", "value": "supersecret123"}}
+key (str, required): A unique identifier for the memory.
+value (str, required): The information to save.
+category (str, optional): The category for this memory. Defaults to 'general'.
+
+Example: {"tool_name": "memorize", "parameters": {"key": "current_step", "value": "Implementing prompt updates", "category": "plan"}}

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Aeon Browser Validation</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; line-height: 1.6; }
+        .section { margin-bottom: 30px; padding: 15px; border: 1px solid #ccc; border-radius: 8px; }
+        h2 { margin-top: 0; }
+        #status { font-weight: bold; color: blue; }
+    </style>
+</head>
+<body>
+    <h1>Aeon Browser Validation Page</h1>
+    
+    <div class="section">
+        <h2>1. Dropdown Test</h2>
+        <p>Select an option from the dropdown:</p>
+        <select id="test-dropdown" onchange="document.getElementById('dropdown-status').innerText = 'Selected: ' + this.value">
+            <option value="option1">Option 1 (Apple)</option>
+            <option value="option2">Option 2 (Banana)</option>
+            <option value="option3">Option 3 (Cherry)</option>
+        </select>
+        <p id="dropdown-status">Selected: None</p>
+    </div>
+
+    <div class="section">
+        <h2>2. Popup Test</h2>
+        <p>Click the button to open a popup window:</p>
+        <button id="popup-button" onclick="openPopup()">Open Popup</button>
+        <p>Popup status: <span id="popup-status">Not opened</span></p>
+    </div>
+
+    <script>
+        function openPopup() {
+            const popup = window.open('', 'AeonPopup', 'width=600,height=400');
+            popup.document.write('<html><body><h1>Popup Window</h1><p>This is a popup window!</p><button onclick="window.close()">Close Me</button></body></html>');
+            document.getElementById('popup-status').innerText = 'Opened!';
+        }
+    </script>
+</body>
+</html>

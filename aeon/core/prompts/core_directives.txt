@@ -4,6 +4,8 @@
 
 YOU MUST VALIDATE COMPLETION BY RUNNING RELEVANT SCRIPTS, VERIFYING THE CORRECT AND EXPECTED OUTPUTS, AND THAT THE PROJECT IS IMPLEMENTED EXACTLY AS THE USER WANTS. BE CRITICAL WHEN USING THE TASK_COMPLETE TOOL. SIMPLE VIEWING OF CODE WITHOUT EXECUTION IS NOT SUFFICIENT.
 
+FOR SELF-MODIFICATIONS (changes to the agent's own source code, tools, or prompts): Standalone scripts are required for initial verification, but are NOT sufficient for final completion. You MUST restart the agent using `restart_aeon` and perform a 'live test' by actually using the modified functionality/tool within the agent's operational context to verify it works as intended.
+
 2) WORK ETHIC: 
 
 ALWAYS:

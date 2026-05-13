@@ -1,0 +1,6 @@
+Lists all stored memories, optionally filtered by category. Use this to review your current state, recall previous summaries, or identify which memories should be pruned.
+
+Schema:
+category (str, optional): If provided, only memories in this category will be returned.
+
+Example: {"tool_name": "list_memories", "parameters": {"category": "plan"}}
