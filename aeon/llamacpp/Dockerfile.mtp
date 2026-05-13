@@ -1,0 +1,96 @@
+# =============================================================================
+# Gemma 4 MTP Speculative Decoding Server
+# Multi-Stage Dockerfile for Blackwell (sm_120) GPUs
+# =============================================================================
+# Uses: CUDA 12.8.1 (required for Blackwell sm_120)
+# Fork: AtomicBot-ai/atomic-llama-cpp-turboquant (Gemma 4 MTP support)
+# Architecture: NVIDIA Blackwell RTX 6000 PRO (sm_120f)
+#
+# Build:   docker build -t aeon_gemma4_mtp:latest -f aeon/llamacpp/Dockerfile.mtp aeon/llamacpp/
+# Run:     docker run --gpus all -p 8080:8080 -v /path/to/models:/models:ro --ipc=host aeon_gemma4_mtp:latest
+# =============================================================================
+
+# =============================================================================
+# STAGE 1: Builder - Compile llama.cpp with CUDA support
+# =============================================================================
+ARG CUDA_VERSION=12.8.1
+ARG UBUNTU_VERSION=24.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+
+ARG LLAMA_REPO=https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git
+ARG LLAMA_BRANCH=feature/turboquant-kv-cache
+ARG CUDA_ARCHITECTURES=120
+ARG CMAKE_BUILD_TYPE=Release
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    git \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Make CUDA stubs available for linking (real driver is injected at runtime via --gpus)
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
+    && echo '/usr/local/cuda/lib64/stubs' > /etc/ld.so.conf.d/cuda-stubs.conf \
+    && ldconfig
+
+WORKDIR /src
+
+# Clone fork with Gemma 4 MTP support (with submodules)
+RUN git clone --recursive --depth=1 -b "${LLAMA_BRANCH}" "${LLAMA_REPO}" llama.cpp
+WORKDIR /src/llama.cpp
+
+# Build llama.cpp with CUDA for Blackwell (sm_120f)
+RUN cmake -S . -B build \
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+    -DGGML_NATIVE=OFF \
+    -DGGML_CUDA_F16=ON \
+    -DGGML_CUDA_FA_ALL_QUANTS=ON \
+    -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+    -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler"
+
+# Build with all available CPU cores
+RUN cmake --build build --config "${CMAKE_BUILD_TYPE}" -j$(nproc) --target llama-server
+
+# =============================================================================
+# STAGE 2: Runtime - Minimal runtime image with compiled binaries
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+
+LABEL maintainer="infra-team" \
+      description="Gemma 4 MTP speculative decoding server" \
+      version="1.0.0"
+
+# Runtime dependencies: curl for health checks, ca-certificates for HTTPS, libgomp1 for OpenMP
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Create non-root user for security
+RUN useradd -m -s /bin/bash -d /app llama
+
+# Create mount point for GGUF models
+RUN mkdir -p /models && chown llama:llama /models
+
+# Copy compiled binaries from builder stage
+COPY --from=builder /src/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=builder /src/llama.cpp/build/bin/ /usr/local/lib/llama/
+ENV LD_LIBRARY_PATH=/usr/local/lib/llama:${LD_LIBRARY_PATH}
+
+# Verify key binary exists
+RUN llama-server --version 2>/dev/null || true
+
+# Runtime configuration
+USER llama
+WORKDIR /app
+EXPOSE 8080
+
+# =============================================================================
+# ENTRYPOINT: Gemma 4 MTP speculative decoding with llama-server
+# =============================================================================
+ENTRYPOINT ["llama-server"]
+# CMD is left blank; arguments are provided dynamically via start_gemma4_mtp.sh
