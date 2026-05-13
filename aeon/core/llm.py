@@ -52,7 +52,7 @@ class VertexAIClient:
             def __init__(self, parent):
                 self.parent = parent
 
-            def create(self, model, messages, temperature=0.7, response_format=None):
+            def create(self, model, messages, temperature=0.7, response_format=None, stream=False):
                 contents = []
                 system_prompt = None
                 for msg in messages:
@@ -103,6 +103,16 @@ class VertexAIClient:
                         self.choices = [MockChoice(text)]
                         self.usage = type('MockUsage', (), {'completion_tokens': len(text)//4})()
                         
+                # Vertex Mock doesn't support actual streaming right now
+                if stream:
+                    class MockChunkChoice:
+                        def __init__(self, text):
+                            self.delta = type('MockDelta', (), {'content': text})()
+                    class MockChunk:
+                        def __init__(self, text):
+                            self.choices = [MockChunkChoice(text)]
+                    return [MockChunk(text)]
+                    
                 return MockResponse(text)
 
 class LLMClient:
@@ -364,7 +374,7 @@ class LLMClient:
         3. Neither                                          ->  leave unchanged
         """
         if missing_blocks is None:
-            missing_blocks = []
+            missing_blocks =[]
 
         if isinstance(obj, dict):
             return {k: self._substitute_blocks(v, blocks, missing_blocks) for k, v in obj.items()}
@@ -469,20 +479,53 @@ class LLMClient:
         for attempt in range(max_retries):
             try:
                 start_time = time.time()
-                resp = self.primary_client.chat.completions.create(
-                    model=self.primary_model,
-                    messages=[{"role": "user", "content": current_prompt}],
-                    temperature=0.2,
-                )
-                elapsed = time.time() - start_time
-                raw = resp.choices[0].message.content
-
-                try:
-                    comp_tokens = resp.usage.completion_tokens
-                except AttributeError:
+                
+                if not isinstance(self.primary_client, VertexAIClient):
+                    # Stream the response to accurately measure TTFT vs pure generation time
+                    resp_stream = self.primary_client.chat.completions.create(
+                        model=self.primary_model,
+                        messages=[{"role": "user", "content": current_prompt}],
+                        temperature=0.2,
+                        stream=True
+                    )
+                    
+                    first_token_time = None
+                    raw_chunks =[]
+                    
+                    for chunk in resp_stream:
+                        if first_token_time is None:
+                            first_token_time = time.time()
+                        
+                        if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                            delta = chunk.choices[0].delta
+                            if hasattr(delta, 'content') and delta.content:
+                                raw_chunks.append(delta.content)
+                                
+                    end_time = time.time()
+                    raw = "".join(raw_chunks)
+                    ttft = (first_token_time - start_time) if first_token_time else 0
+                    gen_time = (end_time - first_token_time) if first_token_time else 0
                     comp_tokens = estimate_tokens(raw)
-                tps = comp_tokens / elapsed if elapsed > 0 else 0
-                print(f"\033[96m[Performance] {self.primary_model} speed: {tps:.2f} t/s ({comp_tokens} tokens in {elapsed:.2f}s)\033[0m")
+                    
+                    tps = comp_tokens / gen_time if gen_time > 0 else 0
+                    print(f"\033[96m[Performance] {self.primary_model} speed: {tps:.2f} t/s (TTFT: {ttft:.2f}s | {comp_tokens} tokens in {gen_time:.2f}s)\033[0m")
+                    
+                else:
+                    # Fallback for Vertex AI (mock doesn't support streaming)
+                    resp = self.primary_client.chat.completions.create(
+                        model=self.primary_model,
+                        messages=[{"role": "user", "content": current_prompt}],
+                        temperature=0.2,
+                    )
+                    elapsed = time.time() - start_time
+                    raw = resp.choices[0].message.content
+
+                    try:
+                        comp_tokens = resp.usage.completion_tokens
+                    except AttributeError:
+                        comp_tokens = estimate_tokens(raw)
+                    tps = comp_tokens / elapsed if elapsed > 0 else 0
+                    print(f"\033[96m[Performance] {self.primary_model} speed: {tps:.2f} t/s (TTFT: N/A | {comp_tokens} tokens in {elapsed:.2f}s)\033[0m")
 
                 if self.debug_path:
                     print(f"{C_YELLOW}[LLM RAW - PRIMARY AGENT]\n{raw}{C_RESET}")
@@ -507,7 +550,7 @@ class LLMClient:
                         raise ValueError("JSON missing required 'actions' field.")
 
                     # Step 4: Substitute content blocks into parsed JSON
-                    missing_blocks = []
+                    missing_blocks =[]
                     parsed = self._substitute_blocks(parsed, blocks, missing_blocks)
                     
                     # --- TARGETED BLOCK RECOVERY ---
