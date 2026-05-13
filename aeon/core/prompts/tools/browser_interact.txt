@@ -8,13 +8,18 @@ SAFETY LOCK: To prevent clicking the wrong element due to visual hallucinations,
 
 Parameters:
 - action: The action to perform. Supported values:
-    - 'click': Clicks the element.
+    - 'click': Clicks the element. Use this for buttons, links, and custom dropdown triggers.
     - 'type': Types the provided 'text' into the element.
     - 'hover': Hovers the mouse over the element.
     - 'enter': Presses the Enter key on the element.
-    - 'select': Selects an option from a dropdown. Use the 'text' parameter to specify the label of the option to select. If 'text' is omitted, the first option will be selected.
+    - 'select': Specifically for native HTML `<select>` elements. Use the 'text' parameter to specify the label or value of the option to select. If 'text' is omitted, the first option will be selected.
     - 'scroll_down': Scrolls the page down.
     - 'scroll_up': Scrolls the page up.
 - element_id: (Required for most actions) The integer ID of the target element.
-- text: (Required for 'type' and 'select') The text to enter into the field or the label of the option to select.
+- text: (Required for 'type' and 'select') The text to enter into the field or the label/value of the option to select.
 - expected_text: (Highly Recommended) The text you expect the element to contain. Used as a safety check before clicking or typing.
+
+STRATEGY FOR DROPDOWNS:
+1. Check the element tag in the interactive elements list.
+2. If the tag is 'select', use the 'select' action with the desired option text.
+3. If the element is a 'div', 'span', or 'button' that looks like a dropdown, use 'click' to open it, then identify the 'element_id' of the desired option in the new overlay and 'click' that option.

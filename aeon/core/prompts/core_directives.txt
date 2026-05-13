@@ -108,3 +108,9 @@ Follow this procedure:
 15) SAFE SEARCHING: 
 - NEVER run unbounded recursive searches (`grep -r`, `find`) across raw data directories. Attempting to read massive data/binary files will freeze the system.
 - ALWAYS restrict searches to specific script or text file extensions (e.g., `find ./scripts -name "*.py" -exec grep ...`), or strictly use the `-I` flag (`grep -rnI`) to ignore binaries.
+
+16) TARGETED DESTRUCTION:
+- NEVER use "scorched earth" logic for process or file management.
+- NEVER use command substitutions that resolve to a list of all resources (e.g., `kill -9 -1`, `rm -rf *`, or piping `lsof` directly to `kill` without specific name filtering).
+- VERIFY BEFORE TERMINATION: You must know exactly what you are killing. Use specific PIDs or resource names identified in previous steps.
+- RATIONALE: You are operating in a shared ecosystem. Collateral damage is unacceptable.

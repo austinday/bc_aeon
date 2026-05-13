@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Aeon Browser Feature Test</title>
+    <style>
+        body { font-family: sans-serif; padding: 50px; line-height: 1.6; }
+        .test-section { margin-bottom: 40px; padding: 20px; border: 1px solid #ccc; border-radius: 8px; }
+        h2 { color: #333; }
+    </style>
+</head>
+<body>
+    <h1>Aeon Browser Feature Test Page</h1>
+
+    <div class="test-section">
+        <h2>1. Dropdown Test</h2>
+        <p>Select an option:</p>
+        <select id="test-dropdown">
+            <option value="val1">Apple</option>
+            <option value="val2">Banana</option>
+            <option value="val3">Cherry</option>
+        </select>
+        <p>Current Selection: <span id="dropdown-status">Apple</span></p>
+        <script>
+            document.getElementById('test-dropdown').addEventListener('change', function() {
+                document.getElementById('dropdown-status').innerText = this.options[this.selectedIndex].text;
+            });
+        </script>
+    </div>
+
+    <div class="test-section">
+        <h2>2. Popup Test</h2>
+        <p>Click to open popup:</p>
+        <button id="popup-btn">OPEN_POPUP_NOW</button>
+        <script>
+            document.getElementById('popup-btn').addEventListener('click', function() {
+                window.open('about:blank', 'aeonTestPopup', 'width=600,height=400');
+            });
+        </script>
+    </div>
+</body>
+</html>

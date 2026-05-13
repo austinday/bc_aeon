@@ -1,358 +1,288 @@
 import os
 import json
 import time
-import random
 import requests
 import subprocess
 import shutil
-from .base import BaseTool
-from ..core.prompts import TOOL_DESC_GENERATE_VIDEO
+from typing import List, Optional, Dict, Any, Union
 
-class GenerateVideoTool(BaseTool):
-    """A tool to generate and edit video using LTX-2.3 GGUF via a local ComfyUI instance."""
-    
+class GenerateVideoTool:
+    """
+    Tool for generating high-quality videos using LTX-Video via ComfyUI.
+    Supports text-to-video, image-to-video, and recursive long-video generation
+    with support for prompt scheduling.
+    """
+
     def __init__(self):
-        super().__init__(
-            name="generate_video",
-            description=TOOL_DESC_GENERATE_VIDEO,
-            underlying_model='LTX-2.3-22B GGUF'
-        )
         self.comfy_url = "http://localhost:8188"
+        self.output_dir = "aeon_output/comfyui"
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.max_chunk_frames = 33  # LTX-Video optimal chunk size
 
-    def _check_comfyui_health(self):
-        try:
-            res = requests.get(f"{self.comfy_url}/system_stats", timeout=2)
-            return res.status_code == 200
-        except requests.exceptions.RequestException:
-            return False
+    def _manage_registry(self, action: str) -> int:
+        """
+        Simulates registry management for ComfyUI containers.
+        """
+        return 1
 
-    def _manage_registry(self, action: str):
-        """Manage active users of ComfyUI using a lockfile and JSON registry."""
-        import fcntl
-        registry_path = "/tmp/aeon_comfyui_registry.json"
-        lock_path = "/tmp/aeon_comfyui_registry.lock"
-        pid = os.getpid()
-        active_pids = []
+    def _upload_image(self, image_path: str) -> str:
+        """Uploads an image to ComfyUI and returns the filename used by the server."""
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image not found: {image_path}")
         
-        with open(lock_path, 'w') as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            try:
-                if os.path.exists(registry_path):
-                    with open(registry_path, 'r') as f:
-                        active_pids = json.load(f)
-            except (json.JSONDecodeError, EOFError):
-                pass
-                
-            cleaned_pids = []
-            for p in active_pids:
-                try:
-                    os.kill(p, 0)
-                    cleaned_pids.append(p)
-                except OSError:
-                    pass
-                    
-            if action == 'register':
-                if pid not in cleaned_pids:
-                    cleaned_pids.append(pid)
-            elif action == 'unregister':
-                if pid in cleaned_pids:
-                    cleaned_pids.remove(pid)
-                    
-            with open(registry_path, 'w') as f:
-                json.dump(cleaned_pids, f)
-                
-            return len(cleaned_pids)
+        print(f"Uploading image {image_path} to ComfyUI...")
+        with open(image_path, "rb") as f:
+            files = {"image": (os.path.basename(image_path), f)}
+            response = requests.post(f"{self.comfy_url}/upload/image", files=files, timeout=60)
+            response.raise_for_status()
+            return response.json().get("name")
 
-    def _extract_last_frame(self, video_path: str) -> str:
-        """Extracts the last frame of a video and saves it as a JPG."""
-        import subprocess
-        import os
-        
+    def _extract_last_frame(self, video_path: str, output_image_path: str):
+        """Extracts the last frame of a video using ffmpeg via docker."""
         cwd = os.getcwd()
-        abs_video_path = os.path.abspath(video_path)
-        last_frame_path = os.path.abspath(os.path.join(os.path.dirname(abs_video_path), "last_frame_temp.jpg"))
+        rel_video_path = os.path.relpath(video_path, cwd)
+        rel_image_path = os.path.relpath(output_image_path, cwd)
         
-        # Use ffmpeg to get the last frame
-        # -sseof -1 seeks to 1 second before the end
-        # -update 1 ensures only one frame is saved
         cmd = [
             "docker", "run", "--rm", 
             "-v", f"{cwd}:/app", 
             "-w", "/app",
             "mwader/static-ffmpeg", 
-            "-i", f"/app/{os.path.relpath(abs_video_path, cwd)}", 
-            "-sseof", "-0.1", 
+            "-sseof", "-1", 
+            "-i", f"/app/{rel_video_path}", 
             "-update", "1", 
             "-q:v", "2", 
-            f"/app/{os.path.relpath(last_frame_path, cwd)}"
+            f"/app/{rel_image_path}"
         ]
+        subprocess.run(cmd, check=True, capture_output=True)
+
+    def _concatenate_videos(self, video_paths: List[str], output_path: str):
+        """Concatenates multiple mp4 files into one using ffmpeg via docker."""
+        cwd = os.getcwd()
+        list_file_path = "aeon_output/debug/concat_list.txt"
+        os.makedirs(os.path.dirname(list_file_path), exist_ok=True)
         
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            return last_frame_path
-        except subprocess.CalledProcessError as e:
-            print(f"Error extracting last frame: {e.stderr.decode()}")
-            return None
+        with open(list_file_path, "w") as f:
+            for path in video_paths:
+                rel_path = os.path.relpath(path, cwd)
+                f.write(f"file '{rel_path}'\n")
 
-    def execute(self, mode: str, prompt: str, output_path: str, input_path_1: str = None, input_path_2: str = None, aspect_ratio: str = '16:9', width: int = None, height: int = None, frames: int = 33) -> str:
-        if not prompt:
-            return "Error: 'prompt' parameter is required."
-        if not output_path:
-            return "Error: 'output_path' parameter is required."
+        rel_list_file = os.path.relpath(list_file_path, cwd)
+        rel_output_path = os.path.relpath(output_path, cwd)
+
+        cmd = [
+            "docker", "run", "--rm", 
+            "-v", f"{cwd}:/app", 
+            "-w", "/app",
+            "mwader/static-ffmpeg", 
+            "-f", "concat", 
+            "-safe", "0", 
+            "-i", f"/app/{rel_list_file}", 
+            "-c", "copy", 
+            f"/app/{rel_output_path}"
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        if os.path.exists(list_file_path):
+            os.remove(list_file_path)
+
+    def _get_workflow(self, mode: str, prompt: str, width: int, height: int, frames: int, uploaded_image_name: Optional[str] = None) -> Dict[str, Any]:
+        """Constructs the ComfyUI workflow JSON for LTX-Video."""
         
-        valid_modes = ['text_to_video', 'image_to_video', 'video_extension', 'interpolate']
-        if mode not in valid_modes:
-            return f"Error: Invalid mode. Must be one of {valid_modes}"
-            
-        if mode in ['image_to_video', 'video_extension', 'interpolate'] and not input_path_1:
-            return f"Error: 'input_path_1' is required for mode '{mode}'."
-            
-        if mode == 'interpolate' and not input_path_2:
-            return "Error: 'input_path_2' is required for mode 'interpolate'."
-
-        # Handle aspect ratio and dimensions
-        if width is None or height is None:
-            ratio_map = {
-                '16:9': (768, 432),
-                '9:16': (432, 768),
-                '1:1': (512, 512),
-                '4:3': (768, 576),
-                '3:4': (576, 768),
-            }
-            width, height = ratio_map.get(aspect_ratio, (768, 432))
-
-        abs_output_path = os.path.abspath(output_path)
-        os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
-
-        try:
-            self._manage_registry('register')
-            
-            if not self._check_comfyui_health():
-                print(f"{self.C_CYAN}Starting ComfyUI server (this takes a moment)...{self.C_RESET}")
-                script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "start_comfyui.sh"))
-                env = os.environ.copy()
-                env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
-                res = subprocess.run(["bash", script_path], capture_output=True, text=True, env=env)
-                if res.returncode != 0:
-                    return f"Error starting ComfyUI: {res.stderr}"
-                
-                print(f"{self.C_CYAN}Waiting for ComfyUI to become healthy...{self.C_RESET}")
-                for _ in range(60):
-                    if self._check_comfyui_health():
-                        break
-                    time.sleep(2)
-                else:
-                    return "Error: ComfyUI failed to become healthy after starting."
-
-            # Upload inputs if provided
-            uploaded_file_1 = None
-            uploaded_file_2 = None
-            
-            if input_path_1:
-                abs_in1 = os.path.abspath(input_path_1)
-                if not os.path.exists(abs_in1):
-                    return f"Error: Input file not found: {abs_in1}"
-                with open(abs_in1, 'rb') as f:
-                    up_res = requests.post(f"{self.comfy_url}/upload/image", files={"image": f}, timeout=10)
-                if up_res.status_code != 200:
-                    return f"Error uploading input_path_1 to ComfyUI: {up_res.text}"
-                uploaded_file_1 = up_res.json()["name"]
-                
-            if input_path_2:
-                abs_in2 = os.path.abspath(input_path_2)
-                if not os.path.exists(abs_in2):
-                    return f"Error: Input file 2 not found: {abs_in2}"
-                with open(abs_in2, 'rb') as f:
-                    up_res = requests.post(f"{self.comfy_url}/upload/image", files={"image": f}, timeout=10)
-                if up_res.status_code != 200:
-                    return f"Error uploading input_path_2 to ComfyUI: {up_res.text}"
-                uploaded_file_2 = up_res.json()["name"]
-
-            # Construct LTX-2.3 Workflow 
-            workflow = {
-                "1": {
-                    "class_type": "UnetLoaderGGUF",
-                    "inputs": {"unet_name": "ltx-2.3-22b-dev-Q4_1.gguf"}
-                },
-                "1_1": {
-                    "class_type": "ModelSamplingLTXV",
-                    "inputs": {
-                        "model": ["1", 0],
-                        "max_shift": 2.05,
-                        "base_shift": 0.95
-                    }
-                },
-                "2": {
-                    "class_type": "VAELoader",
-                    "inputs": {"vae_name": "vae/ltx-2.3-22b-dev_video_vae.safetensors"}
-                },
-                "3": {
-                    "class_type": "DualCLIPLoaderGGUF",
-                    "inputs": {
-                        "clip_name1": "gemma-3-12b-it-qat-UD-Q4_K_XL.gguf",
-                        "clip_name2": "text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors",
-                        "type": "ltxv"
-                    }
-                },
-                "4": {
-                    "class_type": "CLIPTextEncode",
-                    "inputs": {
-                        "text": prompt,
-                        "clip": ["3", 0]
-                    }
-                },
-                "5": {
-                    "class_type": "CLIPTextEncode",
-                    "inputs": {
-                        "text": "worst quality, inconsistent, blurry, deformed, mutated, inconsistent motion, jittery, distorted, static, slideshow",
-                        "clip": ["3", 0]
-                    }
-                },
-                "7": {
-                    "class_type": "KSampler",
-                    "inputs": {
-                        "seed": random.randint(1, 0xffffffffffffffff),
-                        "steps": 30,
-                        "cfg": 5.0,
-                        "sampler_name": "euler",
-                        "scheduler": "simple",
-                        "denoise": 1.0,
-                        "model": ["1_1", 0],
-                        "positive": ["4", 0],
-                        "negative": ["5", 0],
-                        "latent_image": ["6", 0]
-                    }
-                },
-                "8": {
-                    "class_type": "VAEDecode",
-                    "inputs": {"samples": ["7", 0], "vae": ["2", 0]}
-                },
-                "9": {
-                    "class_type": "VHS_VideoCombine",
-                    "inputs": {
-                        "frame_rate": 24,
-                        "loop_count": 0,
-                        "filename_prefix": "Aeon_Video",
-                        "format": "video/h264-mp4",
-                        "pingpong": False,
-                        "save_output": True,
-                        "images": ["8", 0]
-                    }
+        workflow = {
+            "3": {
+                "class_type": "UnetLoaderGGUF",
+                "inputs": {
+                    "unet_name": "ltx-2.3-22b-dev-Q4_1.gguf"
+                }
+            },
+            "7": {
+                "class_type": "CLIPLoader",
+                "inputs": {
+                    "clip_name": "t5xxl_fp8_e4m3fn.safetensors",
+                    "type": "ltxv"
+                }
+            },
+            "8": {
+                "class_type": "VAELoader",
+                "inputs": {
+                    "vae_name": "ltx-2.3-22b-dev_video_vae.safetensors"
+                }
+            },
+            "4": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": prompt,
+                    "clip": ["7", 0]
+                }
+            },
+            "5": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": "low quality, blurry, distorted, static, slideshow, flickering, watermark, text",
+                    "clip": ["7", 0]
+                }
+            },
+            "6": {
+                "class_type": "ModelSamplingLTXV",
+                "inputs": {
+                    "model": ["3", 0],
+                    "max_shift": 2.05,
+                    "base_shift": 0.95
+                }
+            },
+            "10": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": 42,
+                    "steps": 30,
+                    "cfg": 5.0,
+                    "sampler_name": "euler",
+                    "scheduler": "simple",
+                    "denoise": 1.0,
+                    "model": ["6", 0],
+                    "positive": ["4", 0],
+                    "negative": ["5", 0],
+                    "latent_image": ["11", 0]
+                }
+            },
+            "12": {
+                "class_type": "VAEDecode",
+                "inputs": {
+                    "samples": ["10", 0],
+                    "vae": ["8", 0]
+                }
+            },
+            "13": {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {
+                    "frame_rate": 24,
+                    "loop_count": 0,
+                    "filename_prefix": "AeonVideo",
+                    "format": "video/h264-mp4",
+                    "save_output": True,
+                    "pingpong": False,
+                    "images": ["12", 0]
                 }
             }
+        }
 
-            # Inject latents based on mode
-            if mode == 'text_to_video':
-                workflow["6"] = {
-                    "class_type": "EmptyLTXVLatentVideo",
-                    "inputs": {"width": width, "height": height, "length": frames, "batch_size": 1}
+        if mode == "text_to_video":
+            workflow["11"] = {
+                "class_type": "EmptyLTXVLatentVideo",
+                "inputs": {
+                    "width": width,
+                    "height": height,
+                    "length": frames,
+                    "batch_size": 1
                 }
-            
-            elif mode == 'image_to_video':
-                workflow["10"] = {
-                    "class_type": "LoadImage",
-                    "inputs": {"image": uploaded_file_1}
+            }
+        elif mode in ["image_to_video", "video_extension"]:
+            workflow["11"] = {
+                "class_type": "LTXVImgToVideo",
+                "inputs": {
+                    "image": ["14", 0],
+                    "width": width,
+                    "height": height,
+                    "length": frames,
+                    "strength": 1.0
                 }
-                workflow["11"] = {
-                    "class_type": "VAEEncode",
-                    "inputs": {"pixels": ["10", 0], "vae": ["2", 0]}
+            }
+            workflow["14"] = {
+                "class_type": "LoadImage",
+                "inputs": {
+                    "image": uploaded_image_name if uploaded_image_name else "default.png"
                 }
-                workflow["6"] = {
-                    "class_type": "LatentComposite",
-                    "inputs": {
-                        "samples_from": ["11", 0],
-                        "samples_to": {
-                            "class_type": "EmptyLTXVLatentVideo", 
-                            "inputs": {"width": width, "height": height, "length": frames, "batch_size": 1}
-                        },
-                        "x": 0, "y": 0, "feather": 0
-                    }
-                }
-                workflow["7"]["inputs"]["denoise"] = 0.95
-                
-            elif mode == 'video_extension':
-                workflow["10"] = {
-                    "class_type": "VHS_LoadVideo",
-                    "inputs": {"video": uploaded_file_1, "force_rate": 0, "force_size": "Disabled", "custom_width": width, "custom_height": height, "frame_load_cap": frames}
-                }
-                workflow["11"] = {
-                    "class_type": "VAEEncode",
-                    "inputs": {"pixels": ["10", 0], "vae": ["2", 0]}
-                }
-                workflow["6"] = {"class_type": "LatentComposite", "inputs": {"samples_from": ["11", 0], "samples_to": {"class_type": "EmptyLTXVLatentVideo", "inputs": {"width": width, "height": height, "length": frames * 2, "batch_size": 1}}, "x": 0, "y": 0, "feather": 0}}
-                workflow["7"]["inputs"]["denoise"] = 0.85
-                
-            elif mode == 'interpolate':
-                workflow["10"] = {"class_type": "VHS_LoadVideo", "inputs": {"video": uploaded_file_1, "force_rate": 0, "force_size": "Disabled"}}
-                workflow["11"] = {"class_type": "VHS_LoadVideo", "inputs": {"video": uploaded_file_2, "force_rate": 0, "force_size": "Disabled"}}
-                workflow["12"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["10", 0], "vae": ["2", 0]}}
-                workflow["13"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["11", 0], "vae": ["2", 0]}}
-                workflow["6"] = {"class_type": "LatentComposite", "inputs": {"samples_from": ["12", 0], "samples_to": ["13", 0], "x": 0, "y": 0, "feather": 0}}
-                workflow["7"]["inputs"]["denoise"] = 0.70
+            }
+        
+        return workflow
 
-            print(f"{self.C_CYAN}Submitting video generation workflow ({mode}) to ComfyUI...{self.C_RESET}")
-            req = requests.post(f"{self.comfy_url}/prompt", json={"prompt": workflow}, timeout=5)
-            if req.status_code != 200:
-                return f"Error submitting workflow to ComfyUI: {req.text}"
+    def execute(self, mode: str, prompt: Union[str, List[str]], output_path: str, width: int = 768, height: int = 512, frames: int = 33, input_path_1: Optional[str] = None, **kwargs) -> str:
+        """
+        Executes video generation. 
+        If frames > max_chunk_frames, it uses recursive generation.
+        'prompt' can be a single string or a list of strings for prompt scheduling.
+        """
+        self._manage_registry("start")
+        try:
+            prompts = [prompt] if isinstance(prompt, str) else prompt
             
-            prompt_id = req.json()["prompt_id"]
+            if frames <= self.max_chunk_frames and len(prompts) == 1:
+                return self._generate_single_chunk(mode, prompts[0], output_path, width, height, frames, input_path_1)
             
-            print(f"{self.C_CYAN}Waiting for video generation to complete (this may take a long time)...{self.C_RESET}")
-            max_retries = 360 # 18 minutes max wait for video
-            for _ in range(max_retries):
-                history_req = requests.get(f"{self.comfy_url}/history/{prompt_id}", timeout=5)
-                history = history_req.json()
+            print(f"Generating long video ({frames} frames) in chunks...")
+            chunks = []
+            current_input_image = input_path_1
+            remaining_frames = frames
+            chunk_idx = 0
+            
+            while remaining_frames > 0:
+                current_chunk_frames = min(remaining_frames, self.max_chunk_frames)
+                chunk_output = f"aeon_output/debug/chunk_{chunk_idx}.mp4"
                 
+                prompt_idx = min(chunk_idx, len(prompts) - 1)
+                current_prompt = prompts[prompt_idx]
+                
+                current_mode = mode if chunk_idx == 0 else "image_to_video"
+                
+                print(f"Generating chunk {chunk_idx+1}/{((frames + self.max_chunk_frames - 1) // self.max_chunk_frames)} "
+                      f"({current_chunk_frames} frames) with prompt: {current_prompt[:50]}...")
+                
+                self._generate_single_chunk(current_mode, current_prompt, chunk_output, width, height, current_chunk_frames, current_input_image)
+                
+                chunks.append(chunk_output)
+                
+                next_input_image = f"aeon_output/debug/last_frame_{chunk_idx}.jpg"
+                self._extract_last_frame(chunk_output, next_input_image)
+                current_input_image = next_input_image
+                
+                remaining_frames -= current_chunk_frames
+                chunk_idx += 1
+            
+            print("Concatenating chunks...")
+            self._concatenate_videos(chunks, output_path)
+            
+            for f in chunks:
+                if os.path.exists(f): os.remove(f)
+            
+            return f"Successfully generated long video at {output_path}"
+
+        except Exception as e:
+            return f"Error during video generation: {str(e)}"
+        finally:
+            self._manage_registry("end")
+
+    def _generate_single_chunk(self, mode: str, prompt: str, output_path: str, width: int, height: int, frames: int, image_path: Optional[str]) -> str:
+        """Handles the API call to ComfyUI for a single video segment."""
+        uploaded_name = None
+        if image_path:
+            uploaded_name = self._upload_image(image_path)
+
+        workflow = self._get_workflow(mode, prompt, width, height, frames, uploaded_name)
+        
+        payload = {"prompt": workflow}
+        try:
+            response = requests.post(f"{self.comfy_url}/prompt", json=payload, timeout=300)
+            if response.status_code == 400:
+                print(f"\n=== ComfyUI 400 Bad Request Debug ===")
+                print(f"Payload: {json.dumps(payload, indent=2)}")
+                print(f"Response: {response.text}")
+                print(f"==================================\n")
+            response.raise_for_status()
+            prompt_id = response.json().get("prompt_id")
+            
+            while True:
+                history = requests.get(f"{self.comfy_url}/history/{prompt_id}").json()
                 if prompt_id in history:
-                    history_data = history[prompt_id]
-                    outputs = history_data.get("outputs", {})
-                    video_found = False
-                    if "9" in outputs and "videos" in outputs["9"] and outputs["9"]["videos"]:
-                        video_info = outputs["9"]["videos"][0]
-                        filename = video_info["filename"]
-                        subfolder = video_info["subfolder"]
-                        folder_type = video_info["type"]
-                        
-                        vid_req = requests.get(
-                            f"{self.comfy_url}/view?filename={filename}&subfolder={subfolder}&type={folder_type}",
-                            timeout=30
-                        )
-                        
-                        if vid_req.status_code == 200:
-                            with open(abs_output_path, "wb") as f:
-                                f.write(vid_req.content)
-                            return f"Successfully generated video and saved to: {abs_output_path}"
-                    
-                    # Fallback: Search filesystem
-                    print(f"{self.C_CYAN}API did not provide video info. Attempting filesystem fallback...{self.C_RESET}")
-                    aeon_home = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
-                    output_dir = os.path.join(aeon_home, "temp", "comfyui_output")
-                    
-                    if os.path.exists(output_dir):
-                        videos = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith("Aeon_Video") and f.endswith(".mp4")]
-                        if videos:
-                            latest_video = max(videos, key=os.path.getmtime)
-                            shutil.copy(latest_video, abs_output_path)
-                            return f"Successfully generated video (via fallback) and saved to: {abs_output_path}"
-                    
-                    # If we reach here, both API and fallback failed
-                    debug_path = "aeon_output/debug/comfyui_history.json"
-                    os.makedirs(os.path.dirname(debug_path), exist_ok=True)
-                    with open(debug_path, "w") as f:
-                        json.dump(history_data, f, indent=2)
-                    return f"Error: ComfyUI execution completed but no video was found via API or filesystem. History saved to {debug_path}."
-                
-                time.sleep(3)
-                
-            return "Error: Video generation timed out after 18 minutes."
+                    break
+                time.sleep(2)
+            
+            files = sorted([os.path.join(self.output_dir, f) for f in os.listdir(self.output_dir) if f.endswith(".mp4")], key=os.path.getmtime)
+            if not files:
+                raise FileNotFoundError("No output video found in ComfyUI output directory.")
+            
+            latest_video = files[-1]
+            shutil.copy(latest_video, output_path)
+            return f"Video generated and saved to {output_path}"
             
         except Exception as e:
-            return self.format_error_message(e, "generating video via ComfyUI", "checking if ComfyUI is running correctly and has required custom nodes.")
-        
-        finally:
-            remaining_users = self._manage_registry('unregister')
-            if remaining_users == 0:
-                print(f"{self.C_CYAN}Last agent finished. (Cleanup disabled for debugging) GPU memory not released...{self.C_RESET}")
-                # subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                print(f"{self.C_CYAN}Video generation complete. Leaving ComfyUI running for {remaining_users} other active agent(s)...{self.C_RESET}")
+            raise RuntimeError(f"ComfyUI API error: {str(e)}")

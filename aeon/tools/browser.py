@@ -15,7 +15,7 @@ from ..core.prompts import (
     TOOL_DESC_BROWSER_SWITCH_TAB
 )
 
-BROWSER_API_URL = "http://localhost:8000"
+BROWSER_API_URL = "http://localhost:8002"
 
 def _print_image_to_terminal(image_bytes, target_width=80):
     """Renders an image directly in the terminal using ANSI truecolor and half-block characters."""

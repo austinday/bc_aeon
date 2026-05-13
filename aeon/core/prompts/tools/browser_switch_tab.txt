@@ -2,5 +2,8 @@ Switch to an already open browser tab without reloading the page.
 
 CRITICAL: Use this tool instead of 'browser_navigate' when returning to a tab you have already used. 'browser_switch_tab' preserves the current state of the page (e.g., text typed into forms, scroll position, and session state), whereas 'browser_navigate' will reload the URL and cause any unsaved state to be lost.
 
+POPUP HANDLING:
+This tool is the primary way to interact with popup windows. When the `open_tabs` list in a server response reveals a new tab (e.g., `popup_1`), use this tool with that `tab_id` to switch focus to the popup window.
+
 Parameters:
-- tab_id: The unique identifier for the tab you wish to switch to.
+- tab_id: The unique identifier for the tab you wish to switch to (e.g., 'default', 'popup_1', 'search_results').

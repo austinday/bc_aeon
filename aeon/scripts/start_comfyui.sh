@@ -18,6 +18,7 @@ docker rm -f aeon_comfyui >/dev/null 2>&1 || true
 docker run -d \
     --name aeon_comfyui \
     --gpus device=1 \
+    --shm-size=8gb \
     -p 8188:8188 \
     -v "$MODELS_DIR/unet:/workspace/ComfyUI/models/unet" \
     -v "$MODELS_DIR/text_encoders:/workspace/ComfyUI/models/text_encoders" \

@@ -18,3 +18,7 @@
 5) GPU USAGE: Always use --gpus flag when running GPU workloads. Default to using gpu1 and avoid using -all. Check gpu usage before allocating memory to avoid a crash.
 
 6) OWNERSHIP: Always use -u $(id -u):$(id -g) to match Host user. Avoids root output files.
+
+7) INDISCRIMINATE COMMANDS (CRITICAL): 
+   - NEVER use global or indiscriminate cleanup commands: `docker rm -f $(docker ps -aq)`, `docker system prune`, or `docker kill $(docker ps -q)`.
+   - TARGETED CLEANUP ONLY: Only remove containers by their EXPLICIT name (e.g., `docker rm -f aeon_browser_test`). If you did not create it or do not know its exact name, do not touch it.
