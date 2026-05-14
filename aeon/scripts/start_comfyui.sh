@@ -12,13 +12,16 @@ if ! docker image inspect aeon_comfyui:latest >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "Starting ComfyUI container on GPU 1..."
+echo "Starting ComfyUI container..."
 docker rm -f aeon_comfyui >/dev/null 2>&1 || true
 
 GPU_ID=${COMFYUI_GPU:-1}
+echo "Using GPU: ${GPU_ID}"
+
 docker run -d \
     --name aeon_comfyui \
-    --gpus "\"device=${GPU_ID}\"" \    --shm-size=8gb \
+    --gpus "device=${GPU_ID}" \
+    --shm-size=8gb \
     -p 8188:8188 \
     -v "$MODELS_DIR/unet:/workspace/ComfyUI/models/unet" \
     -v "$MODELS_DIR/text_encoders:/workspace/ComfyUI/models/text_encoders" \

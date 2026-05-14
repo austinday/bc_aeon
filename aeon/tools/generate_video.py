@@ -6,7 +6,9 @@ import subprocess
 import shutil
 from typing import List, Optional, Dict, Any, Union
 
-class GenerateVideoTool:
+from aeon.tools.base import BaseTool
+
+class GenerateVideoTool(BaseTool):
     """
     Tool for generating high-quality videos using LTX-Video via ComfyUI.
     Supports text-to-video, image-to-video, and recursive long-video generation
@@ -14,6 +16,10 @@ class GenerateVideoTool:
     """
 
     def __init__(self):
+        super().__init__(
+            name="generate_video",
+            description="Generates high-quality videos using LTX-Video via ComfyUI. Supports text-to-video and image-to-video."
+        )
         self.comfy_url = "http://localhost:8188"
         self.output_dir = "aeon_output/comfyui"
         os.makedirs(self.output_dir, exist_ok=True)

@@ -14,7 +14,7 @@ class AnalyzeImageTool(BaseTool):
     """A tool to analyze images using Qwen3.6-35B-A3B-Uncensored via a local vLLM server."""
 
     # Max image dimension before resizing (keeps VRAM usage reasonable)
-    MAX_IMAGE_DIM = 1280
+    MAX_IMAGE_DIM = 640
     # Port for the dedicated vision llama.cpp server
     VLLM_PORT = 8020
 
@@ -110,10 +110,22 @@ class AnalyzeImageTool(BaseTool):
 
             # Start server if not running
             if not self._check_health():
-
-                script_path = os.path.abspath(
+                # Try package directory first, then fallback to local project root
+                pkg_script_path = os.path.abspath(
                     os.path.join(os.path.dirname(__file__), '..', 'scripts', 'start_qwen36_vl_35b.sh')
                 )
+                if os.path.exists(pkg_script_path):
+                    script_path = pkg_script_path
+                else:
+                    # Fallback to current working directory (assuming we are at project root)
+                    local_script_path = os.path.abspath(
+                        os.path.join(os.getcwd(), 'aeon', 'scripts', 'start_qwen36_vl_35b.sh')
+                    )
+                    if os.path.exists(local_script_path):
+                        script_path = local_script_path
+                    else:
+                        return f'Error: Vision start script not found. Tried {pkg_script_path} and {local_script_path}'
+
                 env = os.environ.copy()
                 env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
                 res = subprocess.run(['bash', script_path], capture_output=True, text=True, env=env)

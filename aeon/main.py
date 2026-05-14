@@ -29,14 +29,7 @@ CLOUD_MODELS = [
         'context_limit': 2000000,
     },
     {
-        'model': 'grok-4-1-fast-reasoning',
-        'provider': 'grok',
-        'api_key_file': 'grok_api_key.txt',
-        'base_url': 'https://api.x.ai/v1',
-        'context_limit': 128000,
-    },
-    {
-        'model': 'grok-4-1-fast-non-reasoning',
+        'model': 'grok-4.3-latest',
         'provider': 'grok',
         'api_key_file': 'grok_api_key.txt',
         'base_url': 'https://api.x.ai/v1',
@@ -159,18 +152,23 @@ def cleanup_transient_tools():
                     fcntl.flock(lock_fd, fcntl.LOCK_EX)
                     if os.path.exists(registry_path):
                         with open(registry_path, 'r') as f:
-                            active_pids = json.load(f)
+                            data = json.load(f)
+                        
+                        # Handle both list and dict formats (e.g., ComfyUI uses a dict)
+                        active_pids = data.get("pids", data) if isinstance(data, dict) else data
                         
                         other_alive_pids = []
-                        for p in active_pids:
-                            if p == my_pid: continue
-                            try:
-                                os.kill(p, 0)
-                                with open(f"/proc/{p}/cmdline", "r") as cmd_f:
-                                    if "aeon" in cmd_f.read().replace('\x00', ' ').lower():
-                                        other_alive_pids.append(p)
-                            except (OSError, FileNotFoundError):
-                                pass
+                        if isinstance(active_pids, list):
+                            for p in active_pids:
+                                if not isinstance(p, int): continue
+                                if p == my_pid: continue
+                                try:
+                                    os.kill(p, 0)
+                                    with open(f"/proc/{p}/cmdline", "r") as cmd_f:
+                                        if "aeon" in cmd_f.read().replace('\x00', ' ').lower():
+                                            other_alive_pids.append(p)
+                                except (OSError, FileNotFoundError):
+                                    pass
                                 
                         if cleanup_callback:
                             cleanup_callback()

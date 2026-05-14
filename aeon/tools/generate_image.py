@@ -60,8 +60,10 @@ class ComfyUITool(BaseTool):
             
             with open(registry_path, 'w') as f:
                 json.dump(state, f)
-                
-            return len(state["pids"]), state.get("gpu_id")
+            
+            count = len(state["pids"])
+            print(f"[REGISTRY DEBUG] PID {pid} {action} | Active Users: {count} | GPU: {state.get('gpu_id')}")
+            return count, state.get("gpu_id")
 
     def _ensure_comfyui_running(self, required_vram: float = 20.0):
         """Ensures ComfyUI is healthy and running on a GPU with sufficient VRAM."""
@@ -255,11 +257,11 @@ class GenerateImageTool(ComfyUITool):
         
         finally:
             # Unregister and check if we are the last active user
-            remaining_users = self._manage_registry('unregister')
+            remaining_users, _ = self._manage_registry('unregister')
             release_vram()
             if remaining_users == 0:
-                print(f"{self.C_CYAN}Last agent finished. (Container deletion disabled for debugging)...{self.C_RESET}")
-                # subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f"{self.C_CYAN}Last agent finished. Cleaning up container...{self.C_RESET}")
+                subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 print(f"{self.C_CYAN}Image complete. Leaving ComfyUI running for {remaining_users} other active agent(s)...{self.C_RESET}")
 
@@ -380,9 +382,10 @@ class EditImageTool(ComfyUITool):
         
         finally:
             # Unregister and check if we are the last active user
-            remaining_users = self._manage_registry('unregister')
+            remaining_users, _ = self._manage_registry('unregister')
             release_vram()
             if remaining_users == 0:
-                print(f"{self.C_CYAN}Last agent finished. (Container deletion disabled for debugging)...{self.C_RESET}")
+                print(f"{self.C_CYAN}Last agent finished. Cleaning up container...{self.C_RESET}")
+                subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 print(f"{self.C_CYAN}Image edit complete. Leaving ComfyUI running for {remaining_users} other active agent(s)...{self.C_RESET}")

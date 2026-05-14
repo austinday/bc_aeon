@@ -61,7 +61,7 @@ fi
 
 docker run -d \
     --name $CONTAINER_NAME \
-  --gpus '"device=0"' \
+    --gpus "device=${GPU_ID}" \
     -v "${MODELS_DIR}:/models:ro" \
     -p ${PORT}:8080 \
     --ipc=host \
@@ -71,7 +71,8 @@ docker run -d \
     --host 0.0.0.0 \
     --port 8080 \
     -ngl 999 \
-    -c 8192 \
+    -c 4096 \
+    --parallel 1 \
     --flash-attn on
 
 echo "[Qwen3.6-VL] Waiting for server to load model..."
