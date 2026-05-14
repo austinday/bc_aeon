@@ -74,37 +74,19 @@ launch_node() {
 # ~33GB Target Model + ~3GB Assistant Model + ~6.4GB KV Cache
 launch_node $NODE0_NAME 0 $NODE0_PORT 262144
 
-# --- NODE 1: High-Capacity (Mirrors NODE 0) ---
-# ~33GB Target Model + ~3GB Assistant Model + ~6.4GB KV Cache
-launch_node $NODE1_NAME 1 $NODE1_PORT 262144
-
-# --- Nginx Symmetric Load Balancer ---
-echo "[Gemma-4-MTP-Cluster] Configuring Nginx Router..."
-cat << 'EOF' > /tmp/aeon_gemma_mtp_lb.conf
-events { worker_connections 1024; }
-http {
-    upstream cluster_all {
-        least_conn;
-        server 127.0.0.1:8014 max_fails=3 fail_timeout=10s;
-        server 127.0.0.1:8015 max_fails=3 fail_timeout=10s;
-    }
-    server {
-        listen 8013;
-        location / {
-            proxy_pass http://cluster_all;
-            proxy_read_timeout 1200s;
-            proxy_set_header Host $host;
-        }
-    }
-}
-EOF
-
-echo "[Gemma-4-MTP-Cluster] Starting Load Balancer on Port $MAIN_PORT..."
+# --- NODE 1: Medium-Capacity
+# ~33GB Target Model + ~3GB Assistant Model + ~2.2GB KV Cache
+launch_node $NODE1_NAME 1 $NODE1_PORT 89984
+# --- Python Context-Aware Load Balancer ---
+echo "[Gemma-4-MTP-Cluster] Starting Python Context-Aware Load Balancer on Port $MAIN_PORT..."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 docker run -d \
     --name $LB_NAME \
     --network host \
-    -v /tmp/aeon_gemma_mtp_lb.conf:/etc/nginx/nginx.conf:ro \
-    nginx:alpine > /dev/null
+    -v "${SCRIPT_DIR}/gemma_lb.py:/app/gemma_lb.py" \
+    -w /app \
+    python:3.11-slim \
+    sh -c "pip install fastapi uvicorn httpx && python gemma_lb.py" > /dev/null
 
 echo "[Gemma-4-MTP-Cluster] Waiting for nodes to load into VRAM (this may take several minutes)..."
 

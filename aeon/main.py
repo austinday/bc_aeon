@@ -343,7 +343,7 @@ def cleanup_ghost_llamacpp_containers():
             # If no PIDs are registered or none of them are alive, it's a ghost
             if not pids or not any(_pid_exists(p) for p in pids):
                 print(f"[SYSTEM] Found ghost container {container} (Model: {model_name}). Terminating...")
-                subprocess.run(["docker", "rm", "-f", container], capture_output=True, stderr=subprocess.DEVNULL)
+                subprocess.run(["docker", "rm", "-f", container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 ghosts_killed += 1
         
         if ghosts_killed:

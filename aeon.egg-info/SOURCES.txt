@@ -62,6 +62,7 @@ aeon/core/prompts/tools_section.txt
 aeon/llamacpp/__init__.py
 aeon/scripts/__init__.py
 aeon/scripts/clear_gpu.sh
+aeon/scripts/gemma_lb.py
 aeon/scripts/start_brain.sh
 aeon/scripts/start_browser.sh
 aeon/scripts/start_comfyui.sh

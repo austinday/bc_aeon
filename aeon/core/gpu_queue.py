@@ -16,11 +16,11 @@ def get_real_vram():
             vram[idx] = free_mb / 1024.0
     return vram
 
-def wait_for_vram(required_gb: float, timeout: int = 600) -> int:
+def wait_for_vram(required_gb: float, timeout: int = 600, gpu_id: int = None) -> int:
     """
     Blocks until a GPU has `required_gb` of free VRAM available.
-    Uses a file lock and a JSON state file to track 'pending' allocations
-    for containers that are booting up but haven't allocated memory yet.
+    If `gpu_id` is provided, it only checks that specific GPU.
+    Uses a file lock and a JSON state file to track 'pending' allocations.
     """
     start_time = time.time()
     
@@ -36,27 +36,31 @@ def wait_for_vram(required_gb: float, timeout: int = 600) -> int:
                     state = {"pending": []}
                 
                 current_time = time.time()
-                # Keep pending allocations that are less than 90 seconds old (gives models time to boot)
                 state["pending"] = [p for p in state.get("pending", []) if current_time - p["timestamp"] < 90]
                 
                 real_vram = get_real_vram()
                 effective_vram = dict(real_vram)
                 
-                # Subtract pending allocations to get the true safe available memory
                 for p in state["pending"]:
                     if p["gpu_id"] in effective_vram:
                         effective_vram[p["gpu_id"]] -= p["requested_gb"]
                 
                 selected_gpu = None
-                # Sort GPUs by available effective memory (descending) so we pack efficiently
-                sorted_gpus = sorted(effective_vram.items(), key=lambda x: x[1], reverse=True)
-                for gpu_id, free_gb in sorted_gpus:
-                    if free_gb >= required_gb:
+                if gpu_id is not None:
+                    # Target specific GPU
+                    if gpu_id in effective_vram and effective_vram[gpu_id] >= required_gb:
                         selected_gpu = gpu_id
-                        break
+                else:
+                    # Pick best available GPU
+                    sorted_gpus = sorted(effective_vram.items(), key=lambda x: x[1], reverse=True)
+                    for gid, free_gb in sorted_gpus:
+                        if free_gb >= required_gb:
+                            selected_gpu = gid
+                            break
                 
                 if selected_gpu is not None:
                     state["pending"].append({
+                        "pid": os.getpid(),
                         "gpu_id": selected_gpu,
                         "requested_gb": required_gb,
                         "timestamp": current_time
@@ -72,3 +76,30 @@ def wait_for_vram(required_gb: float, timeout: int = 600) -> int:
         time.sleep(5)
         
     raise TimeoutError(f"Timed out waiting for {required_gb}GB VRAM.")
+
+def release_vram():
+    """Explicitly releases VRAM allocated by the current process."""
+    pid = os.getpid()
+    try:
+        with open(STATE_FILE, 'a+') as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                lock_fd.seek(0)
+                content = lock_fd.read()
+                try:
+                    state = json.loads(content) if content else {"pending": []}
+                except (json.JSONDecodeError, ValueError):
+                    state = {"pending": []}
+                
+                # Remove all pending allocations for this PID
+                original_count = len(state.get("pending", []))
+                state["pending"] = [p for p in state.get("pending", []) if p.get("pid") != pid]
+                
+                if len(state["pending"]) != original_count:
+                    lock_fd.seek(0)
+                    lock_fd.truncate()
+                    json.dump(state, lock_fd)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except Exception as e:
+        print(f"Error releasing VRAM: {e}")
