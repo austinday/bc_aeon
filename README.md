@@ -1,18 +1,31 @@
-# Aeon Agent - Enhanced Memory System
+# Aeon Agent
 
-The Aeon agent now features a structured persistent memory system that allows it to store, retrieve, and prune key information across iterations.
+Aeon is a highly capable, autonomous LLM agent designed for complex planning and implementation tasks.
 
-## Features
-- **Structured Storage**: Memories are stored as objects containing a value, a category, and a timestamp.
-- **Categorization**: The agent can organize memories into categories (e.g., `planning`, `credentials`, `summaries`) to better manage context.
-- **Targeted Pruning**: The `forget` tool can remove specific memories by key or wipe entire categories to prevent context rot.
-- **Introspection**: The `list_memories` tool allows the agent to review its current knowledge base, optionally filtered by category.
+## Getting Started
 
-## Tools
-- `memorize(key, value, category="general")`: Saves a piece of information.
-- `forget(key=None, category=None)`: Erases memories by key or category.
-- `list_memories(category=None)`: Lists stored memories.
+### Installation
+Follow the instructions in `setup_environment.sh` to prepare the environment.
 
-## Implementation Details
-- **Worker Integration**: `aeon/core/worker.py` has been updated to format structured memories into a human-readable list in the agent's prompt.
-- **Tool Logic**: Implemented in `aeon/tools/memory.py`.
+### Running the Agent
+It is recommended to use the provided launcher script to run the agent. This script monitors the process and automatically prints the end of the logs if the agent crashes, making troubleshooting significantly easier.
+
+```bash
+chmod +x run_aeon.sh
+./run_aeon.sh --model <model_name>
+```
+
+Alternatively, you can run the agent directly via python:
+```bash
+python -m aeon.main --model <model_name>
+```
+
+## Project Structure
+- `aeon/`: Core agent logic, worker loop, and LLM integration.
+- `aeon/tools/`: Tool definitions and analyzers.
+- `aeon/core/prompts/`: System prompts and directives.
+- `scripts/`: Utility scripts for environment setup and service management.
+- `aeon_output/`: Directory for sub-agent outputs and logs.
+
+## Troubleshooting
+If the agent crashes, check `aeon.log` in the root directory for detailed tracebacks. When using `run_aeon.sh`, the most relevant logs are printed to the console immediately after a crash.

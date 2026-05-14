@@ -32,10 +32,10 @@ C_BLUE = '\033[96m'
 
 
 class Worker:
-    def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False):
+    def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False, debug_log_path: Optional[str] = None):
         self.llm_client = llm_client
-        self.tools = {tool.name: tool for tool in tools} if tools else {}
-        
+        self.debug_log_path = debug_log_path
+        self.tools = {tool.name: tool for tool in tools} if tools else {}        
         # Ensure prompt files exist for all tools and categories
         from aeon.core.prompts.manager import ensure_prompt_files
         from aeon.tools.categories import get_all_category_paths
@@ -505,6 +505,16 @@ class Worker:
         return clean_json.strip()
 
     # --- MAIN LOOP ---
+
+    def _log_reasoning_trace(self, iteration, trace_data):
+        if getattr(self, "debug_log_path", None):
+            import json
+            try:
+                with open(self.debug_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(trace_data) + "\n")
+            except Exception:
+                pass
+
     def run(self, objective: str, max_iterations: Optional[int] = None, step_callback: Optional[Callable[[int, int, str], None]] = None, terminal_tools: List[str] = None):
         if terminal_tools is None:
             terminal_tools = ['task_complete', 'restart_aeon']

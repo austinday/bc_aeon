@@ -1,0 +1,7 @@
+Provides a high-level summary of a topic using a wide web search. Use this sparingly as a starting point for research, a final summary to ensure no key details were missed, or for a quick single-topic overview when you don't need to visit specific websites.
+
+CRITICAL: Do NOT use this for general browsing, visiting specific URLs, or repetitive searching across multiple topics; use the web_browser tools for those tasks.
+
+Schema:
+query (str, required): The topic to summarize. Be specific and concise for best results.
+Example: {"tool_name": "summarize_topic", "parameters": {"query": "current state of quantum computing in 2024"}}

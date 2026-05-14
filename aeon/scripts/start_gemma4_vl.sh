@@ -16,8 +16,7 @@ docker rm -f $CONTAINER_NAME >/dev/null 2>&1 || true
 # Increase memory utilization to ensure the 31B model and KV cache fit comfortably.
 docker run -d \
   --name $CONTAINER_NAME \
-  --gpus '"device=1"' \
-  -e VLLM_USE_V1=0 \
+  --gpus "\"device=${GPU_ID}\"" \  -e VLLM_USE_V1=0 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -p ${PORT}:8000 \
   --ipc=host \

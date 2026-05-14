@@ -1,25 +1,49 @@
 import json
-import os
+import inspect
+import comfy.nodes
 
 def inspect_nodes():
-    info_path = "aeon_output/debug/comfyui_nodes_info.json"
-    if not os.path.exists(info_path):
-        print(f"Error: {info_path} not found.")
-        return
-
-    with open(info_path, 'r') as f:
-        data = json.load(f)
-
-    target_nodes = ["LTXVImgToVideo", "LTXVImgToVideoInplace", "LTXVConcatAVLatent"]
+    all_nodes = comfy.nodes.NODE_CLASS_MAPPINGS
+    results = []
     
-    for node_name in target_nodes:
-        if node_name in data:
-            print(f"\n=== Node: {node_name} ===")
-            node_info = data[node_name]
-            print(f"Inputs: {json.dumps(node_info.get('inputs', {}), indent=2)}")
-            print(f"Outputs: {json.dumps(node_info.get('outputs', {}), indent=2)}")
-        else:
-            print(f"\nNode {node_name} NOT found in info dump.")
+    for node_name, node_class in all_nodes.items():
+        # We are looking for nodes that output CONDITIONING
+        # and are likely related to LTX or T5 encoding.
+        
+        # Get return types
+        return_types = getattr(node_class, 'RETURN_TYPES', ())
+        if isinstance(return_types, str):
+            return_types = (return_types,)
+            
+        if 'CONDITIONING' in return_types:
+            # Filter for LTX or T5 related nodes to reduce noise
+            if any(keyword in node_name.upper() for keyword in ['LTX', 'T5', 'ENCODE', 'TEXT']):
+                
+                # Get input types
+                input_types = {}
+                if hasattr(node_class, 'INPUT_TYPES'):
+                    try:
+                        # INPUT_TYPES is often a function
+                        if callable(node_class.INPUT_TYPES):
+                            input_types = node_class.INPUT_TYPES()
+                        else:
+                            input_types = node_class.INPUT_TYPES
+                    except Exception as e:
+                        input_types = {"error": str(e)}
+                
+                # Extract required inputs
+                required = {}
+                if isinstance(input_types, dict) and 'required' in input_types:
+                    required = input_types['required']
+                
+                results.append({
+                    "node_name": node_name,
+                    "class": node_class.__name__,
+                    "inputs": required,
+                    "outputs": return_types
+                })
+    
+    print(json.dumps(results, indent=2))
 
 if __name__ == "__main__":
     inspect_nodes()

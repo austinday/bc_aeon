@@ -15,10 +15,10 @@ fi
 echo "Starting ComfyUI container on GPU 1..."
 docker rm -f aeon_comfyui >/dev/null 2>&1 || true
 
+GPU_ID=${COMFYUI_GPU:-1}
 docker run -d \
     --name aeon_comfyui \
-    --gpus device=1 \
-    --shm-size=8gb \
+    --gpus "\"device=${GPU_ID}\"" \    --shm-size=8gb \
     -p 8188:8188 \
     -v "$MODELS_DIR/unet:/workspace/ComfyUI/models/unet" \
     -v "$MODELS_DIR/text_encoders:/workspace/ComfyUI/models/text_encoders" \

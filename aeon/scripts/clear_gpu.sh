@@ -10,8 +10,12 @@ echo "[2/4] Restarting Brain Node (Ollama)..."
 # Restarting the container is the only 100% guarantee of zero VRAM usage.
 docker restart aeon_brain_node
 
-echo "[3/4] Resetting session locks..."
+echo "[3/4] Resetting session locks and registries..."
 rm -f /tmp/aeon_runtime.lock
 rm -f /tmp/aeon_brain_startup.lock
+rm -f /tmp/aeon_model_registry.json
+rm -f /tmp/aeon_model_registry.lock
+rm -f /tmp/aeon_comfyui_registry.*
+rm -f /tmp/aeon_browser_registry.*
 
 echo "[4/4] Done. GPU memory is empty."

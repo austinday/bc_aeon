@@ -11,6 +11,7 @@ aeon.egg-info/requires.txt
 aeon.egg-info/top_level.txt
 aeon/core/__init__.py
 aeon/core/directives.py
+aeon/core/gpu_queue.py
 aeon/core/llm.py
 aeon/core/logger.py
 aeon/core/system_info.py
@@ -53,6 +54,7 @@ aeon/core/prompts/tool_desc_say_to_user.txt
 aeon/core/prompts/tool_desc_search_web.txt
 aeon/core/prompts/tool_desc_spawn_sub_agent.txt
 aeon/core/prompts/tool_desc_str_replace.txt
+aeon/core/prompts/tool_desc_summarize_topic.txt
 aeon/core/prompts/tool_desc_task_complete.txt
 aeon/core/prompts/tool_desc_think.txt
 aeon/core/prompts/tool_desc_write_file.txt
@@ -100,6 +102,3 @@ aeon/tools/analyzers/handlers/sequence.py
 aeon/tools/analyzers/handlers/tabular.py
 aeon/tools/analyzers/handlers/text.py
 aeon/tools/analyzers/handlers/utility.py
-tests/test_browser.py
-tests/test_sub_agent_termination.py
-tests/test_sub_agents.py

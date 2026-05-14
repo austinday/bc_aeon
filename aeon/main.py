@@ -1,5 +1,6 @@
 import os, argparse, json, time, sys, subprocess, requests, fcntl, signal, atexit
 from pathlib import Path
+from aeon.core.logger import get_logger
 from aeon.core.worker import Worker
 from aeon.core.llm import LLMClient
 from aeon.tools.loader import load_tools_from_directory
@@ -165,8 +166,10 @@ def cleanup_transient_tools():
                             if p == my_pid: continue
                             try:
                                 os.kill(p, 0)
-                                other_alive_pids.append(p)
-                            except OSError:
+                                with open(f"/proc/{p}/cmdline", "r") as cmd_f:
+                                    if "aeon" in cmd_f.read().replace('\x00', ' ').lower():
+                                        other_alive_pids.append(p)
+                            except (OSError, FileNotFoundError):
                                 pass
                                 
                         if cleanup_callback:
@@ -280,9 +283,10 @@ def _cleanup_stale_pids(registry):
     return cleaned, orphaned
 
 def _pid_exists(pid):
+    """Check if PID exists AND is actually an Aeon python process, ignoring recycled PIDs."""
     try:
         os.kill(pid, 0)
-        # Explicitly check for zombies (Z state) in Linux
+        # 1. Check for zombies
         try:
             with open(f"/proc/{pid}/stat", "r") as f:
                 stat_content = f.read().split()
@@ -290,9 +294,62 @@ def _pid_exists(pid):
                     return False
         except FileNotFoundError:
             return False
+        
+        # 2. Check if the command line actually belongs to Aeon
+        try:
+            with open(f"/proc/{pid}/cmdline", "r") as f:
+                cmdline = f.read().replace('\x00', ' ').strip().lower()
+                if "aeon" not in cmdline:
+                    return False
+        except FileNotFoundError:
+            return False
+            
         return True
     except OSError:
         return False
+
+def cleanup_ghost_llamacpp_containers():
+    """Find and kill running llama.cpp containers that aren't in the registry with active PIDs."""
+    print("[SYSTEM] Scanning for ghost llama.cpp containers...")
+    try:
+        # Get all running containers with 'aeon_' prefix
+        res = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"], 
+            capture_output=True, text=True, check=True
+        )
+        running_containers = res.stdout.splitlines()
+        
+        # We need the registry to verify if they SHOULD be running
+        registry = {}
+        if os.path.exists(MODEL_REGISTRY_PATH):
+            try:
+                with open(MODEL_REGISTRY_PATH, 'r') as f:
+                    registry = json.load(f)
+            except: pass
+
+        ghosts_killed = 0
+        for container in running_containers:
+            if not container.startswith("aeon_"):
+                continue
+            
+            # Check if this container belongs to a llama.cpp config
+            matching_config = next((c for c in LLAMACPP_MODELS if c['container_name'] == container), None)
+            if not matching_config:
+                continue # Not a llama.cpp model container (could be brain, browser, etc.)
+            
+            model_name = matching_config['model']
+            pids = registry.get(model_name, [])
+            
+            # If no PIDs are registered or none of them are alive, it's a ghost
+            if not pids or not any(_pid_exists(p) for p in pids):
+                print(f"[SYSTEM] Found ghost container {container} (Model: {model_name}). Terminating...")
+                subprocess.run(["docker", "rm", "-f", container], capture_output=True, stderr=subprocess.DEVNULL)
+                ghosts_killed += 1
+        
+        if ghosts_killed:
+            print(f"[SYSTEM] Cleaned up {ghosts_killed} ghost llama.cpp container(s).")
+    except Exception as e:
+        print(f"[WARN] Ghost cleanup failed: {e}")
 
 def register_models_for_agent(models):
     """Register this agent's PID for the given models."""
@@ -827,8 +884,10 @@ def _execute_restart(session, worker=None):
 
 
 def cli():
+    cleanup_ghost_llamacpp_containers()
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true', help='Enable detailed LLM call logging to ~/')
+    parser.add_argument('--debug-log', type=str, help='Path to the reasoning trace log file (JSONL)')
     parser.add_argument('--strong', type=str, dest='model', help='Model name - skips menu')
     parser.add_argument('--model', type=str, help='Model name - skips menu (alias for --strong)')
     parser.add_argument('--weak', type=str, help=argparse.SUPPRESS)
@@ -873,7 +932,7 @@ def cli():
     try:
         session.enter(strong_config=strong_config, weak_config=weak_config, skip_warmup=args.no_warmup)
         llm_client = LLMClient(strong_config=strong_config, weak_config=weak_config)
-        worker = Worker(llm_client=llm_client, debug_mode=args.debug)
+        worker = Worker(llm_client=llm_client, debug_mode=args.debug, debug_log_path=args.debug_log)
         worker.model_name = strong_config['model']
         worker.model_config = strong_config
         deps = {'llm_client': llm_client, 'worker': worker}

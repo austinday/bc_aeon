@@ -67,7 +67,7 @@ launch_node() {
       -ctv q4_0 \
       --threads ${CORES_PER_NODE} \
       --host 0.0.0.0 \
-      --port 8080 > /dev/null
+      --port 8080 > /tmp/aeon_${NAME}.log 2>&1
 }
 
 # --- NODE 0: High-Capacity ---
