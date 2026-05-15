@@ -41,10 +41,8 @@ def benchmark(port, prompt, n_predict):
                         timings = data['timings']
                         tps = timings.get('predicted_per_second', 0)
                         predicted = timings.get('predicted_n', tokens_generated)
-                        print(f"\n--- Server-Reported Timings ---")
-                        print(f"Time to first token (TTFT): {first_token_time - start_time:.3f} s")
-                        print(f"Tokens Predicted: {predicted}")
-                        print(f"Generation Speed: {tps:.2f} tokens/sec")
+                        ttft_val = first_token_time - start_time
+                        print(f"TTFT:{ttft_val:.3f}s Gen:N/A Tool:N/A Load:N/A TPS:{tps:.2f} Tokens:{predicted}")
                         return
                     
                     tokens_generated += 1
@@ -61,10 +59,7 @@ def benchmark(port, prompt, n_predict):
     gen_time = end_time - first_token_time
     tps = tokens_generated / gen_time if gen_time > 0 else 0
     
-    print(f"\n--- Client-Measured Timings ---")
-    print(f"Time to first token (TTFT): {ttft:.3f} s")
-    print(f"Tokens Predicted: ~{tokens_generated}")
-    print(f"Generation Speed: {tps:.2f} tokens/sec")
+    print(f"TTFT:{ttft:.3f}s Gen:{gen_time:.3f}s Tool:N/A Load:N/A TPS:{tps:.2f} Tokens:{tokens_generated}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark MTP/Speculative Decoding generation speed")

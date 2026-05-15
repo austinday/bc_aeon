@@ -14,7 +14,7 @@ NODE0_URL = "http://127.0.0.1:8014"
 NODE1_URL = "http://127.0.0.1:8015"
 CONTEXT_LIMIT_NODE1 = 89984
 CHAR_PER_TOKEN = 4
-HEALTH_CHECK_INTERVAL = 10  # seconds
+HEALTH_CHECK_INTERVAL = 30  # seconds
 IDLE_SHUTDOWN_TIMEOUT = 300  # 5 minutes of no requests -> shutdown nodes
 START_SCRIPT_NODE0 = "/home/aday/bc_aeon/scripts/debug/start_gemma_node0.sh"
 START_SCRIPT_NODE1 = "/home/aday/bc_aeon/scripts/debug/start_gemma_node1.sh"
@@ -23,7 +23,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("gemma-lb")
 
 app = FastAPI()
-client = httpx.AsyncClient(timeout=None)
+client = httpx.AsyncClient(
+    timeout=None,
+    limits=httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=30.0),
+    http2=False
+)
 
 active_requests = {NODE0_URL: 0, NODE1_URL: 0}
 last_request_time = time.time()
@@ -120,6 +124,13 @@ async def proxy(request: Request, path: str):
         active_requests[target_url] -= 1
         node_health[target_url] = False
         logger.error(f"Proxy error to {target_url}: {e}")
+        # Instant per-node self-heal for crashed GPU
+        script = START_SCRIPT_NODE0 if target_url == NODE0_URL else START_SCRIPT_NODE1
+        try:
+            subprocess.Popen(["bash", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info(f"Instant restart triggered for crashed node {target_url}")
+        except Exception as ex:
+            logger.error(f"Instant restart failed for {target_url}: {ex}")
         return Response(content=f"Backend Error: {e}", status_code=502)
 
 if __name__ == "__main__":

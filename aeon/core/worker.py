@@ -953,7 +953,7 @@ class Worker:
                 }
 
                 iter_duration = time.time() - iter_start_time
-                self.print_func(f"{C_CYAN}Iteration {iteration} completed in {iter_duration:.2f}s{C_RESET}")
+                self.print_func(f"{C_CYAN}Iter {iteration} | {iter_duration:.2f}s | Prompt:{prompt_tokens} ({growth_str}) | Pressure:{pressure}{C_RESET}")
 
             except Exception as e:
                 self.print_func(f"\n{C_RED}CRITICAL ERROR IN ITERATION: {e}{C_RESET}")
