@@ -59,7 +59,11 @@ aeon/core/prompts/tool_desc_task_complete.txt
 aeon/core/prompts/tool_desc_think.txt
 aeon/core/prompts/tool_desc_write_file.txt
 aeon/core/prompts/tools_section.txt
+aeon/core/prompts/categories/__init__.py
+aeon/core/prompts/tools/__init__.py
 aeon/llamacpp/__init__.py
+aeon/memories/__init__.py
+aeon/memories/personalities/__init__.py
 aeon/scripts/__init__.py
 aeon/scripts/clear_gpu.sh
 aeon/scripts/gemma_lb.py
@@ -72,7 +76,12 @@ aeon/scripts/start_gemma4_vl.sh
 aeon/scripts/start_qwen36_vl_35b.sh
 aeon/scripts/start_vllm.sh
 aeon/scripts/sub_agent_wrapper.py
+aeon/scripts/vllm_lb.py
 aeon/services/__init__.py
+aeon/services/browser/__init__.py
+aeon/services/browser/server.py
+aeon/services/comfyui/__init__.py
+aeon/services/vllm/__init__.py
 aeon/tools/__init__.py
 aeon/tools/base.py
 aeon/tools/browser.py

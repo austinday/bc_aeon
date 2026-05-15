@@ -21,13 +21,8 @@ echo "[Browser] Removing old container if exists..."
 docker rm -f $CONTAINER_NAME >/dev/null 2>&1 || true
 
 echo "[Browser] Starting container..."
-docker run -d \
-    --name $CONTAINER_NAME \
-    -v $PROJECT_ROOT:/app \
-    -p $PORT:8030 \
-    -e PORT=8030 \
-    --shm-size=2g \
-    $IMAGE_NAME
+docker run -d --name $CONTAINER_NAME -p $PORT:8030 -e PORT=8030 --shm-size=2g $IMAGE_NAME
+
 echo "[Browser] Waiting for service to become healthy (timeout 60s)..."
 for i in {1..60}; do
     if curl -s http://localhost:$PORT/health >/dev/null; then

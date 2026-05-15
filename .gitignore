@@ -17,6 +17,7 @@ aeon.log
 # User Data & Models
 aeon_models/
 data/
+aeon_output/
 
 # IDEs
 .vscode/

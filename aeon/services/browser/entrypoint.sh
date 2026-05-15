@@ -12,7 +12,7 @@ sleep 2
 
 echo "Xvfb is running. Moving to browser service directory..."
 # Ensure we are in the directory where server.py is located
-cd /app/aeon/services/browser
+cd /app/browser_service
 
 echo "Starting Uvicorn on port ${PORT:-8000}..."
-exec uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}
+exec python3 -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}

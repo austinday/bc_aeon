@@ -1,3 +1,4 @@
+# LIVE TEST RESTART 2026-05-15
 import os, argparse, json, time, sys, subprocess, requests, fcntl, signal, atexit
 from pathlib import Path
 from aeon.core.logger import get_logger
@@ -785,7 +786,7 @@ def _execute_restart(session, worker=None):
         # Phase 3: Reinstall
         print(f'[RESTART] Reinstalling aeon from {aeon_code_dir}...')
         result = subprocess.run(
-            [sys.executable, '-m', 'pip', 'install', '-e', '.', '--quiet'],
+            [sys.executable, '-m', 'pip', 'install', '.', '--quiet'],
             cwd=aeon_code_dir,
             capture_output=True, text=True
         )
@@ -821,7 +822,7 @@ def _execute_restart(session, worker=None):
                 _restore_backup(aeon_code_dir, backup_created)
                 # Reinstall the restored code
                 subprocess.run(
-                    [sys.executable, '-m', 'pip', 'install', '-e', '.', '--quiet'],
+                    [sys.executable, '-m', 'pip', 'install', '.', '--quiet'],
                     cwd=aeon_code_dir, capture_output=True
                 )
                 os.remove(RESTART_STATE_PATH)

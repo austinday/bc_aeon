@@ -1,0 +1,14 @@
+--- Startup Debug Thu May 14 20:38:17 2026 ---
+PID: 1990188
+CWD: /home/aday/bc_aeon
+sys.path: ['/home/aday/.local/bin', '/usr/lib/python312.zip', '/usr/lib/python3.12', '/usr/lib/python3.12/lib-dynload', '/home/aday/.local/lib/python3.12/site-packages', '/home/aday/.local/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages', '/usr/local/lib/python3.12/dist-packages', '/usr/lib/python3/dist-packages']
+PYTHONPATH: Not Set
+aeon.__file__: /home/aday/.local/lib/python3.12/site-packages/aeon/__init__.py
+----------------------------------------
+--- Startup Debug Thu May 14 20:41:32 2026 ---
+PID: 1998260
+CWD: /home/aday/bc_aeon
+sys.path: ['/home/aday/.local/bin', '/usr/lib/python312.zip', '/usr/lib/python3.12', '/usr/lib/python3.12/lib-dynload', '/home/aday/.local/lib/python3.12/site-packages', '/home/aday/.local/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages', '/usr/local/lib/python3.12/dist-packages', '/usr/lib/python3/dist-packages']
+PYTHONPATH: Not Set
+aeon.__file__: /home/aday/.local/lib/python3.12/site-packages/aeon/__init__.py
+----------------------------------------

@@ -1,34 +1,27 @@
-FROM python:3.11-slim
+FROM mcr.microsoft.com/playwright:v1.49.0-jammy
 
-# Install system dependencies for Camoufox/Playwright
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     xvfb \
-    libgbm-dev \
-    libasound2 \
-    libnss3 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxrandr2 \
-    libgtk-3-0 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    wget \
+    curl \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-RUN pip install --no-cache-dir fastapi uvicorn pydantic camoufox requests
+# Set working directory
+WORKDIR /app/browser_service
 
-ENV HOME=/tmp
-WORKDIR /app
+# Copy requirements and install
+COPY requirements.txt .
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
-# We mount the project root to /app at runtime, so we don't COPY files here.
-# Run the entrypoint script to start Xvfb and the server
-CMD ["/bin/bash", "/app/aeon/services/browser/entrypoint.sh"]
+# Copy the service code
+COPY . .
+
+# Set environment variables
+ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
+
+# Ensure entrypoint is executable
+RUN chmod +x entrypoint.sh
+
+ENTRYPOINT ["./entrypoint.sh"]

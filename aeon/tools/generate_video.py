@@ -21,7 +21,7 @@ class GenerateVideoTool(BaseTool):
             description="Generates high-quality videos using LTX-Video via ComfyUI. Supports text-to-video and image-to-video."
         )
         self.comfy_url = "http://localhost:8188"
-        self.output_dir = "aeon_output/comfyui"
+        self.output_dir = "aeon_output/comfyui/output"
         os.makedirs(self.output_dir, exist_ok=True)
         self.max_chunk_frames = 33  # LTX-Video optimal chunk size
 
@@ -102,10 +102,16 @@ class GenerateVideoTool(BaseTool):
                 }
             },
             "7": {
-                "class_type": "CLIPLoader",
+                "class_type": "CLIPLoaderGGUF",
                 "inputs": {
-                    "clip_name": "t5xxl_fp8_e4m3fn.safetensors",
-                    "type": "ltxv"
+                    "clip_name": "gemma-3-12b-it-qat-UD-Q4_K_XL.gguf"
+                }
+            },
+            "15": {
+                "class_type": "LTXVTextProjection",
+                "inputs": {
+                    "clip": ["7", 0],
+                    "projection_name": "ltx-2.3_text_projection_bf16.safetensors"
                 }
             },
             "8": {
@@ -118,14 +124,14 @@ class GenerateVideoTool(BaseTool):
                 "class_type": "CLIPTextEncode",
                 "inputs": {
                     "text": prompt,
-                    "clip": ["7", 0]
+                    "clip": ["15", 0]
                 }
             },
             "5": {
                 "class_type": "CLIPTextEncode",
                 "inputs": {
                     "text": "low quality, blurry, distorted, static, slideshow, flickering, watermark, text",
-                    "clip": ["7", 0]
+                    "clip": ["15", 0]
                 }
             },
             "6": {
