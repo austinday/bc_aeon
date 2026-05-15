@@ -29,3 +29,11 @@ python -m aeon.main --model <model_name>
 
 ## Troubleshooting
 If the agent crashes, check `aeon.log` in the root directory for detailed tracebacks. When using `run_aeon.sh`, the most relevant logs are printed to the console immediately after a crash.
+
+## Gemma Load Balancer Self-Healing
+`aeon/scripts/gemma_lb.py` implements a self-healing load balancer for Gemma-4 instances:
+- Periodic health checks detect crashes or OOM events on either node.
+- Automatic restart via start scripts when a node becomes unhealthy.
+- Active request tracking with lock-protected restarts to prevent race conditions.
+- Idle timeout shutdown (5 min) to release resources when no agents are using the models.
+- Validation test (`scripts/debug/test_gemma_lb_healing.py`) confirms restart-on-crash and idle-shutdown behaviors both succeed.
