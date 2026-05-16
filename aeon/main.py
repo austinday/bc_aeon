@@ -79,22 +79,34 @@ LLAMACPP_MODELS = [
         'start_script': 'start_gemma4_mtp.sh',
         'health_port': 8013,
     },
+    {
+        'model': 'Gemma-4-31B-NVFP4',
+        'family': 'Gemma-4',
+        'label': 'Gemma-4-31B NVFP4 Turbo | vLLM MTP | ~100+ t/s | 128k ctx | Abliterated: Yes | Local/vLLM',
+        'provider': 'vllm',
+        'base_url': 'http://localhost:8018/v1',
+        'context_limit': 131072,
+        'container_name': 'aeon_gemma_vllm_lb',
+        'additional_containers': ['gemma_node0', 'gemma_node1'],
+        'start_script': '0_launch_gemma_nvfp4.sh',
+        'health_port': 8018,
+    },
 ]
 
 def is_container_running(name):
     try: return bool(subprocess.check_output(["docker", "ps", "-q", "-f", f"name={name}"], stderr=subprocess.DEVNULL, text=True).strip())
     except: return False
 
-def wait_for_service(name, port):
+def wait_for_service(name, port, endpoint="/api/tags", timeout=60):
     print(f"Waiting for {name} (Port {port})...", end='', flush=True)
     start = time.time()
-    while time.time() - start < 60:
+    while time.time() - start < timeout:
         try:
-            if requests.get(f"http://localhost:{port}/api/tags", timeout=1).status_code == 200: 
+            if requests.get(f"http://localhost:{port}{endpoint}", timeout=2).status_code == 200: 
                 print(" OK.")
                 return True
         except: pass
-        time.sleep(1)
+        time.sleep(2)
         print(".", end='', flush=True)
     print(" Timeout!")
     return False
@@ -109,7 +121,7 @@ def start_local_brain_services():
     env = os.environ.copy()
     env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
     subprocess.run(["bash", str(script)], check=True, env=env)
-    return wait_for_service("Aeon Brain (Ollama)", 8000)
+    return wait_for_service("Aeon Brain (Ollama)", 8000, endpoint="/api/tags", timeout=120)
 
 def warm_up_models(local_model_names):
     """Preload local models into VRAM by making initial requests."""
@@ -120,7 +132,7 @@ def warm_up_models(local_model_names):
     
     for model in models_to_warm:
         try:
-            print(f"[SYSTEM]   >> Loading {model}...", end='', flush=True)
+            print(f"[SYSTEM]    >> Loading {model}...", end='', flush=True)
             resp = requests.post(
                 "http://localhost:8000/api/generate",
                 json={"model": model, "prompt": "hello", "options": {"num_predict": 1}},
@@ -170,7 +182,7 @@ def cleanup_transient_tools():
                                             other_alive_pids.append(p)
                                 except (OSError, FileNotFoundError):
                                     pass
-                                
+                        
                         if cleanup_callback:
                             cleanup_callback()
                                 
@@ -235,7 +247,9 @@ def start_llamacpp_server(config):
     if result.returncode != 0:
         print(f"[LLAMACPP] ERROR: Failed to start {container_name}")
         return False
-    return True
+        
+    print(f"[LLAMACPP] Waiting for {config['model']} to initialize. This can take 5-10 minutes if compiling kernels...")
+    return wait_for_service(config['model'], port, endpoint="/health", timeout=900)
 
 def stop_llamacpp_server(config):
     """Stop the llama.cpp server container(s)."""
@@ -283,6 +297,8 @@ def _cleanup_stale_pids(registry):
 
 def _pid_exists(pid):
     """Check if PID exists AND is actually an Aeon python process, ignoring recycled PIDs."""
+    if pid == os.getpid():
+        return True
     try:
         os.kill(pid, 0)
         # 1. Check for zombies
@@ -298,7 +314,7 @@ def _pid_exists(pid):
         try:
             with open(f"/proc/{pid}/cmdline", "r") as f:
                 cmdline = f.read().replace('\x00', ' ').strip().lower()
-                if "aeon" not in cmdline:
+                if "aeon.main" not in cmdline and "sub_agent_wrapper" not in cmdline and not cmdline.endswith("aeon"):
                     return False
         except FileNotFoundError:
             return False
@@ -535,7 +551,7 @@ class SessionManager:
         if weak_config and weak_config.get('provider') == 'local':
             local_models.append(weak_config['model'])
         local_models = list(dict.fromkeys(local_models))  # deduplicate
-        self._models_used = local_models
+        self._models_used = list(local_models)
 
         # Determine which models are llama.cpp served
         llamacpp_configs = []
@@ -663,7 +679,12 @@ def terminate_all_sub_agents():
                     try:
                         os.waitpid(pid, 0)
                     except ChildProcessError:
-                        pass
+                        for _ in range(10):
+                            try:
+                                os.kill(pid, 0)
+                                time.sleep(0.1)
+                            except OSError:
+                                break
                     terminated_count += 1
             except (ValueError, ProcessLookupError, PermissionError):
                 pass

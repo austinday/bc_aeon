@@ -6,7 +6,7 @@
 #
 # Build:  docker build -t aeon_vllm:latest -f this/Dockerfile .
 # =============================================================================
-FROM nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -21,8 +21,9 @@ RUN pip install --no-cache-dir --break-system-packages \
     torch torchvision torchaudio \
     --extra-index-url https://download.pytorch.org/whl/cu130
 
-# Install vLLM and vision dependencies. We drop llmcompressor as native MTP requires no manual drafts.
+# Install vLLM nightly for Gemma 4 MTP support
 RUN pip install --no-cache-dir --break-system-packages \
+    --pre --extra-index-url https://wheels.vllm.ai/nightly \
     vllm \
     qwen-vl-utils \
     accelerate

@@ -150,8 +150,8 @@ class LLMClient:
     def _create_client(self, config: dict):
         """Create an OpenAI-compatible client from a model config dict."""
         if config['provider'] == 'local':
-            return openai.OpenAI(base_url='http://localhost:8000/v1', api_key='ollama')
-        elif config['provider'] == 'llamacpp':
+            return openai.OpenAI(base_url='http://localhost:8013/v1', api_key='ollama')
+        elif config['provider'] in ['llamacpp', 'vllm']:
             return openai.OpenAI(base_url=config['base_url'], api_key='no-key-needed')
         elif config['provider'] == 'vertex':
             return VertexAIClient(config['project_id'], config['model'])

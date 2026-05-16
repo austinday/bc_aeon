@@ -64,6 +64,7 @@ aeon/core/prompts/tools/__init__.py
 aeon/llamacpp/__init__.py
 aeon/memories/__init__.py
 aeon/memories/personalities/__init__.py
+aeon/scripts/0_launch_gemma_nvfp4.sh
 aeon/scripts/__init__.py
 aeon/scripts/clear_gpu.sh
 aeon/scripts/gemma_lb.py

@@ -1,37 +1,8 @@
-INFO:     Started server process [44123]
+INFO:     Started server process [1178809]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8020 (Press CTRL+C to quit)
-2026-05-15 11:55:07,765 - ERROR - Node http://127.0.0.1:8016 became unhealthy: Server disconnected without sending a response.. Triggering self-healing...
-2026-05-15 11:55:07,765 - INFO - Attempting to restart container aeon_gemma4_vllm_node0...
-2026-05-15 11:55:18,125 - INFO - Successfully sent restart command to aeon_gemma4_vllm_node0
-2026-05-15 11:55:18,126 - ERROR - Node http://127.0.0.1:8017 became unhealthy: All connection attempts failed. Triggering self-healing...
-2026-05-15 11:55:18,126 - INFO - Attempting to restart container aeon_gemma4_vllm_node1...
-2026-05-15 11:55:18,132 - INFO - Successfully sent restart command to aeon_gemma4_vllm_node1
-INFO:     127.0.0.1:46192 - "POST /v1/chat/completions HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:38170 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:58998 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:41506 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:33484 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:42624 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:44562 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:37006 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:50416 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:42566 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:53324 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:38322 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:40032 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:33774 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:39132 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:48918 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:46154 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:33724 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:48976 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:55462 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:60252 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:49684 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:56704 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:55680 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:43894 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:38060 - "GET /health HTTP/1.1" 503 Service Unavailable
-INFO:     127.0.0.1:37038 - "GET /health HTTP/1.1" 503 Service Unavailable
+INFO:     Uvicorn running on http://0.0.0.0:8018 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [1178809]
