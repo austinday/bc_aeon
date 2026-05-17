@@ -1,22 +1,23 @@
 #!/bin/bash
-# Starts Gemma-4-31B as an ephemeral vision/multimodal server on GPU 1.
+# Starts Gemma-4-31B as an ephemeral vision/multimodal server on GPU 0.
 set -e
 
 CONTAINER_NAME='aeon_gemma4_vl'
 IMAGE_NAME='aeon_vllm:latest'
 PORT=8020
-GPU_ID=${VISION_GPU:-1}
+GPU_ID=${VISION_GPU:-0}
 AEON_HOME="${AEON_HOME:-$HOME/.aeon}"
 
 echo "[Gemma4-VL] Checking for existing container..."
 docker rm -f $CONTAINER_NAME >/dev/null 2>&1 || true
 
 # We use vLLM for Gemma 4 vision as it handles video/multi-image payloads natively.
-# Use TP=1 on GPU 1 to avoid RPC timeouts and communication overhead.
+# Use TP=1 on GPU 0 to avoid RPC timeouts and communication overhead.
 # Increase memory utilization to ensure the 31B model and KV cache fit comfortably.
 docker run -d \
   --name $CONTAINER_NAME \
-  --gpus "\"device=${GPU_ID}\"" \  -e VLLM_USE_V1=0 \
+  --gpus "\"device=${GPU_ID}\"" \
+  -e VLLM_USE_V1=0 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -p ${PORT}:8000 \
   --ipc=host \

@@ -2,7 +2,7 @@
 # =============================================================================
 # Start llama.cpp server for Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P
 # Used by the analyze_image tool for on-demand image understanding.
-# Runs on GPU1 by default.
+# Runs on GPU0 by default.
 # Uses aeon_llamacpp:latest (same image as text model serving).
 # =============================================================================
 set -e
@@ -10,7 +10,7 @@ set -e
 CONTAINER_NAME='aeon_qwen36_vl'
 IMAGE_NAME='aeon_llamacpp:latest'
 PORT=8020
-GPU_ID=${VISION_GPU:-1}
+GPU_ID=${VISION_GPU:-0}
 AEON_HOME="${AEON_HOME:-$HOME/.aeon}"
 MODELS_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
 

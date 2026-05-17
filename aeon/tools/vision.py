@@ -128,16 +128,17 @@ class AnalyzeImageTool(BaseTool):
 
                 env = os.environ.copy()
                 env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
+                env["VISION_GPU"] = "0"
                 res = subprocess.run(['bash', script_path], capture_output=True, text=True, env=env)
                 if res.returncode != 0:
                     return f'Error starting vision server: {res.stderr}'
 
-                for attempt in range(60):  # Up to 3 minutes for Q8 GGUF loading
-                    if self._check_health():
-                        break
-                    time.sleep(3)
-                else:
-                    return 'Error: Vision server failed to become healthy after 3 minutes. Check: docker logs aeon_qwen36_vl'
+            for attempt in range(60):  # Up to 3 minutes for Q8 GGUF loading
+                if self._check_health():
+                    break
+                time.sleep(3)
+            else:
+                return 'Error: Vision server failed to become healthy after 3 minutes. Check: docker logs aeon_qwen36_vl'
 
             # Load and encode image
             try:
