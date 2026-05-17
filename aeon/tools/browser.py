@@ -44,8 +44,8 @@ def _print_image_to_terminal(image_bytes, target_width=80):
         print(f"Failed to render image to terminal: {e}")
 
 
-def _manage_browser_registry():
-    """Register the current agent PID as an active user of the browser service."""
+def _manage_browser_registry(action='register'):
+    """Manage the current agent PID as an active user of the browser service."""
     registry_path = "/tmp/aeon_browser_registry.json"
     lock_path = "/tmp/aeon_browser_registry.lock"
     pid = os.getpid()
@@ -69,14 +69,23 @@ def _manage_browser_registry():
             except OSError:
                 pass
         
-        if pid not in cleaned_pids:
-            cleaned_pids.append(pid)
+        if action == 'register':
+            if pid not in cleaned_pids:
+                cleaned_pids.append(pid)
+        elif action == 'unregister':
+            if pid in cleaned_pids:
+                cleaned_pids.remove(pid)
             
         with open(registry_path, 'w') as f:
             json.dump(cleaned_pids, f)
+            
+        return len(cleaned_pids)
 
 def ensure_browser_running():
-    _manage_browser_registry()
+    _manage_browser_registry('register')
+    # Also register for the vision tool to keep it alive alongside the browser
+    AnalyzeImageTool()._manage_registry('register')
+    
     try:
         res = requests.get(f"{BROWSER_API_URL}/health", timeout=2)
         if res.status_code == 200:
@@ -116,17 +125,26 @@ def process_browser_response(data, action_desc, session_id, tab_id):
     
     # --- AUTO-VISION INJECTION ---
     vision_tool = AnalyzeImageTool()
-    # ROBUST VISION PROMPT: Forces Qwen-VL to map products to specific IDs
-    vision_prompt = (
+    
+    # Dynamic Prompting: Tailor the vision request based on the action just performed
+    # This helps the model focus on state changes (e.g., "Did the menu open?")
+    base_prompt = (
         "This is a webpage with numbered red bounding boxes over interactive elements. "
         "Perform a detailed visual mapping:\n"
         "1. Describe the overall layout.\n"
         "2. Explicitly list all visible products, distinct images, or main content blocks and state their EXACT corresponding red box numbers.\n"
         "3. Identify key navigation links and search bars with their numbers.\n"
-        "Be highly specific. If there are multiple 'View Products' buttons, clarify which number belongs to which product."
     )
+    
+    action_context = f"\n\nCONTEXT: The previous action was '{action_desc}'. "
+    action_context += "Please specifically analyze if this action caused a visible state change (e.g., a new menu appearing, a dropdown opening, a loading spinner disappearing, or an error message appearing). "
+    action_context += "Compare the current state to what would be expected after such an action and report the result clearly."
+    
+    vision_prompt = base_prompt + action_context
+    
     try:
-        vision_analysis = vision_tool.execute(image_path=overlay_path, prompt=vision_prompt)
+        # auto_cleanup=False ensures the vision model stays loaded for future browser interactions
+        vision_analysis = vision_tool.execute(image_path=overlay_path, prompt=vision_prompt, auto_cleanup=False)
     except Exception as e:
         vision_analysis = f"Vision analysis failed: {e}"
     
@@ -199,6 +217,23 @@ class BrowserCloseTabTool(BaseTool):
             resp = requests.post(f"{BROWSER_API_URL}/close_tab", json={"session_id": session_id, "tab_id": tab_id}, timeout=10)
             if resp.status_code != 200:
                 return f"HTTP Error {resp.status_code} from browser API: {resp.text}"
+            
+            data = resp.json()
+            remaining = data.get("remaining_tabs", 1)
+            
+            if remaining == 0:
+                # Unregister from browser
+                rem_browser = _manage_browser_registry('unregister')
+                if rem_browser == 0:
+                    subprocess.run(['docker', 'rm', '-f', 'aeon_browser'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                # Unregister from vision
+                rem_vision = AnalyzeImageTool()._manage_registry('unregister')
+                if rem_vision == 0:
+                    subprocess.run(['docker', 'rm', '-f', 'aeon_qwen36_vl'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    
+                return f"Successfully closed tab: {tab_id}. No more tabs open, released browser and vision resources."
+            
             return f"Successfully closed tab: {tab_id}"
         except Exception as e:
             return self.format_error_message(e, f"closing tab {tab_id}")

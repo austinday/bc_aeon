@@ -95,7 +95,7 @@ class AnalyzeImageTool(BaseTool):
         b64 = base64.b64encode(buffer.read()).decode('utf-8')
         return b64, 'image/jpeg'
 
-    def execute(self, image_path: str, prompt: str) -> str:
+    def execute(self, image_path: str, prompt: str, auto_cleanup: bool = True) -> str:
         if not image_path:
             return "Error: 'image_path' parameter is required."
         if not prompt:
@@ -164,15 +164,17 @@ class AnalyzeImageTool(BaseTool):
                 }
             ]
 
+            payload = {
+                'model': 'Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P',
+                'messages': messages,
+                'max_tokens': 2048,
+                'temperature': 0.3,
+            }
 
+            print("Sending request to vision server...")
             resp = requests.post(
                 f'{self.vllm_url}/v1/chat/completions',
-                json={
-                    'model': 'Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P',
-                    'messages': messages,
-                    'max_tokens': 2048,
-                    'temperature': 0.3,
-                },
+                json=payload,
                 timeout=120
             )
 
@@ -202,6 +204,7 @@ class AnalyzeImageTool(BaseTool):
             return self.format_error_message(e, 'analyzing image via Qwen3.6-35B', 'checking vision server logs (docker logs aeon_qwen36_vl)')
 
         finally:
-            remaining_users = self._manage_registry('unregister')
-            if remaining_users == 0:
-                subprocess.run(['docker', 'rm', '-f', 'aeon_qwen36_vl'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if auto_cleanup:
+                remaining_users = self._manage_registry('unregister')
+                if remaining_users == 0:
+                    subprocess.run(['docker', 'rm', '-f', 'aeon_qwen36_vl'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -152,7 +152,7 @@ def cleanup_transient_tools():
     print("[SYSTEM] Cleaning up transient tool containers...")
     try:
         # Clean standard transient tools
-        subprocess.run("docker ps -a -q --filter 'name=aeon_research' --filter 'name=aeon_vision' | xargs -r docker rm -f", 
+        subprocess.run("docker ps -a -q --filter 'name=aeon_research' | xargs -r docker rm -f", 
                        shell=True, stderr=subprocess.DEVNULL, timeout=5)
         
         # Safely evaluate container cleanup using registry
@@ -192,6 +192,7 @@ def cleanup_transient_tools():
                 pass
         
         _safe_cleanup("/tmp/aeon_comfyui_registry.json", "/tmp/aeon_comfyui_registry.lock", "aeon_comfyui")
+        _safe_cleanup("/tmp/aeon_vision_vllm_registry.json", "/tmp/aeon_vision_vllm_registry.lock", "aeon_qwen36_vl")
         
         def _close_browser_session():
             try:

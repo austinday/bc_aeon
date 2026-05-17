@@ -51,7 +51,7 @@ docker run -d --gpus '"device=1"' \
   --host 0.0.0.0 \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.45 \
-  --max-model-len 89984
+  --max-model-len 262144
 
 echo "Waiting for nodes to start..."
 sleep 25

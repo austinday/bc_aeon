@@ -240,8 +240,10 @@ async def close_tab(req: CloseTabRequest):
             pass
         del tabs[key]
     
+    remaining = sum(1 for k in tabs.keys() if k.startswith(f"{req.session_id}_"))
+    
     # Clean up context if no tabs left for this session
-    if not any(k.startswith(f"{req.session_id}_") for k in tabs.keys()):
+    if remaining == 0:
         if req.session_id in contexts:
             try:
                 await contexts[req.session_id].close()
@@ -249,7 +251,7 @@ async def close_tab(req: CloseTabRequest):
                 pass
             del contexts[req.session_id]
             
-    return {"status": "ok"}
+    return {"status": "ok", "remaining_tabs": remaining}
 
 class CloseSessionRequest(BaseModel):
     session_id: str
@@ -340,7 +342,7 @@ async def extract_page_state(page, session_id=None):
                 document.body.appendChild(box);
                 
                 // INTELLIGENT CONTEXT EXTRACTION
-                let text = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || el.name || '').replace(/\\n/g, ' ').trim();
+                let text = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || el.name || '').replace(/\n/g, ' ').trim();
                 
                 if (el.tagName.toLowerCase() === 'select') {
                     let opts = Array.from(el.options).map(o => o.text).join(' | ');
@@ -350,7 +352,7 @@ async def extract_page_state(page, session_id=None):
                 // Deep scan: Many e-commerce sites wrap images in <a> tags with no innerText. Grab the img alt!
                 let img = el.querySelector('img');
                 if (img && img.alt) {
-                    let altText = img.alt.replace(/\\n/g, ' ').trim();
+                    let altText = img.alt.replace(/\n/g, ' ').trim();
                     text = text ? text + ' - ' + altText : altText;
                 }
                 
@@ -361,7 +363,7 @@ async def extract_page_state(page, session_id=None):
                         let parent = el.closest('article, li, .product, .card, .grid-item') || el.parentElement;
                         if (parent) {
                             let pImg = parent.querySelector('img');
-                            let parentText = (parent.innerText || '').replace(/\\n/g, ' ').replace(/\\s+/g, ' ').trim();
+                            let parentText = (parent.innerText || '').replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
                             let extraCtx = (pImg && pImg.alt) ? pImg.alt : parentText;
                             if (extraCtx) {
                                 text = text ? text + " [Context: " + extraCtx.substring(0, 60) + "]" : extraCtx.substring(0, 60);
