@@ -475,35 +475,84 @@ class LLMClient:
 
     def _handle_connection_error(self, error):
         """Handle API connection errors with exponential backoff and GPU recovery check."""
-        self.logger.warning(f"Connection error detected: {error}. Entering recovery mode (max 10m)...")
+        self.logger.warning(f"Connection error detected: {error}. Entering recovery mode...")
         
         start_time = time.time()
-        delay = 1
-        max_total_wait = 600 
-        max_delay = 60
         
-        while (time.time() - start_time) < max_total_wait:
-            self.logger.info(f"Waiting {delay}s before checking for GPU/Server recovery...")
-            time.sleep(delay)
+        # Check if we are using a local model that we can self-heal
+        llamacpp_config = None
+        try:
+            from aeon.main import get_llamacpp_config
+            llamacpp_config = get_llamacpp_config(self.primary_model)
+        except ImportError:
+            pass
+        
+        if llamacpp_config:
+            self.logger.info(f"Local model {self.primary_model} detected. Pausing for 5 minutes before attempting self-healing...")
+            time.sleep(300)
+            delay = 60
+            max_delay = 600
+        else:
+            delay = 1
+            max_delay = 60
+            max_total_wait = 600
+        
+        while True:
+            self.logger.info("Checking for GPU/Server recovery...")
             
             try:
-                if isinstance(self.primary_client, VertexAIClient):
-                    # Vertex AI check: try a minimal call
-                    self.primary_client.Chat(self.primary_client).Completions(self.primary_client).create(
-                        model=self.primary_model, messages=[{"role": "user", "content": "hi"}], temperature=0
-                    )
+                if llamacpp_config:
+                    from aeon.main import start_llamacpp_server
+                    from aeon.core.gpu_queue import get_real_vram
+                    
+                    self.logger.info(f"Preparing to self-heal {self.primary_model}...")
+                    
+                    # Kill potentially hung containers first to free VRAM
+                    containers_to_kill = [llamacpp_config['container_name']] + llamacpp_config.get('additional_containers', [])
+                    for c_name in containers_to_kill:
+                        subprocess.run(['docker', 'rm', '-f', c_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    
+                    time.sleep(5)  # Allow VRAM to free up
+                    
+                    vram = get_real_vram()
+                    max_free = max(vram.values()) if vram else 0
+                    
+                    # We need enough VRAM (e.g., > 20GB) to reasonably start a model,
+                    # or if `get_real_vram` fails (returns empty), we just try it anyway.
+                    if not vram or max_free > 20.0:
+                        self.logger.info(f"Sufficient VRAM detected (Max free: {max_free:.1f}GB). Running start script...")
+                        success = start_llamacpp_server(llamacpp_config)
+                        if success:
+                            # Verify API works
+                            self.primary_client.models.list()
+                            self.logger.info("Self-healing successful! Resuming agent...")
+                            return True
+                        else:
+                            self.logger.warning("Self-heal script failed. GPU might still be occupied.")
+                    else:
+                        self.logger.info(f"Not enough VRAM to self-heal (Max free: {max_free:.1f}GB). Waiting...")
                 else:
-                    # OpenAI-compatible client check: list models
-                    self.primary_client.models.list()
-                
-                self.logger.info("GPU/Server recovery detected! Resuming agent...")
-                return True
+                    if isinstance(self.primary_client, VertexAIClient):
+                        # Vertex AI check: try a minimal call
+                        self.primary_client.Chat(self.primary_client).Completions(self.primary_client).create(
+                            model=self.primary_model, messages=[{"role": "user", "content": "hi"}], temperature=0
+                        )
+                    else:
+                        # OpenAI-compatible client check: list models
+                        self.primary_client.models.list()
+                    
+                    self.logger.info("Server recovery detected! Resuming agent...")
+                    return True
             except Exception as e:
                 self.logger.warning(f"Recovery check failed: {e}")
-                delay = min(delay * 2, max_delay)
-        
-        self.logger.error("Recovery timed out after 10 minutes.")
-        return False
+            
+            if not llamacpp_config and (time.time() - start_time) > max_total_wait:
+                self.logger.error("Recovery timed out after 10 minutes.")
+                return False
+                
+            self.logger.info(f"Waiting {delay}s before next recovery attempt...")
+            time.sleep(delay)
+            delay = min(delay * 2, max_delay)
 
     def get_primary_agent_response(self, prompt: str, max_retries: int = 3, diagnostic_str: Optional[str] = None) -> str:
         """Get combined reasoning and action from the Primary Agent (Strong Model)."""

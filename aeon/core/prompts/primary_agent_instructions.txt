@@ -43,7 +43,18 @@ Once you have a plan in mind, your implementation goal is to move the current st
     - 'thought': Unconstrained internal monologue. A detailed reasoning about the current state that is helpful towards understanding and implementing the task.
     - 'previous_result_summary': Objective, factual summary of the LAST STEP RESULT. (Use 'N/A' on turn 1).
     - 'intent': A strict, 1-2 sentence factual statement of what you are attempting to achieve in this specific iteration.
-    - 'updated_plan': Numbered steps needed to complete the task from the current state to the complete state. (Long term steps) 
+    - 'updated_plan': You must update your plan every iteration. Do not write a chronological list of completed steps. Instead, write a dense, forward-looking "Active Horizon" using strict Markdown. Since it is multi-line, you MUST use the `__BLOCK_N__` notation.
+      Use this EXACT structure for your Markdown block:
+      ### Active Focus
+      - **Task:** [What I am doing right now]
+      - **Verify:** [Exact terminal command or condition to prove success]
+      - **Fallback:** [If this fails, my immediate pivot is X]
+      
+      ### Parallel Queue
+      - [Orthogonal tasks ready for sub-agents, or "None"]
+      
+      ### Blocked / Future
+      - [Task] (Blocked by: [Dependency])
     - 'actions': One or more actions that the agent must currently take to make progress towards the objective. (Short term steps) These need to be substantial, not simply opening files. Every group of actions should usually include some str_replace, write_file, or run_command operation. Learn through actions, not by passive inspection. Do not queue multiple modification actions (str_replace, write_file) for the same file in a single actions array. Execute one modification, wait to observe the result, and then proceed. Prefer str_replace for existing files. Use write_file for brand new files or if you are replacing the majority of a file's code.
 
 8) RESPONSE FORMAT & BLOCK NOTATION (CRITICAL):
@@ -71,36 +82,60 @@ RULES:
 - The actual content goes AFTER the JSON, between --- BEGIN BLOCK_N --- and --- END BLOCK_N ---.
 - Number blocks sequentially: BLOCK_1, BLOCK_2, BLOCK_3, etc.
 
-SIMPLE EXAMPLE (single-line values, no content blocks needed):
+SIMPLE EXAMPLE (updated_plan uses block notation):
 {
   "thought": "The test script needs to be run.",
   "previous_result_summary": "Successfully wrote main.py.",
   "intent": "Run the test script.",
-  "updated_plan": ["1. Run tests", "2. Fix any failures"],
+  "updated_plan": "__BLOCK_1__",
   "actions": [
     {"tool_name": "run_command", "parameters": {"command": "python test.py"}}
   ]
 }
+--- BEGIN BLOCK_1 ---
+### Active Focus
+- **Task:** Run tests
+- **Verify:** `python test.py` returns 0 exit code
+- **Fallback:** Read error logs and fix bugs
 
-MULTI-LINE / COMPLEX EXAMPLE (Requires Block Notation):
+### Parallel Queue
+- None
+
+### Blocked / Future
+- Deploy code (Blocked by: Tests)
+--- END BLOCK_1 ---
+
+MULTI-LINE / COMPLEX EXAMPLE (Requires Multiple Blocks):
 {
   "thought": "I need to replace a complex JSON node in the ComfyUI workflow.",
   "previous_result_summary": "Workflow failed due to missing type.",
   "intent": "Update the config node.",
-  "updated_plan": ["1. Fix node", "2. Retest"],
+  "updated_plan": "__BLOCK_1__",
   "actions": [
-    {"tool_name": "str_replace", "parameters": {"file_path": "main.py", "old_str": "__BLOCK_1__", "new_str": "__BLOCK_2__"}}
+    {"tool_name": "str_replace", "parameters": {"file_path": "main.py", "old_str": "__BLOCK_2__", "new_str": "__BLOCK_3__"}}
   ]
 }
 --- BEGIN BLOCK_1 ---
+### Active Focus
+- **Task:** Fix missing type in config node
+- **Verify:** Workflow JSON parses correctly
+- **Fallback:** Revert and use a standard node
+
+### Parallel Queue
+- None
+
+### Blocked / Future
+- Retest workflow (Blocked by: Node fix)
+--- END BLOCK_1 ---
+--- BEGIN BLOCK_2 ---
         "2": {
             "class_type": "CLIPLoaderGGUF",
             "inputs": {
                 "clip_name": "mistral_3_small_flux2_fp8.safetensors"
             }
         },
---- END BLOCK_1 ---
---- BEGIN BLOCK_2 ---
+--- END BLOCK_2 ---
+--- BEGIN BLOCK_3 ---
         "2": {
             "class_type": "CLIPLoaderGGUF",
             "inputs": {
@@ -108,7 +143,7 @@ MULTI-LINE / COMPLEX EXAMPLE (Requires Block Notation):
                 "type": "flux"
             }
         },
---- END BLOCK_2 ---
+--- END BLOCK_3 ---
 
 COMMON MISTAKES TO AVOID:
 - WRONG: {"old_str": "{\n  \"key\": \"value\"\n}"} <- CRITICAL: DO NOT inline JSON/code! Use a __BLOCK_N__ placeholder!

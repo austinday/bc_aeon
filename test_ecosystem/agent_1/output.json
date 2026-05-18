@@ -1,5 +1,0 @@
-{
-  "agent_id": "agent_1",
-  "status": "FAILED",
-  "error": "cannot convert dictionary update sequence element #0 to a sequence"
-}

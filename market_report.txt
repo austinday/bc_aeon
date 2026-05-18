@@ -1,8 +1,0 @@
-=== MARKET INTELLIGENCE REPORT ===
-Generated on: 2026-05-17 16:49:03.382124
-----------------------------------
-
-Entity: Market
-Sentiment: Bullish
-Summary: Based on raw data.
-----------------------------------

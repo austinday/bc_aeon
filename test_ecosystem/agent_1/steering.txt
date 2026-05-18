@@ -1,1 +1,0 @@
-Pivot to searching for 'blue' instead of 'red'

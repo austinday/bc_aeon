@@ -1,4 +1,3 @@
-README.md
 setup.py
 aeon/__init__.py
 aeon/main.py

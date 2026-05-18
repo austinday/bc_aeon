@@ -1,7 +1,0 @@
-{
-  "agent_id": "test_agent",
-  "status": "COMPLETED",
-  "result": "Reached maximum iterations.",
-  "plan": "",
-  "memories": {}
-}
