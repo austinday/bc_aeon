@@ -23,8 +23,22 @@ def main():
     output_path = Path(args.output_dir) / "output.json"
     status_path = Path(args.output_dir) / "status.txt"
     log_path = Path(args.output_dir) / "agent.log"
+    telemetry_path = Path(args.output_dir) / "telemetry.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def update_telemetry(iteration, step_description):
+        try:
+            telemetry = {
+                "agent_id": args.agent_id,
+                "iteration": iteration,
+                "current_step": step_description,
+                "timestamp": time.time()
+            }
+            with open(telemetry_path, "w") as f:
+                json.dump(telemetry, f, indent=2)
+        except Exception as e:
+            log(f"Telemetry update failed: {e}")
 
     def log(message):
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -64,7 +78,28 @@ def main():
 
         default_instruction = "When you finish, provide a detailed, informative report of your findings, actions taken, and final result. This report will be read by the main agent."
         objective = f"{default_instruction}\n\n{args.objective}"
-        worker.run(objective, max_iterations=args.max_iterations)
+        
+        # We need to hook into the worker's loop to update telemetry.
+        # Since worker.run is a blocking call, we wrap the iteration logic if possible,
+        # or we can use a simple approach: the worker's state is accessible if we 
+        # can modify the worker or if we run it in a way that we can poll it.
+        # However, the simplest way is to let the worker handle its own telemetry 
+        # if we modify the Worker class, but we are modifying the wrapper.
+        # As a workaround in the wrapper, we can't easily hook into worker.run() 
+        # without modifying aeon/core/worker.py. 
+        # Let's check if we can pass a callback to worker.run or if we should 
+        # modify the Worker class instead.
+        
+        # Actually, the most robust way is to modify the Worker class to accept 
+        # a telemetry callback. But for now, I will implement a basic 
+        # 'start' telemetry entry and then consider modifying the Worker.
+        
+        # Pass the update_telemetry function as a callback to the worker
+        worker.run(
+            objective, 
+            max_iterations=args.max_iterations, 
+            step_callback=update_telemetry
+        )
         
         if args.read_only:
             os.chmod(args.workspace, 0o755)

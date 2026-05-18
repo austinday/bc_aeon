@@ -536,7 +536,9 @@ class Worker:
 
                 display_max = max_iterations if max_iterations is not None else 999
                 if step_callback:
-                    step_callback(iteration, display_max, "Thinking")
+                    # Use the current intent as the step description for telemetry
+                    step_desc = intent if 'intent' in locals() else "Thinking"
+                    step_callback(iteration, display_max, step_desc)
 
                 if max_iterations is not None and iteration > max_iterations:
                     if not graceful_exit_triggered:

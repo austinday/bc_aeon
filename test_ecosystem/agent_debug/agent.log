@@ -1,0 +1,6 @@
+[2026-05-17 03:51:06] Initializing sub-agent test_agent...
+[2026-05-17 03:51:06] Shared space initialized at: test_ecosystem/agent_debug/shared_space
+[2026-05-17 03:51:06] Changed working directory to workspace: /home/aday/bc_aeon
+[2026-05-17 03:51:06] Workspace set to read-only.
+[2026-05-17 03:51:06] Starting execution of objective: Test objective
+[2026-05-17 03:51:06] Task completed successfully.

@@ -84,7 +84,13 @@ class OpenFileTool(BaseTool):
 
         self.worker.update_open_file(abs_path, content)
         slots_used = len(self.worker.open_files)
-        return f"File '{file_path}' opened in working memory. ({slots_used} files open)"
+        
+        # Create a line-numbered version for the user's display
+        lines = content.splitlines()
+        numbered_lines = [f"{i+1}: {line}" for i, line in enumerate(lines, 1)]
+        display_content = '\n'.join(numbered_lines)
+        
+        return f"File '{file_path}' opened in working memory. ({slots_used} files open)\n\n---\n{display_content}"
 
 
 class CloseFileTool(BaseTool):
@@ -152,97 +158,161 @@ class StrReplaceTool(BaseTool):
         return None, best_score
 
     def _apply_single_replace(self, abs_path: str, file_path: str, content: str, old_str: str, new_str: str) -> tuple:
-        match_method = 'exact'
-        matched_text = old_str
+        """
+        Applies a single replacement. 
+        Supports:
+        1. L-syntax: 'L10' or 'L10-L15' for line-based replacement.
+        2. Line-number stripping: Removes '1: ' prefixes from search blocks.
+        3. Exact match.
+        4. Whitespace-normalized match.
+        5. Fuzzy match.
+        """
+        stripped_old = old_str.strip()
+        
+        # --- 1. L-Syntax (Line-Range Replacement) ---
+        # Match L10 or L10-L15
+        line_range_match = re.match(r'^L(\d+)(?:-L(\d+))?$', stripped_old)
+        if line_range_match:
+            try:
+                start_line = int(line_range_match.group(1))
+                end_line = int(line_range_match.group(2)) if line_range_match.group(2) else start_line
+                
+                content_lines = content.splitlines(keepends=True)
+                num_lines = len(content_lines)
+                
+                if start_line < 1 or start_line > num_lines:
+                    return content, None, f'Error: Start line {start_line} is out of bounds for {file_path} (1-{num_lines}).'
+                if end_line < 1 or end_line > num_lines:
+                    return content, None, f'Error: End line {end_line} is out of bounds for {file_path} (1-{num_lines}).'
+                if start_line > end_line:
+                    return content, None, f'Error: Start line {start_line} is greater than end line {end_line} in {file_path}.'
+                
+                matched_text = "".join(content_lines[start_line-1 : end_line])
+                match_method = f'line-range (L{start_line}-L{end_line})'
+                
+                prefix = "".join(content_lines[:start_line-1])
+                suffix = "".join(content_lines[end_line:])
+                new_content = prefix + new_str + suffix
 
-        # --- PHASE 1: Exact match ---
-        count = content.count(old_str)
+                if new_content == content:
+                    return content, None, f'Warning: Replacement produced identical content in {file_path}. No changes written.'
+                return new_content, match_method, None
+            except Exception as e:
+                return content, None, f'Error processing line range: {e}'
+
+        # --- 2. Line-Number Stripping (for copy-paste from open_file) ---
+        processed_old_str = old_str
+        lines = old_str.splitlines(keepends=True)
+        modified_lines = []
+        changed = False
+        for line in lines:
+            # Match "1: " at the start of the line
+            match = re.match(r'^(\d+):\s*', line)
+            if match:
+                modified_lines.append(line[match.end():])
+                changed = True
+            else:
+                modified_lines.append(line)
+        
+        if changed:
+            processed_old_str = ''.join(modified_lines)
+
+        match_method = 'exact'
+        matched_text = None
+
+        # --- 3. Exact Match ---
+        count = content.count(processed_old_str)
         if count == 1:
-            self._consecutive_failures.pop(abs_path, None)  # Reset on success
+            matched_text = processed_old_str
+            self._consecutive_failures.pop(abs_path, None)
         elif count > 1:
             return content, None, (
                 f'Error: The SEARCH block matched {count} times in {file_path}. '
                 f'It must be unique. Add more surrounding context to narrow the match.'
             )
         else:
-            # --- PHASE 2: Whitespace-normalized match ---
+            # Fallback to original old_str if stripped version didn't match
+            count_orig = content.count(old_str)
+            if count_orig == 1:
+                matched_text = old_str
+                self._consecutive_failures.pop(abs_path, None)
+            elif count_orig > 1:
+                return content, None, (
+                    f'Error: The SEARCH block matched {count_orig} times in {file_path}. '
+                    f'It must be unique. Add more surrounding context to narrow the match.'
+                )
+
+        # --- 4. Whitespace-Normalized Match ---
+        if matched_text is None:
             norm_content = self._normalize_whitespace(content)
-            norm_search = self._normalize_whitespace(old_str)
+            norm_search = self._normalize_whitespace(processed_old_str)
             norm_count = norm_content.count(norm_search)
 
             if norm_count == 1:
                 norm_pos = norm_content.find(norm_search)
                 norm_lines_before = norm_content[:norm_pos].count('\n')
-                search_line_count = old_str.count('\n') + (0 if old_str.endswith('\n') else 1)
+                search_line_count = processed_old_str.count('\n') + (0 if processed_old_str.endswith('\n') else 1)
                 original_lines = content.splitlines(keepends=True)
-                start_line = norm_lines_before
-                end_line = start_line + search_line_count
-                if end_line <= len(original_lines):
-                    matched_text = ''.join(original_lines[start_line:end_line])
+                start_line_idx = norm_lines_before
+                end_line_idx = start_line_idx + search_line_count
+                if end_line_idx <= len(original_lines):
+                    matched_text = ''.join(original_lines[start_line_idx:end_line_idx])
                     match_method = 'whitespace-normalized'
-                    self._consecutive_failures.pop(abs_path, None)  # Reset on success
-                else:
-                    matched_text = None
+                    self._consecutive_failures.pop(abs_path, None)
             elif norm_count > 1:
                 return content, None, (
                     f'Error: SEARCH block matched {norm_count} times after whitespace normalization in {file_path}. '
                     f'Add more surrounding context to narrow the match.'
                 )
+
+        # --- 5. Fuzzy Match ---
+        if matched_text is None:
+            fuzzy_match, score = self._find_fuzzy_match(content, old_str)
+            if fuzzy_match is not None:
+                matched_text = fuzzy_match
+                match_method = f'fuzzy (confidence: {score:.1%})'
+                self._consecutive_failures.pop(abs_path, None)
             else:
-                matched_text = None
-
-            # --- PHASE 3: Fuzzy match ---
-            if matched_text is None:
-                fuzzy_match, score = self._find_fuzzy_match(content, old_str)
-                if fuzzy_match is not None:
-                    matched_text = fuzzy_match
-                    match_method = f'fuzzy (confidence: {score:.1%})'
-                    self._consecutive_failures.pop(abs_path, None)  # Reset on success
+                fail_count = self._consecutive_failures.get(abs_path, 0) + 1
+                self._consecutive_failures[abs_path] = fail_count
+                search_preview = old_str[:200] + ('...' if len(old_str) > 200 else '')
+                first_line_of_search = old_str.split('\n')[0].strip()
+                diagnostic_lines = []
+                content_lines = content.splitlines()
+                for i, line in enumerate(content_lines):
+                    if first_line_of_search and first_line_of_search[:30] in line:
+                        start = max(0, i - 1)
+                        end = min(len(content_lines), i + 4)
+                        snippet = '\n'.join(f'  L{start+j+1}: {content_lines[start+j]}' for j in range(end - start))
+                        diagnostic_lines.append(snippet)
+                        break
+                diagnostic = ''
+                if diagnostic_lines:
+                    diagnostic = (
+                        f'\nNearest partial match found around these lines:\n'
+                        f'{diagnostic_lines[0]}\n'
+                        f'Compare carefully with your SEARCH block - the mismatch may be due to '
+                        f'escape characters, quotes, or whitespace that got mangled.'
+                    )
+                if fail_count >= 3:
+                    self._consecutive_failures[abs_path] = 0
+                    return content, None, (
+                        f'Error: str_replace has failed {fail_count} times on {file_path}. '
+                        f'Best fuzzy score was {score:.1%} (threshold: {FUZZY_MATCH_THRESHOLD:.0%}). '
+                        f'The text you provided does not match what is actually in the file.\n'
+                        f'\n*** MANDATORY: Stop using str_replace for this file. '
+                        f'Use open_file to read the current full content, then use write_file to rewrite the ENTIRE file. ***'
+                        f'{diagnostic}'
+                    )
                 else:
-                    fail_count = self._consecutive_failures.get(abs_path, 0) + 1
-                    self._consecutive_failures[abs_path] = fail_count
-
-                    search_preview = old_str[:200] + ('...' if len(old_str) > 200 else '')
-                    first_line_of_search = old_str.split('\n')[0].strip()
-
-                    diagnostic_lines = []
-                    content_lines = content.splitlines()
-                    for i, line in enumerate(content_lines):
-                        if first_line_of_search and first_line_of_search[:30] in line:
-                            start = max(0, i - 1)
-                            end = min(len(content_lines), i + 4)
-                            snippet = '\n'.join(f'  L{start+j+1}: {content_lines[start+j]}' for j in range(end - start))
-                            diagnostic_lines.append(snippet)
-                            break
-
-                    diagnostic = ''
-                    if diagnostic_lines:
-                        diagnostic = (
-                            f'\nNearest partial match found around these lines:\n'
-                            f'{diagnostic_lines[0]}\n'
-                            f'Compare carefully with your SEARCH block - the mismatch may be due to '
-                            f'escape characters, quotes, or whitespace that got mangled.'
-                        )
-
-                    if fail_count >= 3:
-                        self._consecutive_failures[abs_path] = 0  # Reset counter
-                        return content, None, (
-                            f'Error: str_replace has failed {fail_count} times on {file_path}. '
-                            f'Best fuzzy score was {score:.1%} (threshold: {FUZZY_MATCH_THRESHOLD:.0%}). '
-                            f'The text you provided does not match what is actually in the file.\n'
-                            f'\n*** MANDATORY: Stop using str_replace for this file. '
-                            f'Use open_file to read the current full content, then use write_file to rewrite the ENTIRE file. ***'
-                            f'{diagnostic}'
-                        )
-                    else:
-                        return content, None, (
-                            f'Error: Could not find a match for SEARCH block in {file_path} '
-                            f'(attempt {fail_count}/3 before escalation to write_file). '
-                            f'Best fuzzy score was {score:.1%} (threshold: {FUZZY_MATCH_THRESHOLD:.0%}). '
-                            f'Searched for: {search_preview!r}'
-                            f'{diagnostic}\n'
-                            f'Re-open the file with open_file and copy the EXACT text you want to replace.'
-                        )
+                    return content, None, (
+                        f'Error: Could not find a match for SEARCH block in {file_path} '
+                        f'(attempt {fail_count}/3 before escalation to write_file). '
+                        f'Best fuzzy score was {score:.1%} (threshold: {FUZZY_MATCH_THRESHOLD:.0%}). '
+                        f'Searched for: {search_preview!r}'
+                        f'{diagnostic}\n'
+                        f'Re-open the file with open_file and copy the EXACT text you want to replace.'
+                    )
 
         if match_method != 'exact':
             match_count = content.count(matched_text)
@@ -253,10 +323,8 @@ class StrReplaceTool(BaseTool):
                 )
 
         new_content = content.replace(matched_text, new_str, 1)
-
         if new_content == content:
             return content, None, f'Warning: Replacement produced identical content in {file_path}. No changes written.'
-
         return new_content, match_method, None
 
     def execute(self, file_path: str, patch: str = None, old_str: str = None, new_str: str = '') -> str:

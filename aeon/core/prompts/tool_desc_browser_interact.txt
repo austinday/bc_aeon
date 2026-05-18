@@ -1,8 +1,12 @@
-Interacts with a specific tab in the browser. You can click, type, or scroll.
+Interacts with a specific tab in the browser. All interactions are performed with human-like mouse movements and typing delays to avoid bot detection.
 Schema:
-  action (str, required): The action to perform. Must be one of: 'click', 'type', 'enter', 'scroll_down', 'scroll_up'.
-  element_id (int, optional): The ID of the interactive element to target. Required for 'click' and 'type'.
-  text (str, optional): The text to input. Required only if action is 'type'.
-  expected_text (str, optional): REQUIRED for 'click'. A substring of the text you expect this element to contain.
-  tab_id (str, optional, default="default"): The unique name of the tab to interact with (e.g., 'quora', 'gmail'). Must match the tab_id you used in browser_navigate.
-Example: {"tool_name": "browser_interact", "parameters": {"action": "click", "element_id": 14, "expected_text": "Taco Belle", "tab_id": "quora"}}
+action (str, required): The action to perform. Must be one of: 'click', 'type', 'enter', 'hover', 'scroll_down', 'scroll_up'.
+element_id (int, optional): The ID of the interactive element to target. Required for 'click', 'type', and 'hover'.
+text (str, optional): The text to input. Required only if action is 'type'.
+expected_text (str, optional): REQUIRED for 'click'. A substring of the text you expect this element to contain to prevent accidental clicks.
+tab_id (str, optional, default="default"): The unique name of the tab to interact with (e.g., 'quora', 'gmail'). Must match the tab_id you used in browser_navigate.
+
+Notes:
+- 'hover': Use this to trigger dropdown menus or tooltips that only appear on mouse-over.
+- All actions include natural jitter and variable delays.
+Example: {"tool_name": "browser_interact", "parameters": {"action": "hover", "element_id": 14, "tab_id": "amazon"}}

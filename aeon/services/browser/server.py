@@ -2,6 +2,8 @@ import asyncio
 import base64
 import sys
 import random
+import math
+import numpy as np
 
 print("Loading imports...", flush=True)
 from fastapi import FastAPI
@@ -155,6 +157,47 @@ class InteractRequest(BaseModel):
     session_id: str
     tab_id: str = "default"
 
+class HumanoidInteraction:
+    """Helper to simulate human-like mouse and keyboard behavior."""
+    @staticmethod
+    async def move_mouse_human(page, target_x, target_y):
+        # Get current mouse position (approximate or start from 0,0)
+        # Since we can't easily get current mouse pos from Playwright, we assume a start or just jitter
+        start_x, start_y = random.randint(0, 100), random.randint(0, 100)
+        
+        # Generate a Bezier curve for the movement
+        # Control points for a natural arc
+        cp1_x = start_x + (target_x - start_x) * random.uniform(0.1, 0.4)
+        cp1_y = start_y + (target_y - start_y) * random.uniform(0.1, 0.4)
+        cp2_x = start_x + (target_x - start_x) * random.uniform(0.6, 0.9)
+        cp2_y = start_y + (target_y - start_y) * random.uniform(0.6, 0.9)
+        
+        steps = random.randint(10, 25)
+        for i in range(steps + 1):
+            t = i / steps
+            # Cubic Bezier formula
+            x = (1-t)**3 * start_x + 3*(1-t)**2 * t * cp1_x + 3*(1-t)*t**2 * cp2_x + t**3 * target_x
+            y = (1-t)**3 * start_y + 3*(1-t)**2 * t * cp1_y + 3*(1-t)*t**2 * cp2_y + t**3 * target_y
+            await page.mouse.move(x, y)
+            await asyncio.sleep(random.uniform(0.005, 0.015))
+
+    @staticmethod
+    async def type_human(page, selector, text):
+        # Instead of fill(), we use press() for each character with variable delays
+        await page.locator(selector).click() # Focus first
+        for char in text:
+            await page.keyboard.type(char)
+            await asyncio.sleep(random.uniform(0.05, 0.2))
+
+    @staticmethod
+    async def scroll_human(page, delta):
+        # Break a large scroll into smaller, irregular chunks
+        chunks = random.randint(3, 7)
+        for _ in range(chunks):
+            step = delta // chunks + random.randint(-50, 50)
+            await page.mouse.wheel(0, step)
+            await asyncio.sleep(random.uniform(0.2, 0.6))
+
 @app.post("/interact")
 async def interact(req: InteractRequest):
     try:
@@ -164,20 +207,23 @@ async def interact(req: InteractRequest):
         print(f"DEBUG: [INTERACT] Action={req.action}, ID={req.element_id}, Text={req.text}", flush=True)
         
         if req.action == 'scroll_down':
-            await page.mouse.wheel(0, 800)
+            await HumanoidInteraction.scroll_human(page, 800)
         elif req.action == 'scroll_up':
-            await page.mouse.wheel(0, -800)
+            await HumanoidInteraction.scroll_human(page, -800)
         elif req.element_id is not None:
             selector = f'[aeon-id="{req.element_id}"]'
             locator = page.locator(selector).first
             
-            # Verify element exists and is attached
             if not await locator.count():
                 return {"status": "error", "msg": f"Element ID {req.element_id} not found in DOM"}
 
+            # Common preparation for element-based actions
+            await locator.scroll_into_view_if_needed()
+            box = await locator.bounding_box()
+            target_x = box['x'] + box['width']/2 if box else 0
+            target_y = box['y'] + box['height']/2 if box else 0
+
             if req.action == 'click':
-                await locator.scroll_into_view_if_needed()
-                await asyncio.sleep(0.5)
                 if req.expected_text:
                     try:
                         actual_text = await locator.inner_text()
@@ -190,20 +236,19 @@ async def interact(req: InteractRequest):
                     except Exception:
                         pass
                 
+                await HumanoidInteraction.move_mouse_human(page, target_x, target_y)
+                await asyncio.sleep(random.uniform(0.1, 0.3))
                 await locator.click(delay=random.randint(50, 150))
-                print(f"DEBUG: [INTERACT] Clicked ID {req.element_id}", flush=True)
+                print(f"DEBUG: [INTERACT] Human-clicked ID {req.element_id}", flush=True)
             elif req.action == 'type':
-                await locator.scroll_into_view_if_needed()
-                await asyncio.sleep(0.5)
-                await locator.fill(req.text)
-                await asyncio.sleep(0.5)
-                print(f"DEBUG: [INTERACT] Typed '{req.text}' into ID {req.element_id}", flush=True)
+                await HumanoidInteraction.move_mouse_human(page, target_x, target_y)
+                await locator.click()
+                await HumanoidInteraction.type_human(page, selector, req.text)
+                print(f"DEBUG: [INTERACT] Human-typed '{req.text}' into ID {req.element_id}", flush=True)
             elif req.action == 'hover':
-                await locator.scroll_into_view_if_needed()
-                box = await locator.bounding_box()
-                if box:
-                    await page.mouse.move(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                    await asyncio.sleep(0.5)
+                await HumanoidInteraction.move_mouse_human(page, target_x, target_y)
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+                print(f"DEBUG: [INTERACT] Human-hovered ID {req.element_id}", flush=True)
             elif req.action == 'enter':
                 await locator.press('Enter')
             elif req.action == 'select':
@@ -218,8 +263,7 @@ async def interact(req: InteractRequest):
         else:
             return {"status": "error", "msg": "Invalid action or missing element_id"}
             
-        # Settle time for JS and popups
-        await asyncio.sleep(3)
+        await asyncio.sleep(random.uniform(2.0, 4.0))
         return await extract_page_state(page, req.session_id)
     except Exception as e:
         print(f"DEBUG: [INTERACT-ERROR] {e}", flush=True)

@@ -15,8 +15,8 @@ class SubAgentMonitor(BaseTool):
 
     def execute(self, agent_id: str) -> str:
         logger = get_logger()
-        # Path aligned with sub_agent_wrapper.py
-        agent_path = Path("aeon_output") / "sub_agents" / agent_id
+        # Path aligned with spawn_sub_agent.py
+        agent_path = Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents" / agent_id
         telemetry_file = agent_path / "telemetry.json"
         log_file = agent_path / "agent.log"
         status_file = agent_path / "status.txt"
