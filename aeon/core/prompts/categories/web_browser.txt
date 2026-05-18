@@ -1,8 +1,10 @@
 Category-level directive for Web Browser tools:
 
 1. STRATEGIC APPROACH:
-- VISUAL-FIRST: Always prioritize the 'Overlay' screenshot and the 'Interactive Elements' list. Use the visual mapping provided by the VLM to identify the correct `element_id`.
-- HUMAN-LIKE BEHAVIOR: Interact with the page as a human would. Avoid rapid-fire requests. If a page is slow to load, allow time for the DOM to stabilize.
+- HYBRID ANALYSIS: Read the 'Page Title' and 'Visible Text (Markdown)' along with the Visual Layout. If the title says "Just a moment..." or "Cloudflare", the site is checking your browser. Use the `wait` action or interact with the challenge. If the text is empty or blank, the page may still be loading; use the `wait` action.
+- VISUAL-FIRST FOR INTERACTION: Always prioritize the 'Overlay' screenshot and the 'Interactive Elements' list to identify the correct `element_id`.
+- DEEP-DIVE VISION: Every browser action returns the local file paths to the 'Clean' and 'Overlay' screenshots. If the automatic visual summary isn't detailed enough, you have complete freedom to expand the 'image_tools' category and use the `analyze_image` tool on those file paths to ask highly specific questions (e.g., "Read the exact text options inside the expanded dropdown #45", or "Are there any red error messages visible?").
+- HUMAN-LIKE BEHAVIOR: Interact with the page as a human would. Avoid rapid-fire requests. If a page is slow to load, allow time for the DOM to stabilize using the `wait` action.
 - STATE AWARENESS: Keep track of which tab contains which information. Use `tab_id` to organize your workspace.
 
 2. TAB & POPUP MANAGEMENT (CRITICAL):
@@ -13,6 +15,7 @@ Category-level directive for Web Browser tools:
 - Never use 'browser_navigate' to return to a tab you were previously using; this will trigger a reload and lose unsaved information.
 
 3. INTERACTION GUIDELINES:
+- IFRAMES & BOT CHALLENGES: Cloudflare Turnstiles or "Verify you are human" checks often exist inside an `iframe`. Look for elements tagged as `<iframe>` in your interactive elements list. Clicking the center of these iframes (using its `element_id` and the `click` action) will often solve the challenge!
 - VALIDATION: When clicking critical elements, use the `expected_text` parameter in 'browser_interact' to prevent clicking the wrong element due to VLM hallucinations.
 - SCROLLING: Use 'scroll_down' or 'scroll_up' to bring elements into the viewport before attempting to interact with them.
 - TYPING: Use 'type' for input fields and 'enter' to submit forms if no submit button is visible.

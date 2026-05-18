@@ -137,13 +137,15 @@ async def navigate(req: GotoRequest):
     try:
         page = await get_or_create_session(req.session_id, req.tab_id)
         await page.bring_to_front()  # CRITICAL: Bring the tab to the foreground
+        
+        # Adding a simple wait helps bypass anti-bot systems that measure navigation timing
         await page.goto(req.url, wait_until='domcontentloaded', timeout=15000)
+        
+        # Hard wait to allow SPAs and bot-protection redirects (like Cloudflare) to settle
+        await asyncio.sleep(2.0)
         
         # Ensure we start at the top for consistency in tests
         await page.evaluate("window.scrollTo(0, 0)")
-        
-        # Settle time to allow page to fully load and JS to execute
-        await asyncio.sleep(1.5)
             
         return await extract_page_state(page, req.session_id)
     except Exception as e:
@@ -158,45 +160,28 @@ class InteractRequest(BaseModel):
     tab_id: str = "default"
 
 class HumanoidInteraction:
-    """Helper to simulate human-like mouse and keyboard behavior."""
+    """Simplified helper to simulate human-like mouse and keyboard behavior natively."""
+    
     @staticmethod
     async def move_mouse_human(page, target_x, target_y):
-        # Get current mouse position (approximate or start from 0,0)
-        # Since we can't easily get current mouse pos from Playwright, we assume a start or just jitter
-        start_x, start_y = random.randint(0, 100), random.randint(0, 100)
-        
-        # Generate a Bezier curve for the movement
-        # Control points for a natural arc
-        cp1_x = start_x + (target_x - start_x) * random.uniform(0.1, 0.4)
-        cp1_y = start_y + (target_y - start_y) * random.uniform(0.1, 0.4)
-        cp2_x = start_x + (target_x - start_x) * random.uniform(0.6, 0.9)
-        cp2_y = start_y + (target_y - start_y) * random.uniform(0.6, 0.9)
-        
-        steps = random.randint(10, 25)
-        for i in range(steps + 1):
-            t = i / steps
-            # Cubic Bezier formula
-            x = (1-t)**3 * start_x + 3*(1-t)**2 * t * cp1_x + 3*(1-t)*t**2 * cp2_x + t**3 * target_x
-            y = (1-t)**3 * start_y + 3*(1-t)**2 * t * cp1_y + 3*(1-t)*t**2 * cp2_y + t**3 * target_y
-            await page.mouse.move(x, y)
-            await asyncio.sleep(random.uniform(0.005, 0.015))
+        # Native Playwright 'steps' parameter naturally interpolates a smooth line, avoiding teleportation
+        await page.mouse.move(target_x, target_y, steps=random.randint(5, 15))
+        await asyncio.sleep(random.uniform(0.1, 0.3))
 
     @staticmethod
     async def type_human(page, selector, text):
-        # Instead of fill(), we use press() for each character with variable delays
         await page.locator(selector).click() # Focus first
         for char in text:
             await page.keyboard.type(char)
-            await asyncio.sleep(random.uniform(0.05, 0.2))
+            await asyncio.sleep(random.uniform(0.02, 0.1))
 
     @staticmethod
     async def scroll_human(page, delta):
-        # Break a large scroll into smaller, irregular chunks
         chunks = random.randint(3, 7)
         for _ in range(chunks):
-            step = delta // chunks + random.randint(-50, 50)
+            step = delta // chunks + random.randint(-20, 20)
             await page.mouse.wheel(0, step)
-            await asyncio.sleep(random.uniform(0.2, 0.6))
+            await asyncio.sleep(random.uniform(0.1, 0.3))
 
 @app.post("/interact")
 async def interact(req: InteractRequest):
@@ -206,10 +191,17 @@ async def interact(req: InteractRequest):
         
         print(f"DEBUG: [INTERACT] Action={req.action}, ID={req.element_id}, Text={req.text}", flush=True)
         
-        if req.action == 'scroll_down':
+        if req.action == 'wait':
+            wait_time = float(req.text) if req.text else 5.0
+            print(f"DEBUG: [INTERACT] Waiting for {wait_time} seconds...", flush=True)
+            await asyncio.sleep(wait_time)
+            
+        elif req.action == 'scroll_down':
             await HumanoidInteraction.scroll_human(page, 800)
+            
         elif req.action == 'scroll_up':
             await HumanoidInteraction.scroll_human(page, -800)
+            
         elif req.element_id is not None:
             selector = f'[aeon-id="{req.element_id}"]'
             locator = page.locator(selector).first
@@ -217,11 +209,17 @@ async def interact(req: InteractRequest):
             if not await locator.count():
                 return {"status": "error", "msg": f"Element ID {req.element_id} not found in DOM"}
 
-            # Common preparation for element-based actions
+            # Let scroll settle before grabbing bounding box
             await locator.scroll_into_view_if_needed()
+            await asyncio.sleep(0.5) 
+            
             box = await locator.bounding_box()
-            target_x = box['x'] + box['width']/2 if box else 0
-            target_y = box['y'] + box['height']/2 if box else 0
+            if not box:
+                return {"status": "error", "msg": f"Element ID {req.element_id} has no valid bounding box (might be invisible)."}
+
+            # Slight jitter avoids pixel-perfect automated clicking
+            target_x = box['x'] + box['width']/2 + random.uniform(-2, 2)
+            target_y = box['y'] + box['height']/2 + random.uniform(-2, 2)
 
             if req.action == 'click':
                 if req.expected_text:
@@ -237,20 +235,22 @@ async def interact(req: InteractRequest):
                         pass
                 
                 await HumanoidInteraction.move_mouse_human(page, target_x, target_y)
-                await asyncio.sleep(random.uniform(0.1, 0.3))
+                # Playwright's native click with delay is extremely reliable and mimics human click speed
                 await locator.click(delay=random.randint(50, 150))
                 print(f"DEBUG: [INTERACT] Human-clicked ID {req.element_id}", flush=True)
+                
             elif req.action == 'type':
                 await HumanoidInteraction.move_mouse_human(page, target_x, target_y)
-                await locator.click()
                 await HumanoidInteraction.type_human(page, selector, req.text)
                 print(f"DEBUG: [INTERACT] Human-typed '{req.text}' into ID {req.element_id}", flush=True)
+                
             elif req.action == 'hover':
                 await HumanoidInteraction.move_mouse_human(page, target_x, target_y)
-                await asyncio.sleep(random.uniform(0.3, 0.8))
                 print(f"DEBUG: [INTERACT] Human-hovered ID {req.element_id}", flush=True)
+                
             elif req.action == 'enter':
                 await locator.press('Enter')
+                
             elif req.action == 'select':
                 if req.text:
                     try:
@@ -321,6 +321,12 @@ async def close_session(req: CloseSessionRequest):
     return {"status": "ok"}
 
 async def extract_page_state(page, session_id=None):
+    # Wait for the body to be visible to avoid blank white pages
+    try:
+        await page.wait_for_selector("body", state="visible", timeout=3000)
+    except Exception:
+        pass
+
     # Take clean screenshot
     clean_bytes = await page.screenshot(type='jpeg', quality=95)
     
@@ -330,7 +336,8 @@ async def extract_page_state(page, session_id=None):
         let elements = [];
         document.querySelectorAll('.aeon-box').forEach(e => e.remove());
         
-        const interactables = document.querySelectorAll('a, button, input, textarea, select, summary, [role="button"], [role="link"], [role="menuitem"]');
+        // Scan for iframes to catch Turnstile/CAPTCHA challenges
+        const interactables = document.querySelectorAll('a, button, input, textarea, select, summary, [role="button"], [role="link"], [role="menuitem"], iframe');
         console.log(`SOM: Found ${interactables.length} potential interactables`);
         
         interactables.forEach((el, index) => {
@@ -388,7 +395,10 @@ async def extract_page_state(page, session_id=None):
                 // INTELLIGENT CONTEXT EXTRACTION
                 let text = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || el.name || '').replace(/\n/g, ' ').trim();
                 
-                if (el.tagName.toLowerCase() === 'select') {
+                if (el.tagName.toLowerCase() === 'iframe') {
+                    text = `IFrame: ${el.title || el.name || el.id || el.src || 'Unknown Frame'}`;
+                }
+                else if (el.tagName.toLowerCase() === 'select') {
                     let opts = Array.from(el.options).map(o => o.text).join(' | ');
                     text = `Selected: ${el.options[el.selectedIndex]?.text || 'None'} [Options: ${opts}]`;
                 }
@@ -425,9 +435,17 @@ async def extract_page_state(page, session_id=None):
     
     overlay_bytes = await page.screenshot(type='jpeg', quality=95)
     
-    # Extract visible markdown text
-    markdown = await page.evaluate('() => document.body.innerText')
-    
+    # Extract visible markdown text and title/url
+    try:
+        markdown = await page.evaluate('() => document.body.innerText')
+    except Exception:
+        markdown = ""
+        
+    try:
+        title = await page.title()
+    except Exception:
+        title = "Unknown"
+        
     # Cleanup boxes after screenshot to not pollute the real DOM state long-term
     await page.evaluate('() => document.querySelectorAll(".aeon-box").forEach(e => e.remove())')
     
@@ -436,11 +454,11 @@ async def extract_page_state(page, session_id=None):
         "clean_b64": base64.b64encode(clean_bytes).decode(),
         "overlay_b64": base64.b64encode(overlay_bytes).decode(),
         "elements": elements,
-        "markdown": markdown[:4000] # Truncate to save context window
+        "markdown": markdown[:4000], # Truncate to save context window
+        "title": title,
+        "url": page.url
     }
     if session_id:
-        # Return a list of all tab_ids associated with this session
-        # Use slicing instead of split to correctly handle session_ids that contain underscores
         res["open_tabs"] = [k[len(session_id)+1:] for k in tabs.keys() if k.startswith(f"{session_id}_")]
     return res
 

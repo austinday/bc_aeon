@@ -122,6 +122,8 @@ def process_browser_response(data, action_desc, session_id, tab_id):
     element_str = "\n".join([f"[{el['id']}] <{el['tag']}>: {el['text']}" for el in elements])
     
     markdown = data.get("markdown", "")
+    page_title = data.get("title", "Unknown")
+    page_url = data.get("url", "Unknown")
     
     # --- AUTO-VISION INJECTION ---
     vision_tool = AnalyzeImageTool()
@@ -138,7 +140,7 @@ def process_browser_response(data, action_desc, session_id, tab_id):
     
     action_context = f"\n\nCONTEXT: The previous action was '{action_desc}'. "
     action_context += "Please specifically analyze if this action caused a visible state change (e.g., a new menu appearing, a dropdown opening, a loading spinner disappearing, or an error message appearing). "
-    action_context += "Compare the current state to what would be expected after such an action and report the result clearly."
+    action_context += "Also, heavily scrutinize the page for CAPTCHAs, Turnstiles, 'Verify you are human' checks, or loading spinners. If present, state explicitly that the page is blocked or loading."
     
     vision_prompt = base_prompt + action_context
     
@@ -153,6 +155,8 @@ def process_browser_response(data, action_desc, session_id, tab_id):
 
     result = (
         f"--- BROWSER ACTION SUCCESS: {action_desc} (Tab: '{tab_id}') ---\n"
+        f"Current URL: {page_url}\n"
+        f"Page Title: {page_title}\n"
         f"Open Tabs: [{open_tabs_str}]\n\n"
         f"--- VISUAL LAYOUT ANALYSIS (from Qwen-VL) ---\n"
         f"{vision_analysis}\n\n"
