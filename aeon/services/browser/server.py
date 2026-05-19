@@ -126,8 +126,7 @@ class SwitchTabRequest(BaseModel):
 async def switch_tab(req: SwitchTabRequest):
     try:
         page = await get_or_create_session(req.session_id, req.tab_id)
-        await page.bring_to_front()
-        await asyncio.sleep(1)
+        # Removed bring_to_front to avoid driver crashes in some environments
         return await extract_page_state(page, req.session_id)
     except Exception as e:
         return {"status": "error", "msg": str(e)}
@@ -136,16 +135,19 @@ async def switch_tab(req: SwitchTabRequest):
 async def navigate(req: GotoRequest):
     try:
         page = await get_or_create_session(req.session_id, req.tab_id)
-        await page.bring_to_front()  # CRITICAL: Bring the tab to the foreground
+        # Removed bring_to_front to avoid driver crashes
         
-        # Adding a simple wait helps bypass anti-bot systems that measure navigation timing
-        await page.goto(req.url, wait_until='domcontentloaded', timeout=15000)
+        # Increased timeout and changed to networkidle to better handle heavy SPAs and bot-protection
+        await page.goto(req.url, wait_until='networkidle', timeout=30000)
         
         # Hard wait to allow SPAs and bot-protection redirects (like Cloudflare) to settle
         await asyncio.sleep(2.0)
         
         # Ensure we start at the top for consistency in tests
-        await page.evaluate("window.scrollTo(0, 0)")
+        try:
+            await page.evaluate("window.scrollTo(0, 0)")
+        except:
+            pass
             
         return await extract_page_state(page, req.session_id)
     except Exception as e:

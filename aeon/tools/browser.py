@@ -174,7 +174,7 @@ class BrowserNavigateTool(BaseTool):
     def __init__(self, worker=None):
         super().__init__(name="browser_navigate", description=TOOL_DESC_BROWSER_NAVIGATE)
         
-    def execute(self, url: str, tab_id: str = "default") -> str:
+    def execute(self, url: str, tab_id: str = "default", **kwargs) -> str:
         if not any(url.startswith(scheme) for scheme in ["http://", "https://", "data:", "file://"]):
             url = "https://" + url
         try:
@@ -191,7 +191,7 @@ class BrowserInteractTool(BaseTool):
     def __init__(self, worker=None):
         super().__init__(name="browser_interact", description=TOOL_DESC_BROWSER_INTERACT)
         
-    def execute(self, action: str, element_id: int = None, text: str = None, expected_text: str = None, tab_id: str = "default") -> str:
+    def execute(self, action: str, element_id: int = None, text: str = None, expected_text: str = None, tab_id: str = "default", **kwargs) -> str:
         try:
             ensure_browser_running()
             session_id = str(os.getpid())
