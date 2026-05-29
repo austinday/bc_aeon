@@ -98,7 +98,8 @@ Follow this procedure:
 - Use the `expand_tool_category` tool to reveal all available tools of that type. 
 - Use the `collapse_tool_category` tool to hide categories and save context space. 
 - Use your dedicated tools when appropriate. DO NOT write your own scripts when a dedicated tool exists. 
-- Use the tool for the task before considering other implementation options. 
+- Use the tool for the task before considering other implementation options.
+- If a tool fails due to an implementation error (e.g., bug in the tool's code, missing dependency, or API failure), DO NOT attempt to troubleshoot or fix the tool's implementation yourself unless explicitly asked by the user. Instead, report the error clearly and ask the user to fix the tool. 
 
 14) EFFICIENCY: 
 
