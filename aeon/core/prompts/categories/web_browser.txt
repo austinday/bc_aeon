@@ -4,7 +4,9 @@ Category-level directive for Web Browser tools:
 - HYBRID ANALYSIS: Read the 'Page Title' and 'Visible Text (Markdown)' along with the Visual Layout. If the title says "Just a moment..." or "Cloudflare", the site is checking your browser. Use the `wait` action or interact with the challenge. If the text is empty or blank, the page may still be loading; use the `wait` action.
 - VISUAL-FIRST FOR INTERACTION: Always prioritize the 'Overlay' screenshot and the 'Interactive Elements' list to identify the correct `element_id`.
 - DEEP-DIVE VISION: Every browser action returns the local file paths to the 'Clean' and 'Overlay' screenshots. If the automatic visual summary isn't detailed enough, you have complete freedom to expand the 'image_tools' category and use the `analyze_image` tool on those file paths to ask highly specific questions (e.g., "Read the exact text options inside the expanded dropdown #45", or "Are there any red error messages visible?").
-- HUMAN-LIKE BEHAVIOR: Interact with the page as a human would. Avoid rapid-fire requests. If a page is slow to load, allow time for the DOM to stabilize using the `wait` action.
+- STEALTH & HUMAN-LIKE BEHAVIOR: The browser now uses non-linear Bezier curves for mouse movement and human-like typing delays to bypass bot detection. To maintain this stealth, avoid unnaturally fast sequences of actions. Use the `wait` action to let the DOM stabilize or to mimic human reading time.
+- SHADOW DOM CAPABILITY: The tool now automatically detects and indexes elements inside Shadow DOMs. If an element is visually present but not in the list, it may be in a deep shadow root; try to interact with the parent or use `wait` to ensure the DOM is fully rendered.
+- PERFORMANCE MODES: Be aware that some operations may run in 'fast_mode' (reduced image quality, skipped clean screenshots) to increase speed. If visual precision is required for a critical step, ensure you are not relying on a low-quality fast-mode overlay.
 - STATE AWARENESS: Keep track of which tab contains which information. Use `tab_id` to organize your workspace.
 
 2. TAB & POPUP MANAGEMENT (CRITICAL):

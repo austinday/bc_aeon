@@ -4,7 +4,10 @@ CRITICAL: You MUST use the 'element_id' provided in the list of interactive elem
 NEVER use CSS selectors, XPaths, or any other identifier.
 The 'element_id' is the integer found in the red bounding boxes of the overlay image and the accompanying elements list.
 
-SAFETY LOCK: To prevent clicking the wrong element due to visual hallucinations, you are strongly encouraged to provide the 'expected_text' parameter. The system will verify that the element's actual text matches your expectation before performing the action. If they do not match, the action will be aborted to prevent errors.
+STEALTH & SAFETY:
+- SAFETY LOCK: Always provide the 'expected_text' parameter for critical clicks. The system verifies the element's text before acting to prevent VLM hallucinations.
+- HUMAN-LIKE BEHAVIOR: The tool automatically uses Bezier curves for mouse movement. To maintain stealth, avoid rapid-fire interactions; use 'wait' if the page needs time to settle.
+- SHADOW DOM: Elements inside Shadow DOMs are automatically indexed and can be interacted with using their `element_id` just like standard elements.
 
 Parameters:
 - action: The action to perform. Supported values:

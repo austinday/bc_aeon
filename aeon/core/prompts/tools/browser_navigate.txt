@@ -6,5 +6,6 @@ Parameters:
 
 Guidelines:
 1. Use this tool to start a new search or visit a specific page.
-2. If you are returning to a page you already opened, use 'browser_switch_tab' instead to preserve the page state (scroll position, form data).
-3. After navigating, always analyze the visual layout and the interactive elements list before taking the next action.
+2. STATE PRESERVATION: If you are returning to a page you already opened, you MUST use 'browser_switch_tab' instead. Using 'browser_navigate' on an existing tab will trigger a full page reload and lose all unsaved state/input.
+3. BOT DETECTION: If you encounter "Just a moment" or Cloudflare screens, use the 'wait' action in 'browser_interact' to allow the challenge to resolve or interact with the iframe.
+4. After navigating, always analyze the visual layout and the interactive elements list before taking the next action.

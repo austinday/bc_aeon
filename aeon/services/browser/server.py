@@ -162,12 +162,34 @@ class InteractRequest(BaseModel):
     tab_id: str = "default"
 
 class HumanoidInteraction:
-    """Simplified helper to simulate human-like mouse and keyboard behavior natively."""
+    """Enhanced helper to simulate human-like mouse and keyboard behavior natively."""
     
     @staticmethod
+    def _bezier_curve(p0, p1, p2, p3, t):
+        """Cubic Bezier curve formula."""
+        return (1-t)**3 * p0 + 3*(1-t)**2 * t * p1 + 3*(1-t) * t**2 * p2 + t**3 * p3
+
+    @staticmethod
     async def move_mouse_human(page, target_x, target_y):
-        # Native Playwright 'steps' parameter naturally interpolates a smooth line, avoiding teleportation
-        await page.mouse.move(target_x, target_y, steps=random.randint(5, 15))
+        # Get current mouse position (approximate or last known)
+        # Since we can't easily get current mouse pos from playwright, we assume a starting point 
+        # or use a small random offset from the center of the screen if it's the first move.
+        start_x, start_y = random.randint(0, 1920), random.randint(0, 1080) 
+        
+        # Create two random control points to make the path curved
+        cp1_x = start_x + random.uniform(-100, 100)
+        cp1_y = start_y + random.uniform(-100, 100)
+        cp2_x = target_x + random.uniform(-100, 100)
+        cp2_y = target_y + random.uniform(-100, 100)
+        
+        steps = random.randint(15, 30)
+        for i in range(steps + 1):
+            t = i / steps
+            x = HumanoidInteraction._bezier_curve(start_x, cp1_x, cp2_x, target_x, t)
+            y = HumanoidInteraction._bezier_curve(start_y, cp1_y, cp2_y, target_y, t)
+            await page.mouse.move(x, y)
+            await asyncio.sleep(random.uniform(0.005, 0.02))
+        
         await asyncio.sleep(random.uniform(0.1, 0.3))
 
     @staticmethod
@@ -322,15 +344,20 @@ async def close_session(req: CloseSessionRequest):
         
     return {"status": "ok"}
 
-async def extract_page_state(page, session_id=None):
+async def extract_page_state(page, session_id=None, fast_mode=False):
     # Wait for the body to be visible to avoid blank white pages
     try:
         await page.wait_for_selector("body", state="visible", timeout=3000)
     except Exception:
         pass
 
-    # Take clean screenshot
-    clean_bytes = await page.screenshot(type='jpeg', quality=95)
+    # Optimization: In fast_mode, we significantly reduce quality and skip the clean screenshot
+    quality = 60 if fast_mode else 95
+    
+    # Only take clean screenshot if not in fast_mode
+    clean_bytes = None
+    if not fast_mode:
+        clean_bytes = await page.screenshot(type='jpeg', quality=quality)
     
     # Inject Set-of-Mark (SOM) script using a Python RAW string (r''') to prevent \n evaluation
     elements = await page.evaluate(r'''() => {
@@ -338,11 +365,26 @@ async def extract_page_state(page, session_id=None):
         let elements = [];
         document.querySelectorAll('.aeon-box').forEach(e => e.remove());
         
-        // Scan for iframes to catch Turnstile/CAPTCHA challenges
-        const interactables = document.querySelectorAll('a, button, input, textarea, select, summary, [role="button"], [role="link"], [role="menuitem"], iframe');
-        console.log(`SOM: Found ${interactables.length} potential interactables`);
+        // Recursive function to find all interactables, including those in Shadow DOMs
+        const allInteractables = [];
+        function findInteractables(root) {
+            const selectors = 'a, button, input, textarea, select, summary, [role="button"], [role="link"], [role="menuitem"], iframe';
+            const found = root.querySelectorAll(selectors);
+            found.forEach(el => allInteractables.push(el));
+            
+            // Recurse into shadow roots
+            const allElements = root.querySelectorAll('*');
+            allElements.forEach(el => {
+                if (el.shadowRoot) {
+                    findInteractables(el.shadowRoot);
+                }
+            });
+        }
         
-        interactables.forEach((el, index) => {
+        findInteractables(document.body);
+        console.log(`SOM: Found ${allInteractables.length} potential interactables (including Shadow DOM)`);
+        
+        allInteractables.forEach((el, index) => {
             // STABLE ID: Use the index in the DOM list so IDs don't shift when elements move off-screen
             let stableId = index + 1;
             el.setAttribute('aeon-id', stableId);
@@ -435,7 +477,7 @@ async def extract_page_state(page, session_id=None):
         return elements;
     }''')
     
-    overlay_bytes = await page.screenshot(type='jpeg', quality=95)
+    overlay_bytes = await page.screenshot(type='jpeg', quality=quality)
     
     # Extract visible markdown text and title/url
     try:
@@ -453,7 +495,7 @@ async def extract_page_state(page, session_id=None):
     
     res = {
         "status": "success",
-        "clean_b64": base64.b64encode(clean_bytes).decode(),
+        "clean_b64": base64.b64encode(clean_bytes).decode() if clean_bytes else None,
         "overlay_b64": base64.b64encode(overlay_bytes).decode(),
         "elements": elements,
         "markdown": markdown[:4000], # Truncate to save context window
