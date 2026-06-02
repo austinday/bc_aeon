@@ -9,6 +9,16 @@ STEALTH & SAFETY:
 - HUMAN-LIKE BEHAVIOR: The tool automatically uses Bezier curves for mouse movement. To maintain stealth, avoid rapid-fire interactions; use 'wait' if the page needs time to settle.
 - SHADOW DOM: Elements inside Shadow DOMs are automatically indexed and can be interacted with using their `element_id` just like standard elements.
 
+SUPPORTED ACTIONS:
+- 'click': Standard click.
+- 'type': Type text into an input.
+- 'hover': Hover over an element.
+- 'press_and_hold': Press and hold an element. Provide the duration in milliseconds using the 'text' parameter (e.g., '2000' for 2 seconds).
+- 'enter': Press the Enter key.
+- 'select': Select an option from a dropdown.
+- 'scroll_down' / 'scroll_up': Scroll the page.
+- 'wait': Wait for a specified number of seconds (provide seconds in 'text').
+
 Parameters:
 - action: The action to perform. Supported values:
     - 'click': Clicks the element. Use this for buttons, links, and custom dropdown triggers.

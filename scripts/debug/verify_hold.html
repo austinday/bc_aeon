@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Press and Hold Test</title>
+    <style>
+        #test-btn {
+            width: 200px;
+            height: 100px;
+            background-color: lightgrey;
+            text-align: center;
+            line-height: 100px;
+            user-select: none;
+            cursor: pointer;
+        }
+        #test-btn.holding {
+            background-color: yellow;
+        }
+    </style>
+</head>
+<body>
+    <div id="test-btn">Hold Me!</div>
+    <script>
+        const btn = document.getElementById('test-btn');
+        let holdTimer;
+        
+        btn.addEventListener('mousedown', () => {
+            btn.classList.add('holding');
+            btn.innerText = 'Holding...';
+            holdTimer = setTimeout(() => {
+                btn.innerText = 'Held!';
+                btn.style.backgroundColor = 'green';
+            }, 1500);
+        });
+
+        window.addEventListener('mouseup', () => {
+            if (btn.innerText !== 'Held!') {
+                clearTimeout(holdTimer);
+                btn.classList.remove('holding');
+                btn.innerText = 'Hold Me!';
+                btn.style.backgroundColor = 'lightgrey';
+            }
+        });
+    </script>
+</body>
+</html>

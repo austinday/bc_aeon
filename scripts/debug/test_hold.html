@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Press and Hold Test</title>
+    <style>
+        #test-btn {
+            width: 200px;
+            height: 100px;
+            background-color: lightgray;
+            font-size: 20px;
+            cursor: pointer;
+            user-select: none;
+        }
+        #status {
+            margin-top: 20px;
+            font-family: sans-serif;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <button id="test-btn">Press and Hold Me</button>
+    <div id="status">Status: Waiting...</div>
+
+    <script>
+        const btn = document.getElementById('test-btn');
+        const status = document.getElementById('status');
+        let startTime;
+
+        btn.onmousedown = () => {
+            startTime = Date.now();
+            btn.style.backgroundColor = 'yellow';
+            status.innerText = 'Status: Holding...';
+        };
+
+        btn.onmouseup = () => {
+            const duration = Date.now() - startTime;
+            btn.style.backgroundColor = 'green';
+            status.innerText = `Status: Released after ${duration}ms`;
+        };
+    </script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Press and Hold Test V2</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        #testBtn { width: 300px; height: 150px; font-size: 24px; cursor: pointer; background: #eee; border: 2px solid #333; }
+        #status { margin-top: 20px; font-size: 20px; font-weight: bold; }
+        #log { margin-top: 20px; white-space: pre-wrap; font-family: monospace; background: #f0f0f0; padding: 10px; border: 1px solid #ccc; width: 80%; height: 200px; overflow-y: auto; }
+    </style>
+</head>
+<body>
+    <button id="testBtn">HOLD ME!</button>
+    <div id="status">Status: Not Held</div>
+    <div id="log">Event Log:</div>
+    <script>
+        const btn = document.getElementById('testBtn');
+        const stat = document.getElementById('status');
+        const logDiv = document.getElementById('log');
+
+        function addLog(msg) {
+            console.log(msg);
+            logDiv.innerText += '\n' + msg;
+        }
+
+        let startTime = 0;
+
+        btn.addEventListener('mousedown', (e) => {
+            startTime = Date.now();
+            addLog(`Mousedown at ${startTime} (X: ${e.clientX}, Y: ${e.clientY})`);
+        });
+
+        btn.addEventListener('mouseup', (e) => {
+            const endTime = Date.now();
+            const duration = endTime - startTime;
+            addLog(`Mouseup at ${endTime} (X: ${e.clientX}, Y: ${e.clientY}) - Duration: ${duration}ms`);
+            if (duration >= 1000) {
+                stat.innerText = `Status: Held! (${duration}ms)`;
+                stat.style.color = 'green';
+            } else {
+                stat.innerText = `Status: Too Short (${duration}ms)`;
+                stat.style.color = 'red';
+            }
+        });
+
+        // Also track pointer events for modern browsers
+        btn.addEventListener('pointerdown', (e) => addLog(`PointerDown at ${Date.now()}`));
+        btn.addEventListener('pointerup', (e) => addLog(`PointerUp at ${Date.now()}`));
+    </script>
+</body>
+</html>

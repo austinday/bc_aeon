@@ -1,27 +1,19 @@
-FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y \
     xvfb \
     curl \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /app/browser_service
+WORKDIR /app
 
-# Copy requirements and install
-COPY requirements.txt .
-RUN python3 -m pip install --no-cache-dir -r requirements.txt
+COPY aeon/services/browser/requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copy the service code
 COPY . .
 
-# Set environment variables
-ENV PORT=8000
-ENV PYTHONUNBUFFERED=1
+RUN chmod +x aeon/services/browser/entrypoint.sh
 
-# Ensure entrypoint is executable
-RUN chmod +x entrypoint.sh
-
-ENTRYPOINT ["./entrypoint.sh"]
+# Use the absolute path to the entrypoint script relative to the project root
+ENTRYPOINT ["/app/aeon/services/browser/entrypoint.sh"]
