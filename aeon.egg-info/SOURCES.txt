@@ -14,6 +14,7 @@ aeon/core/gpu_queue.py
 aeon/core/llm.py
 aeon/core/llm_utils.py
 aeon/core/logger.py
+aeon/core/paths.py
 aeon/core/session.py
 aeon/core/system_info.py
 aeon/core/utils.py
@@ -63,6 +64,8 @@ aeon/core/prompts/tool_desc_write_file.txt
 aeon/core/prompts/tools_section.txt
 aeon/core/prompts/categories/__init__.py
 aeon/core/prompts/tools/__init__.py
+aeon/core/skills/__init__.py
+aeon/core/skills/manager.py
 aeon/core/utils/__init__.py
 aeon/core/utils/prompt_enhancer.py
 aeon/core/utils/tokens.py

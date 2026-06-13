@@ -3,8 +3,9 @@ import os
 import time
 import fnmatch
 from datetime import datetime
+from aeon.core.paths import RUNTIME_ROOT
 
-STARTUP_DIR = os.getcwd()
+STARTUP_DIR = RUNTIME_ROOT
 
 # ===========================================================================
 # Project Tree Configuration (ported from bc_llm_tools/read.py)

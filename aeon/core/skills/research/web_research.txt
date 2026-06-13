@@ -1,0 +1,22 @@
+# RESEARCH SKILL: Comprehensive Web Research Protocol
+# This protocol defines the standard for conducting deep research on a topic.
+
+1. DECONSTRUCTION:
+   - Break the primary research topic into at least 3 distinct, orthogonal avenues of research.
+   - Define specific goals for each avenue to ensure comprehensive coverage.
+
+2. EXECUTION (Parallelization):
+   - Spawn separate sub-agents for each research avenue.
+   - Each sub-agent must:
+     a. Search for primary sources and authoritative data.
+     b. Analyze the findings and synthesize a detailed set of notes.
+     c. Think critically about the implications of the findings.
+
+3. SYNTHESIS:
+   - Use the `think` tool to combine the results from all sub-agents.
+   - Identify contradictions, synergies, and key patterns across the different avenues.
+   - Create a single, combined summary with key points highlighted.
+
+4. REPORTING:
+   - Use the `say_to_user` tool to present the final synthesized findings.
+   - Create a formal report file in a directory named `results/research/[topic_name]/` containing the full detailed analysis.

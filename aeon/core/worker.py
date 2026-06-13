@@ -21,6 +21,7 @@ from .prompts import (
     TOOLS_SECTION,
     OBJECTIVE_SECTION
 )
+from aeon.core.skills.manager import SkillsManager
 
 # Colors for terminal output
 C_RED = '\033[91m'
@@ -225,6 +226,43 @@ class Worker:
         if not active_directives:
             return ""            
         return "\n".join(active_directives)
+    def _get_skills_description(self) -> str:
+        """Build skills description with category-aware rendering."""
+        from aeon.core.skills.manager import SkillsManager
+        sm = SkillsManager()
+        
+        # We need to find all categories in the skills directory
+        # Since SkillsManager doesn't have a list_categories, we derive it from the filesystem
+        try:
+            skills_root = sm.base_dir
+            categories = [d.name for d in skills_root.iterdir() if d.is_dir()]
+        except Exception as e:
+            return f"Error loading skills categories: {e}"
+
+        if not categories:
+            return "No skills available."
+
+        lines = ["**SKILLS CATEGORIES** (use expand_skill_category / collapse_skill_category to manage)"]
+        
+        for cat in sorted(categories):
+            # Check if this skill category is expanded
+            # We use 'skill:' prefix to distinguish from tool categories
+            is_expanded = f"skill:{cat}" in self.expanded_categories
+            
+            if is_expanded:
+                lines.append(f"[-] {cat}:")
+                skills = sm.get_skills_in_category(cat)
+                for skill in sorted(skills):
+                    content = sm.get_skill_content(cat, skill)
+                    summary = content[:200].replace('\n', ' ') + "..." if content else "(empty)"
+                    lines.append(f"  - {skill}: {summary}")
+            else:
+                skills = sm.get_skills_in_category(cat)
+                count = len(skills)
+                lines.append(f"[+] {cat}: ({count} skill{'s' if count != 1 else ''})")
+        
+        return "\n".join(lines)
+
     def _get_tools_description(self) -> str:
         """Build tool descriptions with category-aware rendering.
 
@@ -263,7 +301,8 @@ class Worker:
 
         for name, cat in categories.items():
             path = f'{parent_path}/{name}' if parent_path else name
-            is_expanded = path in self.expanded_categories
+            # Check both raw path and skill-prefixed path
+            is_expanded = (path in self.expanded_categories) or (f"skill:{path}" in self.expanded_categories)
             desc = cat.get('description', '')
             tool_count = count_tools_in_category(path)
 
@@ -463,6 +502,8 @@ class Worker:
 
         diag_section = f"\n**CONTEXT DIAGNOSTICS**\n{context_diagnostics}\n" if context_diagnostics else ""
 
+        skills_text = self._get_skills_description()
+
         return f"""{self.base_directives}
 
 {self.docker_directives}
@@ -471,6 +512,9 @@ class Worker:
 {active_tool_directives if active_tool_directives else 'None'}
 
 {tools_text}
+
+{skills_text}
+
 {reminders_section}**PERSISTENT MEMORIES**
 {memories_str}
 

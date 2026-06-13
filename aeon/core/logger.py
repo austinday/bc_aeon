@@ -1,13 +1,14 @@
 import logging
 import os
 from pathlib import Path
+from aeon.core.paths import PROJECT_ROOT
 
 def get_logger():
     logger = logging.getLogger('aeon')
     if not logger.handlers:
         logger.setLevel(logging.INFO)
         # File handler to project root
-        log_file = Path(__file__).parent.parent.parent / 'aeon.log'
+        log_file = PROJECT_ROOT / 'aeon.log'
         file_handler = logging.FileHandler(log_file)
         # Console handler
         console_handler = logging.StreamHandler()

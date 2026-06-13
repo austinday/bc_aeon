@@ -13,8 +13,26 @@ NODE1_URL = "http://127.0.0.1:8017"  # ~88k context GPU1
 CONTEXT_LIMIT_NODE1 = 89984
 CHAR_PER_TOKEN = 4
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Setup logging to both console and file
 logger = logging.getLogger("vllm-lb")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# Console handler
+ch = logging.StreamHandler()
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
+# File handler - write to /app/vllm_lb.log inside container
+try:
+    fh = RotatingFileHandler("/app/vllm_lb.log", maxBytes=10*1024*1024, backupCount=5)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+except Exception as e:
+    print(f"Failed to setup file logger: {e}")
 
 app = FastAPI()
 client = httpx.AsyncClient(timeout=None)

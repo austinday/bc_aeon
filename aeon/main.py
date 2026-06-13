@@ -1,5 +1,12 @@
 # LIVE TEST RESTART 2026-05-15
 import os, argparse, json, time, sys, subprocess, requests, fcntl, signal, atexit
+
+# Force local source priority to prevent site-packages resolution issues
+import sys
+import os
+current_dir = os.getcwd()
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 from pathlib import Path
 from aeon.core.logger import get_logger
 from aeon.core.worker import Worker

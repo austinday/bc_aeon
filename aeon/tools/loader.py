@@ -2,6 +2,7 @@ import importlib
 import pkgutil
 import inspect
 import os
+from pathlib import Path
 from typing import List, Dict, Any
 from aeon.tools.base import BaseTool
 
@@ -96,5 +97,24 @@ def load_tools_from_directory(
             for t in found_tools:
                 model_str = f" \033[90m[{t.underlying_model}]\033[0m" if getattr(t, 'underlying_model', None) else ""
                 print(f"  - {t.name}{model_str}")
+
+        # --- Load and Print Skills Tree ---
+        try:
+            from aeon.core.skills.manager import SkillsManager
+            sm = SkillsManager()
+            # We find categories by looking at the directories in the skills folder
+            skills_dir = Path(sm.base_dir)
+            if skills_dir.exists():
+                skill_categories = [d.name for d in skills_dir.iterdir() if d.is_dir() and not d.name.startswith('__')]
+                if skill_categories:
+                    print("\nLoaded Skills:")
+                    for cat in sorted(skill_categories):
+                        skills = sm.get_skills_in_category(cat)
+                        print(f"  - {cat}/")
+                        for skill in sorted(skills):
+                            print(f"    - {skill}")
+        except Exception as e:
+            if verbose:
+                print(f"\033[91mError loading skills tree: {e}\033[0m")
 
     return found_tools

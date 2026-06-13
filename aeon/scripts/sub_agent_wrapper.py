@@ -27,7 +27,7 @@ def main():
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def update_telemetry(iteration, step_description):
+    def update_telemetry(iteration, display_max, step_description):
         try:
             telemetry = {
                 "agent_id": args.agent_id,
