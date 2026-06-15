@@ -4,6 +4,7 @@ import json
 import base64
 import difflib
 import re
+import tempfile
 from ..core.prompts import (
     TOOL_DESC_OPEN_FILE,
     TOOL_DESC_CLOSE_FILE,
@@ -16,7 +17,57 @@ from .analyzers import FileAnalyzer
 MAX_FILE_READ_SIZE = 250000
 
 # Fuzzy match confidence threshold (0.0 - 1.0)
-FUZZY_MATCH_THRESHOLD = 0.6  # Must be reasonably confident before applying a fuzzy replacement
+FUZZY_MATCH_THRESHOLD = 0.6
+
+
+def _atomic_write(abs_path: str, content, binary: bool = False):
+    """Write content to abs_path atomically (temp file in the same dir + os.replace).
+
+    Creates parent directories as needed and preserves the original file's
+    permission bits when overwriting. A crash mid-write never leaves a file
+    half-written: either the old content or the full new content is present.
+    """
+    parent = os.path.dirname(abs_path) or '.'
+    os.makedirs(parent, exist_ok=True)
+
+    orig_mode = None
+    if os.path.exists(abs_path):
+        try:
+            orig_mode = os.stat(abs_path).st_mode
+        except OSError:
+            orig_mode = None
+
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix='.aeon_tmp_')
+    try:
+        if binary:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(content)
+        else:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(content)
+        os.replace(tmp, abs_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    try:
+        os.chmod(abs_path, orig_mode if orig_mode is not None else 0o644)
+    except OSError:
+        pass
+
+
+def _edit_failures(worker):
+    """Per-file failure counter, stored on the worker so str_replace and write_file
+    can coordinate escalation/reset across separate tool instances."""
+    if worker is None:
+        return {}
+    if not hasattr(worker, '_edit_failures'):
+        worker._edit_failures = {}
+    return worker._edit_failures
 
 
 class OpenFileTool(BaseTool):
@@ -37,7 +88,6 @@ class OpenFileTool(BaseTool):
         if os.path.isdir(abs_path):
             return f'Error: {file_path} is a directory. Refer to the Project Tree in your system context to see files, then open a specific file.'
 
-        # Return accurate status if file is already loaded
         if self.worker.is_file_open(file_path) or self.worker.is_file_open(abs_path):
             return f"File '{file_path}' is already open in working memory. No need to re-open it."
 
@@ -57,7 +107,6 @@ class OpenFileTool(BaseTool):
 
         if summary_type in ('empty_file', 'empty'):
             content = '(empty file)'
-
         elif summary_type == 'full_content':
             raw = result.get('content', '')
             if isinstance(raw, (dict, list)):
@@ -65,7 +114,6 @@ class OpenFileTool(BaseTool):
             else:
                 content = str(raw)
         else:
-            # Structured summary (dataframe, sequence_summary, archive_contents, etc.)
             parts = [f'[File Summary: {summary_type}]']
             for key, value in result.items():
                 if key in ('file_name', 'file_size_bytes', 'summary_type'):
@@ -84,12 +132,13 @@ class OpenFileTool(BaseTool):
 
         self.worker.update_open_file(abs_path, content)
         slots_used = len(self.worker.open_files)
-        
-        # Create a line-numbered version for the user's display
+
+        # Correct 1-based line numbering. The previous "{i+1}" with enumerate(start=1)
+        # labeled the first line "2:", so every line number the model saw was wrong.
         lines = content.splitlines()
-        numbered_lines = [f"{i+1}: {line}" for i, line in enumerate(lines, 1)]
+        numbered_lines = [f"{i}: {line}" for i, line in enumerate(lines, 1)]
         display_content = '\n'.join(numbered_lines)
-        
+
         return f"File '{file_path}' opened in working memory. ({slots_used} files open)\n\n---\n{display_content}"
 
 
@@ -110,22 +159,24 @@ class CloseFileTool(BaseTool):
 
 
 class StrReplaceTool(BaseTool):
-    """A tool to make targeted string replacements in files using unified diff blocks or fuzzy matching fallback."""
+    """Targeted SEARCH/REPLACE edits with exact, whitespace-tolerant, and fuzzy
+    matching. After repeated failures on a file it hard-escalates to write_file
+    instead of letting the model loop forever on a mismatching SEARCH block."""
+
+    MAX_FAILURES_BEFORE_ESCALATION = 2
+
     def __init__(self, worker):
         super().__init__(
             name='str_replace',
             description=TOOL_DESC_STR_REPLACE
         )
         self.worker = worker
-        self._consecutive_failures = {}  # {abs_path: count} tracks fuzzy match failures per file
 
     def _normalize_whitespace(self, text: str) -> str:
-        """Normalize trailing whitespace on each line for comparison."""
         lines = text.splitlines()
         return '\n'.join(line.rstrip() for line in lines)
 
     def _find_fuzzy_match(self, content: str, search_str: str) -> tuple:
-        """Find the best fuzzy match for search_str in content using a sliding window."""
         search_lines = search_str.splitlines(keepends=True)
         content_lines = content.splitlines(keepends=True)
 
@@ -157,97 +208,84 @@ class StrReplaceTool(BaseTool):
 
         return None, best_score
 
-    def _apply_single_replace(self, abs_path: str, file_path: str, content: str, old_str: str, new_str: str) -> tuple:
-        """
-        Applies a single replacement. 
-        Supports:
-        1. L-syntax: 'L10' or 'L10-L15' for line-based replacement.
-        2. Line-number stripping: Removes '1: ' prefixes from search blocks.
-        3. Exact match.
-        4. Whitespace-normalized match.
-        5. Fuzzy match.
+    def _apply_single_replace(self, file_path, content, old_str, new_str):
+        """Apply one replacement. Returns (new_content, method_used, error).
+        Does NOT touch failure counters; the caller owns escalation.
+
+        Match order: L-range syntax -> line-number-prefix stripping -> exact ->
+        whitespace-normalized -> fuzzy.
         """
         stripped_old = old_str.strip()
-        
-        # --- 1. L-Syntax (Line-Range Replacement) ---
-        # Match L10 or L10-L15
+
+        # 1. L-syntax line-range replacement (e.g. "L10" or "L10-L15").
+        #    Now reliable because open_file line numbers are correct.
         line_range_match = re.match(r'^L(\d+)(?:-L(\d+))?$', stripped_old)
         if line_range_match:
             try:
                 start_line = int(line_range_match.group(1))
                 end_line = int(line_range_match.group(2)) if line_range_match.group(2) else start_line
-                
                 content_lines = content.splitlines(keepends=True)
                 num_lines = len(content_lines)
-                
                 if start_line < 1 or start_line > num_lines:
                     return content, None, f'Error: Start line {start_line} is out of bounds for {file_path} (1-{num_lines}).'
                 if end_line < 1 or end_line > num_lines:
                     return content, None, f'Error: End line {end_line} is out of bounds for {file_path} (1-{num_lines}).'
                 if start_line > end_line:
                     return content, None, f'Error: Start line {start_line} is greater than end line {end_line} in {file_path}.'
-                
-                matched_text = "".join(content_lines[start_line-1 : end_line])
-                match_method = f'line-range (L{start_line}-L{end_line})'
-                
-                prefix = "".join(content_lines[:start_line-1])
+                prefix = "".join(content_lines[:start_line - 1])
                 suffix = "".join(content_lines[end_line:])
                 new_content = prefix + new_str + suffix
-
                 if new_content == content:
                     return content, None, f'Warning: Replacement produced identical content in {file_path}. No changes written.'
-                return new_content, match_method, None
+                return new_content, f'line-range (L{start_line}-L{end_line})', None
             except Exception as e:
                 return content, None, f'Error processing line range: {e}'
 
-        # --- 2. Line-Number Stripping (for copy-paste from open_file) ---
+        # 2. Strip "N: " line-number prefixes (from open_file display).
+        #    Uses \s? (single optional space) instead of \s* so it removes ONLY the
+        #    "N: " prefix and preserves the code's own leading indentation. The old
+        #    \s* greedily ate the indentation, which then broke exact matching.
         processed_old_str = old_str
         lines = old_str.splitlines(keepends=True)
         modified_lines = []
         changed = False
         for line in lines:
-            # Match "1: " at the start of the line
-            match = re.match(r'^(\d+):\s*', line)
-            if match:
-                modified_lines.append(line[match.end():])
+            m = re.match(r'^(\d+):\s?', line)
+            if m:
+                modified_lines.append(line[m.end():])
                 changed = True
             else:
                 modified_lines.append(line)
-        
         if changed:
             processed_old_str = ''.join(modified_lines)
 
         match_method = 'exact'
         matched_text = None
 
-        # --- 3. Exact Match ---
+        # 3. Exact match
         count = content.count(processed_old_str)
         if count == 1:
             matched_text = processed_old_str
-            self._consecutive_failures.pop(abs_path, None)
         elif count > 1:
             return content, None, (
                 f'Error: The SEARCH block matched {count} times in {file_path}. '
                 f'It must be unique. Add more surrounding context to narrow the match.'
             )
         else:
-            # Fallback to original old_str if stripped version didn't match
             count_orig = content.count(old_str)
             if count_orig == 1:
                 matched_text = old_str
-                self._consecutive_failures.pop(abs_path, None)
             elif count_orig > 1:
                 return content, None, (
                     f'Error: The SEARCH block matched {count_orig} times in {file_path}. '
                     f'It must be unique. Add more surrounding context to narrow the match.'
                 )
 
-        # --- 4. Whitespace-Normalized Match ---
+        # 4. Whitespace-normalized match
         if matched_text is None:
             norm_content = self._normalize_whitespace(content)
             norm_search = self._normalize_whitespace(processed_old_str)
             norm_count = norm_content.count(norm_search)
-
             if norm_count == 1:
                 norm_pos = norm_content.find(norm_search)
                 norm_lines_before = norm_content[:norm_pos].count('\n')
@@ -258,61 +296,42 @@ class StrReplaceTool(BaseTool):
                 if end_line_idx <= len(original_lines):
                     matched_text = ''.join(original_lines[start_line_idx:end_line_idx])
                     match_method = 'whitespace-normalized'
-                    self._consecutive_failures.pop(abs_path, None)
             elif norm_count > 1:
                 return content, None, (
                     f'Error: SEARCH block matched {norm_count} times after whitespace normalization in {file_path}. '
                     f'Add more surrounding context to narrow the match.'
                 )
 
-        # --- 5. Fuzzy Match ---
+        # 5. Fuzzy match
         if matched_text is None:
             fuzzy_match, score = self._find_fuzzy_match(content, old_str)
             if fuzzy_match is not None:
                 matched_text = fuzzy_match
-                match_method = f'fuzzy (confidence: {score:.1%})'
-                self._consecutive_failures.pop(abs_path, None)
+                match_method = f'fuzzy ({score:.0%})'
             else:
-                fail_count = self._consecutive_failures.get(abs_path, 0) + 1
-                self._consecutive_failures[abs_path] = fail_count
                 search_preview = old_str[:200] + ('...' if len(old_str) > 200 else '')
                 first_line_of_search = old_str.split('\n')[0].strip()
-                diagnostic_lines = []
+                diagnostic = ''
                 content_lines = content.splitlines()
                 for i, line in enumerate(content_lines):
                     if first_line_of_search and first_line_of_search[:30] in line:
                         start = max(0, i - 1)
                         end = min(len(content_lines), i + 4)
-                        snippet = '\n'.join(f'  L{start+j+1}: {content_lines[start+j]}' for j in range(end - start))
-                        diagnostic_lines.append(snippet)
+                        snippet = '\n'.join(
+                            f'  L{start + j + 1}: {content_lines[start + j]}'
+                            for j in range(end - start)
+                        )
+                        diagnostic = (
+                            '\nNearest region in the file:\n' + snippet +
+                            '\nCompare it carefully against your SEARCH block (watch for '
+                            'differing quotes, escapes, or whitespace).'
+                        )
                         break
-                diagnostic = ''
-                if diagnostic_lines:
-                    diagnostic = (
-                        f'\nNearest partial match found around these lines:\n'
-                        f'{diagnostic_lines[0]}\n'
-                        f'Compare carefully with your SEARCH block - the mismatch may be due to '
-                        f'escape characters, quotes, or whitespace that got mangled.'
-                    )
-                if fail_count >= 3:
-                    self._consecutive_failures[abs_path] = 0
-                    return content, None, (
-                        f'Error: str_replace has failed {fail_count} times on {file_path}. '
-                        f'Best fuzzy score was {score:.1%} (threshold: {FUZZY_MATCH_THRESHOLD:.0%}). '
-                        f'The text you provided does not match what is actually in the file.\n'
-                        f'\n*** MANDATORY: Stop using str_replace for this file. '
-                        f'Use open_file to read the current full content, then use write_file to rewrite the ENTIRE file. ***'
-                        f'{diagnostic}'
-                    )
-                else:
-                    return content, None, (
-                        f'Error: Could not find a match for SEARCH block in {file_path} '
-                        f'(attempt {fail_count}/3 before escalation to write_file). '
-                        f'Best fuzzy score was {score:.1%} (threshold: {FUZZY_MATCH_THRESHOLD:.0%}). '
-                        f'Searched for: {search_preview!r}'
-                        f'{diagnostic}\n'
-                        f'Re-open the file with open_file and copy the EXACT text you want to replace.'
-                    )
+                return content, None, (
+                    f'Error: Could not find a match for the SEARCH block in {file_path}. '
+                    f'Best fuzzy score was {score:.0%} (threshold {FUZZY_MATCH_THRESHOLD:.0%}). '
+                    f'Searched for: {search_preview!r}{diagnostic}'
+                )
 
         if match_method != 'exact':
             match_count = content.count(matched_text)
@@ -327,11 +346,23 @@ class StrReplaceTool(BaseTool):
             return content, None, f'Warning: Replacement produced identical content in {file_path}. No changes written.'
         return new_content, match_method, None
 
+    def _escalation_note(self, file_path, count):
+        if count >= self.MAX_FAILURES_BEFORE_ESCALATION:
+            return (
+                f'\n\n*** str_replace has failed {count} time(s) on {file_path} and is now '
+                f'LOCKED for this file. You MUST use write_file to rewrite the ENTIRE file '
+                f'with the corrected content. Open the file first to get its current content. ***'
+            )
+        return (
+            f'\n\n(Attempt {count}/{self.MAX_FAILURES_BEFORE_ESCALATION} before str_replace is '
+            f'disabled for this file and you must switch to write_file.)'
+        )
+
     def execute(self, file_path: str, patch: str = None, old_str: str = None, new_str: str = '') -> str:
         if not file_path:
             return 'Error: file_path parameter is required.'
         if not patch and not old_str:
-            return 'Error: Must provide either patch or old_str parameter.'
+            return 'Error: Must provide either a patch or an old_str parameter.'
         if new_str is None:
             new_str = ''
 
@@ -340,6 +371,19 @@ class StrReplaceTool(BaseTool):
             return f'Error: File not found: {file_path}'
         if os.path.isdir(abs_path):
             return f'Error: {file_path} is a directory, not a file.'
+
+        failures = _edit_failures(self.worker)
+
+        # Hard escalation gate: refuse further str_replace once a file has failed
+        # too many times. This breaks the retry loops that waste iterations and
+        # forces the reliable path (write_file).
+        if failures.get(abs_path, 0) >= self.MAX_FAILURES_BEFORE_ESCALATION:
+            return (
+                f'str_replace is disabled for {file_path} after '
+                f'{failures[abs_path]} consecutive failed attempts.\n'
+                f'*** Use write_file to rewrite the ENTIRE file. *** '
+                f'Open the file to read its current content, then write_file with the full corrected content.'
+            )
 
         try:
             with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -353,20 +397,31 @@ class StrReplaceTool(BaseTool):
         if patch:
             blocks = re.findall(r'<<<<\s*SEARCH\n?(.*?)\n?====\n?(.*?)\n?>>>>\s*REPLACE', patch, re.DOTALL)
             if not blocks:
-                return "Error: Could not parse SEARCH/REPLACE blocks. Ensure you use <<<< SEARCH, ====, and >>>> REPLACE correctly."
-            
+                # Count parse failures toward escalation too. Previously a model that
+                # kept malforming the patch format looped forever and never escalated.
+                failures[abs_path] = failures.get(abs_path, 0) + 1
+                msg = (
+                    'Error: Could not parse any SEARCH/REPLACE blocks. Use this exact format '
+                    '(inside a content block):\n'
+                    '<<<< SEARCH\n<existing code>\n====\n<replacement code>\n>>>> REPLACE'
+                )
+                return msg + self._escalation_note(file_path, failures[abs_path])
+
             for s_str, r_str in blocks:
-                if not s_str: continue
-                new_c, method, err = self._apply_single_replace(abs_path, file_path, current_content, s_str, r_str)
+                if not s_str:
+                    continue
+                new_c, method, err = self._apply_single_replace(file_path, current_content, s_str, r_str)
                 if err and err.startswith('Error'):
-                    return err
+                    failures[abs_path] = failures.get(abs_path, 0) + 1
+                    return err + self._escalation_note(file_path, failures[abs_path])
                 if method:
                     methods_used.append(method)
                 current_content = new_c
         else:
-            new_c, method, err = self._apply_single_replace(abs_path, file_path, current_content, old_str, new_str)
+            new_c, method, err = self._apply_single_replace(file_path, current_content, old_str, new_str)
             if err and err.startswith('Error'):
-                return err
+                failures[abs_path] = failures.get(abs_path, 0) + 1
+                return err + self._escalation_note(file_path, failures[abs_path])
             if method:
                 methods_used.append(method)
             current_content = new_c
@@ -375,17 +430,19 @@ class StrReplaceTool(BaseTool):
             return f"Warning: No changes were made to {file_path}. Content is identical."
 
         try:
-            with open(abs_path, 'w', encoding='utf-8') as f:
-                f.write(current_content)
+            _atomic_write(abs_path, current_content)
         except Exception as e:
             return f'Error writing file: {type(e).__name__}: {e}'
+
+        # Success resets the failure counter for this file.
+        failures.pop(abs_path, None)
 
         if self.worker.is_file_open(abs_path) or self.worker.is_file_open(file_path):
             self.worker.update_open_file(abs_path, current_content)
 
-        method_str = ", ".join(set(methods_used)) if methods_used else "exact"
+        method_str = ", ".join(dict.fromkeys(methods_used)) if methods_used else "exact"
         block_count = len(methods_used) if patch else 1
-        return f"Successfully applied {block_count} patch block(s) to {file_path} (matched via {method_str})."
+        return f"Successfully applied {block_count} edit block(s) to {file_path} (matched via {method_str})."
 
 
 class WriteFileTool(BaseTool):
@@ -403,12 +460,13 @@ class WriteFileTool(BaseTool):
             return 'Error: content parameter is required (can be empty string).'
 
         is_binary = False
-        if content.startswith('base64:'):
+        if isinstance(content, str) and content.startswith('base64:'):
             try:
-                content_decoded = base64.b64decode(content[7:])
+                decoded = base64.b64decode(content[7:])
                 try:
-                    content_decoded = content_decoded.decode('utf-8')
+                    content_decoded = decoded.decode('utf-8')
                 except UnicodeDecodeError:
+                    content_decoded = decoded
                     is_binary = True
             except Exception as e:
                 return f'Error decoding base64 content: {e}'
@@ -416,24 +474,25 @@ class WriteFileTool(BaseTool):
             content_decoded = content
 
         abs_path = os.path.abspath(file_path)
+        if os.path.isdir(abs_path):
+            return f'Error: {file_path} is a directory, not a file.'
+
         try:
-            parent_dir = os.path.dirname(abs_path)
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
-
-            if is_binary:
-                with open(abs_path, 'wb') as f:
-                    f.write(content_decoded)
-            else:
-                with open(abs_path, 'w', encoding='utf-8') as f:
-                    f.write(content_decoded)
-
-            # Always remove from working memory after writing.
-            self.worker.close_file(file_path)
-            self.worker.close_file(abs_path)
-
-            return f'Successfully wrote to {file_path}.'
+            _atomic_write(abs_path, content_decoded, binary=is_binary)
         except PermissionError:
             return f'Error: Permission denied writing to {file_path}'
         except Exception as e:
             return f'Error writing file: {type(e).__name__}: {e}'
+
+        # Remove from working memory; a fresh open will show the new content.
+        self.worker.close_file(file_path)
+        self.worker.close_file(abs_path)
+
+        # A clean full rewrite clears any str_replace failure lock on this file,
+        # so the model can go back to targeted edits afterward if it wants to.
+        _edit_failures(self.worker).pop(abs_path, None)
+
+        if is_binary:
+            return f'Successfully wrote {file_path} ({len(content_decoded):,} bytes, binary).'
+        line_count = content_decoded.count('\n') + 1 if content_decoded else 0
+        return f'Successfully wrote {file_path} ({line_count:,} lines).'

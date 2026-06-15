@@ -19,7 +19,7 @@ TOP_LEVEL_TOOLS = {
     'open_file', 'close_file', 'write_file', 'str_replace',
     'search_web', 'run_command', 'task_complete',
     'memorize', 'forget',
-    'restart_aeon',
+    'verify_self_modification', 'restart_aeon',
     'expand_tool_category', 'collapse_tool_category',
 }
 

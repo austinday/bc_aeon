@@ -2,8 +2,6 @@
 import os, argparse, json, time, sys, subprocess, requests, fcntl, signal, atexit
 
 # Force local source priority to prevent site-packages resolution issues
-import sys
-import os
 current_dir = os.getcwd()
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
@@ -112,7 +110,8 @@ def wait_for_service(name, port, endpoint="/api/tags", timeout=60):
             if requests.get(f"http://localhost:{port}{endpoint}", timeout=2).status_code == 200: 
                 print(" OK.")
                 return True
-        except: pass
+        except:
+            pass
         time.sleep(2)
         print(".", end='', flush=True)
     print(" Timeout!")
@@ -784,8 +783,8 @@ def _execute_restart(session, worker=None):
             print(f'[RESTART] ERROR: No aeon/ package directory found in {aeon_code_dir}')
             os.remove(RESTART_STATE_PATH)
             if worker:
-                worker.last_observation = f'RESTART FAILED: No aeon/ package found in {aeon_code_dir}. Fix the directory structure and try again.'
-                worker.action_log.append(f'[RESTART FAILED] No aeon/ package in {aeon_code_dir}')
+                worker.last_observation = f'RESTART FAILED: No aeon_pkg_dir in {aeon_code_dir}. Fix the directory structure and try again.'
+                worker.action_log.append(f'[RESTART FAILED] No aeon_pkg_dir in {aeon_code_dir}')
                 return objective
             return None
 
@@ -903,10 +902,9 @@ def _execute_restart(session, worker=None):
         if worker:
             worker.last_observation = (
                 f'RESTART FAILED: Unexpected error: {e}. '
-                f'Backup restored (if available), old code is running.\n'
-                f'Fix the issue and try restart_aeon again.'
+                f'Backup restored (if available), old code is running.'
             )
-            worker.action_log.append(f'[RESTART FAILED] Exception: {e}. Backup restored.')
+            worker.action_log.append(f'[RESTART] Exception: {e}. Backup restored.')
             return objective
         return None
 
@@ -965,9 +963,75 @@ def cli():
         worker.model_config = strong_config
         deps = {'llm_client': llm_client, 'worker': worker}
         tools = load_tools_from_directory("aeon.tools", dependencies=deps)
+        
+        # Manual override for skill manager tools to bypass loader issues
+        try:
+            from aeon.tools.skills_manager_tool import ExpandSkillsCategory, CollapseSkillsCategory
+            manual_tools = [
+                ExpandSkillsCategory(worker=worker, llm_client=llm_client),
+                CollapseSkillsCategory(worker=worker, llm_client=llm_client)
+            ]
+            tools.extend(manual_tools)
+            print("[SYSTEM] Manually registered skill manager tools.")
+        except Exception as e:
+            print(f"[SYSTEM] Failed to manually register skill tools: {e}")
+
         worker.register_tools(tools)
 
+        # --- Startup Skills Summary ---
+        try:
+            from aeon.core.skills.manager import SkillsManager
+            sm = SkillsManager()
+            skills_dir = Path(sm.base_dir).resolve()
+            if skills_dir.exists():
+                root_skills = [f.stem for f in skills_dir.glob("*.txt") if not f.name.startswith('__')]
+                skill_categories = [d.name for d in skills_dir.iterdir() if d.is_dir() and not d.name.startswith('__')]
+                
+                if root_skills or skill_categories:
+                    print("\n\033[92m[S-V-S-S-S] Loaded Skills:\033[0m", file=sys.stderr)
+                    if root_skills:
+                        for skill in sorted(root_skills):
+                            print(f"  - {skill}", file=sys.stderr)
+                    for cat in sorted(skill_categories):
+                        skills = sm.get_skills_in_category(cat)
+                        if skills:
+                            print(f"  - {cat}/", file=sys.stderr)
+                            for skill in sorted(skills):
+                                print(f"    - {skill}", file=sys.stderr)
+                else:
+                    print(f"\n[SYSTEM] No skill protocols found in: {skills_dir}", file=sys.stderr)
+            else:
+                print(f"\n[SYSTEM] Skills directory not found at: {skills_dir}", file=sys.stderr)
+        except Exception as e:
+            print(f"\n[SYSTEM] Failed to load skills summary: {e}")
         prov = strong_config['provider'].upper()
+
+        # --- Startup Tool Summary ---
+        try:
+            from aeon.tools.categories import TOOL_CATEGORIES, TOP_LEVEL_TOOLS
+            
+            if TOOL_CATEGORIES or TOP_LEVEL_TOOLS:
+                print("\n\033[94m[S-V-S-S-S] Loaded Tools:\033[0m")
+                
+                # 1. Print Top Level Tools
+                top_level = sorted(list(TOP_LEVEL_TOOLS))
+                if top_level:
+                    for tool in top_level:
+                        print(f"  - {tool}")
+                
+                # 2. Print Categorized Tools
+                for cat_name, cat_data in sorted(TOOL_CATEGORIES.items()):
+                    tools = cat_data.get('tools', [])
+                    if tools:
+                        print(f"  - {cat_name}/")
+                        for tool in sorted(tools):
+                            print(f"    - {tool}")
+                    else:
+                        print(f"  - {cat_name}/ (No tools found in category data)")
+        except Exception as e:
+            print(f"\n[SYSTEM] Failed to load tools summary: {e}")
+
+        # --- Startup Visibility ---
         print(f"\n\033[93mAeon Ready (Model: {strong_config['model']} [{prov}], Debug: {args.debug})\033[0m")
 
         # --- Resume from restart if applicable ---

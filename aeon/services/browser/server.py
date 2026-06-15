@@ -72,7 +72,6 @@ async def human_jitter_hold(page: Page, selector: str, duration_ms: int):
 
 @app.post("/interact")
 async def interact(req: InteractRequest):
-    # DEBUG: Log all incoming requests to see why they are failing
     logger.info(f"Interact Request: {req.dict()}")
     
     # FIX: Allow selector-based or page-wide actions without element_id
@@ -120,12 +119,11 @@ async def interact(req: InteractRequest):
         logger.exception("Error during interaction")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- DEBUG ENDPOINTS (Bypass Dispatcher and SOM) ---
+# --- ENDPOINTS (Bypass Dispatcher and SOM) ---
 
 @app.post("/debug_press_and_hold")
 async def debug_press_and_hold(req: InteractRequest):
     """Bypasses SOM and dispatcher. Uses 'selector' directly."""
-    logger.info(f"DEBUG Press-and-Hold: {req.selector} for {req.duration}ms")
     if not req.selector:
         raise HTTPException(status_code=400, detail="Selector required")
     page = await get_page(req.session_id)
@@ -135,7 +133,6 @@ async def debug_press_and_hold(req: InteractRequest):
 @app.post("/debug_get_text")
 async def debug_get_text(req: InteractRequest):
     """Bypasses SOM and dispatcher. Uses 'selector' directly."""
-    logger.info(f"DEBUG Get Text: {req.selector}")
     if not req.selector:
         raise HTTPException(status_code=400, detail="Selector required")
     page = await get_page(req.session_id)
@@ -147,7 +144,6 @@ async def debug_get_page_text(req: InteractRequest):
     """Bypasses SOM and dispatcher. Returns full page text."""
     page = await get_page(req.session_id)
     return {"text": await page.content()}
-
 @app.get("/ping")
 async def ping():
     return {"status": "pong", "version": "jitter_v1"}

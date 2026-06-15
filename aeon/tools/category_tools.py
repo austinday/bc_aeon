@@ -46,9 +46,7 @@ class ExpandToolCategoryTool(BaseTool):
             self.worker.expanded_categories.add(f"skill:{category_path}")
             return f"Expanded skill category '{category_path}'. Revealed:\n" + "\n".join(skills)
         
-        # DEBUG: Log where SkillsManager is looking if it failed to find the category
-        print(f"[DEBUG] SkillsManager base_dir: {getattr(sm, 'base_dir', 'N/A')}")
-        print(f"[DEBUG] SkillsManager search path: {sm.base_dir if hasattr(sm, 'base_dir') else 'N/A'}")
+        pass
 
         # 3. Not found in either
         all_tool_paths = get_all_category_paths()

@@ -19,6 +19,10 @@ setup(
             "scripts/*.py",
             "services/*.yml",
             "core/prompts/*.txt",
+            "core/prompts/categories/*.txt",
+            "core/prompts/tools/*.txt",
+            "core/skills/**/*.txt",
+            "core/skills/*/*.txt",
         ]
     },
     install_requires=[

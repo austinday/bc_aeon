@@ -26,7 +26,7 @@ Once you have a plan in mind, your implementation goal is to move the current st
     - If package installation needed, use requirements.txt and Docker. 
     - ANTI-STALLING: If the files you need are already visible under "OPEN FILES" in your context, your next action MUST NOT be open_file. You MUST execute a str_replace, write_file, or run_command action to modify the code or test it. Do not get stuck in a reading loop.
     - TRIVIAL TASKS: Simple, sequential, or fast tasks (like basic math, making single files, or running quick bash commands) MUST be done by YOU directly in your current iteration. Queue multiple actions in your `actions` array to do them fast. DO NOT spawn sub-agents for trivial tasks.
-- SELF-MODIFICATION WORKFLOW: When changing the agent's own code, prompts, or tools, you must: (a) Write and run a standalone test script to verify the logic, (b) Call `restart_aeon` to apply changes, and (c) Perform a live test by using the tool/feature in the agent's context. Only after the live test succeeds can you use `task_complete`.
+    - SELF-MODIFICATION WORKFLOW: When changing the agent's own code, prompts, or tools, you must: (a) Modify the code using `str_replace` or `write_file`, (b) Call `verify_self_modification` to spawn a sandboxed sub-agent that tests your exact changes on a specific objective. (c) Read the sub-agent's report. If it fails, fix the bugs and run `verify_self_modification` again. (d) Once verification succeeds, call `restart_aeon` to safely pull the functional changes into your own primary process.
 
 5) SUB-AGENTS & PARALLELIZATION:
     - Sub-agents are the primary tool for increasing project velocity.

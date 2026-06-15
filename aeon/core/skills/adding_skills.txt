@@ -1,0 +1,48 @@
+# SKILL: Adding New Skills and Supporting Tools to Aeon
+
+## OBJECTIVE
+To provide a deterministic, fail-safe process for extending the agent's capabilities by adding new skill protocols and the necessary supporting tools.
+
+## THE PROCESS
+
+### PHASE 1: DESIGN & MAPPING
+1. **Define the Skill:** Clearly define the goal, the step-by-step algorithm, and the expected output of the skill.
+2. **Identify Tool Dependencies:** Determine if the skill can be implemented using existing tools. If not, design the necessary `BaseTool` subclasses.
+3. **Map File Paths:** 
+   - Skill Protocol: `aeon/core/skills/[category]/[skill_name].txt`
+   - Supporting Tool: `aeon/tools/[tool_module].py`
+
+### PHASE 2: IMPLEMENTING THE SKILL PROTOCOL
+1. **Create Category Directory:** Ensure the category directory exists: `mkdir -p aeon/core/skills/[category]`.
+2. **Write Protocol:** Create the `.txt` file. Use a structured format (Objective, Process, Verification).
+3. **Verify Path:** Confirm the file is exactly at `aeon/core/skills/[category]/[skill_name].txt`. The `SkillsManager` relies on this specific path.
+
+### PHASE 3: IMPLEMENTING SUPPORTING TOOLS (The "Gotchas" Phase)
+If the skill requires a new tool, follow these strict rules to avoid registration failures:
+
+1. **BaseTool Inheritance:** The tool MUST inherit from `BaseTool`.
+2. **Constructor Signature:**
+   - Avoid using `**kwargs` in the `__init__` signature if possible, as the dynamic loader may interpret them as missing dependencies.
+   - Explicitly call `super().__init__(name="tool_name", description="...")`.
+   - Ensure all required dependencies (e.g., `worker`, `llm_client`) are passed and stored.
+3. **The `execute` Method:** The class MUST implement a method named `execute` that takes the parameters defined in the tool's logic.
+4. **Registration:**
+   - **Dynamic Loading:** Place the tool in `aeon/tools/`. The `load_tools_from_directory` function will attempt to pick it up.
+   - **Manual Override:** If the dynamic loader fails (due to signature mismatches), manually instantiate the tool in `aeon/main.py` and add it to the `tools` list before `worker.register_tools(tools)`.
+
+### PHASE 4: VERIFICATION & ACTIVATION
+1. **Self-Modification Workflow:**
+   - **Modify:** Use `write_file` or `str_replace` to implement the tool/skill.
+   - **Verify:** Call `verify_self_modification` with a specific objective that forces the agent to use the new tool/skill.
+   - **Restart:** Call `restart_aeon` to apply changes to the primary process.
+2. **Live Test:**
+   - Use `expand_skills_category` (if applicable) to verify the skill is visible.
+   - Execute a task that requires the new skill to prove it is functional in the operational context.
+
+## CRITICAL PITFALLS & SOLUTIONS
+- **"Tool Not Found" Error:** 
+  - Check if the tool is actually in the `Worker`'s registry.
+  - Ensure the tool name in the `BaseTool` constructor matches the name being called.
+  - Use `.strip()` on tool names in the `Worker.run` dispatch loop to prevent whitespace issues.
+- **Loader Rejection:** If a tool isn't loading, check `aeon.log` or run a diagnostic script to see if the `__init__` signature is causing a `TypeError` or missing dependency error.
+- **Path Resolution:** Always use `PROJECT_ROOT` or absolute paths when dealing with the `SkillsManager` to avoid issues with `site-packages` vs. local source.

@@ -1,10 +1,20 @@
-Makes targeted edits to a file using SEARCH/REPLACE blocks. Use this for ANY edit that doesn't require rewriting the entire file from scratch.
+Makes a small, targeted edit to a LARGE file using one or more SEARCH/REPLACE blocks.
+
+WHEN TO USE THIS vs write_file:
+- For files under ~400 lines: PREFER write_file to rewrite the whole file. It is far more reliable than str_replace.
+- Use str_replace ONLY for large files where rewriting everything would be wasteful, and only for a small, well-bounded change.
+
+RELIABILITY NOTES:
+- The SEARCH text is matched using exact, whitespace-tolerant, and fuzzy matching, so minor whitespace differences are forgiven. Large mismatches still fail.
+- ALWAYS open_file the file immediately before editing and copy the SEARCH text verbatim from what you see. Do not reconstruct it from memory.
+- After 2 failed attempts on the same file, str_replace is automatically DISABLED for that file and you MUST switch to write_file. Do not keep retrying.
+
 Schema:
   file_path (str, required): Path to the file to edit.
   patch (str, required): A string containing one or more SEARCH/REPLACE blocks.
-Example: {"tool_name": "str_replace", "parameters": {"file_path": "src/main.py", "patch": "__BLOCK_1__"}}
+Example: {"tool_name": "str_replace", "parameters": {"file_path": "src/big_module.py", "patch": "__BLOCK_1__"}}
 
-In your content block, format the patch EXACTLY like this (you can include multiple blocks):
+Format the patch EXACTLY like this in your content block (you may include multiple blocks):
 --- BEGIN BLOCK_1 ---
 <<<< SEARCH
     def calculate_metrics(self):
@@ -15,6 +25,7 @@ In your content block, format the patch EXACTLY like this (you can include multi
 >>>> REPLACE
 --- END BLOCK_1 ---
 
-CRITICAL RULES:
-1. The SEARCH block must EXACTLY match existing code (including leading indentation).
-2. Include enough surrounding context in the SEARCH block to make it unique.
+RULES:
+1. The SEARCH block should match the existing code; copy it from a freshly opened file.
+2. Include enough surrounding context to make the SEARCH block unique.
+3. The "N: " line-number prefixes shown by open_file are stripped automatically, but it is cleaner to omit them.

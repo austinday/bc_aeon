@@ -759,7 +759,7 @@ class Worker:
                 # === PRIMARY AGENT CALL ===
                 response_str = self.llm_client.get_primary_agent_response(prompt=prompt, diagnostic_str=diagnostic_str)
                 if self.debug_mode:
-                    self.print_func(f"{C_YELLOW}[DEBUG] Primary Agent Raw Output:\n{response_str}{C_RESET}")
+                    pass
 
                 try:
                     response_data = json.loads(response_str)
@@ -839,12 +839,13 @@ class Worker:
                     if not tool_name:
                         combined_summary_parts.append(f"Action {idx+1}: Missing tool_name.")
                         continue
-
+                    
+                    # Normalize tool name to prevent whitespace/case issues
+                    tool_name = tool_name.strip()
+                    
                     if tool_name not in self.tools:
                         combined_summary_parts.append(f"Action {idx+1}: Tool '{tool_name}' not found.")
                         continue
-
-                    self.print_func(f"{C_YELLOW}Executing (Step {idx+1}):{C_RESET} {tool_name} {params}")
                     
                     full_action_desc = f"{tool_name}({params})" if params else f"{tool_name}()"
                     display_action_desc = f"{tool_name}({str(params)[:40]}...)" if params else f"{tool_name}()"

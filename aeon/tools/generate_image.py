@@ -62,7 +62,7 @@ class ComfyUITool(BaseTool):
                 json.dump(state, f)
             
             count = len(state["pids"])
-            print(f"[REGISTRY DEBUG] PID {pid} {action} | Active Users: {count} | GPU: {state.get('gpu_id')}")
+            pass
             return count, state.get("gpu_id")
 
     def _ensure_comfyui_running(self, required_vram: float = 20.0):

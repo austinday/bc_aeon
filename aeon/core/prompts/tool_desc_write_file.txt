@@ -1,6 +1,14 @@
-Writes or overwrites an ENTIRE file from scratch. Creates parent directories if needed. Use this ONLY for: (1) creating new files, or (2) rewriting a file where more than ~50% of the content is changing. For small or targeted edits (fixing a bug, changing a few lines, updating a function), use str_replace instead -- it is faster, safer, and less error-prone.
+Writes or overwrites an ENTIRE file from scratch. Creates parent directories automatically. Writes are atomic (written to a temp file then swapped in), so a file is never left half-written, even on a crash.
+
+THIS IS THE PREFERRED, MOST RELIABLE WAY TO CREATE OR EDIT FILES.
+- Use write_file to CREATE new files.
+- Use write_file to EDIT any file under ~400 lines: just provide the full, corrected content. This is far more reliable than str_replace and avoids all text-matching failures.
+- Reserve str_replace for small edits to very large files only.
+- Whenever str_replace fails to match, immediately switch to write_file and supply the full file content.
+
 Schema:
-  file_path (str, required): Path to the file to write. Created if it does not exist; overwritten if it does.
-  content (str, required): The complete file content. Prefix with "base64:" for base64-encoded content.
-Example: {"tool_name": "write_file", "parameters": {"file_path": "test.py", "content": "__BLOCK_1__"}}
-For multi-line content, use a "__BLOCK_N__" placeholder and write the actual content in a content block after the JSON. See RESPONSE FORMAT in your instructions.
+  file_path (str, required): Path to the file. Created if it does not exist; fully overwritten if it does.
+  content (str, required): The COMPLETE file content. Prefix with "base64:" for binary content.
+Example: {"tool_name": "write_file", "parameters": {"file_path": "src/main.py", "content": "__BLOCK_1__"}}
+
+For multi-line content, put a "__BLOCK_N__" placeholder in the JSON and write the actual content in a content block after the JSON (see RESPONSE FORMAT in your instructions). No escaping is needed inside content blocks.

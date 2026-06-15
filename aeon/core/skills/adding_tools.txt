@@ -1,0 +1,48 @@
+# SKILL: Adding New Tools to Aeon
+
+## 1. Overview
+This protocol defines the standard process for implementing, registering, and deploying new tools within the Aeon agent framework. All tools must be designed for maximum portability and minimal friction during agent startup.
+
+## 2. Implementation Requirements (The Code)
+### BaseTool Subclassing
+All tools MUST inherit from `BaseTool`. 
+- **Constructor:** The `__init__` method must call `super().__init__(name="tool_name", description="...")`.
+- **Dependencies:** If the tool requires the `worker` or `llm_client`, these should be passed in the constructor and stored as instance attributes.
+- **Execution:** Implement the `execute(**kwargs)` method. This method must return a string or a serializable object that can be converted to a string.
+- **Error Handling:** Use try-except blocks within `execute` to return descriptive error messages rather than crashing the agent process.
+
+### Portability & Pathing (CRITICAL)
+Tools must be usable by an agent instance regardless of its current working directory.
+- **NEVER** use relative paths like `../data/file.txt` or assume the agent is running from the `bc_aeon` root.
+- **ALWAYS** use absolute paths or resolve paths relative to the `PROJECT_ROOT` (imported from `aeon.core.paths`).
+- **Sourcing:** If a tool needs to call a script, use `os.path.abspath` or `Path().resolve()` to ensure the target is found.
+
+## 3. Infrastructure & Environment Setup
+If a tool requires external dependencies (e.g., a specific Docker container, a large model file, or a system library), these must be integrated into the deployment pipeline.
+
+### setup_environment.sh
+Modify `setup_environment.sh` to ensure the tool's environment is ready before the agent starts:
+1. **Model Downloads:** Add logic to check for the existence of required models and download them using `wget` or `curl` if missing.
+2. **Docker Containers:** 
+   - Define the `Dockerfile` for the tool's service.
+   - Add the `docker run` or `docker-compose` command to the setup script to ensure the service is healthy.
+   - Use health checks (e.g., `curl` to a port) to verify the service is up before the script exits.
+
+## 4. Categorization & Registration
+### Categorization
+Tools must not be dumped into a single directory. They must be organized by function:
+- **Location:** Place the tool class in the appropriate subdirectory under `aeon/tools/` (e.g., `aeon/tools/analyzers/`, `aeon/tools/web_browser/`).
+- **Category Mapping:** Add the tool name to the corresponding category in `aeon/tools/categories.py`. This ensures the tool is correctly rendered in the agent's tool tree and that the correct prompt directives are loaded.
+
+### Registration
+- **Dynamic Loading:** The `load_tools_from_directory` logic in `aeon/tools/loader.py` will pick up `BaseTool` subclasses automatically.
+- **Manual Registration:** If a tool has complex dependency requirements that the dynamic loader cannot satisfy, it must be manually instantiated and added to the tool list in `aeon/main.py`.
+
+## 5. Verification Checklist
+- [ ] Does the tool inherit from `BaseTool`?
+- [ ] Is the `name` unique and descriptive?
+- [ ] Does the `execute` method handle exceptions gracefully?
+- [ ] Are all paths absolute or resolved via `PROJECT_ROOT`?
+- [ ] Are all required models/containers added to `setup_environment.sh`?
+- [ ] Is the tool added to the correct category in `aeon/tools/categories.py`?
+- [ ] Does the tool work when the agent is started from a directory other than the source root?

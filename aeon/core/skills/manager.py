@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 from typing import List, Optional
+from aeon.core.paths import PROJECT_ROOT
 
 class SkillsManager:
     """
@@ -9,13 +10,11 @@ class SkillsManager:
     Prioritizes the local project root to avoid site-packages resolution issues.
     """
     def __init__(self):
-        # Force resolution to the local project root relative to this file
-        # This file is at aeon/core/skills/manager.py
-        # Project root is 3 levels up
-        self.base_dir = Path(__file__).resolve().parent.parent.parent.parent / "aeon" / "core" / "skills"
+        # Force resolution using aeon.core.paths to ensure we look at the source repo
+        # and not a pip-installed site-packages directory which may lack txt files.
+        self.base_dir = PROJECT_ROOT / "aeon" / "core" / "skills"
         
-        # Fallback: If the above doesn't exist (e.g. different install layout), 
-        # try to find the 'skills' directory relative to the current working directory
+        # Fallback: If the above doesn't exist, try relative to cwd
         if not self.base_dir.exists():
             self.base_dir = Path(os.getcwd()) / "aeon" / "core" / "skills"
 
