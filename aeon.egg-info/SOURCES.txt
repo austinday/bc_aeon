@@ -120,6 +120,7 @@ aeon/tools/restart.py
 aeon/tools/search.py
 aeon/tools/skill_category_manager.py
 aeon/tools/skills_manager_tool.py
+aeon/tools/skills_runtime.py
 aeon/tools/sub_agent.py
 aeon/tools/sub_agent_coordination.py
 aeon/tools/sub_agent_steering.py

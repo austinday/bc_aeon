@@ -2,6 +2,10 @@
 {objective}
 Above is your objective. If unclear, ambiguous, or conversational, use "get_user_input" tool to clarify before proceeding. 
 
+*** BEFORE YOU ACT ***
+- If this objective matches a protocol listed in the SKILLS section, call activate_skill('<category>/<skill_name>') FIRST so the protocol stays pinned to your context and is followed end-to-end. Skills are NOT applied automatically.
+- Proactively use `memorize` to capture credentials, discovered paths, and key decisions, and `spawn_sub_agent` for genuinely independent parallel work. These tools are easy to forget; reach for them deliberately rather than improvising.
+
 *** FINAL FORMATTING REMINDER ***
 You MUST output a valid JSON object.
 CRITICAL: You MUST use the `__BLOCK_N__` placeholder system for ANY multi-line code, quotes, or complex strings. DO NOT try to write raw code/JSON inside the action JSON values! Put the "__BLOCK_N__" string in the JSON, and put the actual code below the JSON.

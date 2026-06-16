@@ -80,6 +80,7 @@ class Worker:
         self.max_history_tokens = 30000
         self.current_objective = None
         self.model_name = None  # Set by main.py for restart persistence
+        self.active_skill = None  # {'path': ..., 'content': ...} when a skill protocol is active
 
     def _init_debug_logging(self):
         """Initialize debug logging once per worker instance."""
@@ -242,22 +243,31 @@ class Worker:
         if not categories:
             return "No skills available."
 
-        lines = ["**SKILLS CATEGORIES** (use expand_skill_category / collapse_skill_category to manage)"]
-        
+        active_path = self.active_skill.get('path') if self.active_skill else None
+
+        lines = ["**SKILLS** (reusable step-by-step protocols; they are NOT applied automatically)"]
+        if active_path:
+            lines.append(f"ACTIVE PROTOCOL: {active_path} (pinned in full below; call deactivate_skill once its steps are complete).")
+        else:
+            lines.append(
+                "No skill is active. If the current objective matches one of the protocols below, call "
+                "activate_skill('<category>/<skill_name>') BEFORE starting work so the protocol is pinned "
+                "and followed. To read a protocol first without committing, use expand_tool_category('<category>')."
+            )
+
         for cat in sorted(categories):
-            # Check if this skill category is expanded
-            # We use 'skill:' prefix to distinguish from tool categories
+            # A skill category is 'expanded' (browsable) when its skill: key is set.
             is_expanded = f"skill:{cat}" in self.expanded_categories
-            
+            skills = sm.get_skills_in_category(cat)
+
             if is_expanded:
                 lines.append(f"[-] {cat}:")
-                skills = sm.get_skills_in_category(cat)
                 for skill in sorted(skills):
                     content = sm.get_skill_content(cat, skill)
-                    summary = content[:200].replace('\n', ' ') + "..." if content else "(empty)"
-                    lines.append(f"  - {skill}: {summary}")
+                    summary = (content[:200].replace('\n', ' ') + "...") if content else "(empty)"
+                    marker = " (ACTIVE)" if active_path == f"{cat}/{skill}" else ""
+                    lines.append(f"  - {cat}/{skill}{marker}: {summary}")
             else:
-                skills = sm.get_skills_in_category(cat)
                 count = len(skills)
                 lines.append(f"[+] {cat}: ({count} skill{'s' if count != 1 else ''})")
         
@@ -419,6 +429,7 @@ class Worker:
         self._recent_outputs.clear()
         self.expanded_categories.clear()
         self.notified_sub_agents.clear()
+        self.active_skill = None
         self.effective_iterations = 0
 
     def serialize_state(self) -> dict:
@@ -431,6 +442,7 @@ class Worker:
             'objective': self.current_objective or '',
             'expanded_categories': list(self.expanded_categories),
             'notified_sub_agents': list(self.notified_sub_agents),
+            'active_skill': self.active_skill,
             'instance_id': self.instance_id,
             'open_files_list': list(self.open_files.keys()),
             'open_files_access_order': list(self.open_files_access_order),
@@ -443,6 +455,7 @@ class Worker:
         self.action_log_summary = state.get('action_log_summary', "")
         self.expanded_categories = set(state.get('expanded_categories', []))
         self.notified_sub_agents = set(state.get('notified_sub_agents', []))
+        self.active_skill = state.get('active_skill', None)
         self.open_files_access_order = state.get('open_files_access_order', [])
         
         # Restore the list of open files (placeholders will be synced to actual content by _sync_open_files)
@@ -503,6 +516,7 @@ class Worker:
         diag_section = f"\n**CONTEXT DIAGNOSTICS**\n{context_diagnostics}\n" if context_diagnostics else ""
 
         skills_text = self._get_skills_description()
+        active_skill_section = self._format_active_skill()
 
         return f"""{self.base_directives}
 
@@ -533,10 +547,46 @@ class Worker:
 
 **LAST STEP RESULT**
 {self.last_observation}
-
+{active_skill_section}
 {PRIMARY_AGENT_INSTRUCTIONS}
 
 {objective_text}"""
+
+    def _format_active_skill(self) -> str:
+        """Render the pinned active skill protocol block, or '' if none is active.
+
+        This block is re-injected into EVERY prompt while a skill is active, which is
+        what keeps the agent following an injection-based protocol instead of drifting.
+        """
+        if not self.active_skill:
+            return ""
+        path = self.active_skill.get('path', 'unknown')
+        content = self.active_skill.get('content', '')
+        return (
+            f"\n**ACTIVE SKILL PROTOCOL: {path}**\n"
+            f"You have committed to this protocol. Work through its steps in order and do NOT abandon it "
+            f"until you call deactivate_skill. Where a step calls for a dedicated tool (memorize, "
+            f"spawn_sub_agent, etc.), use that tool rather than improvising.\n"
+            f"--- BEGIN PROTOCOL ---\n{content}\n--- END PROTOCOL ---\n"
+        )
+
+    def _summarize_action(self, tool_name: str, params) -> str:
+        """One-line, readable summary of a tool call for terminal display.
+
+        Each parameter value is truncated so a huge payload (e.g. a full file in
+        write_file) never floods the terminal."""
+        if not isinstance(params, dict) or not params:
+            return f"{tool_name}()"
+        parts = []
+        for k, v in params.items():
+            v_str = str(v).replace('\n', ' ').strip()
+            if len(v_str) > 50:
+                v_str = v_str[:50] + '\u2026'
+            parts.append(f"{k}={v_str}")
+        inner = ", ".join(parts)
+        if len(inner) > 220:
+            inner = inner[:219] + '\u2026'
+        return f"{tool_name}({inner})"
 
     def _clean_action_json(self, raw_str: str) -> str:
         clean_json = raw_str.strip()
@@ -595,6 +645,9 @@ class Worker:
                         break
 
                 self.print_func(f"\n{C_BLUE}{'='*60}\n ITERATION {iteration}\n{'='*60}{C_RESET}")
+
+                if self.active_skill:
+                    self.print_func(f"{C_GREEN}\U0001F3AF Active skill: {self.active_skill.get('path')}{C_RESET}")
 
                 # --- BACKGROUND AGENT TERMINAL UI ---
                 active_agents = []
@@ -832,6 +885,14 @@ class Worker:
                     actions = actions[:15]
                     self.logger.warning("Truncated actions to 15")
 
+                # Show the agent's summarized tool-call choices for this turn up front,
+                # before the (already-visible) tool output streams in below.
+                queued = []
+                for a in actions:
+                    tn = (a.get("tool_name") or "?").strip()
+                    queued.append(self._summarize_action(tn, a.get("parameters", {})))
+                self.print_func(f"{C_CYAN}Tool calls ({len(actions)}): {' | '.join(queued)}{C_RESET}")
+
                 for idx, action_data in enumerate(actions):
                     tool_name = action_data.get("tool_name")
                     params = action_data.get("parameters", {})
@@ -851,6 +912,9 @@ class Worker:
                     display_action_desc = f"{tool_name}({str(params)[:40]}...)" if params else f"{tool_name}()"
                     actions_taken_str.append(display_action_desc)
                     full_actions_taken_str.append(full_action_desc)
+
+                    # Per-action marker so each tool's streamed output sits under its own header.
+                    self.print_func(f"{C_BLUE}\u25B6 [{idx+1}/{len(actions)}] {self._summarize_action(tool_name, params)}{C_RESET}")
 
                     if tool_name in terminal_tools:
                         try:
