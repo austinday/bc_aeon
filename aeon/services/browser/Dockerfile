@@ -8,12 +8,15 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY aeon/services/browser/requirements.txt .
+# Build context is aeon/services/browser/ (set by setup_environment.sh), so the
+# service files are at the root of the context — reference them by bare name.
+COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN chmod +x aeon/services/browser/entrypoint.sh
+# COPY . . placed server.py and entrypoint.sh directly in /app, which matches
+# entrypoint.sh running `uvicorn server:app` from /app.
+RUN chmod +x /app/entrypoint.sh
 
-# Use the absolute path to the entrypoint script relative to the project root
-ENTRYPOINT ["/app/aeon/services/browser/entrypoint.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]
