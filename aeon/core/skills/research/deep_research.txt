@@ -1,0 +1,25 @@
+# RESEARCH SKILL: Deep Research & Source Synthesis Protocol
+# Triggered when a question requires gathering, evaluating, and synthesizing external
+# information (literature, documentation, current events, technical references).
+# Goal: a well-sourced, balanced synthesis — not a single-source summary.
+
+1. DECONSTRUCT:
+- Break the question into 3+ distinct, orthogonal sub-questions. Define what a complete answer must cover.
+- Decide where each sub-question is best answered (web search, specific authoritative sites/docs, internal files).
+
+2. GATHER BROADLY, THEN NARROW:
+- Start with broad queries, then refine with specific terms. Use multiple distinct queries per sub-question; do not rephrase the same query repeatedly.
+- For parallelizable, independent research threads, consider spawning sub-agents (one per orthogonal avenue) and gathering their reports with gather_sub_agents.
+- Fetch full sources when snippets are insufficient. Prefer primary/authoritative sources (papers, official docs, standards bodies) over aggregators.
+
+3. EVALUATE SOURCES CRITICALLY:
+- Note each source's authority, recency, and potential bias. Be skeptical on contested or SEO-heavy topics.
+- Prefer recent sources where the topic evolves; date-stamp time-sensitive claims.
+
+4. SYNTHESIZE:
+- Combine findings across threads. Explicitly surface agreements, contradictions, and gaps between sources.
+- Distinguish well-supported claims from weak/single-source ones. Do not paper over conflicting evidence — present it.
+
+5. REPORT:
+- Produce a synthesis organized by the original sub-questions, with key points and the supporting source for each material claim.
+- State remaining uncertainties and what would be needed to resolve them. Save a detailed report file if the work is substantial.

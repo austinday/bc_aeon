@@ -1,0 +1,28 @@
+# DEEP LEARNING SKILL: Neural Network Training & Debugging Protocol
+# Triggered when building or training neural networks (PyTorch/TF/JAX) or debugging
+# training dynamics. Goal: a correctly-learning model with verified training behavior.
+
+1. PIPELINE SANITY BEFORE SCALE:
+- Verify the data pipeline end-to-end: shapes, dtypes, value ranges, label correctness, and that augmentation is applied to TRAIN only.
+- OVERFIT A TINY BATCH first: a correct model+loss must drive loss toward ~0 on a handful of examples. If it cannot, the model/loss/data wiring is broken — fix that before any real training.
+
+2. ENVIRONMENT & RESOURCES:
+- Containerize with pinned framework + CUDA versions matched to the hardware. Check GPU availability and free VRAM before allocating; size batch/precision to fit.
+- Use mixed precision and the largest stable batch size for throughput; enable checkpointing for long runs.
+
+3. TRAIN WITH INSTRUMENTATION:
+- Fix seeds. Log train AND validation loss/metrics every epoch (or step). Watch for divergence, NaNs, and the train/val gap.
+- Start from sane defaults for LR/optimizer/schedule; use an LR warmup/schedule. Tune LR first — it dominates.
+
+4. DIAGNOSE TRAINING FAILURES:
+- Loss NaN/exploding -> lower LR, add grad clipping, check for bad inputs / log of zero.
+- Not learning (flat loss) -> check LR too low, frozen params, broken gradient flow, or mislabeled data.
+- Train good / val bad (overfitting) -> add regularization/augmentation/early stopping or more data.
+- Both poor (underfitting) -> more capacity, longer training, or better features.
+
+5. EVALUATE & VALIDATE:
+- Evaluate on a held-out test set ONCE. Report variance across seeds where feasible.
+- Confirm no data leakage between splits (apply the ml_experiment leakage checks).
+
+6. DOCUMENT:
+- Save a README with architecture, data version, seeds, hyperparameters, the tiny-batch overfit check result, and final metrics.

@@ -1,0 +1,29 @@
+# SELF-IMPROVEMENT SKILL: Safe Self-Modification Protocol
+# Triggered when modifying Aeon's OWN source code, tools, or prompts.
+# Goal: change the framework safely, verify in a sandbox, then go live — without
+# breaking the running agent. Self-modifications are HIGH RISK; follow every step.
+
+1. SCOPE & PORTABILITY:
+- State precisely what you are changing and why. Identify exact file paths.
+- All changes MUST be portable: the agent runs from arbitrary working directories, so use no hardcoded paths and no dependency on the aeon source being in the current workspace.
+
+2. MAP PROPAGATION (use the verifying_change_propagation skill if the change is non-trivial):
+- Identify upstream callers and downstream consumers of every file you touch.
+- Check that interfaces (signatures, flags, return types, file paths) remain valid for all callers.
+- If you rename or move a file, update ALL references.
+
+3. IMPLEMENT:
+- Use write_file for whole files under ~400 lines; str_replace for small edits to large files.
+- Modify one logical unit at a time; do not stack multiple unverified edits to the same file in one turn.
+
+4. SANDBOX VERIFY (MANDATORY — code review is NOT sufficient):
+- Call verify_self_modification with a specific test_objective that actually exercises the new/changed code or tool.
+- Read the sub-agent's report. If it failed, fix the bugs and run verify_self_modification AGAIN. Do not proceed on a failed or ambiguous verification.
+
+5. GO LIVE:
+- Only after verification SUCCEEDS, call restart_aeon with the aeon_code_dir pointing at the source root (the dir containing setup.py).
+- BEFORE restarting, memorize all critical context (paths, decisions, state); open files are NOT preserved across restart.
+
+6. LIVE TEST (the only acceptable final validation):
+- After restart, actually USE the modified functionality/tool in the live agent context and confirm it behaves as intended.
+- Do NOT call restart_aeon again unless you make further NEW code changes.

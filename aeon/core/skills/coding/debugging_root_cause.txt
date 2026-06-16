@@ -1,0 +1,28 @@
+# CODING SKILL: Root-Cause Debugging Protocol
+# Triggered when a bug, crash, failing test, or unexpected output must be fixed.
+# Goal: fix the ROOT CAUSE, not the symptom, and prove the fix with execution.
+
+1. REPRODUCE FIRST:
+- Before changing anything, run the failing case and capture the EXACT error (full traceback, exit code, or wrong output). Memorize the reproduction command.
+- If you cannot reproduce it, you cannot fix it. Establish a deterministic repro before proceeding.
+
+2. ISOLATE:
+- Identify the smallest unit (function, module, command) that exhibits the failure.
+- Form 3-5 concrete hypotheses for the root cause. Write each one down.
+- For each hypothesis, design a quick, targeted probe (a print, an assertion, a one-off script in scripts/debug/) that will confirm or refute it. Do NOT guess-and-edit the main code.
+
+3. CONFIRM THE ROOT CAUSE:
+- Run the probes. Rank hypotheses by the evidence. Select the single most-likely root cause.
+- State explicitly WHY this is the cause and what mechanism produces the observed symptom.
+
+4. FIX MINIMALLY:
+- Apply the smallest change that addresses the root cause. Avoid unrelated refactors.
+- Before editing, check upstream callers and downstream consumers of the code you are changing for breakage.
+
+5. PROVE IT:
+- Re-run the ORIGINAL reproduction command. Confirm the error is gone.
+- Run any adjacent tests to confirm you did not introduce a regression.
+- Clean up temporary debug scripts from scripts/debug/.
+
+6. ANTI-LOOP:
+- If the same fix attempt fails twice, your root-cause hypothesis is wrong. Stop. Return to step 2 and form new hypotheses. Do not re-run the same failing edit expecting a different result.

@@ -1,0 +1,29 @@
+# GENOMICS SKILL: Variant Calling & Genomic Data Workflow Protocol
+# Triggered for alignment, variant calling (VCF), genomic intervals (BED), coverage,
+# or population/annotation analyses over sequencing data.
+# Goal: a correct, reproducible genomics workflow with the right reference and QC gates.
+
+1. REFERENCE & METADATA (do this FIRST):
+- Lock the reference genome build and memorize it. Mixing GRCh37/GRCh38 coordinates silently corrupts every downstream result.
+- Record sample metadata, library prep, and sequencing platform — they drive parameter choices and batch awareness.
+
+2. ENVIRONMENT:
+- Containerize the toolchain (bwa/minimap2, samtools, bcftools/GATK, bedtools) with pinned versions. Mount large data at runtime; do not bake it into images.
+- BAM/CRAM/VCF are binary or huge — never cat them; use samtools/bcftools view on a region or the file analyzer for structure.
+
+3. QC GATES (gate each stage; do not proceed past a failed gate):
+- Raw reads: check quality, adapter content, duplication.
+- Post-alignment: mapping rate, coverage depth/uniformity, insert size.
+- Variants: Ti/Tv ratio, het/hom ratio, filter status. Flag values outside expected ranges.
+
+4. WORKFLOW AS IDEMPOTENT STEPS:
+- Numbered .sh scripts; each resumable and skipping completed outputs (alignment/variant calling are expensive — never silently redo them).
+- Maximize available CPU/GPU; use appropriate thread counts.
+
+5. CONTROLS & MULTIPLE TESTING:
+- Include controls (e.g. known-truth samples, negative controls) where applicable.
+- For any association/enrichment testing, apply multiple-testing correction (e.g. FDR). Report raw and corrected significance.
+
+6. VALIDATE & DOCUMENT:
+- Spot-check called variants against expectations or known sites. Report QC metrics, not just "the pipeline ran."
+- Save a README capturing reference build, tool versions, parameters, and QC summary.
