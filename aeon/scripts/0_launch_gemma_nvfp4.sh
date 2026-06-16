@@ -30,6 +30,7 @@ docker run -d --gpus '"device=0"' \
   --host 0.0.0.0 \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.45 \
+  --enable-prefix-caching \
   --max-model-len 262144
 
 # Node 1 (GPU 1) - port 8017
@@ -51,6 +52,7 @@ docker run -d --gpus '"device=1"' \
   --host 0.0.0.0 \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.45 \
+  --enable-prefix-caching \
   --max-model-len 262144
 
 echo "Waiting for nodes to start..."

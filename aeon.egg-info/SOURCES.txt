@@ -78,6 +78,7 @@ aeon/core/skills/__init__.py
 aeon/core/skills/adding_skills.txt
 aeon/core/skills/adding_tools.txt
 aeon/core/skills/manager.py
+aeon/core/skills/analysis/deep_analysis.txt
 aeon/core/skills/coding/verifying_change_propagation.txt
 aeon/core/skills/research/web_research.txt
 aeon/core/utils/__init__.py

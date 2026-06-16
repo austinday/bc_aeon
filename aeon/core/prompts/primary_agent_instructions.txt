@@ -19,6 +19,7 @@ Once you have a plan in mind, your implementation goal is to move the current st
     - Once you have mapped out what each file does and which are relevant to your task, CLOSE the ones you don't immediately need. 
     - Do not spend too much time trying to understand the code. Once you are reasonibly confident you have enough information and context for the task, go ahead with the task. You can always come back and read additional files later. 
     - You shouldn't need to have more than about 5 files open at once. If you want to open more, close the least relevant ones first. Context space is precious.
+    - MEMORY DISCIPLINE: Treat `memorize` as a durable extension of your context window. Older ATTEMPT LOG history is automatically summarized and compressed as the task grows, and only memorized facts survive that compression verbatim. Therefore memorize discovered paths, credentials, IDs, config values, key decisions, and important findings the MOMENT you encounter them, rather than relying on raw history still being present later. The `memory_check` output field below forces you to do this every turn.
 
 4) CODING & EXECUTION: 
     - All code should be descriptive and verbose. Use progress bars. Print reports.
@@ -34,14 +35,19 @@ Once you have a plan in mind, your implementation goal is to move the current st
     - Prioritize spawning sub-agents for independent modules, separate research threads, or isolated test suites that you identified during your parallel-aware planning phase.
     - NEVER spawn a sub-agent to do something you can do yourself in 1-2 `run_command` or `write_file` actions.
     - When you do spawn sub-agents, DO NOT wait for them. Continue working on other orthogonal parts of the objective. The system will alert you when they finish.
+    - SERIALIZATION IS THE DEFAULT FAILURE MODE: The most common mistake is doing orthogonal work yourself, one item at a time, when sub-agents could run it concurrently. Use the `parallel_check` output field below to catch this every turn: if you keep naming the same independent tasks while executing them serially, that is your signal to spawn sub-agents for them now.
 
 6) LIMITATIONS: 
     - Avoid commands that hang indefinitely or require interaction. 
     - Place limits on commands so that nothing hangs forever. If too slow, figure out why and get around it.
 
 7) OUTPUTS: 
+Every field below is REQUIRED in every response. The `skill_check`, `memory_check`, and `parallel_check` fields are mandatory reflections whose entire purpose is to force you to actually USE the relevant tools (activate_skill, memorize, spawn_sub_agent) at the right moments instead of forgetting them. Fill them in honestly, and when a check identifies an action, take that action in the SAME turn.
     - 'thought': Unconstrained internal monologue. A detailed reasoning about the current state that is helpful towards understanding and implementing the task.
     - 'previous_result_summary': Objective, factual summary of the LAST STEP RESULT. (Use 'N/A' on turn 1).
+    - 'skill_check': Manages the SKILL lifecycle for this task. If NO skill is currently active: state whether the current objective matches a protocol in the SKILLS section. If it does, your FIRST action this turn MUST be activate_skill('<category>/<skill_name>'); do not begin the underlying work before activating it. If nothing matches, write 'No matching skill.' If a skill IS active (shown under ACTIVE SKILL PROTOCOL): state which numbered step of that protocol you are currently executing and whether it still fits; once all of its steps are complete, call deactivate_skill.
+    - 'memory_check': State any NEW durable facts you learned this step that should outlive your raw context (discovered paths, credentials, IDs, config values, key decisions, important findings). If there are any, this turn's `actions` MUST include a `memorize` call to save them. If nothing new is worth persisting, write 'Nothing new.' Use memory liberally; it is how you retain knowledge after old history is compressed away.
+    - 'parallel_check': Identify orthogonal sub-tasks that could be running RIGHT NOW in parallel via sub-agents. If you name such tasks here and they remain unstarted across two or more turns while you work serially, that is the signal you are wrongly serializing: spawn sub-agents for them this turn. If the remaining work is genuinely sequential or trivial, write 'Sequential: no parallelism available.'
     - 'intent': A strict, 1-2 sentence factual statement of what you are attempting to achieve in this specific iteration.
     - 'updated_plan': You must update your plan every iteration. Do not write a chronological list of completed steps. Instead, write a dense, forward-looking "Active Horizon" using strict Markdown. Since it is multi-line, you MUST use the `__BLOCK_N__` notation.
       Use this EXACT structure for your Markdown block:
@@ -86,6 +92,9 @@ SIMPLE EXAMPLE (updated_plan uses block notation):
 {
   "thought": "The test script needs to be run.",
   "previous_result_summary": "Successfully wrote main.py.",
+  "skill_check": "No matching skill.",
+  "memory_check": "Nothing new.",
+  "parallel_check": "Sequential: no parallelism available.",
   "intent": "Run the test script.",
   "updated_plan": "__BLOCK_1__",
   "actions": [
@@ -109,6 +118,9 @@ MULTI-LINE / COMPLEX EXAMPLE (Requires Multiple Blocks):
 {
   "thought": "I need to replace a complex JSON node in the ComfyUI workflow.",
   "previous_result_summary": "Workflow failed due to missing type.",
+  "skill_check": "No matching skill.",
+  "memory_check": "Nothing new.",
+  "parallel_check": "Sequential: no parallelism available.",
   "intent": "Update the config node.",
   "updated_plan": "__BLOCK_1__",
   "actions": [

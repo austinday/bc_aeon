@@ -1,0 +1,27 @@
+# DEEP ANALYSIS SKILL: Multi-Dimensional Exploration Protocol
+# This protocol is triggered when the agent needs to "think hard", "think deep", or "analyze" a complex problem.
+# The goal is to prevent tunnel vision by forcing the exploration of multiple orthogonal dimensions of a problem in parallel.
+
+1. DECONSTRUCTION & DIMENSIONALITY:
+- Use the `think` tool to break the core problem into at least 3-5 "Dimensions of Analysis".
+- Dimensions should be orthogonal (e.g., Technical, Ethical, Economic, User Experience, Edge Cases, etc.).
+- For each dimension, define a specific research objective and a set of questions that must be answered.
+
+2. PARALLEL EXPLORATION:
+- Spawn a separate sub-agent for each identified Dimension.
+- Each sub-agent must:
+    - Use the `think` tool to brainstorm hypotheses within its specific dimension.
+    - Use `search_web` or `open_file` to gather evidence.
+    - Produce a detailed "Dimension Report" containing findings, contradictions, and conclusions.
+
+3. SYNTHESIS & CONSOLIDATION:
+- Once all sub-agents have reported back, use the `think` tool to perform a cross-dimensional synthesis.
+- Identify:
+    - Convergent points (where different dimensions agree).
+    - Divergent points (where dimensions conflict).
+    - Blind spots (what is still unknown).
+- Construct a final "Comprehensive Analysis Report" that integrates all findings into a coherent strategy or answer.
+
+4. FINAL VALIDATION:
+- Review the final report against the original objective to ensure no dimensions were missed.
+- If gaps remain, repeat Step 1 for the missing dimensions.
