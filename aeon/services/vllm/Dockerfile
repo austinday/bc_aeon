@@ -21,10 +21,10 @@ RUN pip install --no-cache-dir --break-system-packages \
     torch torchvision torchaudio \
     --extra-index-url https://download.pytorch.org/whl/cu130
 
-# Install vLLM nightly for Gemma 4 MTP support
+# Install vLLM pinned to the last known working release for MTP + NVFP4
 RUN pip install --no-cache-dir --break-system-packages \
     --pre --extra-index-url https://wheels.vllm.ai/nightly \
-    vllm \
+    "vllm==0.23.0" \
     qwen-vl-utils \
     accelerate
 
