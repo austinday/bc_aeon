@@ -341,9 +341,27 @@ class Worker:
         self._sync_open_files(max_content_len=max_content_len)
         if not self.open_files:
             return "No files currently open."
-        out = []
+        try:
+            from aeon.core.paths import PROJECT_ROOT
+            root = PROJECT_ROOT
+        except Exception:
+            root = None
+
+        def _disp(p):
+            try:
+                return os.path.relpath(p, root) if root else p
+            except Exception:
+                return p
+
+        manifest = ", ".join(_disp(p) for p in self.open_files)
+        out = [
+            f"{len(self.open_files)} file(s) are ALREADY loaded in full below "
+            f"({manifest}). Their complete current contents are in your context. "
+            f"Do NOT call open_file on any of these — read them where they are and let "
+            f"your next action advance the task."
+        ]
         for path, content in self.open_files.items():
-            out.append(f"--- FILE: {path} ---\n{content}\n--- END FILE: {path} ---")
+            out.append(f"--- FILE: {_disp(path)}  (abs: {path}) ---\n{content}\n--- END FILE: {_disp(path)} ---")
         return "\n\n".join(out)
 
     def _format_memories(self) -> str:

@@ -15,7 +15,9 @@ aeon/core/llm.py
 aeon/core/llm_utils.py
 aeon/core/logger.py
 aeon/core/paths.py
+aeon/core/runtime_signals.py
 aeon/core/session.py
+aeon/core/sub_agent_state.py
 aeon/core/system_info.py
 aeon/core/utils.py
 aeon/core/worker.py
@@ -78,6 +80,7 @@ aeon/core/skills/__init__.py
 aeon/core/skills/adding_skills.txt
 aeon/core/skills/adding_tools.txt
 aeon/core/skills/manager.py
+aeon/core/skills/analysis/codebase_analysis.txt
 aeon/core/skills/analysis/deep_analysis.txt
 aeon/core/skills/coding/debugging_root_cause.txt
 aeon/core/skills/coding/safe_refactor.txt

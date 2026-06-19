@@ -3,7 +3,8 @@
 Above is your objective. If unclear, ambiguous, or conversational, use "get_user_input" tool to clarify before proceeding. 
 
 *** BEFORE YOU ACT ***
-- If this objective matches a protocol listed in the SKILLS section, call activate_skill('<category>/<skill_name>') FIRST so the protocol stays pinned to your context and is followed end-to-end. Skills are NOT applied automatically.
+- SKILL ROUTING: If the objective above contains a "[SKILL ROUTING]" directive, the system has already analyzed your task against the available skill protocols. Treat its recommendation as strong guidance: if it names a matching skill, your FIRST action this turn should normally be activate_skill('<category>/<skill_name>'), before you begin the underlying work. Only override it if it is clearly wrong for the actual task.
+- If there is no routing directive but the objective matches a protocol listed in the SKILLS section, call activate_skill('<category>/<skill_name>') FIRST so the protocol stays pinned to your context and is followed end-to-end. Skills are NOT applied automatically.
 - Proactively use `memorize` to capture credentials, discovered paths, and key decisions, and `spawn_sub_agent` for genuinely independent parallel work. These tools are easy to forget; reach for them deliberately rather than improvising.
 
 *** FINAL FORMATTING REMINDER ***

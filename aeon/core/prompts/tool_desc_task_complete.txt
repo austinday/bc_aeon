@@ -1,4 +1,9 @@
-Marks the current task as complete and terminates the agent loop. Use ONLY after validating that the objective has been fully achieved (e.g., by running scripts and checking outputs, OR by fully answering an informational user query). 
+Marks the current task as complete and terminates the agent loop. Use ONLY after the objective is fully achieved AND its result has been delivered.
+
+CRITICAL: If the objective was to produce information (analysis, research, brainstorm, plan, recommendations, or an answer), you MUST first present the FULL result to the user via say_to_user (or write_file for a long report). The `reason` field below is only a log summary — it is NOT shown to the user as the deliverable, and naming your findings in it does NOT deliver them. Deliver first, then complete (often in the same actions array).
+
+For code/implementation objectives, validate by running scripts and checking outputs before completing.
+
 Schema:
   reason (str, optional, default="Task completed."): A brief summary of what was accomplished and how it was verified.
-Example: {"tool_name": "task_complete", "parameters": {"reason": "Built Docker image, ran tests, all 12 tests passed."}}
+Example: {"tool_name": "task_complete", "parameters": {"reason": "Delivered the 5-point analysis to the user via say_to_user; objective met."}}

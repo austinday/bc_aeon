@@ -2,69 +2,182 @@ import os
 import sys
 import json
 import uuid
-import subprocess
 import time
-import copy
-import re
-import ctypes
 import signal
+import ctypes
+import subprocess
 from pathlib import Path
+
 from aeon.tools.base import BaseTool
-from ..core.prompts import (
-    TOOL_DESC_SPAWN_SUB_AGENT,
-    TOOL_DESC_GET_SUB_AGENT_REPORT,
-    TOOL_DESC_KILL_SUB_AGENT
-)
+from aeon.core import runtime_signals as rt
+from aeon.core.sub_agent_state import resolve, norm_status, group_kill
+
+
+def _resolve_agent_dir(base_dir, agent_id):
+    """Resolve an agent_id (full UUID, an unambiguous prefix, or a full directory
+    name) to its actual sub-agent directory. gather_sub_agents shows operators a
+    SHORT id, so the model frequently passes a prefix back to report/kill/steer;
+    an exact-match lookup then fails with 'not found'. Matches:
+      1. exact directory name (fast path)
+      2. unique prefix match
+      3. unique substring match (covers labelled dirs like 'verify_<uuid>')
+    Returns (path, error_string). Exactly one of the two is None.
+    """
+    base_dir = Path(base_dir)
+    if not agent_id:
+        return None, "No agent_id provided."
+    if not base_dir.exists():
+        return None, "No sub-agents have been spawned in this session."
+
+    agent_id = str(agent_id).strip()
+    exact = base_dir / agent_id
+    if exact.exists() and exact.is_dir():
+        return exact, None
+
+    dirs = [d for d in base_dir.iterdir() if d.is_dir()]
+    prefix = [d for d in dirs if d.name.startswith(agent_id)]
+    if len(prefix) == 1:
+        return prefix[0], None
+    if len(prefix) > 1:
+        opts = ", ".join(sorted(d.name[:12] for d in prefix))
+        return None, (f"Ambiguous agent id '{agent_id}' matches multiple sub-agents ({opts}). "
+                      f"Use more characters of the id.")
+
+    sub = [d for d in dirs if agent_id in d.name]
+    if len(sub) == 1:
+        return sub[0], None
+    if len(sub) > 1:
+        opts = ", ".join(sorted(d.name[:12] for d in sub))
+        return None, (f"Ambiguous agent id '{agent_id}' matches multiple sub-agents ({opts}). "
+                      f"Use more characters of the id.")
+
+    available = sorted(d.name[:12] for d in dirs if (d / "pid.txt").exists())
+    hint = f" Known sub-agents: {', '.join(available)}." if available else ""
+    return None, f"Agent '{agent_id}' not found.{hint}"
+
+
+def uncollected_sub_agents(base_dir, notified_set):
+    """Return short ids of sub-agents that have a terminal result which was never
+    surfaced to the principal (i.e. never gathered/reported). Used to stop the
+    primary from abandoning a dispatched researcher at task_complete."""
+    base_dir = Path(base_dir)
+    out = []
+    if not base_dir.exists():
+        return out
+    for d in base_dir.iterdir():
+        if not (d.is_dir() and (d / "pid.txt").exists()):
+            continue
+        is_term, status, _ = resolve(d)
+        if not is_term:
+            # Still running but spawned this session and never harvested -> also worth flagging.
+            out.append((d.name.split("-")[0], "RUNNING"))
+            continue
+        key = f"{d.name}_{norm_status(status)}"
+        if key not in (notified_set or set()):
+            out.append((d.name.split("-")[0], norm_status(status)))
+    return out
+
 
 class SpawnSubAgent(BaseTool):
+    MAX_CONCURRENT = 5
+    DEFAULT_BUDGET_MIN = 40
+    DEFAULT_STALL = 600
+    HARD_WALLCLOCK_CEILING = 7200
+    HARD_STALL_CEILING = 1800
+
     def __init__(self, worker=None, llm_client=None):
         super().__init__(
             name="spawn_sub_agent",
-            description=TOOL_DESC_SPAWN_SUB_AGENT
+            description=(
+                "Dispatch a background sub-agent to work an INDEPENDENT thread in parallel (a research "
+                "avenue, a separate module, an isolated experiment). You are a principal investigator: "
+                "spawn the batch, do your own orthogonal work, then COLLECT every report. NEVER spawn a "
+                "sub-agent for something you can do yourself in 1-2 commands, and NEVER finish a task while "
+                "a sub-agent you spawned is still running or unread -- if you spawned it, you must gather "
+                "and read it (or kill it) before task_complete.\n"
+                "Each sub-agent runs your model, shares the workspace, CANNOT spawn its own sub-agents, and "
+                "is GUARANTEED to reach a terminal state within its budget (an internal watchdog enforces "
+                "this). Its final report reaches you via get_sub_agent_report, so make the deliverable "
+                "explicit in the objective.\n"
+                "Schema:\n"
+                "  objective (str, required): a SELF-CONTAINED task with clear, explicitly-stated deliverables.\n"
+                "  time_budget_minutes (int, optional, default=40): wall-clock budget. Deep research: 60-90; "
+                "quick lookups: 10-15. Capped at 120.\n"
+                "  max_iterations (int, optional, default=20): planning-step cap.\n"
+                "  stall_timeout_seconds (int, optional, default=600): kill if it makes no progress this long.\n"
+                "Example: {\"tool_name\": \"spawn_sub_agent\", \"parameters\": {\"objective\": \"Map aeon/tools: "
+                "list every tool, its base class, and its upstream/downstream imports; report as a structured "
+                "summary with risks.\", \"time_budget_minutes\": 30}}"
+            ),
         )
         self.worker = worker
         self.llm_client = llm_client
-        self.max_concurrent = 5
 
     @property
     def output_dir(self):
         return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
 
-    def execute(self, objective: str):
-        # Enforce concurrency limit
-        running = self._get_running_agents()
-        if len(running) >= self.max_concurrent:
-            return (f"COMMAND FAILED: Maximum concurrent sub-agents ({self.max_concurrent}) reached. "
-                    f"Kill one (kill_sub_agent) or wait for completion (gather_sub_agents).")
+    def _running_count(self):
+        if not self.output_dir.exists():
+            return 0
+        n = 0
+        for d in self.output_dir.iterdir():
+            if d.is_dir() and (d / "pid.txt").exists() and not resolve(d)[0]:
+                n += 1
+        return n
 
-        # Sub-agents ALWAYS run the same model as the primary agent. Heterogeneous
-        # models are not supported: exactly one model is served per session, and the
-        # sub-agent inherits the primary worker's model_config. There is no fallback
-        # to a different model.
-        model_cfg = getattr(self.worker, 'model_config', None)
+    def execute(self, objective, time_budget_minutes=None, max_iterations=None, stall_timeout_seconds=None):
+        if not self.worker:
+            return "COMMAND FAILED: Worker context missing."
+
+        running = self._running_count()
+        if running >= self.MAX_CONCURRENT:
+            return (f"COMMAND FAILED: Maximum concurrent sub-agents ({self.MAX_CONCURRENT}) reached. "
+                    f"Wait/collect with gather_sub_agents or free one with kill_sub_agent.")
+
+        model_cfg = getattr(self.worker, "model_config", None)
         if not model_cfg:
-            return ("COMMAND FAILED: No model_config is set on the primary worker, so a sub-agent "
-                    "cannot be configured with the active model. Cannot spawn.")
+            return ("COMMAND FAILED: No model_config on the primary worker, so a sub-agent cannot be "
+                    "configured with the active model.")
+
+        try:
+            budget_min = int(time_budget_minutes) if time_budget_minutes else self.DEFAULT_BUDGET_MIN
+        except (TypeError, ValueError):
+            budget_min = self.DEFAULT_BUDGET_MIN
+        max_wallclock = max(60, min(budget_min * 60, self.HARD_WALLCLOCK_CEILING))
+
+        try:
+            stall = int(stall_timeout_seconds) if stall_timeout_seconds else self.DEFAULT_STALL
+        except (TypeError, ValueError):
+            stall = self.DEFAULT_STALL
+        stall = max(60, min(stall, self.HARD_STALL_CEILING))
+
+        try:
+            iters = int(max_iterations) if max_iterations else 20
+        except (TypeError, ValueError):
+            iters = 20
+        iters = max(1, min(iters, 100))
 
         agent_id = str(uuid.uuid4())
         agent_dir = self.output_dir / agent_id
         agent_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create symlinked workspace (points at the shared task workspace)
         workspace_path = Path(os.getcwd())
         symlink_path = agent_dir / "workspace"
         if symlink_path.exists() or symlink_path.is_symlink():
             symlink_path.unlink()
         symlink_path.symlink_to(workspace_path)
 
-        # Tell the sub-agent to coordinate through the shared blackboard.
         coordinated_objective = (
             f"{objective}\n\n"
-            f"[COORDINATION] You are one of several parallel sub-agents sharing this task. "
-            f"BEFORE starting a self-contained chunk of work, call blackboard_read to check whether "
-            f"a sibling has already produced that result or already hit that dead end. When you "
-            f"produce something reusable (a working approach, a confirmed fact, an artifact path, or "
-            f"a dead end), call blackboard_post so the others can use it."
+            f"[COORDINATION] You are one of several parallel sub-agents sharing this task. BEFORE starting "
+            f"a self-contained chunk of work, call blackboard_read to check whether a sibling already "
+            f"produced that result or already hit that dead end. When you produce something reusable, call "
+            f"blackboard_post.\n\n"
+            f"[REPORTING] Your final say_to_user message IS your report back to the principal agent and is "
+            f"the deliverable. Before you call task_complete, deliver your COMPLETE findings via say_to_user "
+            f"as a structured report (not a one-line summary, not just a log of what you opened). The "
+            f"principal cannot see your internal thoughts or your task_complete reason."
         )
 
         cmd = [
@@ -74,9 +187,11 @@ class SpawnSubAgent(BaseTool):
             "--model_config", json.dumps(model_cfg),
             "--workspace", str(symlink_path),
             "--output_dir", str(agent_dir),
-            "--max_iterations", "20"
+            "--max_iterations", str(iters),
+            "--stall_timeout", str(stall),
+            "--max_wallclock", str(max_wallclock),
         ]
-        if getattr(self.worker, 'debug_mode', False):
+        if getattr(self.worker, "debug_mode", False):
             cmd.append("--debug")
 
         def set_pdeathsig():
@@ -85,49 +200,56 @@ class SpawnSubAgent(BaseTool):
             except Exception:
                 pass
 
-        # Redirect stdout/stderr directly to the log file to prevent OS pipe buffer deadlocks
-        log_file_path = agent_dir / "agent.log"
-        log_fd = open(log_file_path, "a")
-        process = subprocess.Popen(cmd, stdout=log_fd, stderr=subprocess.STDOUT, preexec_fn=set_pdeathsig)
+        log_fd = open(agent_dir / "agent.log", "a")
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                preexec_fn=set_pdeathsig,
+                start_new_session=True,
+            )
+        except Exception as e:
+            log_fd.close()
+            return f"COMMAND FAILED: could not launch sub-agent process: {e}"
 
-        with open(agent_dir / "pid.txt", "w") as f:
-            f.write(str(process.pid))
-        with open(agent_dir / "status.txt", "w") as f:
-            f.write("RUNNING")
+        rt.atomic_write_text(agent_dir / "pid.txt", str(process.pid))
+        rt.atomic_write_text(agent_dir / "status.txt", "RUNNING")
 
-        return (f"Sub-agent spawned successfully. Agent ID: {agent_id}. It runs the same model as you. "
-                f"The system will notify you when it finishes. DO NOT poll it one-by-one; continue with "
-                f"other orthogonal work, then call gather_sub_agents to collect the whole batch at once.")
-
-    def _get_running_agents(self):
-        if not self.output_dir.exists():
-            return []
-        running = []
-        for agent_dir in self.output_dir.iterdir():
-            if agent_dir.is_dir():
-                status_path = agent_dir / "status.txt"
-                if status_path.exists():
-                    status = status_path.read_text().strip()
-                    if status == "RUNNING":
-                        running.append(agent_dir.name)
-        return running
+        short_id = agent_id[:8]
+        return (f"Sub-agent spawned. Agent ID: {agent_id} (refer to it as '{short_id}' in gather/report/kill). "
+                f"Budget: {max_wallclock // 60} min wall-clock, {stall}s stall, {iters} max iterations. "
+                f"REMEMBER: you must collect its report with gather_sub_agents + get_sub_agent_report before "
+                f"you finish the task. Do other orthogonal work now, then check in (use a non-zero timeout so "
+                f"you actually wait for it).")
 
 
 class GatherSubAgents(BaseTool):
+    DEFAULT_TIMEOUT = 120
+    HARD_MAX_TIMEOUT = 600
+    STALL_FLAG_SECONDS = 120
+    FREEZE_SECONDS = 60
+    POLL_INTERVAL = 3
+
     def __init__(self, worker=None, llm_client=None):
         super().__init__(
             name="gather_sub_agents",
             description=(
-                "Fan-in primitive: blocks until the specified (or all currently running) sub-agents "
-                "reach a terminal state (COMPLETED / FAILED / KILLED), then returns ALL of their final "
-                "reports together in one result. After spawning a batch of orthogonal sub-agents, do "
-                "your own orthogonal work first, then call gather_sub_agents ONCE to wait for the batch "
-                "and collect every result in a single step instead of polling get_sub_agent_report.\n"
+                "Bounded, progress-aware check-in on running sub-agents. Returns the INSTANT any agent newly "
+                "finishes (so you can consume its result and spawn follow-ups), or when one freezes, or after "
+                "a short window. NEVER blocks indefinitely. For each agent you get its short id, status, time "
+                "since last progress, and current step, plus a recommended action. Pass a displayed short id "
+                "straight to get_sub_agent_report.\n"
+                "IMPORTANT: timeout=0 is only an instant snapshot -- it does NOT wait. To actually wait for a "
+                "result, use a non-zero timeout (e.g. 120). Repeatedly snapshotting with timeout=0 and then "
+                "giving up is a common mistake: if you spawned an agent, wait for it and read its report.\n"
                 "Schema:\n"
-                "  agent_ids (list[str], optional): specific agent IDs to wait for. Omit to wait for ALL sub-agents that are currently running.\n"
-                "  timeout (int, optional, default=1200): max seconds to block before returning with whatever has finished so far.\n"
-                "Example: {\"tool_name\": \"gather_sub_agents\", \"parameters\": {\"timeout\": 900}}"
-            )
+                "  agent_ids (list[str], optional): specific ids; omit for all running sub-agents.\n"
+                "  timeout (int, optional, default=120): max seconds to wait this check-in (capped 600). "
+                "0 = instant snapshot (no wait).\n"
+                "  stall_threshold (int, optional, default=120): flag an agent showing no progress this long.\n"
+                "Example: {\"tool_name\": \"gather_sub_agents\", \"parameters\": {\"timeout\": 120}}"
+            ),
         )
         self.worker = worker
         self.llm_client = llm_client
@@ -136,38 +258,45 @@ class GatherSubAgents(BaseTool):
     def output_dir(self):
         return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
 
-    def _resolve(self, agent_dir):
-        """Return (is_terminal, status, report). Treats a present output.json OR an
-        explicit terminal status.txt as terminal, because the primary loop's notifier
-        may have already consumed (deleted) the status file after alerting."""
-        status_path = agent_dir / "status.txt"
-        output_path = agent_dir / "output.json"
+    def _short_id(self, dir_name):
+        return dir_name.split("-")[0]
 
-        status = None
-        if status_path.exists():
-            try:
-                status = status_path.read_text().strip()
-            except Exception:
-                status = None
+    def _progress(self, agent_dir):
+        pj = agent_dir / "progress.json"
+        try:
+            if pj.exists():
+                frozen = (time.time() - pj.stat().st_mtime) > self.FREEZE_SECONDS
+                data = json.loads(pj.read_text(encoding="utf-8"))
+                return data.get("activity_age"), data.get("step"), data.get("iteration"), frozen
+        except Exception:
+            pass
+        tj = agent_dir / "telemetry.json"
+        try:
+            if tj.exists():
+                data = json.loads(tj.read_text(encoding="utf-8"))
+                ts = data.get("timestamp")
+                if ts:
+                    return max(0.0, time.time() - float(ts)), data.get("current_step"), data.get("iteration"), False
+        except Exception:
+            pass
+        for fname in ("pid.txt", "status.txt"):
+            p = agent_dir / fname
+            if p.exists():
+                return max(0.0, time.time() - p.stat().st_mtime), None, None, False
+        return None, None, None, False
 
-        if output_path.exists():
-            try:
-                data = json.loads(output_path.read_text())
-                st = data.get("status", "COMPLETED")
-                if "error" in data and st != "COMPLETED":
-                    return True, st, f"Error: {data['error']}"
-                return True, st, str(data.get("result", "N/A"))
-            except Exception as e:
-                return True, (status or "COMPLETED"), f"(output.json present but unreadable: {e})"
-
-        if status and (status in ("COMPLETED", "KILLED") or status.startswith("FAILED")):
-            return True, status, "(terminal status reported, no output.json found)"
-
-        return False, (status or "RUNNING"), None
-
-    def execute(self, agent_ids=None, timeout: int = 1200):
+    def execute(self, agent_ids=None, timeout=None, stall_threshold=None):
         if not self.worker:
             return "Error: Worker context missing."
+        try:
+            timeout = self.DEFAULT_TIMEOUT if timeout is None else int(timeout)
+        except (TypeError, ValueError):
+            timeout = self.DEFAULT_TIMEOUT
+        timeout = max(0, min(self.HARD_MAX_TIMEOUT, timeout))
+        try:
+            stall_threshold = self.STALL_FLAG_SECONDS if stall_threshold is None else int(stall_threshold)
+        except (TypeError, ValueError):
+            stall_threshold = self.STALL_FLAG_SECONDS
 
         base = self.output_dir
         if not base.exists():
@@ -179,64 +308,104 @@ class GatherSubAgents(BaseTool):
                 agent_ids = [agent_ids]
             targets = []
             for aid in agent_ids:
-                p = base / str(aid)
-                if p.exists():
-                    targets.append(p)
+                d, err = _resolve_agent_dir(base, aid)
+                if d:
+                    targets.append(d)
                 else:
                     missing.append(str(aid))
             if not targets:
                 return f"None of the requested sub-agents were found: {agent_ids}"
         else:
-            targets = [
-                d for d in base.iterdir()
-                if d.is_dir() and (
-                    (d / "status.txt").exists() or (d / "output.json").exists() or (d / "pid.txt").exists()
-                )
-            ]
+            targets = [d for d in base.iterdir()
+                       if d.is_dir() and ((d / "status.txt").exists()
+                                          or (d / "output.json").exists()
+                                          or (d / "pid.txt").exists())]
             if not targets:
                 return "No sub-agents found to gather."
 
+        initially_running = {d.name for d in targets if not resolve(d)[0]}
         start = time.time()
-        pending = list(targets)
-        while pending and (time.time() - start) < timeout:
-            pending = [d for d in pending if not self._resolve(d)[0]]
-            if not pending:
+        while (time.time() - start) < timeout:
+            running_now = {d.name for d in targets if not resolve(d)[0]}
+            if running_now != initially_running:
                 break
-            time.sleep(3)
+            if not running_now:
+                break
+            if any(self._progress(d)[3] for d in targets if d.name in running_now):
+                break
+            time.sleep(self.POLL_INTERVAL)
 
-        completed = failed = killed = timed_out = 0
+        completed = failed = killed = stalled = frozen = healthy = 0
         lines = []
         for d in targets:
-            is_term, status, report = self._resolve(d)
-            aid = d.name[:8]
-            if not is_term:
-                timed_out += 1
-                lines.append(f"[{aid}] STILL RUNNING after {timeout}s (timed out of the wait).")
+            is_term, status, report = resolve(d)
+            sid = self._short_id(d.name)
+            if is_term:
+                base_status = norm_status(status)
+                self.worker.notified_sub_agents.add(f"{d.name}_{base_status}")
+                if base_status == "COMPLETED":
+                    completed += 1
+                    lines.append(f"[{sid}] COMPLETED\n  {(report or '')[:800]}\n"
+                                 f"  (full findings: get_sub_agent_report(agent_id='{sid}'))")
+                elif base_status == "KILLED":
+                    killed += 1
+                    lines.append(f"[{sid}] KILLED")
+                else:
+                    failed += 1
+                    lines.append(f"[{sid}] {status}\n  {(report or '')[:600]}")
                 continue
-            if status == "COMPLETED":
-                completed += 1
-            elif status and status.startswith("FAILED"):
-                failed += 1
-            elif status == "KILLED":
-                killed += 1
-            snippet = (report or "")[:800]
-            lines.append(f"[{aid}] {status}\n  {snippet}")
+            age, step, it, is_frozen = self._progress(d)
+            age_str = f"{age:.0f}s ago" if age is not None else "unknown"
+            sfx = (f" on '{step}'" if step else "") + (f" (iter {it})" if it else "")
+            if is_frozen:
+                frozen += 1
+                lines.append(f"[{sid}] FROZEN - watchdog stopped responding (whole-process freeze). "
+                             f"It cannot self-recover; kill_sub_agent(agent_id='{sid}') and proceed.")
+            elif age is not None and age > stall_threshold:
+                stalled += 1
+                lines.append(f"[{sid}] POSSIBLY STALLED - no progress for {age_str}{sfx}. "
+                             f"Confirm with get_sub_agent_report(agent_id='{sid}'), then steer or kill.")
+            else:
+                healthy += 1
+                lines.append(f"[{sid}] RUNNING (healthy) - last progress {age_str}{sfx}. "
+                             f"Do other orthogonal work, or gather_sub_agents again with a non-zero timeout to wait.")
 
-        header = (
-            f"Gathered {len(targets)} sub-agent(s): {completed} completed, "
-            f"{failed} failed, {killed} killed, {timed_out} still running."
-        )
+        header = (f"Check-in: {completed} completed, {failed} failed, {killed} killed, "
+                  f"{stalled} possibly stalled, {frozen} frozen, {healthy} healthy & running.")
         if missing:
             header += f" (Requested but not found: {missing})"
-        return header + "\n\n" + "\n\n".join(lines)
+        if frozen:
+            footer = "\n\nAction: kill the FROZEN agent(s) - they cannot recover - then continue."
+        elif stalled:
+            footer = ("\n\nAction: confirm stalls with get_sub_agent_report before acting (an agent may be on "
+                      "a long legitimate step). If truly stuck, steer with a corrected approach or kill.")
+        elif healthy:
+            footer = ("\n\nAction: agents are still running. Do orthogonal work, then gather again with a "
+                      "NON-ZERO timeout to actually wait for them. Do not finish the task until you have read "
+                      "each spawned agent's report.")
+        else:
+            footer = ""
+        return header + "\n\n" + "\n\n".join(lines) + footer
 
 
 class GetSubAgentReport(BaseTool):
+    MAX_RESULT_CHARS = 8000
+
     def __init__(self, worker=None, llm_client=None):
         super().__init__(
             name="get_sub_agent_report",
-            description=TOOL_DESC_GET_SUB_AGENT_REPORT,
-            underlying_model=llm_client.utility_model if llm_client else None
+            description=(
+                "Read a sub-agent in depth. If finished, returns its FULL findings (fold these into your "
+                "synthesis and spawn follow-ups for leads it surfaced). If still running, returns a live "
+                "analysis of its recent activity. Accepts the short id shown by gather_sub_agents or a full "
+                "UUID. Don't call this every turn for a running agent - prefer gather_sub_agents for batch "
+                "check-ins.\n"
+                "Schema:\n"
+                "  agent_id (str, required): short id or full UUID.\n"
+                "  specific_question (str, optional): a targeted question about a running agent's progress.\n"
+                "Example: {\"tool_name\": \"get_sub_agent_report\", \"parameters\": {\"agent_id\": \"a44fa909\"}}"
+            ),
+            underlying_model=llm_client.utility_model if llm_client else None,
         )
         self.worker = worker
         self.llm_client = llm_client
@@ -245,102 +414,106 @@ class GetSubAgentReport(BaseTool):
     def output_dir(self):
         return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
 
-    def execute(self, agent_id: str, specific_question: str = None):
-        agent_dir = self.output_dir / agent_id
-        if not agent_dir.exists():
-            return f"Agent {agent_id} not found."
+    def execute(self, agent_id, specific_question=None):
+        agent_dir, err = _resolve_agent_dir(self.output_dir, agent_id)
+        if err:
+            return err
 
-        status_path = agent_dir / "status.txt"
-        output_path = agent_dir / "output.json"
+        is_term, status, report = resolve(agent_dir)
+        base_status = norm_status(status)
 
-        status = "UNKNOWN"
-        if status_path.exists():
-            status = status_path.read_text().strip()
-        elif output_path.exists():
-            status = "COMPLETED"
+        if is_term:
+            self.worker.notified_sub_agents.add(f"{agent_dir.name}_{base_status}")
+            if base_status == "COMPLETED":
+                result = report or "N/A"
+                tail = ""
+                if len(result) > self.MAX_RESULT_CHARS:
+                    tail = (f"\n\n[... truncated at {self.MAX_RESULT_CHARS} chars; full text in "
+                            f"{agent_dir / 'output.json'} ...]")
+                    result = result[:self.MAX_RESULT_CHARS]
+                return f"Agent {agent_dir.name[:8]} Status: COMPLETED\n\n--- FINDINGS ---\n{result}{tail}"
+            return f"Agent {agent_dir.name[:8]} Status: {status}\n\n{report or ''}"
 
-        report = f"Agent {agent_id} Status: {status}"
-
-        if status == "COMPLETED" and output_path.exists():
+        report_str = f"Agent {agent_dir.name[:8]} Status: RUNNING"
+        log_path = agent_dir / "agent.log"
+        log_tail = ""
+        if log_path.exists():
             try:
-                report_data = json.loads(output_path.read_text())
-                report += f"\nResult: {report_data.get('result', 'N/A')[:500]}"
-            except:
-                pass
+                with open(log_path, "r", encoding="utf-8") as f:
+                    log_tail = "".join(f.readlines()[-150:])
+            except Exception as e:
+                log_tail = f"(Could not read log: {e})"
 
-        elif status == "RUNNING" and self.llm_client:
-            log_path = agent_dir / "agent.log"
-            log_tail = ""
-            if log_path.exists():
-                try:
-                    with open(log_path, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()
-                        log_tail = "".join(lines[-150:])
-                except Exception as e:
-                    log_tail = f"(Could not read log: {e})"
-
-            if log_tail:
-                prompt = (
-                    f"You are a master AI agent monitoring a sub-agent's progress.\n"
-                    f"Analyze the following recent log tail from sub-agent '{agent_id}'.\n"
-                    f"1. What progress has been made recently?\n"
-                    f"2. Is the agent stuck, looping, or blocked?\n"
-                    f"3. Are there critical framework errors?\n"
-                    f"4. Recommendation: Should the main agent keep waiting, intervene, or kill it?\n"
+        if self.llm_client and log_tail:
+            prompt = (
+                f"You are a principal agent monitoring a research sub-agent's progress.\n"
+                f"Analyze this recent log tail from sub-agent '{agent_dir.name[:8]}'.\n"
+                f"1. What concrete progress has it made recently?\n"
+                f"2. Is it stuck, looping, or blocked?\n"
+                f"3. Any critical errors?\n"
+                f"4. Recommendation: keep waiting, steer it, or kill it?\n"
+            )
+            if specific_question:
+                prompt += f"\nAlso answer this specific question: {specific_question}\n"
+            prompt += f"\n--- RECENT LOG TAIL ---\n{log_tail}\n--- END LOG ---"
+            try:
+                resp = self.llm_client.utility_client.chat.completions.create(
+                    model=self.llm_client.utility_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
                 )
-                if specific_question:
-                    prompt += f"\nAlso answer this specific question from the main agent: {specific_question}\n"
-                prompt += f"\n--- RECENT LOG TAIL ---\n{log_tail}\n--- END LOG ---"
+                report_str += f"\n\n[LIVE PROGRESS ANALYSIS]\n{resp.choices[0].message.content}"
+            except Exception as e:
+                report_str += f"\n\n[LIVE PROGRESS ANALYSIS FAILED]: {e}\nRaw log tail:\n{log_tail[-1000:]}"
+        elif log_tail:
+            report_str += f"\n\n[RECENT LOG TAIL]\n{log_tail[-1500:]}"
+        else:
+            report_str += "\n\n[No log data found yet.]"
 
-                try:
-                    resp = self.llm_client.utility_client.chat.completions.create(
-                        model=self.llm_client.utility_model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.3
-                    )
-                    analysis = resp.choices[0].message.content
-                    report += f"\n\n[LIVE PROGRESS ANALYSIS]\n{analysis}"
-                except Exception as e:
-                    report += f"\n\n[LIVE PROGRESS ANALYSIS FAILED]: {e}\nRaw log tail:\n{log_tail[-1000:]}"
-            else:
-                report += "\n\n[LIVE PROGRESS ANALYSIS FAILED]: No log data found yet."
-
-            report += ("\n\n[CRITICAL INSTRUCTION] The sub-agent is still RUNNING. DO NOT call "
-                       "get_sub_agent_report again next iteration. Go do other work, or call "
-                       "gather_sub_agents to block until the batch finishes. The system auto-notifies "
-                       "you on completion.")
-
-        return report
+        report_str += ("\n\n[GUIDANCE] Still running. Don't re-poll every turn - do other orthogonal work, or "
+                       "gather_sub_agents with a non-zero timeout to wait. If stuck, steer_sub_agent or "
+                       "kill_sub_agent. Do not finish the task with this agent's report uncollected.")
+        return report_str
 
 
 class KillSubAgent(BaseTool):
     def __init__(self, worker=None, llm_client=None):
         super().__init__(
             name="kill_sub_agent",
-            description=TOOL_DESC_KILL_SUB_AGENT
+            description=(
+                "Terminate a sub-agent and its child processes when it is stuck, frozen, or no longer needed. "
+                "Kills the whole process group so nothing leaks. Accepts the short id shown by "
+                "gather_sub_agents or a full UUID.\n"
+                "Schema:\n  agent_id (str, required): short id or full UUID.\n"
+                "Example: {\"tool_name\": \"kill_sub_agent\", \"parameters\": {\"agent_id\": \"a44fa909\"}}"
+            ),
         )
         self.worker = worker
+        self.llm_client = llm_client
 
     @property
     def output_dir(self):
         return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
 
-    def execute(self, agent_id: str):
-        agent_dir = self.output_dir / agent_id
-        if not agent_dir.exists():
-            return f"Agent {agent_id} not found."
+    def execute(self, agent_id):
+        agent_dir, err = _resolve_agent_dir(self.output_dir, agent_id)
+        if err:
+            return err
+
+        rt.atomic_write_json(agent_dir / "output.json", {
+            "agent_id": agent_dir.name,
+            "status": "KILLED",
+            "result": "Terminated by the principal agent before completion.",
+        })
+        rt.atomic_write_text(agent_dir / "status.txt", "KILLED")
+        self.worker.notified_sub_agents.add(f"{agent_dir.name}_KILLED")
 
         pid_path = agent_dir / "pid.txt"
-        if pid_path.exists():
+        if not pid_path.exists():
+            return f"Sub-agent {agent_dir.name[:8]} marked KILLED (no PID file; process may have already exited)."
+        try:
             pid = int(pid_path.read_text().strip())
-            try:
-                os.kill(pid, 9)
-                with open(agent_dir / "status.txt", "w") as f:
-                    f.write("KILLED")
-                return f"Sub-agent {agent_id} (PID {pid}) killed successfully."
-            except ProcessLookupError:
-                return f"Sub-agent {agent_id} (PID {pid}) already dead."
-            except Exception as e:
-                return f"Failed to kill sub-agent {agent_id}: {e}"
-        else:
-            return f"PID not found for agent {agent_id}."
+        except Exception:
+            return f"Sub-agent {agent_dir.name[:8]} marked KILLED (PID file unreadable)."
+        group_kill(pid)
+        return f"Sub-agent {agent_dir.name[:8]} (PID {pid}) terminated (process group killed) and marked KILLED."

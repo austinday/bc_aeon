@@ -1,25 +1,41 @@
-# RESEARCH SKILL: Deep Research & Source Synthesis Protocol
-# Triggered when a question requires gathering, evaluating, and synthesizing external
-# information (literature, documentation, current events, technical references).
-# Goal: a well-sourced, balanced synthesis — not a single-source summary.
+# RESEARCH SKILL: Deep Topic Research & Brainstorming Protocol
+# USE THIS SKILL WHEN: the task is to research, investigate, brainstorm, or reason about a
+# TOPIC, QUESTION, or IDEA that does NOT center on an existing codebase -- e.g. "research X",
+# "what are the best approaches to Y", "brainstorm ideas for Z", "investigate the
+# state-of-the-art in W", "compare options for V". The defining signal is that the work is
+# about a SUBJECT and is driven by external information / reasoning, NOT by reading source code.
+# DO NOT use this to analyze an existing codebase/repo (use analysis/codebase_analysis for that).
+# Goal: produce a thorough, well-sourced, multi-perspective answer or idea set by decomposing
+# the topic into orthogonal dimensions and researching each in parallel.
 
-1. DECONSTRUCT:
-- Break the question into 3+ distinct, orthogonal sub-questions. Define what a complete answer must cover.
-- Decide where each sub-question is best answered (web search, specific authoritative sites/docs, internal files).
+1. SCOPE & FRAMING (FIRST):
+- Restate the question/goal in your own words and define what a complete answer looks like
+  (a decision, a ranked set of options, a literature survey, a brainstormed idea list). If the
+  scope is ambiguous, ask ONE clarifying question; else state your assumption and proceed.
 
-2. GATHER BROADLY, THEN NARROW:
-- Start with broad queries, then refine with specific terms. Use multiple distinct queries per sub-question; do not rephrase the same query repeatedly.
-- For parallelizable, independent research threads, consider spawning sub-agents (one per orthogonal avenue) and gathering their reports with gather_sub_agents.
-- Fetch full sources when snippets are insufficient. Prefer primary/authoritative sources (papers, official docs, standards bodies) over aggregators.
+2. DIMENSIONAL DECOMPOSITION (the core of topic research):
+- Break the topic into 3-5 ORTHOGONAL sub-questions / dimensions that together cover it with
+  minimal overlap (e.g. technical feasibility / cost / prior art / risks / alternatives). This
+  dimensionality reduction is what keeps the research comprehensive rather than tunnel-visioned.
 
-3. EVALUATE SOURCES CRITICALLY:
-- Note each source's authority, recency, and potential bias. Be skeptical on contested or SEO-heavy topics.
-- Prefer recent sources where the topic evolves; date-stamp time-sensitive claims.
+3. PARALLEL RESEARCH:
+- Spawn ONE sub-agent per orthogonal dimension with a self-contained objective that names the
+  exact deliverable (the findings + sources for that dimension AS A STRUCTURED REPORT). Do your
+  own orthogonal research meanwhile (search_web for current, credible sources; prefer primary
+  sources). Then you MUST gather_sub_agents and get_sub_agent_report EACH spawned agent and fold
+  its findings in -- never complete while a spawned sub-agent's report is uncollected.
+- Use blackboard_post / blackboard_read so dimensions share facts and avoid duplicated effort.
 
-4. SYNTHESIZE:
-- Combine findings across threads. Explicitly surface agreements, contradictions, and gaps between sources.
-- Distinguish well-supported claims from weak/single-source ones. Do not paper over conflicting evidence — present it.
+4. CRITICAL EVALUATION:
+- Cross-check claims across sources; note agreements, conflicts, and gaps. Distinguish
+  well-supported conclusions from speculation. Call out where the evidence is thin.
 
-5. REPORT:
-- Produce a synthesis organized by the original sub-questions, with key points and the supporting source for each material claim.
-- State remaining uncertainties and what would be needed to resolve them. Save a detailed report file if the work is substantial.
+5. SYNTHESIZE & DELIVER:
+- Integrate the dimensions into a coherent answer organized around the user's actual question
+  (not around the sub-agent structure). For brainstorming, present the idea set with the
+  trade-offs of each; for a research question, give the conclusion with its support and
+  caveats.
+- Cite sources for external claims; state remaining uncertainties.
+- Deliver the FULL result via say_to_user (or write_file for a long report) BEFORE
+  task_complete -- the content is the deliverable, not the task_complete reason. Then
+  deactivate_skill.

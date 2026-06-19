@@ -175,6 +175,76 @@ class LLMClient:
         """Legacy debug logger - removed to prevent log flooding."""
         pass
 
+    def route_skills(self, objective: str) -> str:
+        """Pre-flight skill router. Scans available skill protocols and returns a
+        short '[SKILL ROUTING]' directive naming the best-matching skill (or none)
+        for the given objective. Runs on the utility model so it adds minimal cost,
+        and is fully best-effort: any failure returns '' so the agent proceeds
+        exactly as before. Tools are deliberately NOT routed here -- they are
+        managed by the collapsible-category system and the model already sees the
+        top-level set every turn; the real gap is that skills get ignored.
+        """
+        try:
+            from aeon.core.skills.manager import SkillsManager
+            sm = SkillsManager()
+            try:
+                categories = [d.name for d in sm.base_dir.iterdir() if d.is_dir()]
+            except Exception:
+                return ""
+
+            catalog = []
+            for cat in sorted(categories):
+                for skill in sorted(sm.get_skills_in_category(cat)):
+                    content = sm.get_skill_content(cat, skill) or ""
+                    # The first 1-2 comment lines of each protocol describe when it applies.
+                    desc_lines = [ln.lstrip("# ").strip()
+                                  for ln in content.splitlines()[:4]
+                                  if ln.strip().startswith("#")]
+                    desc = " ".join(desc_lines)[:240] if desc_lines else "(no description)"
+                    catalog.append(f"- {cat}/{skill}: {desc}")
+
+            if not catalog:
+                return ""
+
+            catalog_str = "\n".join(catalog)
+            prompt = (
+                "You are a skill router for an autonomous agent. Given the agent's task and a catalog of "
+                "available skill protocols (reusable step-by-step procedures), decide whether ONE clearly "
+                "applies. Be selective: recommend a skill ONLY if the task genuinely matches it. Trivial, "
+                "conversational, or one-off tasks should get NONE.\n\n"
+                f"TASK:\n{objective}\n\n"
+                f"SKILL CATALOG:\n{catalog_str}\n\n"
+                "Respond with ONLY a valid JSON object, no prose, no markdown fences:\n"
+                '{\"skill\": \"<category>/<skill_name>\" or null, \"reason\": \"<one sentence>\"}'
+            )
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+            content = resp.choices[0].message.content or ""
+            cleaned = self._clean_json_response(content)
+            data = json.loads(cleaned)
+            skill = data.get("skill")
+            reason = data.get("reason", "")
+            if not skill or str(skill).lower() == "null":
+                return ""
+
+            # Validate the routed skill actually exists before suggesting it.
+            if "/" in str(skill):
+                cat, _, name = str(skill).partition("/")
+                if name not in sm.get_skills_in_category(cat):
+                    return ""
+            else:
+                return ""
+
+            return (f"[SKILL ROUTING] This task strongly matches the '{skill}' skill protocol "
+                    f"({reason}). You should activate it with activate_skill('{skill}') as your first "
+                    f"action, then follow its steps, unless it is clearly wrong for the actual task.")
+        except Exception as e:
+            self.logger.warning(f"Skill routing failed (continuing without it): {e}")
+            return ""
+
     def _clean_json_response(self, content: str) -> str:
         """Clean LLM response to extract JSON, handling common LLM formatting quirks."""
         if not content:

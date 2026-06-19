@@ -1,0 +1,64 @@
+# ANALYSIS SKILL: In-Depth Codebase Analysis Protocol
+# USE THIS SKILL WHEN: the task is to analyze, review, audit, understand, or improve an
+# EXISTING CODEBASE / REPOSITORY / PROJECT that has source files on disk -- e.g. "analyze
+# this project", "review the agent harness", "audit this repo", "find bugs/improvements in
+# the code", "do an in-depth analysis of the codebase", "understand how this system works".
+# The defining signal is that there is ACTUAL CODE to read and reason about.
+# DO NOT use this for researching a general topic that has no codebase (use
+# research/deep_research for that).
+# Goal: understand the project so deeply -- its code, how its files link upstream and
+# downstream, AND the theory/domain it operates in -- that you can judge not just whether the
+# code is correct, but whether the project is doing the RIGHT THING at all. Opening a few
+# files and emitting one "think" is the shallow pass this protocol exists to replace.
+
+1. SCOPE & INTENT (FIRST, before deep reading):
+- Restate, in your own words, what the project is FOR and what the user actually wants
+  (a bug hunt, an improvement list, a correctness audit, a high-level summary -- each needs a
+  different emphasis). If genuinely ambiguous, ask ONE clarifying question; else state your
+  assumption and proceed.
+- From the project tree, identify entry points, core modules, config/build files, and what is
+  peripheral. Memorize this map. Open the spine of the project first.
+
+2. STRUCTURAL & DEPENDENCY MAPPING (the core of codebase analysis):
+- For each important file, determine what it does AND how it links to the rest: what it imports
+  and is imported by, who calls it (UPSTREAM) and what it calls (DOWNSTREAM), and the data /
+  control flow between them. Build an explicit dependency picture, not a pile of file summaries.
+- Note interface contracts between modules (function signatures, expected files, shared state)
+  and where they look fragile or implicit.
+- This is the canonical use of sub-agents: spawn ONE per orthogonal subsystem (e.g. "map
+  aeon/tools", "map aeon/services", "map the core loop") with a self-contained objective to
+  report structure + upstream/downstream links + risks AS A STRUCTURED REPORT. State the exact
+  deliverable in each objective. Do your own orthogonal mapping meanwhile. Then you MUST
+  gather_sub_agents and get_sub_agent_report EACH spawned agent and fold its findings in before
+  synthesizing -- never complete the task while a spawned sub-agent's report is uncollected.
+
+3. DOMAIN & THEORY RESEARCH (what makes it in-depth, not just a code read):
+- Identify the FIELD the project operates in (e.g. computational biology, an ML training
+  pipeline, a trading system, a compiler) and become enough of a specialist to evaluate it.
+- Use search_web to ground yourself: standard methods, accepted best practices, known pitfalls,
+  relevant prior art / state-of-the-art. If a domain skill applies (e.g. compbio/...,
+  machine_learning/...), consult it for what "correct" looks like.
+- Bar: you can explain WHY the project takes its approach, the credible alternatives, and where
+  it sits relative to how a field expert would do it.
+
+4. CORRECTNESS, BUGS & RISK:
+- With structure + domain in hand, look for logic bugs, broken/implicit interface contracts,
+  silent-failure paths, race conditions, resource leaks, unsafe assumptions.
+- Separate CONFIRMED issues (point to the code, explain the failure) from SUSPECTED ones (flag,
+  needs verification). Never present a guess as a confirmed bug.
+
+5. META-LEVEL CRITIQUE (most important, most skipped):
+- Step back from "is the code correct" to "is the project doing the RIGHT THING". Given the
+  domain research: is the overall approach sound? Methodological flaws no clean code would fix?
+  A fundamentally better strategy/framework/algorithm for the goal? Act as a specialized
+  research agent on the project's actual topic, not just a code reviewer.
+
+6. SYNTHESIZE & DELIVER:
+- Organize by what the user asked for: (a) what the project is and how it works, (b)
+  interdependencies / structural observations, (c) concrete bugs/risks with code-level evidence,
+  (d) the meta-level judgment on whether the approach is right, domain-grounded.
+- Cite specific files/functions for code claims and sources for domain claims; state remaining
+  uncertainties.
+- Deliver the FULL analysis via say_to_user (or write_file for a long report) BEFORE
+  task_complete -- the content is the deliverable, not the task_complete reason. Then
+  deactivate_skill.
