@@ -107,6 +107,7 @@ aeon/scripts/gemma_lb.py
 aeon/scripts/start_brain.sh
 aeon/scripts/start_browser.sh
 aeon/scripts/start_comfyui.sh
+aeon/scripts/start_cyberneurova.sh
 aeon/scripts/start_gemma4_31b.sh
 aeon/scripts/start_gemma4_mtp.sh
 aeon/scripts/start_gemma4_vl.sh

@@ -62,6 +62,17 @@ CLOUD_MODELS = [
 # =============================================================================
 LLAMACPP_MODELS = [
     {
+        'model': 'CyberNeurova-DeepSeek-V4-Flash',
+        'family': 'DeepSeek-V4',
+        'label': 'CyberNeurova DeepSeek V4 Flash | GPU0: Max, GPU1: Spill | ~?? t/s | 128k ctx | Abliterated: Yes | Local/llama.cpp',
+        'provider': 'llamacpp',
+        'base_url': 'http://localhost:8021/v1',
+        'context_limit': 131072,
+        'container_name': 'aeon_cyberneurova',
+        'start_script': 'start_cyberneurova.sh',
+        'health_port': 8021,
+    },
+    {
         'model': 'Qwen3.6-35B-A3B-Uncensored',
         'family': 'Qwen3.6',
         'label': 'Qwen3.6-35B-A3B-Uncensored      | GPU0: 100%, GPU1: 0%     | ~?? t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
@@ -110,8 +121,7 @@ def wait_for_service(name, port, endpoint="/api/tags", timeout=60):
             if requests.get(f"http://localhost:{port}{endpoint}", timeout=2).status_code == 200: 
                 print(" OK.")
                 return True
-        except:
-            pass
+        except: pass
         time.sleep(2)
         print(".", end='', flush=True)
     print(" Timeout!")
@@ -331,16 +341,22 @@ def _pid_exists(pid):
         return False
 
 def cleanup_ghost_llamacpp_containers():
-    """Find and kill running llama.cpp containers that aren't in the registry with active PIDs."""
+    """Find and terminate llama.cpp containers whose owning agent PIDs are all dead.
+
+    Iterates by MODEL CONFIG (not by running container) so that multi-container
+    clusters are handled as a unit: when a model is a ghost, BOTH its primary
+    container_name AND every entry in additional_containers are torn down. The
+    previous version matched only container_name, which left orphaned cluster
+    nodes (e.g. aeon_gemma4_mtp_node0/node1) running after an agent was killed.
+    """
     print("[SYSTEM] Scanning for ghost llama.cpp containers...")
     try:
-        # Get all running containers with 'aeon_' prefix
         res = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"], 
+            ["docker", "ps", "--format", "{{.Names}}"],
             capture_output=True, text=True, check=True
         )
-        running_containers = res.stdout.splitlines()
-        
+        running = set(res.stdout.splitlines())
+
         # We need the registry to verify if they SHOULD be running
         registry = {}
         if os.path.exists(MODEL_REGISTRY_PATH):
@@ -350,24 +366,25 @@ def cleanup_ghost_llamacpp_containers():
             except: pass
 
         ghosts_killed = 0
-        for container in running_containers:
-            if not container.startswith("aeon_"):
-                continue
-            
-            # Check if this container belongs to a llama.cpp config
-            matching_config = next((c for c in LLAMACPP_MODELS if c['container_name'] == container), None)
-            if not matching_config:
-                continue # Not a llama.cpp model container (could be brain, browser, etc.)
-            
-            model_name = matching_config['model']
+        for config in LLAMACPP_MODELS:
+            # Every container this model owns (load balancer + worker nodes).
+            owned = [config['container_name']] + config.get('additional_containers', [])
+            running_owned = [c for c in owned if c in running]
+            if not running_owned:
+                continue  # none of this model's containers are up
+
+            model_name = config['model']
             pids = registry.get(model_name, [])
-            
-            # If no PIDs are registered or none of them are alive, it's a ghost
-            if not pids or not any(_pid_exists(p) for p in pids):
-                print(f"[SYSTEM] Found ghost container {container} (Model: {model_name}). Terminating...")
-                subprocess.run(["docker", "rm", "-f", container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if pids and any(_pid_exists(p) for p in pids):
+                continue  # a live agent still owns it; leave it alone
+
+            # Ghost: no live owner. Tear down the WHOLE cluster, not just the LB.
+            print(f"[SYSTEM] Found ghost cluster for '{model_name}': {running_owned}. Terminating...")
+            for c in owned:
+                subprocess.run(["docker", "rm", "-f", c],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 ghosts_killed += 1
-        
+
         if ghosts_killed:
             print(f"[SYSTEM] Cleaned up {ghosts_killed} ghost llama.cpp container(s).")
     except Exception as e:
@@ -592,12 +609,20 @@ class SessionManager:
             print("[SESSION] No local Ollama models selected, skipping brain startup.")
 
         # --- PHASE 1b: Start llama.cpp servers (shared across agents via ref counting) ---
+        # A required model server that fails to come up is a HARD failure: abort
+        # startup (raise) so the caller's finally-block cleans up and the process
+        # exits, rather than dropping the user into a prompt with no working model.
         for lcfg in llamacpp_configs:
             model_name = lcfg['model']
             register_models_for_agent([model_name])
             self._models_used.append(model_name)
             if not start_llamacpp_server(lcfg):
-                print(f"[SESSION] WARNING: Failed to start llama.cpp server for {model_name}")
+                raise RuntimeError(
+                    f"Failed to start the required llama.cpp server for '{model_name}'. "
+                    f"Aborting startup. Inspect 'docker logs {lcfg['container_name']}' for the "
+                    f"root cause (a common one is the cached aeon_llamacpp image lacking support "
+                    f"for the model architecture -- rebuild with ./setup_environment.sh)."
+                )
 
         # --- PHASE 2: Register local Ollama models for reference counting ---
         if local_models:
