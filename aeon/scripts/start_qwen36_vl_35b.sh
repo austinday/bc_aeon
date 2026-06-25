@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# Start llama.cpp server for Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P
+# Start llama.cpp server for Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive (Q4_K_M)
 # Used by the analyze_image tool for on-demand image understanding.
-# Runs on GPU0 by default.
+# Runs on GPU1 by default (override with VISION_GPU).
 # Uses aeon_llamacpp:latest (same image as text model serving).
 # =============================================================================
 set -e
@@ -10,7 +10,7 @@ set -e
 CONTAINER_NAME='aeon_qwen36_vl'
 IMAGE_NAME='aeon_llamacpp:latest'
 PORT=8020
-GPU_ID=${VISION_GPU:-0}
+GPU_ID=${VISION_GPU:-1}
 AEON_HOME="${AEON_HOME:-$HOME/.aeon}"
 MODELS_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
 
@@ -40,23 +40,27 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     fi
 fi
 
-# Verify model files exist
-MODEL_FILE="$MODELS_DIR/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf"
-MMPROJ_FILE=$(find "$MODELS_DIR" -maxdepth 1 -name "mmproj*.gguf" | head -n 1)
+# Discover the Q4_K_M model GGUF and the mmproj projector dynamically.
+# (The exact filename/subpath depends on the HF repo layout, so we search rather
+# than hardcode it.)
+MODEL_FILE=$(find "$MODELS_DIR" -iname "*Q4_K_M*.gguf" | head -n 1)
+MMPROJ_FILE=$(find "$MODELS_DIR" -iname "mmproj*.gguf" | head -n 1)
 
-if [ ! -f "$MODEL_FILE" ]; then
-    echo "[Qwen3.6-VL] ERROR: Model file not found at $MODEL_FILE"
+if [ -z "$MODEL_FILE" ] || [ ! -f "$MODEL_FILE" ]; then
+    echo "[Qwen3.6-VL] ERROR: No Q4_K_M GGUF model found under $MODELS_DIR"
     echo "Please run setup_environment.sh first."
     exit 1
 fi
 
+MODEL_REL="${MODEL_FILE#$MODELS_DIR/}"
+echo "[Qwen3.6-VL] Using model file: ${MODEL_REL}"
 echo "[Qwen3.6-VL] Starting llama.cpp server on GPU ${GPU_ID} (port ${PORT})..."
 
 # Conditionally use mmproj if it exists
 MMPROJ_FLAG=""
 if [ -n "$MMPROJ_FILE" ] && [ -f "$MMPROJ_FILE" ]; then
-    MMPROJ_BASENAME=$(basename "$MMPROJ_FILE")
-    MMPROJ_FLAG="--mmproj /models/$MMPROJ_BASENAME"
+    MMPROJ_REL="${MMPROJ_FILE#$MODELS_DIR/}"
+    MMPROJ_FLAG="--mmproj /models/${MMPROJ_REL}"
 fi
 
 docker run -d \
@@ -66,7 +70,8 @@ docker run -d \
     -p ${PORT}:8080 \
     --ipc=host \
     $IMAGE_NAME \
-    --model /models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf \
+    --model "/models/${MODEL_REL}" \
+    --alias Qwen3.6-35B-A3B-VL \
     $MMPROJ_FLAG \
     --host 0.0.0.0 \
     --port 8080 \

@@ -91,12 +91,12 @@ mkdir -p "$GEMMA4_GGUF_DIR"
 CMD="hf download paperscarecrow/Gemma-4-31B-it-abliterated gemma-4-31b-abliterated-Q8_0.gguf --local-dir /models && hf download mradermacher/gemma-4-E2B-it-heretic-i1-GGUF --include '*Q4_K_M*.gguf' --local-dir /models && hf download AtomicChat/gemma-4-31B-it-assistant-GGUF --include '*assistant*4_*.gguf' --local-dir /models"
 run_downloader "$GEMMA4_GGUF_DIR/.setup_state" "$SETUP_VERSION:gemma4-q8_0-e2b-draft-mtp-v2" "$GEMMA4_GGUF_DIR:/models" "$CMD"
 
-log_step "PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF"
+log_step "PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF (Q4_K_M for the dedicated GPU1 vision server)"
 QWEN36_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
 mkdir -p "$QWEN36_VL_DIR"
-CMD="hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf --local-dir /models && \
+CMD="hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*Q4_K_M*.gguf' --local-dir /models && \
      hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*mmproj*.gguf' --local-dir /models"
-run_downloader "$QWEN36_VL_DIR/.setup_state" "$SETUP_VERSION:qwen36-vl-q8_k_p" "$QWEN36_VL_DIR:/models" "$CMD"
+run_downloader "$QWEN36_VL_DIR/.setup_state" "$SETUP_VERSION:qwen36-vl-q4_k_m" "$QWEN36_VL_DIR:/models" "$CMD"
 
 log_step "PHASE 6: Build aeon_vllm:latest Docker image"
 build_image "aeon_vllm:latest" "$PROJECT_ROOT/aeon/services/vllm/Dockerfile" "$PROJECT_ROOT/aeon/services/vllm/"

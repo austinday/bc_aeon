@@ -128,12 +128,12 @@ class AnalyzeImageTool(BaseTool):
 
                 env = os.environ.copy()
                 env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
-                env["VISION_GPU"] = "0"
+                env["VISION_GPU"] = "1"
                 res = subprocess.run(['bash', script_path], capture_output=True, text=True, env=env)
                 if res.returncode != 0:
                     return f'Error starting vision server: {res.stderr}'
 
-            for attempt in range(60):  # Up to 3 minutes for Q8 GGUF loading
+            for attempt in range(60):  # Up to 3 minutes for Q4 GGUF loading
                 if self._check_health():
                     break
                 time.sleep(3)
@@ -166,7 +166,7 @@ class AnalyzeImageTool(BaseTool):
             ]
 
             payload = {
-                'model': 'Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q8_K_P',
+                'model': 'Qwen3.6-35B-A3B-VL',
                 'messages': messages,
                 'max_tokens': 2048,
                 'temperature': 0.3,

@@ -4,6 +4,8 @@ import logging
 import os
 import random
 import time
+import base64
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Request
@@ -144,9 +146,112 @@ async def debug_get_page_text(req: InteractRequest):
     """Bypasses SOM and dispatcher. Returns full page text."""
     page = await get_page(req.session_id)
     return {"text": await page.content()}
+
 @app.get("/ping")
 async def ping():
     return {"status": "pong", "version": "jitter_v1"}
+
+# --- Screenshot & Page Data Helpers ---
+
+async def capture_screenshot(page: Page) -> Tuple[str, str]:
+    """Capture full page screenshot and return base64 encoded clean and overlay images."""
+    # Capture clean screenshot
+    clean_bytes = await page.screenshot(full_page=True, type='jpeg', quality=85)
+    clean_b64 = base64.b64encode(clean_bytes).decode('utf-8')
+    
+    # For overlay, we'll use the same screenshot for now (SOM overlay will be added later)
+    overlay_b64 = clean_b64
+    
+    return clean_b64, overlay_b64
+
+async def extract_page_data(page: Page) -> Dict[str, Any]:
+    """Extract page title, URL, visible text, and interactive elements."""
+    title = await page.title()
+    url = page.url
+    
+    # Get visible text (simplified markdown)
+    markdown = await page.inner_text('body')
+    # Truncate very long text
+    if len(markdown) > 10000:
+        markdown = markdown[:10000] + "\n\n[... content truncated ...]"
+    
+    # Build interactive elements list with robust selectors
+    elements = await page.query_selector_all(
+        "button, input, a, [role='button'], [role='link'], select, textarea, "
+        "[tabindex]:not([tabindex='-1']), [onclick], [contenteditable='true'], "
+        "label, summary, details, [type='checkbox'], [type='radio'], [type='submit']"
+    )
+    
+    som_elements = []
+    for i, el in enumerate(elements):
+        try:
+            tag = await el.evaluate("el => el.tagName.toLowerCase()")
+            text = await el.inner_text()
+            text = text.strip()[:100] if text else ""
+            
+            # Build a robust CSS selector using attributes
+            selector = await el.evaluate("""el => {
+                // Try ID first
+                if (el.id) return '#' + CSS.escape(el.id);
+                // Try unique class combination
+                if (el.className && typeof el.className === 'string' && el.className.trim()) {
+                    const classes = el.className.trim().split(/\\s+/).slice(0, 3).map(c => CSS.escape(c)).join('.');
+                    return tag + '.' + classes;
+                }
+                // Fallback: use nth-of-type path
+                let path = tag;
+                let parent = el.parentElement;
+                while (parent && parent !== document.body) {
+                    const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+                    if (siblings.length > 1) {
+                        const idx = siblings.indexOf(el) + 1;
+                        path = tag + ':nth-of-type(' + idx + ')' + ' > ' + path;
+                    } else {
+                        path = tag + ' > ' + path;
+                    }
+                    el = parent;
+                    parent = parent.parentElement;
+                }
+                return path;
+            }""")
+            
+            som_elements.append({
+                "id": i + 1,
+                "tag": tag,
+                "text": text,
+                "selector": selector
+            })
+        except Exception:
+            # Skip elements that can't be evaluated
+            pass
+    
+    return {
+        "title": title,
+        "url": url,
+        "markdown": markdown,
+        "elements": som_elements
+    }
+
+async def build_response(page: Page, session_id: str, tab_id: str) -> Dict[str, Any]:
+    """Build the full response with screenshots, page data, and open tabs."""
+    clean_b64, overlay_b64 = await capture_screenshot(page)
+    page_data = await extract_page_data(page)
+    
+    # Get list of open tabs for this session
+    open_tabs = list(pages.keys())
+    
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "tab_id": tab_id,
+        "clean_b64": clean_b64,
+        "overlay_b64": overlay_b64,
+        "title": page_data["title"],
+        "url": page_data["url"],
+        "markdown": page_data["markdown"],
+        "elements": page_data["elements"],
+        "open_tabs": open_tabs
+    }
 
 # --- Standard Browser Management ---
 
@@ -171,24 +276,39 @@ async def navigate(req: Dict[str, Any]):
     page = pages[session_id]
     await page.goto(url)
     
-    # Update SOM
-    await update_som(session_id)
+    # Wait for page to fully load
+    await page.wait_for_load_state("networkidle")
     
-    return {"status": "success", "session_id": session_id}
+    return await build_response(page, session_id, req.get("tab_id", "default"))
 
-async def update_som(session_id: str):
-    page = pages[session_id]
-    state = session_states[session_id]
+@app.post("/switch_tab")
+async def switch_tab(req: Dict[str, Any]):
+    session_id = req.get("session_id", "default")
+    tab_id = req.get("tab_id", "default")
     
-    # Simple SOM implementation: find all buttons, inputs, etc.
-    elements = await page.query_selector_all("button, input, a, [role='button'], div[onclick]")
-    state.som_elements = []
-    for i, el in enumerate(elements):
-        # This is a simplification. In reality, we'd use a more robust selector.
-        # For this debug version, we'll just use a unique identifier if possible.
-        selector = f"div:nth-of-type({i+1})" # Very brittle, but for demo
-        # Better: use a custom attribute or just the index
-        state.som_elements.append({"id": i + 1, "selector": selector})
+    if session_id not in pages:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    page = pages[session_id]
+    return await build_response(page, session_id, tab_id)
+
+@app.post("/close_tab")
+async def close_tab(req: Dict[str, Any]):
+    session_id = req.get("session_id", "default")
+    tab_id = req.get("tab_id", "default")
+    
+    if session_id in pages:
+        page = pages[session_id]
+        await page.close()
+        del pages[session_id]
+        if session_id in contexts:
+            await contexts[session_id].close()
+            del contexts[session_id]
+        if session_id in session_states:
+            del session_states[session_id]
+    
+    remaining = len(pages)
+    return {"status": "success", "remaining_tabs": remaining}
 
 @app.on_event("startup")
 async def on_startup():
