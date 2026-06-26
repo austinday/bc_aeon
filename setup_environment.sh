@@ -8,10 +8,15 @@ HF_TOKEN_FILE="/home/aday/huggingface_access_token.txt"
 SETUP_VERSION="v2"
 
 DOCKER_CACHE_FLAG=""
+LITE_MODE="false"
+
 for arg in "$@"; do
     if [ "$arg" == "--force" ]; then
         DOCKER_CACHE_FLAG="--no-cache"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] FORCE MODE ENABLED: Docker builds will use --no-cache"
+    elif [ "$arg" == "--lite" ]; then
+        LITE_MODE="true"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] LITE MODE ENABLED: Skipping massive models and heavy containers."
     fi
 done
 
@@ -91,12 +96,26 @@ mkdir -p "$GEMMA4_GGUF_DIR"
 CMD="hf download paperscarecrow/Gemma-4-31B-it-abliterated gemma-4-31b-abliterated-Q8_0.gguf --local-dir /models && hf download mradermacher/gemma-4-E2B-it-heretic-i1-GGUF --include '*Q4_K_M*.gguf' --local-dir /models && hf download AtomicChat/gemma-4-31B-it-assistant-GGUF --include '*assistant*4_*.gguf' --local-dir /models"
 run_downloader "$GEMMA4_GGUF_DIR/.setup_state" "$SETUP_VERSION:gemma4-q8_0-e2b-draft-mtp-v2" "$GEMMA4_GGUF_DIR:/models" "$CMD"
 
-log_step "PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF (Q4_K_M for the dedicated GPU1 vision server)"
-QWEN36_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
-mkdir -p "$QWEN36_VL_DIR"
-CMD="hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*Q4_K_M*.gguf' --local-dir /models && \
-     hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*mmproj*.gguf' --local-dir /models"
-run_downloader "$QWEN36_VL_DIR/.setup_state" "$SETUP_VERSION:qwen36-vl-q4_k_m" "$QWEN36_VL_DIR:/models" "$CMD"
+# The published MTP assistant GGUF uses a naming convention the fork's
+# gemma4-assistant loader rejects. Normalize it once into *.aeon.* so the MTP
+# cluster can load it. Idempotent; start_gemma4_mtp.sh also self-heals at runtime.
+RAW_MTP_ASSISTANT="$GEMMA4_GGUF_DIR/gemma-4-31B-it-assistant.Q4_K_M.gguf"
+NORM_MTP_ASSISTANT="$GEMMA4_GGUF_DIR/gemma-4-31B-it-assistant.aeon.Q4_K_M.gguf"
+if [[ -f "$RAW_MTP_ASSISTANT" && ! -f "$NORM_MTP_ASSISTANT" ]]; then
+    log_step "PHASE 5.6b: Normalize Gemma-4 MTP assistant GGUF for fork compatibility"
+    python3 "$PROJECT_ROOT/aeon/scripts/normalize_gemma4_assistant.py" \
+        "$RAW_MTP_ASSISTANT" "$NORM_MTP_ASSISTANT" \
+        || { rm -f "$NORM_MTP_ASSISTANT"; echo "WARNING: MTP assistant normalization failed (will retry at runtime)"; }
+fi
+
+if [[ "$LITE_MODE" != "true" ]]; then
+    log_step "PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF (Q4_K_M for the dedicated GPU1 vision server)"
+    QWEN36_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
+    mkdir -p "$QWEN36_VL_DIR"
+    CMD="hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*Q4_K_M*.gguf' --local-dir /models && \
+         hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*mmproj*.gguf' --local-dir /models"
+    run_downloader "$QWEN36_VL_DIR/.setup_state" "$SETUP_VERSION:qwen36-vl-q4_k_m" "$QWEN36_VL_DIR:/models" "$CMD"
+fi
 
 log_step "PHASE 6: Build aeon_vllm:latest Docker image"
 build_image "aeon_vllm:latest" "$PROJECT_ROOT/aeon/services/vllm/Dockerfile" "$PROJECT_ROOT/aeon/services/vllm/"
@@ -107,58 +126,62 @@ build_image "aeon_llamacpp:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PR
 log_step "PHASE 6.8b: Build aeon_gemma4_mtp:latest Docker image"
 build_image "aeon_gemma4_mtp:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile.mtp" "$PROJECT_ROOT/aeon/llamacpp/"
 
-log_step "PHASE 6.8c: Build aeon_ds4:latest (DeepSeek-V4-Flash fork) Docker image"
-build_image "aeon_ds4:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile.ds4" "$PROJECT_ROOT/aeon/llamacpp/"
+if [[ "$LITE_MODE" != "true" ]]; then
+    log_step "PHASE 6.8c: Build aeon_ds4:latest (DeepSeek-V4-Flash fork) Docker image"
+    build_image "aeon_ds4:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile.ds4" "$PROJECT_ROOT/aeon/llamacpp/"
 
-log_step "PHASE 6.9: Build aeon_comfyui:latest Docker image"
-build_image "aeon_comfyui:latest" "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
+    log_step "PHASE 6.9: Build aeon_comfyui:latest Docker image"
+    build_image "aeon_comfyui:latest" "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
 
-log_step "PHASE 7: ComfyUI Models (FLUX)"
-COMFY_MODELS_DIR="$AEON_HOME/models/comfyui"
-mkdir -p "$COMFY_MODELS_DIR/unet" "$COMFY_MODELS_DIR/text_encoders" "$COMFY_MODELS_DIR/vae"
-CMD="hf download kpsss34/FHDR_Uncensored FHDR_ComfyUI-Q8_0.gguf --local-dir /models/unet && \
-     hf download black-forest-labs/FLUX.1-schnell ae.safetensors --local-dir /models/vae && \
-     hf download comfyanonymous/flux_text_encoders clip_l.safetensors --local-dir /models/text_encoders && \
-     hf download comfyanonymous/flux_text_encoders t5xxl_fp8_e4m3fn.safetensors --local-dir /models/text_encoders"
-run_downloader "$COMFY_MODELS_DIR/.flux_setup_state" "$SETUP_VERSION:flux_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+    log_step "PHASE 7: ComfyUI Models (FLUX)"
+    COMFY_MODELS_DIR="$AEON_HOME/models/comfyui"
+    mkdir -p "$COMFY_MODELS_DIR/unet" "$COMFY_MODELS_DIR/text_encoders" "$COMFY_MODELS_DIR/vae"
+    CMD="hf download kpsss34/FHDR_Uncensored FHDR_ComfyUI-Q8_0.gguf --local-dir /models/unet && \
+         hf download black-forest-labs/FLUX.1-schnell ae.safetensors --local-dir /models/vae && \
+         hf download comfyanonymous/flux_text_encoders clip_l.safetensors --local-dir /models/text_encoders && \
+         hf download comfyanonymous/flux_text_encoders t5xxl_fp8_e4m3fn.safetensors --local-dir /models/text_encoders"
+    run_downloader "$COMFY_MODELS_DIR/.flux_setup_state" "$SETUP_VERSION:flux_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
 
-log_step "PHASE 7.5: Qwen-Image-Edit-2511 (ComfyUI Edit Models)"
-CMD="hf download Arunk25/Qwen-Image-Edit-Rapid-AIO-GGUF v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf --local-dir /models/unet && \
-     hf download Comfy-Org/Qwen-Image_ComfyUI split_files/vae/qwen_image_vae.safetensors --local-dir /models/tmp && \
-     mv /models/tmp/split_files/vae/qwen_image_vae.safetensors /models/vae/ && \
-     hf download Comfy-Org/Qwen-Image_ComfyUI split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors --local-dir /models/tmp && \
-     mv /models/tmp/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors /models/text_encoders/ && \
-     rm -rf /models/tmp"
-run_downloader "$COMFY_MODELS_DIR/.qwen_edit_setup_state" "$SETUP_VERSION:qwen_edit_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+    log_step "PHASE 7.5: Qwen-Image-Edit-2511 (ComfyUI Edit Models)"
+    CMD="hf download Arunk25/Qwen-Image-Edit-Rapid-AIO-GGUF v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf --local-dir /models/unet && \
+         hf download Comfy-Org/Qwen-Image_ComfyUI split_files/vae/qwen_image_vae.safetensors --local-dir /models/tmp && \
+         mv /models/tmp/split_files/vae/qwen_image_vae.safetensors /models/vae/ && \
+         hf download Comfy-Org/Qwen-Image_ComfyUI split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors --local-dir /models/tmp && \
+         mv /models/tmp/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors /models/text_encoders/ && \
+         rm -rf /models/tmp"
+    run_downloader "$COMFY_MODELS_DIR/.qwen_edit_setup_state" "$SETUP_VERSION:qwen_edit_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
 
-log_step "PHASE 8: PuLID FLUX Models (Consistent Characters)"
-PULID_MODELS_DIR="$COMFY_MODELS_DIR/pulid"
-CLIP_DIR="$COMFY_MODELS_DIR/clip"
-INSIGHTFACE_DIR="$COMFY_MODELS_DIR/insightface"
-mkdir -p "$PULID_MODELS_DIR" "$CLIP_DIR" "$INSIGHTFACE_DIR"
-CMD="hf download guozinan/PuLID pulid_flux_v0.9.0.safetensors --local-dir /models/pulid && \
-     hf download QuanSun/EVA-CLIP EVA02_CLIP_L_336_psz14_s6B.pt --local-dir /models/clip && \
-     hf download kidyu/antelopev2-for-InstantID-ComfyUI --local-dir /models/insightface/models/antelopev2"
-run_downloader "$COMFY_MODELS_DIR/.pulid_setup_state" "$SETUP_VERSION:pulid_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+    log_step "PHASE 8: PuLID FLUX Models (Consistent Characters)"
+    PULID_MODELS_DIR="$COMFY_MODELS_DIR/pulid"
+    CLIP_DIR="$COMFY_MODELS_DIR/clip"
+    INSIGHTFACE_DIR="$COMFY_MODELS_DIR/insightface"
+    mkdir -p "$PULID_MODELS_DIR" "$CLIP_DIR" "$INSIGHTFACE_DIR"
+    CMD="hf download guozinan/PuLID pulid_flux_v0.9.0.safetensors --local-dir /models/pulid && \
+         hf download QuanSun/EVA-CLIP EVA02_CLIP_L_336_psz14_s6B.pt --local-dir /models/clip && \
+         hf download kidyu/antelopev2-for-InstantID-ComfyUI --local-dir /models/insightface/models/antelopev2"
+    run_downloader "$COMFY_MODELS_DIR/.pulid_setup_state" "$SETUP_VERSION:pulid_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+fi
 
 log_step "PHASE 9: Build aeon_browser_service:latest Docker image"
 build_image "aeon_browser_service:latest" "$PROJECT_ROOT/aeon/services/browser/Dockerfile" "$PROJECT_ROOT/aeon/services/browser/"
 
-log_step "PHASE 10: LTX-2.3 Video Generation Models"
-CMD="hf download unsloth/LTX-2.3-GGUF ltx-2.3-22b-dev-F16.gguf --local-dir /models/unet && \
-     hf download unsloth/LTX-2.3-GGUF vae/ltx-2.3-22b-dev_video_vae.safetensors --local-dir /models/vae && \
-     hf download unsloth/LTX-2.3-GGUF text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors --local-dir /models/text_encoders && \
-     hf download unsloth/gemma-3-12b-it-qat-GGUF gemma-3-12b-it-qat-UD-Q4_K_XL.gguf --local-dir /models/text_encoders && \
-     hf download unsloth/gemma-3-12b-it-qat-GGUF mmproj-BF16.gguf --local-dir /models/text_encoders && \
-     hf download unsloth/gemma-3-12b-it-FP8-Dynamic tokenizer.model --local-dir /models/tmp && \
-     mv /models/tmp/tokenizer.model /models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.model && \
-     rm -rf /models/tmp"
-run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+if [[ "$LITE_MODE" != "true" ]]; then
+    log_step "PHASE 10: LTX-2.3 Video Generation Models"
+    CMD="hf download unsloth/LTX-2.3-GGUF ltx-2.3-22b-dev-F16.gguf --local-dir /models/unet && \
+         hf download unsloth/LTX-2.3-GGUF vae/ltx-2.3-22b-dev_video_vae.safetensors --local-dir /models/vae && \
+         hf download unsloth/LTX-2.3-GGUF text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors --local-dir /models/text_encoders && \
+         hf download unsloth/gemma-3-12b-it-qat-GGUF gemma-3-12b-it-qat-UD-Q4_K_XL.gguf --local-dir /models/text_encoders && \
+         hf download unsloth/gemma-3-12b-it-qat-GGUF mmproj-BF16.gguf --local-dir /models/text_encoders && \
+         hf download unsloth/gemma-3-12b-it-FP8-Dynamic tokenizer.model --local-dir /models/tmp && \
+         mv /models/tmp/tokenizer.model /models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.model && \
+         rm -rf /models/tmp"
+    run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
 
-log_step "PHASE 11: CyberNeurova DeepSeek V4 Model"
-CYBER_DIR="$AEON_HOME/models/gguf_models/CyberNeurova"
-mkdir -p "$CYBER_DIR"
-CMD="hf download audreyt/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF cyberneurova-DeepSeek-V4-Flash-abliterated-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf --local-dir /models"
-run_downloader "$CYBER_DIR/.setup_state" "$SETUP_VERSION:cyberneurova-v4-q4k" "$CYBER_DIR:/models" "$CMD"
+    log_step "PHASE 11: CyberNeurova DeepSeek V4 Model"
+    CYBER_DIR="$AEON_HOME/models/gguf_models/CyberNeurova"
+    mkdir -p "$CYBER_DIR"
+    CMD="hf download audreyt/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF cyberneurova-DeepSeek-V4-Flash-abliterated-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf --local-dir /models"
+    run_downloader "$CYBER_DIR/.setup_state" "$SETUP_VERSION:cyberneurova-v4-q4k" "$CYBER_DIR:/models" "$CMD"
+fi
 
 log_step "Setup complete! All Dockerfiles will automatically rebuild if changed, and partial downloads will automatically resume."

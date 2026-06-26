@@ -1,116 +1,175 @@
 #!/bin/bash
+
 set -euo pipefail
 
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AEON_HOME="${AEON_HOME:-$HOME/.aeon}"
-CACHE_DIR="$AEON_HOME/.setup_cache"
-mkdir -p "$CACHE_DIR"
+HF_TOKEN_FILE="/home/aday/huggingface_access_token.txt"
+SETUP_VERSION="v2"
 
-# =============================================================================
-# IDEMPOTENCY HELPERS
-# =============================================================================
-_stamp_path() { echo "$CACHE_DIR/$(echo "$1" | sha256sum | cut -d' ' -f1).stamp"; }
+DOCKER_CACHE_FLAG=""
+LITE_MODE="false"
 
-docker_needs_rebuild() {
-    local dockerfile="$1"
-    local image_tag="$2"
-    local context_dir="${3:-$(dirname "$dockerfile")}"
-    
-    if ! docker image inspect "$image_tag" >/dev/null 2>&1; then
-        return 0  # missing
+for arg in "$@"; do
+    if [ "$arg" == "--force" ]; then
+        DOCKER_CACHE_FLAG="--no-cache"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FORCE MODE ENABLED: Docker builds will use --no-cache"
+    elif [ "$arg" == "--lite" ]; then
+        LITE_MODE="true"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] LITE MODE ENABLED: Skipping massive models and heavy containers."
     fi
-    
-    local current_hash
-    current_hash=$(find "$context_dir" -type f -not -path '*/\.*' -not -path '*/__pycache__/*' | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
-    
-    local stamp_file="$(_stamp_path "$image_tag")"
-    if [[ -f "$stamp_file" ]] && [[ "$(cat "$stamp_file")" == "$current_hash" ]]; then
-        return 1  # up-to-date
+done
+
+log_step() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# Load HF_TOKEN if not set
+if [[ -z "${HF_TOKEN:-}" && -f "$HF_TOKEN_FILE" ]]; then
+    export HF_TOKEN=$(cat "$HF_TOKEN_FILE" | tr -d '\n')
+    log_step "Loaded HF_TOKEN from $HF_TOKEN_FILE"
+fi
+
+if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "ERROR: HF_TOKEN environment variable required for model downloads."
+    echo "Create $HF_TOKEN_FILE with your token or export HF_TOKEN."
+    exit 1
+fi
+
+build_image() {
+    local img_name=$1
+    local dockerfile=$2
+    local context=$3
+    log_step "Building/Verifying $img_name (Docker cache will handle unchanged layers)..."
+    docker build --network=host $DOCKER_CACHE_FLAG -t "$img_name" -f "$dockerfile" "$context"
+}
+
+run_downloader() {
+    local state_file="$1"
+    local state_val="$2"
+    local vol_map="$3"
+    local cmd="$4"
+
+    if [[ -f "$state_file" ]] && [[ "$(cat "$state_file")" == "$state_val" ]]; then
+        log_step "Skipping download (already up-to-date): $(basename "$state_file")"
+        return 0
     fi
-    return 0  # stale or never built
-}
 
-record_docker_build() {
-    local dockerfile="$1"
-    local image_tag="$2"
-    local context_dir="${3:-$(dirname "$dockerfile")}"
-    local current_hash
-    current_hash=$(find "$context_dir" -type f -not -path '*/\.*' -not -path '*/__pycache__/*' | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
-    echo "$current_hash" > "$(_stamp_path "$image_tag")"
-}
+    log_step "Running downloader for $state_val..."
 
-model_needs_download() {
-    local path="$1"
-    local min_size="${2:-1048576}"  # 1 MB sanity floor
-    [[ ! -f "$path" ]] && return 0
-    local size
-    size=$(stat -f%z "$path" 2>/dev/null || stat -c%s "$path" 2>/dev/null || echo 0)
-    [[ "$size" -lt "$min_size" ]] && return 0
-    return 1
-}
+    local tty_flag=""
+    if [ -t 0 ]; then tty_flag="-t"; fi
 
-record_download() {
-    local path="$1"
-    sha256sum "$path" 2>/dev/null | cut -d' ' -f1 > "$(_stamp_path "$path")" || touch "$(_stamp_path "$path")"
-}
+    docker run --network=host --rm $tty_flag \
+        -e HF_TOKEN="$HF_TOKEN" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "$vol_map" \
+        aeon_downloader:latest \
+        bash -c "$cmd"
 
-# =============================================================================
-# BUILD WRAPPER
-# =============================================================================
-build_if_needed() {
-    local name="$1"
-    local dockerfile="$2"
-    local tag="$3"
-    local context="${4:-$(dirname "$dockerfile")}"
-    
-    if docker_needs_rebuild "$dockerfile" "$tag" "$context"; then
-        echo "[BUILD] $name changed or missing. Building $tag ..."
-        docker build -t "$tag" -f "$dockerfile" "$context"
-        record_docker_build "$dockerfile" "$tag" "$context"
-        echo "[BUILD] $name done."
-    else
-        echo "[BUILD] $name up-to-date (cached)."
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        log_step "ERROR: Download failed (exit code $exit_code)"
+        exit 1
     fi
+
+    # Fix permissions to match host user
+    local vol_mount="${vol_map##*:}"
+    docker run --rm -v "$vol_map" aeon_downloader:latest chown -R $(id -u):$(id -g) "$vol_mount" || true
+
+    echo "$state_val" > "$state_file"
 }
 
-# =============================================================================
-# DOWNLOAD WRAPPER
-# =============================================================================
-download_if_needed() {
-    local url="$1"
-    local dest="$2"
-    local min_size="${3:-1048576}"
-    
-    if model_needs_download "$dest" "$min_size"; then
-        echo "[DOWNLOAD] Fetching $(basename "$dest") ..."
-        mkdir -p "$(dirname "$dest")"
-        if command -v aria2c >/dev/null 2>&1; then
-            aria2c -x4 -s4 -c -d "$(dirname "$dest")" -o "$(basename "$dest")" "$url"
-        else
-            wget -c -q --show-progress -O "$dest" "$url"
-        fi
-        record_download "$dest"
-        echo "[DOWNLOAD] $(basename "$dest") ready."
-    else
-        echo "[DOWNLOAD] $(basename "$dest") already present. Skipping."
-    fi
-}
+log_step "PHASE 1: Build aeon_downloader"
+cat > "$PROJECT_ROOT/Dockerfile.downloader" << 'EOF'
+FROM python:3.12-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir "huggingface_hub[cli]"
+EOF
+build_image "aeon_downloader:latest" "$PROJECT_ROOT/Dockerfile.downloader" "$PROJECT_ROOT"
+rm -f "$PROJECT_ROOT/Dockerfile.downloader"
 
-# =============================================================================
-# EXAMPLE USAGE (populate with your real images / models)
-# =============================================================================
-echo "=================================================="
-echo "    AEON ENVIRONMENT SETUP (idempotent)           "
-echo "=================================================="
+log_step "PHASE 5.6: Gemma-4-31B + E2B Draft Models + MTP Assistant"
+GEMMA4_GGUF_DIR="$AEON_HOME/models/gguf_models/Gemma-4"
+mkdir -p "$GEMMA4_GGUF_DIR"
+CMD="hf download paperscarecrow/Gemma-4-31B-it-abliterated gemma-4-31b-abliterated-Q8_0.gguf --local-dir /models && hf download mradermacher/gemma-4-E2B-it-heretic-i1-GGUF --include '*Q4_K_M*.gguf' --local-dir /models && hf download AtomicChat/gemma-4-31B-it-assistant-GGUF --include '*assistant*4_*.gguf' --local-dir /models"
+run_downloader "$GEMMA4_GGUF_DIR/.setup_state" "$SETUP_VERSION:gemma4-q8_0-e2b-draft-mtp-v2" "$GEMMA4_GGUF_DIR:/models" "$CMD"
 
-# Docker images
-# build_if_needed "ComfyUI"   "aeon/services/comfyui/Dockerfile"   "aeon_comfyui:latest"   "aeon/services/comfyui"
-# build_if_needed "vLLM"      "aeon/services/vllm/Dockerfile"      "aeon_vllm:latest"      "aeon/services/vllm"
-# build_if_needed "Browser"   "aeon/services/browser/Dockerfile"   "aeon_browser_service:latest" "aeon/services/browser"
-# build_if_needed "llama.cpp" "aeon/llamacpp/Dockerfile"           "aeon_llamacpp:latest"  "aeon/llamacpp"
+if [[ "$LITE_MODE" != "true" ]]; then
+    log_step "PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF (Q4_K_M for the dedicated GPU1 vision server)"
+    QWEN36_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
+    mkdir -p "$QWEN36_VL_DIR"
+    CMD="hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*Q4_K_M*.gguf' --local-dir /models && \
+         hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*mmproj*.gguf' --local-dir /models"
+    run_downloader "$QWEN36_VL_DIR/.setup_state" "$SETUP_VERSION:qwen36-vl-q4_k_m" "$QWEN36_VL_DIR:/models" "$CMD"
+fi
 
-# Models
-# download_if_needed "<url>" "$AEON_HOME/models/gguf_models/Gemma-4/gemma-4-31b-abliterated-Q8_0.gguf"  30000000000
+log_step "PHASE 6: Build aeon_vllm:latest Docker image"
+build_image "aeon_vllm:latest" "$PROJECT_ROOT/aeon/services/vllm/Dockerfile" "$PROJECT_ROOT/aeon/services/vllm/"
 
-echo "=================================================="
-echo "    SETUP COMPLETE                                "
-echo "=================================================="
+log_step "PHASE 6.8: Build aeon_llamacpp:latest Docker image"
+build_image "aeon_llamacpp:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
+
+log_step "PHASE 6.8b: Build aeon_gemma4_mtp:latest Docker image"
+build_image "aeon_gemma4_mtp:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile.mtp" "$PROJECT_ROOT/aeon/llamacpp/"
+
+if [[ "$LITE_MODE" != "true" ]]; then
+    log_step "PHASE 6.8c: Build aeon_ds4:latest (DeepSeek-V4-Flash fork) Docker image"
+    build_image "aeon_ds4:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile.ds4" "$PROJECT_ROOT/aeon/llamacpp/"
+
+    log_step "PHASE 6.9: Build aeon_comfyui:latest Docker image"
+    build_image "aeon_comfyui:latest" "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
+
+    log_step "PHASE 7: ComfyUI Models (FLUX)"
+    COMFY_MODELS_DIR="$AEON_HOME/models/comfyui"
+    mkdir -p "$COMFY_MODELS_DIR/unet" "$COMFY_MODELS_DIR/text_encoders" "$COMFY_MODELS_DIR/vae"
+    CMD="hf download kpsss34/FHDR_Uncensored FHDR_ComfyUI-Q8_0.gguf --local-dir /models/unet && \
+         hf download black-forest-labs/FLUX.1-schnell ae.safetensors --local-dir /models/vae && \
+         hf download comfyanonymous/flux_text_encoders clip_l.safetensors --local-dir /models/text_encoders && \
+         hf download comfyanonymous/flux_text_encoders t5xxl_fp8_e4m3fn.safetensors --local-dir /models/text_encoders"
+    run_downloader "$COMFY_MODELS_DIR/.flux_setup_state" "$SETUP_VERSION:flux_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+
+    log_step "PHASE 7.5: Qwen-Image-Edit-2511 (ComfyUI Edit Models)"
+    CMD="hf download Arunk25/Qwen-Image-Edit-Rapid-AIO-GGUF v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf --local-dir /models/unet && \
+         hf download Comfy-Org/Qwen-Image_ComfyUI split_files/vae/qwen_image_vae.safetensors --local-dir /models/tmp && \
+         mv /models/tmp/split_files/vae/qwen_image_vae.safetensors /models/vae/ && \
+         hf download Comfy-Org/Qwen-Image_ComfyUI split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors --local-dir /models/tmp && \
+         mv /models/tmp/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors /models/text_encoders/ && \
+         rm -rf /models/tmp"
+    run_downloader "$COMFY_MODELS_DIR/.qwen_edit_setup_state" "$SETUP_VERSION:qwen_edit_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+
+    log_step "PHASE 8: PuLID FLUX Models (Consistent Characters)"
+    PULID_MODELS_DIR="$COMFY_MODELS_DIR/pulid"
+    CLIP_DIR="$COMFY_MODELS_DIR/clip"
+    INSIGHTFACE_DIR="$COMFY_MODELS_DIR/insightface"
+    mkdir -p "$PULID_MODELS_DIR" "$CLIP_DIR" "$INSIGHTFACE_DIR"
+    CMD="hf download guozinan/PuLID pulid_flux_v0.9.0.safetensors --local-dir /models/pulid && \
+         hf download QuanSun/EVA-CLIP EVA02_CLIP_L_336_psz14_s6B.pt --local-dir /models/clip && \
+         hf download kidyu/antelopev2-for-InstantID-ComfyUI --local-dir /models/insightface/models/antelopev2"
+    run_downloader "$COMFY_MODELS_DIR/.pulid_setup_state" "$SETUP_VERSION:pulid_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+fi
+
+log_step "PHASE 9: Build aeon_browser_service:latest Docker image"
+build_image "aeon_browser_service:latest" "$PROJECT_ROOT/aeon/services/browser/Dockerfile" "$PROJECT_ROOT/aeon/services/browser/"
+
+if [[ "$LITE_MODE" != "true" ]]; then
+    log_step "PHASE 10: LTX-2.3 Video Generation Models"
+    CMD="hf download unsloth/LTX-2.3-GGUF ltx-2.3-22b-dev-F16.gguf --local-dir /models/unet && \
+         hf download unsloth/LTX-2.3-GGUF vae/ltx-2.3-22b-dev_video_vae.safetensors --local-dir /models/vae && \
+         hf download unsloth/LTX-2.3-GGUF text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors --local-dir /models/text_encoders && \
+         hf download unsloth/gemma-3-12b-it-qat-GGUF gemma-3-12b-it-qat-UD-Q4_K_XL.gguf --local-dir /models/text_encoders && \
+         hf download unsloth/gemma-3-12b-it-qat-GGUF mmproj-BF16.gguf --local-dir /models/text_encoders && \
+         hf download unsloth/gemma-3-12b-it-FP8-Dynamic tokenizer.model --local-dir /models/tmp && \
+         mv /models/tmp/tokenizer.model /models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.model && \
+         rm -rf /models/tmp"
+    run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+
+    log_step "PHASE 11: CyberNeurova DeepSeek V4 Model"
+    CYBER_DIR="$AEON_HOME/models/gguf_models/CyberNeurova"
+    mkdir -p "$CYBER_DIR"
+    CMD="hf download audreyt/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF cyberneurova-DeepSeek-V4-Flash-abliterated-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf --local-dir /models"
+    run_downloader "$CYBER_DIR/.setup_state" "$SETUP_VERSION:cyberneurova-v4-q4k" "$CYBER_DIR:/models" "$CMD"
+fi
+
+log_step "Setup complete! All Dockerfiles will automatically rebuild if changed, and partial downloads will automatically resume."

@@ -19,6 +19,13 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 ARG LLAMA_REPO=https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git
 ARG LLAMA_BRANCH=feature/turboquant-kv-cache
+# Pin to a known-good commit. The branch above is a MOVING target, so an unpinned
+# --depth=1 clone makes every rebuild non-reproducible (two machines built weeks
+# apart get incompatible llama-server arg interfaces). This commit is verified to
+# build on Blackwell (sm_120) and run Gemma-4 MTP with the args in
+# aeon/scripts/start_gemma4_mtp.sh (--spec-type draft-mtp / --spec-draft-n-max).
+# To move the pin, rebuild and re-test the MTP cluster end-to-end first.
+ARG LLAMA_COMMIT=d86eb0b8cd22507f05ba09975dcc979331ab62ba
 ARG CUDA_ARCHITECTURES=120
 ARG CMAKE_BUILD_TYPE=Release
 
@@ -37,8 +44,17 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
 
 WORKDIR /src
 
-# Clone fork with Gemma 4 MTP support (with submodules)
-RUN git clone --recursive --depth=1 -b "${LLAMA_BRANCH}" "${LLAMA_REPO}" llama.cpp
+# Clone fork with Gemma 4 MTP support (with submodules).
+# If LLAMA_COMMIT is set, check it out for a reproducible build (full clone needed
+# so an arbitrary historical commit is reachable); otherwise use branch HEAD.
+RUN if [ -n "${LLAMA_COMMIT}" ]; then \
+        git clone --recursive -b "${LLAMA_BRANCH}" "${LLAMA_REPO}" llama.cpp && \
+        cd llama.cpp && \
+        git checkout "${LLAMA_COMMIT}" && \
+        git submodule update --init --recursive; \
+    else \
+        git clone --recursive --depth=1 -b "${LLAMA_BRANCH}" "${LLAMA_REPO}" llama.cpp; \
+    fi
 WORKDIR /src/llama.cpp
 
 # Build llama.cpp with CUDA for Blackwell (sm_120f)

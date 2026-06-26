@@ -20,16 +20,31 @@ AEON_HOME="${AEON_HOME:-$HOME/.aeon}"
 MODELS_DIR="$AEON_HOME/models/gguf_models/Gemma-4"
 
 TARGET_MODEL="gemma-4-31b-abliterated-Q8_0.gguf"
-ASSISTANT_MODEL="gemma-4-31B-it-assistant.Q4_K_M.gguf"
+# Raw assistant GGUF as published on HF (AtomicChat) uses a naming convention the
+# fork's gemma4-assistant loader does not accept. We normalize it once into
+# *.aeon.* (arch rename + nextn_predict_layers/embedding_length_out keys + tensor
+# renames) and run the cluster against the normalized file. See
+# aeon/scripts/normalize_gemma4_assistant.py for the exact transform.
+RAW_ASSISTANT_MODEL="gemma-4-31B-it-assistant.Q4_K_M.gguf"
+ASSISTANT_MODEL="gemma-4-31B-it-assistant.aeon.Q4_K_M.gguf"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ ! -f "${MODELS_DIR}/${TARGET_MODEL}" ]; then
     echo "[Gemma-4-MTP-Cluster] ERROR: Target model ${TARGET_MODEL} not found in ${MODELS_DIR}"
     exit 1
 fi
 
+# Self-heal: produce the normalized assistant GGUF from the raw download if absent.
 if [ ! -f "${MODELS_DIR}/${ASSISTANT_MODEL}" ]; then
-    echo "[Gemma-4-MTP-Cluster] ERROR: Assistant model ${ASSISTANT_MODEL} not found in ${MODELS_DIR}"
-    exit 1
+    if [ ! -f "${MODELS_DIR}/${RAW_ASSISTANT_MODEL}" ]; then
+        echo "[Gemma-4-MTP-Cluster] ERROR: Assistant model ${RAW_ASSISTANT_MODEL} not found in ${MODELS_DIR}"
+        exit 1
+    fi
+    echo "[Gemma-4-MTP-Cluster] Normalizing assistant GGUF for fork compatibility (one-time)..."
+    python3 "${SCRIPT_DIR}/normalize_gemma4_assistant.py" \
+        "${MODELS_DIR}/${RAW_ASSISTANT_MODEL}" "${MODELS_DIR}/${ASSISTANT_MODEL}" \
+        || { echo "[Gemma-4-MTP-Cluster] ERROR: assistant normalization failed"; rm -f "${MODELS_DIR}/${ASSISTANT_MODEL}"; exit 1; }
 fi
 
 PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l 2>/dev/null || nproc)
@@ -56,8 +71,8 @@ launch_node() {
       $IMAGE_NAME \
       -m "/models/${TARGET_MODEL}" \
       -md "/models/${ASSISTANT_MODEL}" \
-      --spec-type mtp \
-      --draft-block-size 6 \
+      --spec-type draft-mtp \
+      --spec-draft-n-max 6 \
       -ngl 99 \
       -ngld 99 \
       --flash-attn on \
@@ -79,7 +94,6 @@ launch_node $NODE0_NAME 0 $NODE0_PORT 262144
 launch_node $NODE1_NAME 1 $NODE1_PORT 89984
 # --- Python Context-Aware Load Balancer ---
 echo "[Gemma-4-MTP-Cluster] Starting Python Context-Aware Load Balancer on Port $MAIN_PORT..."
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 docker run -d \
     --name $LB_NAME \
     --network host \
