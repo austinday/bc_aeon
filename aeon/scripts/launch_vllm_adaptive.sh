@@ -24,6 +24,7 @@ HF_MODEL="$AEON_HF_MODEL"
 SERVED="$AEON_SERVED_NAME"
 
 case "$TIER" in
+    solo)    DEF_UTIL=0.85 ;;   # GPU0 to ourselves; leave room for MTP draft + activations
     dual)    DEF_UTIL=0.85 ;;
     split)   DEF_UTIL=0.90 ;;
     *)       DEF_UTIL=0.92 ;;
@@ -66,9 +67,9 @@ launch_node() {
 NODE_LINES=$(python3 -c "
 import os,json
 p=json.loads(os.environ['AEON_DEPLOY_PLAN'])
-n=len(p['nodes'])
-tp = 1 if p['tier']=='dual' else n
 for nd in p['nodes']:
+    # tensor-parallel size = number of GPUs this node spans (solo/dual=1, split/offload=2)
+    tp = len(str(nd['devices']).split(','))
     print('|'.join([nd['container'], str(nd['devices']), str(nd['port']), str(nd['ctx']), str(tp), str(nd.get('cpu_offload_gib',''))]))
 ")
 

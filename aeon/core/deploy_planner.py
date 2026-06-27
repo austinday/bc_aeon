@@ -79,7 +79,19 @@ def _tensor_split_gpu0_weighted(weight_plus_kv: float, v_usable: float, n: int) 
     return f"{g0},{100 - g0}"
 
 
-def plan(entry: CatalogEntry, gpus: List[GpuInfo]) -> DeployPlan:
+def plan(entry: CatalogEntry, gpus: List[GpuInfo], mode: Optional[str] = None) -> DeployPlan:
+    """Plan a deployment for `entry` on `gpus`.
+
+    mode:
+      'solo'  -> one instance on GPU0 only, MTP on, leaving GPU1 free for tools
+                 (ComfyUI / vision). This is the DEFAULT for models that fit one GPU,
+                 because this harness runs image/video/vision tools on GPU1.
+      'dual'  -> two copies (one per GPU) + router for max LLM throughput (uses BOTH
+                 GPUs, so GPU1 is NOT available for tools).
+      None    -> auto: solo if it fits GPU0, else split across GPUs, else CPU offload.
+
+    force_split models (too big for one GPU) ignore mode and use split/offload.
+    """
     n = len(gpus)
     v = min_total_vram_gib(gpus)               # min per-GPU total VRAM
     v_usable = v * SAFETY
@@ -88,18 +100,21 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo]) -> DeployPlan:
     kv_per_tok = entry.kv_gib_per_64k / 65536.0
     one_copy_min = entry.weights_gib + entry.kv_gib_per_64k  # weights + KV(64k)
 
-    can_dual = (n >= 2 and not entry.force_split and one_copy_min <= v_usable)
+    fits_one_gpu = one_copy_min <= v_usable
     fits_gpus = (entry.weights_gib + entry.kv_gib_per_64k + MAIN_GPU_BUFFER) <= total_usable
 
-    if can_dual:
+    if entry.force_split:
+        tier = "split" if fits_gpus else "offload"
+    elif mode == "dual" and n >= 2 and fits_one_gpu:
         tier = "dual"
+    elif mode == "solo" and fits_one_gpu:
+        tier = "solo"
+    elif fits_one_gpu:
+        tier = "solo"                          # auto default: keep GPU1 free for tools
     elif fits_gpus and n >= 2:
         tier = "split"
-    elif n >= 2:
-        tier = "offload"
     else:
-        # Single GPU machine: dual impossible; either fits or offloads.
-        tier = "split" if one_copy_min <= v_usable else "offload"
+        tier = "offload"
 
     launcher = ("launch_vllm_adaptive.sh" if entry.provider == "vllm"
                 else "launch_llamacpp_adaptive.sh")
@@ -107,7 +122,20 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo]) -> DeployPlan:
     base_url = f"http://localhost:{lb_port}/v1"
     mtp = entry.supports_mtp
 
-    if tier == "dual":
+    if tier == "solo":
+        # One instance on GPU0; agent connects to it directly (no router). GPU1 stays free.
+        ctx = _round_ctx((v_usable - entry.weights_gib) / kv_per_tok, entry.max_ctx)
+        node = {"role": "node", "devices": "0", "port": lb_port, "ctx": ctx,
+                "tensor_split": "", "ngl": 99, "cpu_offload_gib": 0.0,
+                "container": f"aeon_{slug}"}
+        plan_obj = DeployPlan(
+            entry_name=entry.name, provider=entry.provider, image=entry.image, tier=tier,
+            nodes=[node], lb_port=lb_port, health_port=lb_port, base_url=base_url,
+            container_name=f"aeon_{slug}", all_containers=[node["container"]], launcher=launcher,
+            context_limit=ctx, mtp=mtp,
+            label=_label(entry, "solo", n, ctx, mtp),
+        )
+    elif tier == "dual":
         # Largest context that fits one GPU alongside one copy of the weights.
         ctx = _round_ctx((v_usable - entry.weights_gib) / kv_per_tok, entry.max_ctx)
         node0 = {"role": "node", "devices": "0", "port": entry.ports["node0"], "ctx": ctx,
@@ -122,7 +150,7 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo]) -> DeployPlan:
             nodes=[node0, node1], lb_port=lb_port, health_port=lb_port, base_url=base_url,
             container_name=f"aeon_{slug}_lb", all_containers=containers, launcher=launcher,
             context_limit=ctx, mtp=mtp,
-            label=_label(entry, "Dual-copy", n, ctx, mtp),
+            label=_label(entry, "dual", n, ctx, mtp),
         )
     else:
         # Single instance spanning all GPUs (split) or GPUs+RAM (offload).
@@ -151,7 +179,7 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo]) -> DeployPlan:
             nodes=[node], lb_port=lb_port, health_port=lb_port, base_url=base_url,
             container_name=f"aeon_{slug}", all_containers=containers, launcher=launcher,
             context_limit=ctx, mtp=mtp,
-            label=_label(entry, "GPU0-split" if tier == "split" else "CPU-offload", n, ctx, mtp),
+            label=_label(entry, tier, n, ctx, mtp),
         )
 
     plan_obj.env = {
@@ -168,10 +196,15 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo]) -> DeployPlan:
     return plan_obj
 
 
-def _label(entry: CatalogEntry, tier_h: str, n: int, ctx: int, mtp: bool) -> str:
+def _label(entry: CatalogEntry, tier: str, n: int, ctx: int, mtp: bool) -> str:
     ctx_h = f"{ctx // 1024}k"
     mtp_h = "MTP " if mtp else ""
-    gpu_h = f"{n}xGPU" if tier_h == "Dual-copy" else ("GPU0+GPU1" if n >= 2 else "1xGPU")
     prov = "vLLM" if entry.provider == "vllm" else "llama.cpp"
-    return (f"{entry.name:<28} | {mtp_h}{tier_h} {gpu_h} | {ctx_h} ctx | "
-            f"Abliterated: Yes | Local/{prov}")
+    desc = {
+        "solo":    "GPU0 only (GPU1 free for tools)",
+        "dual":    "Dual-copy both GPUs (max throughput)",
+        "split":   "GPU0+GPU1 split",
+        "offload": "GPU0+GPU1+CPU offload",
+    }.get(tier, tier)
+    return (f"{entry.name:<24} | {mtp_h}{desc} | {ctx_h} ctx | "
+            f"Uncensored: Yes | Local/{prov}")

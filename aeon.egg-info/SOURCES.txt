@@ -9,11 +9,14 @@ aeon.egg-info/entry_points.txt
 aeon.egg-info/requires.txt
 aeon.egg-info/top_level.txt
 aeon/core/__init__.py
+aeon/core/deploy_planner.py
 aeon/core/directives.py
+aeon/core/gpu.py
 aeon/core/gpu_queue.py
 aeon/core/llm.py
 aeon/core/llm_utils.py
 aeon/core/logger.py
+aeon/core/model_catalog.py
 aeon/core/paths.py
 aeon/core/runtime_signals.py
 aeon/core/session.py
@@ -87,6 +90,7 @@ aeon/core/skills/coding/safe_refactor.txt
 aeon/core/skills/coding/verifying_change_propagation.txt
 aeon/core/skills/compbio/genomics_variant_workflow.txt
 aeon/core/skills/compbio/sequence_analysis.txt
+aeon/core/skills/creative/video_director.txt
 aeon/core/skills/drug_design/small_molecule_design.txt
 aeon/core/skills/machine_learning/deep_learning_training.txt
 aeon/core/skills/machine_learning/ml_experiment.txt
@@ -102,8 +106,12 @@ aeon/memories/__init__.py
 aeon/memories/personalities/__init__.py
 aeon/scripts/0_launch_gemma_nvfp4.sh
 aeon/scripts/__init__.py
+aeon/scripts/adaptive_lb.py
 aeon/scripts/clear_gpu.sh
 aeon/scripts/gemma_lb.py
+aeon/scripts/launch_llamacpp_adaptive.sh
+aeon/scripts/launch_vllm_adaptive.sh
+aeon/scripts/normalize_gemma4_assistant.py
 aeon/scripts/start_brain.sh
 aeon/scripts/start_browser.sh
 aeon/scripts/start_comfyui.sh

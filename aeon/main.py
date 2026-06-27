@@ -87,27 +87,50 @@ def _local_model_available(entry, gpus):
     return _catalog.fits_download(entry, min_total_vram_gib(gpus))
 
 
+def _config_from_plan(entry, p, model_name):
+    return {
+        'model': model_name,
+        'family': entry.family,
+        'label': p.label,
+        'provider': entry.provider,
+        'base_url': p.base_url,
+        'context_limit': p.context_limit,
+        'container_name': p.container_name,
+        'additional_containers': [c for c in p.all_containers if c != p.container_name],
+        'start_script': p.launcher,
+        'health_port': p.health_port,
+        '_deploy_env': p.env,
+    }
+
+
 def build_local_model_configs():
-    """Plan each catalog model for this machine's GPUs -> menu/runtime configs."""
+    """Plan each catalog model for this machine's GPUs -> menu/runtime configs.
+
+    For models that fit a single GPU we offer two deployment choices:
+      - SOLO: the model on GPU0 only, leaving GPU1 free for image/video/vision tools
+        (the default this harness expects). Listed first / recommended.
+      - DUAL: two copies (one per GPU) + router for max throughput, using BOTH GPUs
+        (so GPU1 is unavailable for tools).
+    Bigger models (force_split / don't fit one GPU) get a single auto plan.
+    """
     gpus = detect_gpus()
+    n = len(gpus)
     configs = []
     for entry in _catalog.CATALOG:
         if not _local_model_available(entry, gpus):
             continue
-        p = _plan_deploy(entry, gpus)
-        configs.append({
-            'model': entry.name,
-            'family': entry.family,
-            'label': p.label,
-            'provider': entry.provider,
-            'base_url': p.base_url,
-            'context_limit': p.context_limit,
-            'container_name': p.container_name,
-            'additional_containers': [c for c in p.all_containers if c != p.container_name],
-            'start_script': p.launcher,
-            'health_port': p.health_port,
-            '_deploy_env': p.env,
-        })
+        solo = _plan_deploy(entry, gpus, mode='solo')
+        if solo.tier == 'solo':
+            # Primary: GPU0-only (keeps GPU1 for tools).
+            configs.append(_config_from_plan(entry, solo, entry.name))
+            # Alternative: dual-copy across both GPUs, when present.
+            if n >= 2 and not entry.force_split:
+                dual = _plan_deploy(entry, gpus, mode='dual')
+                if dual.tier == 'dual':
+                    configs.append(_config_from_plan(entry, dual, f"{entry.name} [dual-GPU]"))
+        else:
+            # Too big for one GPU: single split/offload plan.
+            configs.append(_config_from_plan(entry, solo, entry.name))
     return configs
 
 
