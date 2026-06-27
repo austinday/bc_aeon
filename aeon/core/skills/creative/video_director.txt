@@ -1,0 +1,60 @@
+# CREATIVE SKILL: Video Director Protocol
+# How to fulfil ANY open-ended video request from a text chat by orchestrating the
+# image + video tools. You are the director: assets are clay, the tools are camera
+# and crew. Decompose the ask, build assets, render shot-by-shot, stitch.
+
+## TOOLS YOU COMPOSE
+- generate_image(prompt, output_path, ...)         -> create stills (characters, sets, props).
+- edit_image(input_path, prompt, output_path, ...) -> place a subject in a new scene / restyle a still.
+- analyze_image(...)                               -> inspect a user-supplied asset before using it.
+- generate_video(mode=..., ...)                    -> the video engine. Modes:
+    text_to_video   | image_to_video | keyframes | extend_video | edit_video
+- sub_agent(...)    -> render independent shots IN PARALLEL, then collect their files.
+
+## THE METHOD
+
+1. INTERPRET THE BRIEF
+   - Identify: subject(s)/character(s), setting, action beats, style, length, and any
+     assets the user already provided (images or videos). Ask only if truly ambiguous.
+   - Decide the shot list: one clip per distinct beat (~3-5s / up to ~121 frames each).
+
+2. LOCK THE ASSETS (consistency comes from REUSING images, not from prompts alone)
+   - Character: generate (or take the user's) ONE clean character image = the "character
+     sheet". For each new scene, use edit_image to drop that SAME character into the new
+     setting/pose, OR reuse the character sheet directly as a keyframe. Reusing the literal
+     image is what keeps the character consistent across shots.
+   - Sets/props/style refs: generate stills once; reuse them as keyframes.
+
+3. RENDER EACH SHOT (pick the mode by what anchors the shot)
+   - From nothing            -> text_to_video.
+   - From one still          -> image_to_video (init_image = the still).
+   - Start at A, end at B / storyboard / "bring these stills to life in order"
+                             -> keyframes: pass [{image, at_frame, strength}], frame 0 = first
+                                beat, last frame = final beat. strength 1.0 hard-locks a pose.
+   - Continue an existing clip-> extend_video (init_video = previous shot). Chain to grow length
+                                or to flow one beat into the next (it seeds from the last frame).
+   - Change an existing clip  -> edit_video (init_video + prompt + denoise: 0.3 light, 0.7 heavy).
+   - Run independent shots in parallel via sub_agents to save wall-clock time.
+
+4. CONTINUITY ACROSS SHOTS
+   - To make shot N+1 continue shot N seamlessly, use extend_video on shot N.
+   - To re-use a character/location, feed the same anchor image as the frame-0 keyframe of
+     each shot so the subject reads as the same across cuts.
+
+5. ASSEMBLE
+   - Save shots to a working dir (e.g. aeon_output/video/<project>/shotNN.mp4).
+   - Stitch the ordered shots into the final cut by calling extend_video to chain, or by
+     concatenating the mp4s (ffmpeg). Deliver the final path to the user with say_to_user.
+
+## PATTERNS (map a request -> a plan)
+- "Make a character and put them in an action scene from these images":
+    edit_image(character + each scene) -> image_to_video / keyframes per scene -> extend/stitch.
+- "Animate this storyboard": keyframes mode with the boards pinned across the timeline.
+- "Extend / continue this video": extend_video, repeat to reach the target length.
+- "Restyle / edit this video": edit_video with a style prompt and a suitable denoise.
+- "Interpolate between two images": keyframes with image A at frame 0 and image B at the last.
+
+## VERIFICATION
+- Confirm each generate_video call returned a real .mp4 path before using it downstream.
+- If a shot is wrong, regenerate that shot only (change prompt/keyframes/seed) — don't redo all.
+- Report the final video path; list intermediate shots if the user may want to revise one.

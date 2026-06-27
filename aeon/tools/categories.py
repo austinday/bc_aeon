@@ -36,7 +36,9 @@ TOOL_CATEGORIES = {
         ],
     },
     'video_tools': {
-        'description': 'AI video generation and editing tools (LTX-2.3 via ComfyUI)',
+        'description': 'AI video creation & editing (LTX-2.3 via ComfyUI): text/image-to-video, '
+                       'storyboard keyframes, extend, and restyle. See the video_director skill for '
+                       'orchestrating multi-shot, character-consistent sequences from any assets.',
         'tools': [
             'generate_video',
         ],
