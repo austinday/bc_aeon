@@ -58,56 +58,60 @@ CLOUD_MODELS = [
 ]
 
 # =============================================================================
-# LLAMA.CPP SERVED MODELS (GGUF, GPU+RAM hybrid, continuous batching)
+# LOCAL MODEL CATALOG -> per-machine adaptive deploy configs
 # =============================================================================
-LLAMACPP_MODELS = [
-    {
-        'model': 'CyberNeurova-DeepSeek-V4-Flash',
-        'family': 'DeepSeek-V4',
-        'label': 'CyberNeurova DeepSeek V4 Flash | GPU0: Max, GPU1: Spill | ~?? t/s | 128k ctx | Abliterated: Yes | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8021/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_cyberneurova',
-        'start_script': 'start_cyberneurova.sh',
-        'health_port': 8021,
-    },
-    {
-        'model': 'Qwen3.6-35B-A3B-Uncensored',
-        'family': 'Qwen3.6',
-        'label': 'Qwen3.6-35B-A3B-Uncensored      | GPU0: 100%, GPU1: 0%     | ~?? t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8009/v1',
-        'context_limit': 262144,
-        'container_name': 'aeon_qwen36_35b',
-        'start_script': 'start_qwen36_35b.sh',
-        'health_port': 8009,
-    },
-    {
-        'model': 'Gemma-4-31B-MTP-Q8_0',
-        'family': 'Gemma-4',
-        'label': 'Gemma-4-31B Native MTP Cluster  | Symmetrical Dual 256k    | ~100+ t/s | 256k ctx | Abliterated: Yes | Local/llama.cpp',
-        'provider': 'llamacpp',
-        'base_url': 'http://localhost:8013/v1',
-        'context_limit': 262144,
-        'container_name': 'aeon_gemma_mtp_lb',
-        'additional_containers': ['aeon_gemma4_mtp_node0', 'aeon_gemma4_mtp_node1'],
-        'start_script': 'start_gemma4_mtp.sh',
-        'health_port': 8013,
-    },
-    {
-        'model': 'Gemma-4-31B-NVFP4',
-        'family': 'Gemma-4',
-        'label': 'Gemma-4-31B NVFP4 Turbo | vLLM MTP | ~100+ t/s | 128k ctx | Abliterated: Yes | Local/vLLM',
-        'provider': 'vllm',
-        'base_url': 'http://localhost:8018/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_gemma_vllm_lb',
-        'additional_containers': ['gemma_node0', 'gemma_node1'],
-        'start_script': '0_launch_gemma_nvfp4.sh',
-        'health_port': 8018,
-    },
-]
+# The local model list is no longer hardcoded: it is derived from the shared
+# catalog (aeon.core.model_catalog) by planning each model against THIS machine's
+# detected GPUs (aeon.core.deploy_planner). This makes the same repo portable
+# across the 48 GB (RTX 5000) and 96 GB (RTX 6000) Blackwell machines -- each
+# model is auto-deployed dual-copy / GPU0-split / CPU-offload to fit, always
+# keeping >=64k context and MTP where a draft head exists.
+from aeon.core.gpu import detect_gpus, min_total_vram_gib
+from aeon.core import model_catalog as _catalog
+from aeon.core.deploy_planner import plan as _plan_deploy
+
+
+def _local_model_available(entry, gpus):
+    """A catalog model is offered only if deployable here AND present (or, for
+    vLLM, runtime-fetchable within the machine's VRAM budget)."""
+    if not gpus:
+        return False
+    aeon_home = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
+    if entry.provider == 'llamacpp':
+        d = Path(aeon_home) / 'models' / (entry.model_dir or '')
+        try:
+            return d.is_dir() and any(d.glob(entry.target_glob or '*.gguf'))
+        except Exception:
+            return False
+    # vLLM fetches weights from the HF hub at runtime; offer it if it fits.
+    return _catalog.fits_download(entry, min_total_vram_gib(gpus))
+
+
+def build_local_model_configs():
+    """Plan each catalog model for this machine's GPUs -> menu/runtime configs."""
+    gpus = detect_gpus()
+    configs = []
+    for entry in _catalog.CATALOG:
+        if not _local_model_available(entry, gpus):
+            continue
+        p = _plan_deploy(entry, gpus)
+        configs.append({
+            'model': entry.name,
+            'family': entry.family,
+            'label': p.label,
+            'provider': entry.provider,
+            'base_url': p.base_url,
+            'context_limit': p.context_limit,
+            'container_name': p.container_name,
+            'additional_containers': [c for c in p.all_containers if c != p.container_name],
+            'start_script': p.launcher,
+            'health_port': p.health_port,
+            '_deploy_env': p.env,
+        })
+    return configs
+
+
+LLAMACPP_MODELS = build_local_model_configs()
 
 def is_container_running(name):
     try: return bool(subprocess.check_output(["docker", "ps", "-q", "-f", f"name={name}"], stderr=subprocess.DEVNULL, text=True).strip())
@@ -260,6 +264,9 @@ def start_llamacpp_server(config):
     print(f"[LLAMACPP] Starting {config['model']} server (this may take several minutes for model loading)...")
     env = os.environ.copy()
     env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
+    # Adaptive deploy plan (tier, GPU split, ctx, MTP) computed by deploy_planner.
+    for k, v in config.get('_deploy_env', {}).items():
+        env[k] = v
     result = subprocess.run(['bash', str(script)], capture_output=False, env=env)
     if result.returncode != 0:
         print(f"[LLAMACPP] ERROR: Failed to start {container_name}")

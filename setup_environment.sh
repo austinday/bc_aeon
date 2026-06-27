@@ -90,15 +90,35 @@ EOF
 build_image "aeon_downloader:latest" "$PROJECT_ROOT/Dockerfile.downloader" "$PROJECT_ROOT"
 rm -f "$PROJECT_ROOT/Dockerfile.downloader"
 
-log_step "PHASE 5.6: Gemma-4-31B + E2B Draft Models + MTP Assistant"
+log_step "PHASE 5.6: Local model catalog (GPU-adaptive, VRAM-gated downloads)"
+# Detect this machine's GPUs and download only the catalog models that fit (see
+# aeon/core/model_catalog.py). The same catalog drives runtime auto-deployment,
+# so setup and the agent agree on what is available. Portable across the 48 GB
+# (RTX 5000) and 96 GB (RTX 6000) Blackwell machines.
 GEMMA4_GGUF_DIR="$AEON_HOME/models/gguf_models/Gemma-4"
 mkdir -p "$GEMMA4_GGUF_DIR"
-CMD="hf download paperscarecrow/Gemma-4-31B-it-abliterated gemma-4-31b-abliterated-Q8_0.gguf --local-dir /models && hf download mradermacher/gemma-4-E2B-it-heretic-i1-GGUF --include '*Q4_K_M*.gguf' --local-dir /models && hf download AtomicChat/gemma-4-31B-it-assistant-GGUF --include '*assistant*4_*.gguf' --local-dir /models"
-run_downloader "$GEMMA4_GGUF_DIR/.setup_state" "$SETUP_VERSION:gemma4-q8_0-e2b-draft-mtp-v2" "$GEMMA4_GGUF_DIR:/models" "$CMD"
+MIN_VRAM=$(python3 -m aeon.core.gpu 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('min_total_gib',0))" 2>/dev/null || echo 0)
+log_step "Detected min per-GPU VRAM: ${MIN_VRAM} GiB"
+LITE_FLAG=""; [[ "$LITE_MODE" == "true" ]] && LITE_FLAG="--lite"
+if python3 -c "import sys; sys.exit(0 if float('${MIN_VRAM}')>0 else 1)" 2>/dev/null; then
+    while IFS=$'\t' read -r action a b c; do
+        case "$action" in
+            DOWNLOAD)
+                DEST_DIR="$AEON_HOME/models/$a"
+                mkdir -p "$DEST_DIR"
+                log_step "  -> downloading into $a (state: $b)"
+                run_downloader "$DEST_DIR/.setup_state" "$SETUP_VERSION:$b" "$DEST_DIR:/models" "$c"
+                ;;
+            SKIP) log_step "  -> skip $a ($b)" ;;
+        esac
+    done < <(python3 -m aeon.core.model_catalog --emit-downloads "$MIN_VRAM" $LITE_FLAG)
+else
+    log_step "WARNING: no GPU detected; skipping local model downloads."
+fi
 
 # The published MTP assistant GGUF uses a naming convention the fork's
 # gemma4-assistant loader rejects. Normalize it once into *.aeon.* so the MTP
-# cluster can load it. Idempotent; start_gemma4_mtp.sh also self-heals at runtime.
+# cluster can load it. Idempotent; the adaptive launcher also self-heals at runtime.
 RAW_MTP_ASSISTANT="$GEMMA4_GGUF_DIR/gemma-4-31B-it-assistant.Q4_K_M.gguf"
 NORM_MTP_ASSISTANT="$GEMMA4_GGUF_DIR/gemma-4-31B-it-assistant.aeon.Q4_K_M.gguf"
 if [[ -f "$RAW_MTP_ASSISTANT" && ! -f "$NORM_MTP_ASSISTANT" ]]; then
@@ -167,21 +187,28 @@ build_image "aeon_browser_service:latest" "$PROJECT_ROOT/aeon/services/browser/D
 
 if [[ "$LITE_MODE" != "true" ]]; then
     log_step "PHASE 10: LTX-2.3 Video Generation Models"
-    CMD="hf download unsloth/LTX-2.3-GGUF ltx-2.3-22b-dev-F16.gguf --local-dir /models/unet && \
-         hf download unsloth/LTX-2.3-GGUF vae/ltx-2.3-22b-dev_video_vae.safetensors --local-dir /models/vae && \
-         hf download unsloth/LTX-2.3-GGUF text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors --local-dir /models/text_encoders && \
+    # Quantized unet (Q4_K_M, ~14 GiB) so ComfyUI fits one Blackwell GPU alongside
+    # the VAE + Gemma text encoder. F16 (~42 GiB) does not fit a 48 GB card.
+    # generate_video.py auto-resolves whichever ltx unet quant is present.
+    # VAE and text-encoder connectors live in repo subfolders; flatten them into
+    # models/vae and models/text_encoders so ComfyUI lists them by basename
+    # (matching the names generate_video.py resolves).
+    CMD="hf download unsloth/LTX-2.3-GGUF ltx-2.3-22b-dev-Q4_K_M.gguf --local-dir /models/unet && \
+         hf download unsloth/LTX-2.3-GGUF vae/ltx-2.3-22b-dev_video_vae.safetensors --local-dir /models/tmp_vae && \
+         mv /models/tmp_vae/vae/*.safetensors /models/vae/ && rm -rf /models/tmp_vae && \
+         hf download unsloth/LTX-2.3-GGUF text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors --local-dir /models/tmp_te && \
+         mv /models/tmp_te/text_encoders/*.safetensors /models/text_encoders/ && rm -rf /models/tmp_te && \
          hf download unsloth/gemma-3-12b-it-qat-GGUF gemma-3-12b-it-qat-UD-Q4_K_XL.gguf --local-dir /models/text_encoders && \
          hf download unsloth/gemma-3-12b-it-qat-GGUF mmproj-BF16.gguf --local-dir /models/text_encoders && \
          hf download unsloth/gemma-3-12b-it-FP8-Dynamic tokenizer.model --local-dir /models/tmp && \
          mv /models/tmp/tokenizer.model /models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.model && \
          rm -rf /models/tmp"
-    run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+    run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_comfyui_q4km" "$COMFY_MODELS_DIR:/models" "$CMD"
 
-    log_step "PHASE 11: CyberNeurova DeepSeek V4 Model"
-    CYBER_DIR="$AEON_HOME/models/gguf_models/CyberNeurova"
-    mkdir -p "$CYBER_DIR"
-    CMD="hf download audreyt/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF cyberneurova-DeepSeek-V4-Flash-abliterated-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf --local-dir /models"
-    run_downloader "$CYBER_DIR/.setup_state" "$SETUP_VERSION:cyberneurova-v4-q4k" "$CYBER_DIR:/models" "$CMD"
+    # PHASE 11 (CyberNeurova DeepSeek V4) is now handled by the GPU-adaptive
+    # catalog loop in PHASE 5.6: it downloads DeepSeek only on machines whose
+    # VRAM can deploy it (e.g. 2x 96 GB), and skips it elsewhere.
+    :
 fi
 
 log_step "Setup complete! All Dockerfiles will automatically rebuild if changed, and partial downloads will automatically resume."
