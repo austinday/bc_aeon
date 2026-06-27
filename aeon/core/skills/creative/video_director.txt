@@ -5,6 +5,8 @@
 
 ## TOOLS YOU COMPOSE
 - generate_image(prompt, output_path, ...)         -> create stills (characters, sets, props).
+    Backed by an UNCENSORED FLUX.2-klein model: no content restrictions, so you can design
+    any character/scene the user asks for and feed it straight into video.
 - edit_image(input_path, prompt, output_path, ...) -> place a subject in a new scene / restyle a still.
 - analyze_image(...)                               -> inspect a user-supplied asset before using it.
 - generate_video(mode=..., ...)                    -> the video engine. Modes:

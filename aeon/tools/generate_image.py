@@ -122,8 +122,29 @@ class GenerateImageTool(ComfyUITool):
         super().__init__(
             name="generate_image",
             description=TOOL_DESC_GENERATE_IMAGE,
-            underlying_model='FLUX.2 GGUF'
+            underlying_model='FLUX.2-klein-9B uncensored GGUF'
         )
+
+    def _resolve(self, subdir: str, patterns, default: str) -> str:
+        """Basename of the first model in comfyui/<subdir> matching any pattern; else default."""
+        import glob
+        base = os.path.join(os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon")),
+                            "models", "comfyui", subdir)
+        for pat in patterns:
+            hits = sorted(glob.glob(os.path.join(base, pat)))
+            if hits:
+                return os.path.basename(hits[0])
+        return default
+
+    def _flux2_models(self):
+        """Resolve the uncensored FLUX.2 model set (auto-adapts to whichever quant is present)."""
+        unet = self._resolve("unet", ("*flux*2*klein*.gguf", "*flux-2*.gguf", "*flux*klein*.gguf"),
+                             "flux-2-klein-9b-Q8_0.gguf")
+        clip = self._resolve("text_encoders", ("*flux2*uncensored*.gguf", "*flux*2*klein*uncensored*.gguf"),
+                             "flux2-klein-9b-uncensored-q8_0.gguf")
+        vae = self._resolve("vae", ("*flux2*vae*.safetensors", "flux2-vae*.safetensors"),
+                            "flux2-vae.safetensors")
+        return unet, clip, vae
 
     def execute(self, prompt: str, output_path: str, width: int = 1024, height: int = 1024) -> str:
         if not prompt:
@@ -139,78 +160,26 @@ class GenerateImageTool(ComfyUITool):
             self._manage_registry('register')
             self._ensure_comfyui_running(required_vram=20.0)
 
+            unet, clip, vae = self._flux2_models()
+            seed = random.randint(1, 0xffffffffffffffff)
+            # Uncensored FLUX.2-klein graph: GGUF model + flux2 (Mistral) uncensored text
+            # encoder + flux2 VAE, sampled via the modern guider path (validated).
             workflow = {
-                "1": {
-                    "class_type": "UnetLoaderGGUF",
-                    "inputs": {
-                        "unet_name": "FHDR_ComfyUI-Q8_0.gguf"
-                    }
-                },
-                "2": {
-                    "class_type": "DualCLIPLoader",
-                    "inputs": {
-                        "clip_name1": "clip_l.safetensors",
-                        "clip_name2": "t5xxl_fp8_e4m3fn.safetensors",
-                        "type": "flux"
-                    }
-                },
-                "3": {
-                    "class_type": "VAELoader",
-                    "inputs": {
-                        "vae_name": "ae.safetensors"
-                    }
-                },
-                "4": {
-                    "class_type": "CLIPTextEncode",
-                    "inputs": {
-                        "text": prompt,
-                        "clip": ["2", 0]
-                    }
-                },
-                "5": {
-                    "class_type": "CLIPTextEncode",
-                    "inputs": {
-                        "text": "",
-                        "clip": ["2", 0]
-                    }
-                },
-                "6": {
-                    "class_type": "EmptyLatentImage",
-                    "inputs": {
-                        "batch_size": 1,
-                        "width": width,
-                        "height": height
-                    }
-                },
-                "7": {
-                    "class_type": "KSampler",
-                    "inputs": {
-                        "seed": random.randint(1, 0xffffffffffffffff),
-                        "steps": 25,
-                        "cfg": 1.0,
-                        "sampler_name": "euler",
-                        "scheduler": "simple",
-                        "denoise": 1.0,
-                        "model": ["1", 0],
-                        "positive": ["4", 0],
-                        "negative": ["5", 0],
-                        "latent_image": ["6", 0]
-                    }
-                },
-                "8": {
-                    "class_type": "VAEDecode",
-                    "inputs": {
-                        "samples": ["7", 0],
-                        "vae": ["3", 0]
-                    }
-                },
-                "9": {
-                    "class_type": "SaveImage",
-                    "inputs": {
-                        "filename_prefix": "Aeon",
-                        "images": ["8", 0]
-                    }
-                }
+                "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": unet}},
+                "2": {"class_type": "CLIPLoaderGGUF", "inputs": {"clip_name": clip, "type": "flux2"}},
+                "3": {"class_type": "VAELoader", "inputs": {"vae_name": vae}},
+                "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
+                "5": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": 4.0}},
+                "6": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+                "7": {"class_type": "Flux2Scheduler", "inputs": {"steps": 20, "width": width, "height": height}},
+                "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+                "14": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["5", 0]}},
+                "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+                "11": {"class_type": "SamplerCustomAdvanced",
+                       "inputs": {"noise": ["10", 0], "guider": ["14", 0], "sampler": ["8", 0],
+                                  "sigmas": ["7", 0], "latent_image": ["6", 0]}},
+                "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+                "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "Aeon", "images": ["12", 0]}},
             }
 
             print(f"{self.C_CYAN}Submitting image generation workflow to ComfyUI...{self.C_RESET}")

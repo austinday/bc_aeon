@@ -153,14 +153,22 @@ if [[ "$LITE_MODE" != "true" ]]; then
     log_step "PHASE 6.9: Build aeon_comfyui:latest Docker image"
     build_image "aeon_comfyui:latest" "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
 
-    log_step "PHASE 7: ComfyUI Models (FLUX)"
+    log_step "PHASE 7: ComfyUI Image Models (FLUX.2-klein-9B, UNCENSORED)"
+    # Best uncensored image model that fits one Blackwell GPU: FLUX.2-klein-9B (Q8_0, ~10 GiB)
+    # paired with an UNCENSORED FLUX.2 text encoder (the Mistral encoder is where FLUX.2's
+    # restrictions live; this abliterated replacement removes them). Newer/higher-quality than
+    # FLUX.1; generate_image.py builds the FLUX.2 graph and auto-resolves these files.
+    #
+    # NOTE: the uncensored encoder repo is GATED. Accept it once (with the account that owns
+    # your HF token) before running setup, or this phase will fail with "requires approval":
+    #   https://huggingface.co/ponpoke/flux2-klein-9b-uncensored-text-encoder
     COMFY_MODELS_DIR="$AEON_HOME/models/comfyui"
     mkdir -p "$COMFY_MODELS_DIR/unet" "$COMFY_MODELS_DIR/text_encoders" "$COMFY_MODELS_DIR/vae"
-    CMD="hf download kpsss34/FHDR_Uncensored FHDR_ComfyUI-Q8_0.gguf --local-dir /models/unet && \
-         hf download black-forest-labs/FLUX.1-schnell ae.safetensors --local-dir /models/vae && \
-         hf download comfyanonymous/flux_text_encoders clip_l.safetensors --local-dir /models/text_encoders && \
-         hf download comfyanonymous/flux_text_encoders t5xxl_fp8_e4m3fn.safetensors --local-dir /models/text_encoders"
-    run_downloader "$COMFY_MODELS_DIR/.flux_setup_state" "$SETUP_VERSION:flux_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+    CMD="hf download unsloth/FLUX.2-klein-9B-GGUF flux-2-klein-9b-Q8_0.gguf --local-dir /models/unet && \
+         hf download ponpoke/flux2-klein-9b-uncensored-text-encoder flux2-klein-9b-uncensored-q8_0.gguf --local-dir /models/text_encoders && \
+         hf download Comfy-Org/flux2-dev split_files/vae/flux2-vae.safetensors --local-dir /models/tmp_fv && \
+         mv /models/tmp_fv/split_files/vae/flux2-vae.safetensors /models/vae/ && rm -rf /models/tmp_fv"
+    run_downloader "$COMFY_MODELS_DIR/.flux_setup_state" "$SETUP_VERSION:flux2_klein_uncensored" "$COMFY_MODELS_DIR:/models" "$CMD"
 
     log_step "PHASE 7.5: Qwen-Image-Edit-2511 (ComfyUI Edit Models)"
     CMD="hf download Arunk25/Qwen-Image-Edit-Rapid-AIO-GGUF v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf --local-dir /models/unet && \
