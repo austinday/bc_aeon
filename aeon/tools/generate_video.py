@@ -226,6 +226,26 @@ class GenerateVideoTool(ComfyUITool):
                 input_path_1: Optional[str] = None, **kwargs) -> str:
         if not output_path:
             return "Error: 'output_path' is required."
+
+        # Validate mode up front: an unrecognized mode previously fell through to
+        # text_to_video, silently ignoring init_image/init_video/keyframes.
+        valid_modes = {"text_to_video", "image_to_video", "extend_video", "edit_video", "keyframes"}
+        if not mode or mode not in valid_modes:
+            import difflib
+            sugg = difflib.get_close_matches(str(mode), sorted(valid_modes), n=1, cutoff=0.3)
+            hint = f" Did you mean '{sugg[0]}'?" if sugg else ""
+            return (f"Error: invalid mode '{mode}'. Valid modes: {', '.join(sorted(valid_modes))}.{hint}")
+
+        # Tolerate string/odd numeric params from the model.
+        def _int(v, default):
+            try:
+                return int(round(float(v)))
+            except (TypeError, ValueError):
+                return default
+        width, height = _int(width, 768), _int(height, 512)
+        frames = _int(frames, self.DEFAULT_FRAMES)
+        seed = _int(seed, 42)
+
         # Back-compat: older callers used input_path_1 for the image/video asset.
         if input_path_1 and not init_image and not init_video:
             (init_video, init_image) = (input_path_1, None) if mode in ("extend_video", "edit_video") else (None, input_path_1)
