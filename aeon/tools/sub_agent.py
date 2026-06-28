@@ -461,12 +461,16 @@ class GetSubAgentReport(BaseTool):
             self.worker.notified_sub_agents.add(f"{agent_dir.name}_{base_status}")
             if base_status == "COMPLETED":
                 result = report or "N/A"
-                tail = ""
+                note = ""
                 if len(result) > self.MAX_RESULT_CHARS:
-                    tail = (f"\n\n[... truncated at {self.MAX_RESULT_CHARS} chars; full text in "
-                            f"{agent_dir / 'output.json'} ...]")
-                    result = result[:self.MAX_RESULT_CHARS]
-                return f"Agent {agent_dir.name[:8]} Status: COMPLETED\n\n--- FINDINGS ---\n{result}{tail}"
+                    # Keep BOTH ends: a structured report frames the work up top
+                    # and puts conclusions/deliverables at the bottom, so a
+                    # head-only cut would discard the most important part.
+                    from aeon.core.worker_utils import truncate_output
+                    result = truncate_output(result, max_chars=self.MAX_RESULT_CHARS)
+                    note = (f"\n\n[Report exceeded {self.MAX_RESULT_CHARS} chars; shown head+tail. "
+                            f"Full text in {agent_dir / 'output.json'}.]")
+                return f"Agent {agent_dir.name[:8]} Status: COMPLETED\n\n--- FINDINGS ---\n{result}{note}"
             return f"Agent {agent_dir.name[:8]} Status: {status}\n\n{report or ''}"
 
         report_str = f"Agent {agent_dir.name[:8]} Status: RUNNING"
