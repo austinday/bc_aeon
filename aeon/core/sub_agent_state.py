@@ -21,10 +21,61 @@ the primary agent's group, which verify_self_modification's test sub-agent share
 
 import os
 import json
+import time
 import signal
 from pathlib import Path
 
 TERMINAL = {"COMPLETED", "FAILED", "KILLED"}
+
+
+def read_progress(agent_dir, freeze_seconds=60):
+    """Best-effort live progress for a (presumed running) sub-agent.
+
+    Single source of truth for "what is this student doing right now", used by
+    both the principal's always-on SUB-AGENTS digest and gather_sub_agents so
+    they never disagree. Returns a dict:
+      age          seconds since the sub-agent last signalled activity (or None)
+      step         human-readable current step (or None)
+      iteration    planning iteration (or None)
+      frozen       True if progress.json itself stopped being written (whole-
+                   process freeze the watchdog can't report on)
+      stuck_reason short string when the sub-agent self-reported a loop (or None)
+      wallclock    seconds the sub-agent has been running (or None)
+    """
+    agent_dir = Path(agent_dir)
+    pj = agent_dir / "progress.json"
+    try:
+        if pj.exists():
+            frozen = (time.time() - pj.stat().st_mtime) > freeze_seconds
+            data = json.loads(pj.read_text(encoding="utf-8"))
+            return {
+                "age": data.get("activity_age"),
+                "step": data.get("step"),
+                "iteration": data.get("iteration"),
+                "frozen": frozen,
+                "stuck_reason": data.get("stuck_reason"),
+                "wallclock": data.get("wallclock"),
+            }
+    except Exception:
+        pass
+    tj = agent_dir / "telemetry.json"
+    try:
+        if tj.exists():
+            data = json.loads(tj.read_text(encoding="utf-8"))
+            ts = data.get("timestamp")
+            if ts:
+                return {"age": max(0.0, time.time() - float(ts)), "step": data.get("current_step"),
+                        "iteration": data.get("iteration"), "frozen": False,
+                        "stuck_reason": None, "wallclock": None}
+    except Exception:
+        pass
+    for fname in ("pid.txt", "status.txt"):
+        p = agent_dir / fname
+        if p.exists():
+            return {"age": max(0.0, time.time() - p.stat().st_mtime), "step": None,
+                    "iteration": None, "frozen": False, "stuck_reason": None, "wallclock": None}
+    return {"age": None, "step": None, "iteration": None, "frozen": False,
+            "stuck_reason": None, "wallclock": None}
 
 
 def norm_status(status):

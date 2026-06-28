@@ -89,12 +89,14 @@ class SpawnSubAgent(BaseTool):
         super().__init__(
             name="spawn_sub_agent",
             description=(
-                "Dispatch a background sub-agent to work an INDEPENDENT thread in parallel (a research "
-                "avenue, a separate module, an isolated experiment). You are a principal investigator: "
-                "spawn the batch, do your own orthogonal work, then COLLECT every report. NEVER spawn a "
-                "sub-agent for something you can do yourself in 1-2 commands, and NEVER finish a task while "
-                "a sub-agent you spawned is still running or unread -- if you spawned it, you must gather "
-                "and read it (or kill it) before task_complete.\n"
+                "Dispatch a background sub-agent (a graduate student) to work an INDEPENDENT thread in "
+                "parallel (a research avenue, a separate module, an isolated experiment). You are its "
+                "advisor: spawn the batch, then each turn watch the SUB-AGENTS section of your context, "
+                "steer the ones drifting (steer_sub_agent), relay useful cross-findings, and do your own "
+                "orthogonal work meanwhile -- never sit idle waiting. NEVER spawn a sub-agent for something "
+                "you can do yourself in 1-2 commands, and NEVER finish a task while a sub-agent you spawned "
+                "is still running or unread: collect its report (get_sub_agent_report), or kill it if you no "
+                "longer need its work, before task_complete.\n"
                 "Each sub-agent runs your model, shares the workspace, CANNOT spawn its own sub-agents, and "
                 "is GUARANTEED to reach a terminal state within its budget (an internal watchdog enforces "
                 "this). Its final report reaches you via get_sub_agent_report, so make the deliverable "
@@ -217,16 +219,17 @@ class SpawnSubAgent(BaseTool):
         rt.atomic_write_text(agent_dir / "status.txt", "RUNNING")
 
         short_id = agent_id[:8]
-        return (f"Sub-agent spawned. Agent ID: {agent_id} (refer to it as '{short_id}' in gather/report/kill). "
+        return (f"Sub-agent spawned. Agent ID: {agent_id} (refer to it as '{short_id}' in steer/report/kill). "
                 f"Budget: {max_wallclock // 60} min wall-clock, {stall}s stall, {iters} max iterations. "
-                f"REMEMBER: you must collect its report with gather_sub_agents + get_sub_agent_report before "
-                f"you finish the task. Do other orthogonal work now, then check in (use a non-zero timeout so "
-                f"you actually wait for it).")
+                f"It will now appear LIVE in the SUB-AGENTS section of your context every turn -- watch it "
+                f"there, steer_sub_agent if it drifts, and meanwhile advance your own orthogonal work. You "
+                f"must collect its report with get_sub_agent_report (or kill_sub_agent if you no longer need "
+                f"it) before you can task_complete.")
 
 
 class GatherSubAgents(BaseTool):
-    DEFAULT_TIMEOUT = 120
-    HARD_MAX_TIMEOUT = 600
+    DEFAULT_TIMEOUT = 0
+    HARD_MAX_TIMEOUT = 120
     STALL_FLAG_SECONDS = 120
     FREEZE_SECONDS = 60
     POLL_INTERVAL = 3
@@ -235,20 +238,22 @@ class GatherSubAgents(BaseTool):
         super().__init__(
             name="gather_sub_agents",
             description=(
-                "Bounded, progress-aware check-in on running sub-agents. Returns the INSTANT any agent newly "
-                "finishes (so you can consume its result and spawn follow-ups), or when one freezes, or after "
-                "a short window. NEVER blocks indefinitely. For each agent you get its short id, status, time "
-                "since last progress, and current step, plus a recommended action. Pass a displayed short id "
-                "straight to get_sub_agent_report.\n"
-                "IMPORTANT: timeout=0 is only an instant snapshot -- it does NOT wait. To actually wait for a "
-                "result, use a non-zero timeout (e.g. 120). Repeatedly snapshotting with timeout=0 and then "
-                "giving up is a common mistake: if you spawned an agent, wait for it and read its report.\n"
+                "Snapshot check-in on your sub-agents (your graduate students). For each you get its short id, "
+                "status, time since last progress, current step, and any stall/loop/freeze flag, plus a "
+                "recommended action. NOTE: you ALSO see this automatically in the SUB-AGENTS section of your "
+                "context every turn -- so as an advisor you should mostly be ACTING on that (steer_sub_agent, "
+                "get_sub_agent_report, kill_sub_agent) and doing your own orthogonal work, not repeatedly "
+                "polling here.\n"
+                "By default this returns an INSTANT snapshot and does NOT block. Only pass a non-zero timeout "
+                "when you have genuinely nothing else to do and want to pause until something changes; even "
+                "then it returns the moment any agent finishes/freezes (capped at 120s). Do NOT use it as an "
+                "idle wait loop -- supervising and doing parallel work is the whole point of dispatching them.\n"
                 "Schema:\n"
                 "  agent_ids (list[str], optional): specific ids; omit for all running sub-agents.\n"
-                "  timeout (int, optional, default=120): max seconds to wait this check-in (capped 600). "
-                "0 = instant snapshot (no wait).\n"
+                "  timeout (int, optional, default=0): 0 = instant snapshot (recommended). Non-zero = wait up "
+                "to this many seconds (capped 120) for a change.\n"
                 "  stall_threshold (int, optional, default=120): flag an agent showing no progress this long.\n"
-                "Example: {\"tool_name\": \"gather_sub_agents\", \"parameters\": {\"timeout\": 120}}"
+                "Example: {\"tool_name\": \"gather_sub_agents\", \"parameters\": {}}"
             ),
         )
         self.worker = worker
@@ -262,28 +267,10 @@ class GatherSubAgents(BaseTool):
         return dir_name.split("-")[0]
 
     def _progress(self, agent_dir):
-        pj = agent_dir / "progress.json"
-        try:
-            if pj.exists():
-                frozen = (time.time() - pj.stat().st_mtime) > self.FREEZE_SECONDS
-                data = json.loads(pj.read_text(encoding="utf-8"))
-                return data.get("activity_age"), data.get("step"), data.get("iteration"), frozen
-        except Exception:
-            pass
-        tj = agent_dir / "telemetry.json"
-        try:
-            if tj.exists():
-                data = json.loads(tj.read_text(encoding="utf-8"))
-                ts = data.get("timestamp")
-                if ts:
-                    return max(0.0, time.time() - float(ts)), data.get("current_step"), data.get("iteration"), False
-        except Exception:
-            pass
-        for fname in ("pid.txt", "status.txt"):
-            p = agent_dir / fname
-            if p.exists():
-                return max(0.0, time.time() - p.stat().st_mtime), None, None, False
-        return None, None, None, False
+        """Delegate to the shared reader so gather and the principal's always-on
+        digest never disagree about what a student is doing."""
+        from aeon.core.sub_agent_state import read_progress
+        return read_progress(agent_dir, freeze_seconds=self.FREEZE_SECONDS)
 
     def execute(self, agent_ids=None, timeout=None, stall_threshold=None):
         if not self.worker:
@@ -331,11 +318,11 @@ class GatherSubAgents(BaseTool):
                 break
             if not running_now:
                 break
-            if any(self._progress(d)[3] for d in targets if d.name in running_now):
+            if any(self._progress(d)["frozen"] for d in targets if d.name in running_now):
                 break
             time.sleep(self.POLL_INTERVAL)
 
-        completed = failed = killed = stalled = frozen = healthy = 0
+        completed = failed = killed = stalled = frozen = looping = healthy = 0
         lines = []
         for d in targets:
             is_term, status, report = resolve(d)
@@ -354,16 +341,21 @@ class GatherSubAgents(BaseTool):
                     failed += 1
                     lines.append(f"[{sid}] {status}\n  {(report or '')[:600]}")
                 continue
-            age, step, it, is_frozen = self._progress(d)
+            pr = self._progress(d)
+            age, step, it, is_frozen, stuck = pr["age"], pr["step"], pr["iteration"], pr["frozen"], pr["stuck_reason"]
             age_str = f"{age:.0f}s ago" if age is not None else "unknown"
             sfx = (f" on '{step}'" if step else "") + (f" (iter {it})" if it else "")
             if is_frozen:
                 frozen += 1
                 lines.append(f"[{sid}] FROZEN - watchdog stopped responding (whole-process freeze). "
                              f"It cannot self-recover; kill_sub_agent(agent_id='{sid}') and proceed.")
+            elif stuck:
+                looping += 1
+                lines.append(f"[{sid}] LOOPING - {stuck} It is burning budget without progress; "
+                             f"steer_sub_agent(agent_id='{sid}') with a new approach, or kill_sub_agent.")
             elif age is not None and age > stall_threshold:
                 stalled += 1
-                lines.append(f"[{sid}] POSSIBLY STALLED - no progress for {age_str}{sfx}. "
+                lines.append(f"[{sid}] POSSIBLY STALLED - no progress for {age:.0f}s{sfx}. "
                              f"Confirm with get_sub_agent_report(agent_id='{sid}'), then steer or kill.")
             else:
                 healthy += 1
@@ -371,18 +363,22 @@ class GatherSubAgents(BaseTool):
                              f"Do other orthogonal work, or gather_sub_agents again with a non-zero timeout to wait.")
 
         header = (f"Check-in: {completed} completed, {failed} failed, {killed} killed, "
-                  f"{stalled} possibly stalled, {frozen} frozen, {healthy} healthy & running.")
+                  f"{stalled} possibly stalled, {looping} looping, {frozen} frozen, "
+                  f"{healthy} healthy & running.")
         if missing:
             header += f" (Requested but not found: {missing})"
         if frozen:
             footer = "\n\nAction: kill the FROZEN agent(s) - they cannot recover - then continue."
+        elif looping:
+            footer = ("\n\nAction: a LOOPING agent self-reported it is repeating itself. Steer it with a "
+                      "concretely different approach, or kill it if its work is no longer needed.")
         elif stalled:
             footer = ("\n\nAction: confirm stalls with get_sub_agent_report before acting (an agent may be on "
                       "a long legitimate step). If truly stuck, steer with a corrected approach or kill.")
         elif healthy:
-            footer = ("\n\nAction: agents are still running. Do orthogonal work, then gather again with a "
-                      "NON-ZERO timeout to actually wait for them. Do not finish the task until you have read "
-                      "each spawned agent's report.")
+            footer = ("\n\nAction: agents are still running and you can see them live in your SUB-AGENTS "
+                      "section each turn. Advance your OWN orthogonal work and steer them as needed; collect "
+                      "each report (get_sub_agent_report) before you finish the task. Don't idle-poll.")
         else:
             footer = ""
         return header + "\n\n" + "\n\n".join(lines) + footer
@@ -470,9 +466,10 @@ class GetSubAgentReport(BaseTool):
         else:
             report_str += "\n\n[No log data found yet.]"
 
-        report_str += ("\n\n[GUIDANCE] Still running. Don't re-poll every turn - do other orthogonal work, or "
-                       "gather_sub_agents with a non-zero timeout to wait. If stuck, steer_sub_agent or "
-                       "kill_sub_agent. Do not finish the task with this agent's report uncollected.")
+        report_str += ("\n\n[GUIDANCE] Still running. You see its live status every turn in your SUB-AGENTS "
+                       "section, so don't re-poll here each turn - advance your own orthogonal work. If it is "
+                       "drifting, steer_sub_agent; if its work is no longer needed, kill_sub_agent. Do not "
+                       "finish the task with this agent's report uncollected.")
         return report_str
 
 

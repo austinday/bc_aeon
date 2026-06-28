@@ -31,6 +31,13 @@ C_GREEN = '\033[95m'
 C_RESET = '\033[0m'
 C_BLUE = '\033[96m'
 
+# Tools through which the principal actively engages its sub-agents. Touching any
+# of them resets the "you're ignoring your students" idle nudge.
+SUB_AGENT_TOOLS = {
+    "spawn_sub_agent", "gather_sub_agents", "get_sub_agent_report",
+    "kill_sub_agent", "steer_sub_agent", "get_sub_agent_status",
+}
+
 
 class Worker:
     def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False, debug_log_path: Optional[str] = None):
@@ -62,7 +69,10 @@ class Worker:
         self._recent_commands = []  # Rolling window for loop detection
         self._recent_outputs = []   # Corresponding outputs for loop detection
         self.expanded_categories = set()  # Tracks which tool categories are currently expanded
-        self.notified_sub_agents = set()  # Tracks which sub-agent terminal states have been alerted to the main agent
+        self.notified_sub_agents = set()  # Tracks which sub-agent terminal results the principal has actively collected (read/gathered)
+        self.stuck_reason = None  # Set by loop-detection; a sub-agent publishes this so its principal sees it's looping
+        self._blackboard_seen = 0  # Line count of the shared blackboard at last digest, to report new findings
+        self._last_sub_agent_action_iter = 0  # Iteration the principal last engaged a sub-agent tool (for the idle nudge)
         self.open_files_access_order = []  # Tracks order of file access for LRU suggestions
         self.recent_intents = deque(maxlen=3)  # Tracks recent intents for loop detection
         self.prev_prompt_tokens = 0  # Tracks context size of previous iteration for growth metrics
@@ -364,6 +374,101 @@ class Worker:
             out.append(f"--- FILE: {_disp(path)}  (abs: {path}) ---\n{content}\n--- END FILE: {_disp(path)} ---")
         return "\n\n".join(out)
 
+    def _format_sub_agent_digest(self, current_iteration: int) -> str:
+        """Build the always-on SUB-AGENTS awareness block, injected EVERY turn.
+
+        This is the mechanism that lets the principal behave like an advisor
+        watching its graduate students instead of blocking to poll them: each
+        turn it passively sees every running agent's live step, activity age,
+        and stall/loop/freeze flags, plus any finished-but-unread reports and
+        new shared-blackboard findings -- with no blocking call. Returns '' when
+        there is nothing to report so the section disappears entirely.
+        """
+        from aeon.core.sub_agent_state import resolve, norm_status, read_progress
+        base = Path(os.getcwd()) / "aeon_output" / self.instance_id / "sub_agents"
+        if not base.exists():
+            return ""
+        dirs = [d for d in base.iterdir() if d.is_dir() and (d / "pid.txt").exists()]
+        if not dirs:
+            return ""
+
+        running = 0
+        flagged = False
+        lines = []
+        for d in sorted(dirs, key=lambda p: p.name):
+            sid = d.name.split("-")[0]
+            is_term, status, _ = resolve(d)
+            if is_term:
+                base_status = norm_status(status)
+                if f"{d.name}_{base_status}" in self.notified_sub_agents:
+                    continue  # already collected -> don't clutter the digest
+                if base_status == "COMPLETED":
+                    lines.append(f"- [{sid}] ✓ FINISHED, report UNREAD — "
+                                 f"read it now with get_sub_agent_report(agent_id='{sid}').")
+                elif base_status == "KILLED":
+                    lines.append(f"- [{sid}] KILLED (uncollected).")
+                else:
+                    lines.append(f"- [{sid}] ✗ {status} (unread) — "
+                                 f"get_sub_agent_report(agent_id='{sid}').")
+                continue
+            running += 1
+            pr = read_progress(d)
+            age = pr["age"]
+            age_str = f"{age:.0f}s ago" if age is not None else "unknown"
+            sfx = (f" on '{pr['step']}'" if pr["step"] else "") + \
+                  (f" (iter {pr['iteration']})" if pr["iteration"] else "")
+            if pr["frozen"]:
+                flagged = True
+                lines.append(f"- [{sid}] ⚠ FROZEN — stopped heartbeating; it cannot recover. "
+                             f"kill_sub_agent(agent_id='{sid}').")
+            elif pr["stuck_reason"]:
+                flagged = True
+                lines.append(f"- [{sid}] ⚠ LOOPING — {pr['stuck_reason']} "
+                             f"steer_sub_agent(agent_id='{sid}', guidance=...) with a new approach, or kill_sub_agent.")
+            elif age is not None and age > 180:
+                flagged = True
+                lines.append(f"- [{sid}] ⚠ STALLED — no progress for {age:.0f}s{sfx}. "
+                             f"Confirm with get_sub_agent_report, then steer_sub_agent or kill_sub_agent.")
+            else:
+                lines.append(f"- [{sid}] RUNNING (healthy) — last progress {age_str}{sfx}.")
+
+        if not lines:
+            return ""
+
+        out = [
+            "**SUB-AGENTS** (your dispatched graduate students; you are their advisor). "
+            "Review this EVERY turn: steer the ones drifting, read finished reports, relay useful "
+            "findings between them, and meanwhile keep advancing your OWN orthogonal work. There is "
+            "NO blocking wait — never sit idle just because students are running."
+        ]
+        out.extend(lines)
+
+        # New shared-blackboard findings since the last turn.
+        try:
+            bb = Path(os.getcwd()) / "aeon_output" / "blackboard.jsonl"
+            if bb.exists():
+                with bb.open("r", encoding="utf-8") as f:
+                    count = sum(1 for _ in f)
+                new = count - self._blackboard_seen
+                self._blackboard_seen = count
+                if new > 0:
+                    out.append(f"→ {new} new finding(s) on the shared blackboard since last turn "
+                               f"— call blackboard_read, then relay anything relevant to the right student via steer_sub_agent.")
+        except Exception:
+            pass
+
+        # Engagement nudge: students running but unsupervised for several turns.
+        idle_turns = current_iteration - self._last_sub_agent_action_iter
+        if running and idle_turns >= 3:
+            out.append(f"→ {running} student(s) have been running for {idle_turns} turns without you "
+                       f"engaging them. Check their progress and steer/redirect as needed, or push your own "
+                       f"orthogonal work forward — do not leave them unsupervised.")
+        elif flagged:
+            out.append("→ Flagged students above need attention: steer them with a corrected approach, "
+                       "or kill_sub_agent the ones whose work you no longer need.")
+
+        return "\n".join(out)
+
     def _format_memories(self) -> str:
         if not self.memories:
             return "No memories recorded yet."
@@ -449,6 +554,9 @@ class Worker:
         self.notified_sub_agents.clear()
         self.active_skill = None
         self.effective_iterations = 0
+        self.stuck_reason = None
+        self._blackboard_seen = 0
+        self._last_sub_agent_action_iter = 0
 
     def serialize_state(self) -> dict:
         """Serialize worker state for persistence across restarts."""
@@ -524,7 +632,7 @@ class Worker:
     def _build_primary_agent_context(self, tool_list_str: str, system_specs: str,
                                      memories_str: str, objective: str, open_files_str: str,
                                      active_tool_directives: str, attempt_log_str: str,
-                                     context_diagnostics: str = "") -> str:
+                                     context_diagnostics: str = "", sub_agent_digest: str = "") -> str:
         """Build the full context prompt for the Primary Agent."""
         reminders_section = f"**IMPORTANT REMINDERS**\n{self.important_reminders}\n\n" if self.important_reminders.strip() else ""
 
@@ -535,6 +643,8 @@ class Worker:
 
         skills_text = self._get_skills_description()
         active_skill_section = self._format_active_skill()
+
+        sub_agent_section = f"\n{sub_agent_digest}\n" if sub_agent_digest else ""
 
         return f"""{self.base_directives}
 
@@ -565,7 +675,7 @@ class Worker:
 
 **LAST STEP RESULT**
 {self.last_observation}
-{active_skill_section}
+{sub_agent_section}{active_skill_section}
 {PRIMARY_AGENT_INSTRUCTIONS}
 
 {objective_text}"""
@@ -690,25 +800,15 @@ class Worker:
                         log_text = "\n\n".join(older_history)
                         self.action_log_summary = self.llm_client.compress_action_log(log_text)
 
-                # --- SUB-AGENT NOTIFICATION CHECK ---
-                sub_agent_dir = Path(os.getcwd()) / "aeon_output" / self.instance_id / "sub_agents"
-                if sub_agent_dir.exists():
-                    for agent_dir in sub_agent_dir.iterdir():
-                        if agent_dir.is_dir():
-                            status_path = agent_dir / "status.txt"
-                            if status_path.exists():
-                                status = status_path.read_text().strip()
-                                if status in ["COMPLETED", "FAILED", "KILLED"]:
-                                    state_key = f"{agent_dir.name}_{status}"
-                                    if state_key not in self.notified_sub_agents:
-                                        notification = f"\n[SYSTEM ALERT] Sub-agent {agent_dir.name} has transitioned to status: {status}. Use get_sub_agent_report to review its findings."
-                                        self.last_observation += notification
-                                        self.notified_sub_agents.add(state_key)
-                                        # Cleanup status file now that agent has been notified
-                                        try:
-                                            status_path.unlink()
-                                        except Exception as e:
-                                            self.logger.error(f"Failed to cleanup status file {status_path}: {e}")
+                # --- SUB-AGENT AWARENESS DIGEST ---
+                # Passive, always-on. Built every turn and injected into the prompt
+                # so the principal continuously SEES what its students are doing
+                # (and which need steering/reading) without any blocking poll. This
+                # replaces the old fire-once "[SYSTEM ALERT]" notification, which
+                # only fired on terminal transitions and prematurely marked agents
+                # "collected". notified_sub_agents is now set ONLY when the principal
+                # actively reads a report (gather/get_sub_agent_report).
+                sub_agent_digest = self._format_sub_agent_digest(iteration)
 
                 # --- PRE-PROMPT CONTEXT ANALYSIS ---
                 # We estimate the prompt size first to determine pressure and dynamic limits
@@ -785,7 +885,8 @@ class Worker:
 
                 prompt = self._build_primary_agent_context(
                     tool_list_str, system_specs, memories_str, objective, open_files_str, 
-                    active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str
+                    active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
+                    sub_agent_digest=sub_agent_digest
                 )
 
                 if max_iterations is not None:
@@ -898,6 +999,7 @@ class Worker:
                 actions_taken_str = []
                 full_actions_taken_str = []
                 user_input_handled = False
+                completion_blocked = False
 
                 if len(actions) > 15:
                     actions = actions[:15]
@@ -925,7 +1027,12 @@ class Worker:
                     if tool_name not in self.tools:
                         combined_summary_parts.append(f"Action {idx+1}: Tool '{tool_name}' not found.")
                         continue
-                    
+
+                    # Track active engagement with sub-agents so the idle nudge can
+                    # tell when students are being left to drift unsupervised.
+                    if tool_name in SUB_AGENT_TOOLS:
+                        self._last_sub_agent_action_iter = iteration
+
                     full_action_desc = f"{tool_name}({params})" if params else f"{tool_name}()"
                     display_action_desc = f"{tool_name}({str(params)[:40]}...)" if params else f"{tool_name}()"
                     actions_taken_str.append(display_action_desc)
@@ -935,6 +1042,38 @@ class Worker:
                     self.print_func(f"{C_BLUE}\u25B6 [{idx+1}/{len(actions)}] {self._summarize_action(tool_name, params)}{C_RESET}")
 
                     if tool_name in terminal_tools:
+                        # HARD GUARD: don't let the principal finish while it still has
+                        # dispatched students running or finished-but-unread. It must
+                        # either collect their reports or, if it no longer needs the
+                        # work, explicitly release them with kill_sub_agent.
+                        if tool_name == "task_complete":
+                            from aeon.tools.sub_agent import uncollected_sub_agents
+                            sa_base = Path(os.getcwd()) / "aeon_output" / self.instance_id / "sub_agents"
+                            pending = uncollected_sub_agents(sa_base, self.notified_sub_agents)
+                            if pending:
+                                still_running = [sid for sid, st in pending if st == "RUNNING"]
+                                unread = [(sid, st) for sid, st in pending if st != "RUNNING"]
+                                parts = ["COMMAND BLOCKED: you cannot task_complete while dispatched sub-agents are unresolved."]
+                                if still_running:
+                                    parts.append(
+                                        "Still RUNNING: " + ", ".join(still_running) +
+                                        ". Either let them finish and read their reports (get_sub_agent_report), "
+                                        "or — if you ALREADY have what you need and no longer want their work — "
+                                        "release each with kill_sub_agent(agent_id=...).")
+                                if unread:
+                                    parts.append(
+                                        "Finished but UNREAD: " + ", ".join(f"{sid}({st})" for sid, st in unread) +
+                                        ". Read each with get_sub_agent_report before finishing.")
+                                parts.append("Resolve every student (collect or kill), THEN call task_complete.")
+                                block_msg = " ".join(parts)
+                                self.print_func(f"{C_RED}{block_msg}{C_RESET}")
+                                self.last_observation = block_msg
+                                self.action_log.append(
+                                    f"[Iter {iteration}]\n- Intent: {intent}\n- Actions: task_complete\n"
+                                    f"- Result: BLOCKED — unresolved sub-agents ({[sid for sid, _ in pending]}). "
+                                    f"Collect or kill them first.")
+                                completion_blocked = True
+                                break
                         try:
                             tool = self.tools[tool_name]
                             result_str = str(tool.execute(**params))
@@ -1030,6 +1169,12 @@ class Worker:
                 if user_input_handled:
                     continue
 
+                # task_complete was blocked (unresolved sub-agents). last_observation
+                # already holds the block message; loop so the principal acts on it.
+                if completion_blocked:
+                    self.pending_iteration_state = None
+                    continue
+
                 # Deterministic truncation — raw output preserved, no LLM interpretation
                 if not combined_summary_parts:
                     raw_output = "No actions produced output."
@@ -1052,9 +1197,11 @@ class Worker:
                     self._recent_commands.pop(0)
                     self._recent_outputs.pop(0)
                 # Check for repeated identical command+output pairs
+                loop_detected = False
                 if len(self._recent_commands) >= self.REPEAT_THRESHOLD:
                     recent_pairs = list(zip(self._recent_commands[-self.REPEAT_THRESHOLD:], self._recent_outputs[-self.REPEAT_THRESHOLD:]))
                     if len(set(recent_pairs)) == 1:
+                        loop_detected = True
                         repeat_count = self.REPEAT_THRESHOLD
                         # Count actual streak length
                         for i in range(len(self._recent_commands) - 1, -1, -1):
@@ -1062,6 +1209,11 @@ class Worker:
                                 repeat_count = len(self._recent_commands) - i
                             else:
                                 break
+                        # Publish the loop so that, IF this worker is a sub-agent, its
+                        # principal sees a LOOPING flag in the digest (a fast loop keeps
+                        # the heartbeat fresh, so it would otherwise look healthy).
+                        self.stuck_reason = (f"self-reported loop: ran the same command(s) {repeat_count}x "
+                                             f"with identical output.")
                         loop_warning = (
                             f"\n\n** LOOP DETECTED: You have run the SAME command(s) {repeat_count} times in a row "
                             f"and received IDENTICAL output each time. The situation is NOT changing. **\n"
@@ -1073,7 +1225,11 @@ class Worker:
                         )
                         self.last_observation += loop_warning
                         self.print_func(f"{C_RED}{loop_warning}{C_RESET}")
-                
+                if not loop_detected:
+                    # Progress was made (commands/outputs changed) -> clear any prior
+                    # loop flag so a recovered sub-agent stops showing as LOOPING.
+                    self.stuck_reason = None
+
                 # Cache the pending iteration state to be finalized next iteration
                 self.pending_iteration_state = {
                     'iter': iteration,

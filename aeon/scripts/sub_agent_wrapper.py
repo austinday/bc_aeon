@@ -65,7 +65,7 @@ def main():
     done_event = threading.Event()
     rt.reset()
     started_at = time.time()
-    current_step = {"iteration": 0, "step": "initializing"}
+    current_step = {"iteration": 0, "step": "initializing", "stuck_reason": None}
 
     # Only ever group-kill if WE are the group leader. verify_self_modification
     # launches this wrapper inside the PRIMARY's process group; a killpg there
@@ -99,6 +99,7 @@ def main():
                 "wallclock": round(time.time() - started_at, 1),
                 "iteration": current_step["iteration"],
                 "step": current_step["step"],
+                "stuck_reason": current_step.get("stuck_reason"),
             })
         except Exception:
             pass
@@ -184,6 +185,10 @@ def main():
         rt.touch()
         current_step["iteration"] = iteration
         current_step["step"] = step_description
+        # Surface the sub-agent's OWN loop-detector to the principal: a student
+        # spinning on an identical command keeps touching the heartbeat, so it
+        # never looks "stalled" -- this is how the principal learns it's looping.
+        current_step["stuck_reason"] = getattr(worker, "stuck_reason", None)
         try:
             rt.atomic_write_json(telemetry_path, {
                 "agent_id": args.agent_id,
