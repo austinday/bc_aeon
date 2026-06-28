@@ -1,5 +1,6 @@
-Opens a URL in a real, human-like Chromium browser (headed, stealthed, with a PERSISTENT profile — so logins and cookies survive across steps and runs; if you logged into a site before, you are likely still logged in). Returns an observation: the page's INTERACTIVE ELEMENTS as a stable numbered list you act on by [id], the scroll state, a numbered ("Set-of-Mark") screenshot, and a vision analysis. Use distinct tab_ids to keep several pages open at once.
+Opens a URL in a real, human-like browser (real Google Chrome, headed, stealthed via Patchright, with a PERSISTENT profile — so logins and cookies survive across steps and runs; if you logged into a site before, you are likely still logged in). Returns an observation: the page's INTERACTIVE ELEMENTS as a stable numbered list you act on by [id], the scroll state, a numbered ("Set-of-Mark") screenshot, and a vision analysis. Use distinct tab_ids to keep several pages open at once.
 Schema:
   url (str, required): The URL to open (scheme optional; 'https://' is added if missing).
   tab_id (str, optional, default="default"): A name for this tab (e.g. 'gmail', 'search'). Reuse the same tab_id with browser_interact/browser_read to keep working on that page; use browser_switch_tab to return to it without reloading.
+  include_vision (bool, optional, default true): set false to skip the screenshot vision analysis for a faster load when the element list alone is enough.
 Example: {"tool_name": "browser_navigate", "parameters": {"url": "https://mail.google.com", "tab_id": "gmail"}}

@@ -21,6 +21,7 @@ Schema:
   element_id (int): the [id] from the element list.
   text (str): for 'type'. expected_text (str): for clicks — a substring you expect in the target's name; the click is REFUSED if it doesn't match, preventing wrong-element clicks.
   tab_id (str, default 'default'): which tab to act on.
+  include_vision (bool, default true): leave on when you need to SEE the page (layout, images, CAPTCHAs, visual state). Set false for a FASTER turn when the element list alone is enough (e.g. plain scrolling, typing, simple navigation) — it skips the screenshot vision analysis.
 
 Aliases accepted: scroll_down, scroll_up, scroll_to_top, scroll_to_bottom, enter.
 

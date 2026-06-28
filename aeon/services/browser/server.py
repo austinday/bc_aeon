@@ -51,8 +51,7 @@ PROFILE_DIR = os.environ.get("AEON_BROWSER_PROFILE", "/profiles/default")
 TIMEZONE = os.environ.get("AEON_BROWSER_TZ", "America/Los_Angeles")
 LOCALE = os.environ.get("AEON_BROWSER_LOCALE", "en-US")
 MAX_INDEXED_ELEMENTS = 250
-NAV_SETTLE_MS = 2500          # bounded "networkidle" wait so SPAs never hang us
-ACTION_SETTLE_MS = 600        # let the DOM react after an action before re-reading
+ACTION_SETTLE_MS = 500        # let the DOM react after an action before re-reading
 
 # --- Global state -----------------------------------------------------------
 _playwright = None
@@ -94,14 +93,6 @@ _EXTRACT_JS = r"""
   // Semantic, non-interactive containers worth surfacing (e.g. inbox rows).
   const SEMANTIC = '[role=row],[role=listitem],[role=article],[role=heading],[role=gridcell],[role=cell]';
 
-  function isVisible(el) {
-    const s = window.getComputedStyle(el);
-    if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity || '1') === 0) return false;
-    const r = el.getBoundingClientRect();
-    if (r.width < 2 || r.height < 2) return false;
-    // Off-screen far above/below is fine (scrollable) but fully zero-area is not.
-    return true;
-  }
   function inViewport(r) {
     return r.bottom > 0 && r.right > 0 && r.top < (window.innerHeight || 0) && r.left < (window.innerWidth || 0);
   }
@@ -167,32 +158,37 @@ _EXTRACT_JS = r"""
     return null;
   }
 
+  // Single pass: read each candidate's style + rect EXACTLY ONCE (avoids the
+  // O(n log n) getBoundingClientRect reflow storm a sort comparator would cause
+  // on a page with thousands of nodes).
   const seen = new Set();
-  const nodes = [];
+  const cands = [];
   document.querySelectorAll(INTERACTIVE + ',' + SEMANTIC).forEach(el => {
     if (seen.has(el)) return;
     seen.add(el);
-    if (!isVisible(el)) return;
-    nodes.push(el);
+    const s = window.getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity || '1') === 0) return;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return;
+    cands.push({ el: el, r: r });
   });
 
-  // Sort top-to-bottom, left-to-right for stable, readable numbering.
-  nodes.sort((a, b) => {
-    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-    const dy = (ra.top + window.scrollY) - (rb.top + window.scrollY);
+  // Sort top-to-bottom, left-to-right on the precomputed rects (no reflow).
+  cands.sort((a, b) => {
+    const dy = a.r.top - b.r.top;
     if (Math.abs(dy) > 8) return dy;
-    return ra.left - rb.left;
+    return a.r.left - b.r.left;
   });
 
   const results = [];
   let id = 0;
   let scId = 0;
   const scMap = new Map();
-  for (const el of nodes) {
+  for (const cand of cands) {
     if (id >= maxEls) break;
+    const el = cand.el, r = cand.r;
     id += 1;
     el.setAttribute('data-aeon-id', String(id));
-    const r = el.getBoundingClientRect();
     const sc = scrollableAncestor(el);
     let scKey = null;
     if (sc) {
@@ -413,18 +409,31 @@ async def _press_and_hold(page: Page, locator, duration_ms: int):
 # Observation (screenshots + structured snapshot)
 # ============================================================================
 
-async def _settle(page: Page, ms: int):
-    """Best-effort wait that NEVER hangs: domcontentloaded, then a bounded
-    networkidle, then a tiny fixed pause for SPA paints."""
+async def _settle_nav(page: Page):
+    """Wait for a real page load WITHOUT hanging. domcontentloaded is the true
+    signal; networkidle is only a short, bounded bonus because SPAs that keep a
+    socket open (Gmail, chat apps) never reach networkidle and would otherwise
+    burn the full timeout every navigation."""
     try:
-        await page.wait_for_load_state("domcontentloaded", timeout=ms)
+        await page.wait_for_load_state("domcontentloaded", timeout=8000)
     except PWError:
         pass
     try:
-        await page.wait_for_load_state("networkidle", timeout=ms)
+        await page.wait_for_load_state("networkidle", timeout=1500)
     except PWError:
         pass
     await asyncio.sleep(0.2)
+
+
+async def _settle_action(page: Page):
+    """Light settle after an in-page interaction: if the action navigated,
+    domcontentloaded fires; if it only mutated the DOM, this returns ~instantly.
+    Deliberately NO networkidle wait — that is the main per-action latency sink."""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=4000)
+    except PWError:
+        pass
+    await asyncio.sleep(ACTION_SETTLE_MS / 1000)
 
 
 async def _extract(page: Page, session_id: str, tab_id: str) -> Dict[str, Any]:
@@ -525,7 +534,7 @@ async def navigate(req: NavigateRequest):
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
     except PWError as e:
         return {"status": "error", "msg": f"Navigation to {url} failed: {e}"}
-    await _settle(page, NAV_SETTLE_MS)
+    await _settle_nav(page)
     return await _build_response(page, req.session_id, req.tab_id)
 
 
@@ -555,15 +564,15 @@ async def interact(req: InteractRequest):
     try:
         if a in ("go_back", "back"):
             await page.go_back(wait_until="domcontentloaded")
-            await _settle(page, NAV_SETTLE_MS)
+            await _settle_nav(page)
             return await _build_response(page, req.session_id, req.tab_id)
         if a in ("go_forward", "forward"):
             await page.go_forward(wait_until="domcontentloaded")
-            await _settle(page, NAV_SETTLE_MS)
+            await _settle_nav(page)
             return await _build_response(page, req.session_id, req.tab_id)
         if a in ("reload", "refresh"):
             await page.reload(wait_until="domcontentloaded")
-            await _settle(page, NAV_SETTLE_MS)
+            await _settle_nav(page)
             return await _build_response(page, req.session_id, req.tab_id)
         if a == "press_key":
             if not req.key:
@@ -637,8 +646,7 @@ async def interact(req: InteractRequest):
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported action: {a}")
 
-        await asyncio.sleep(ACTION_SETTLE_MS / 1000)
-        await _settle(page, NAV_SETTLE_MS)
+        await _settle_action(page)
         return await _build_response(page, req.session_id, req.tab_id)
 
     except HTTPException:

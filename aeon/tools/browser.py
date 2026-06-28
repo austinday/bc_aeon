@@ -162,7 +162,7 @@ def _format_scroll(page_state):
         return ""
 
 
-def process_browser_response(data, action_desc, session_id, tab_id):
+def process_browser_response(data, action_desc, session_id, tab_id, include_vision=True):
     if data.get("status") == "error":
         return f"Browser Error during {action_desc}: {data.get('msg')}"
 
@@ -191,24 +191,26 @@ def process_browser_response(data, action_desc, session_id, tab_id):
     open_tabs_str = ", ".join(open_tabs) if open_tabs else tab_id
 
     # --- Vision channel (real Set-of-Mark overlay) ---
-    # The numbered red boxes in the overlay now correspond EXACTLY to the [id]s in
-    # the element list above, so vision and the structured view agree.
-    vision_prompt = (
-        "This screenshot of a web page has numbered, colored boxes drawn over the interactive "
-        "elements; each number is that element's id. Describe what is visible and useful: the "
-        "overall layout, the main content, and which numbered elements correspond to key items "
-        "(links, buttons, fields, list rows). "
-        f"The action just performed was '{action_desc}'. Note any visible state change it caused "
-        "(a menu opening, a panel appearing, a field filling, an error). Explicitly flag any "
-        "CAPTCHA, 'verify you are human' check, cookie/consent wall, or loading spinner that is "
-        "blocking the page."
-    )
-    try:
-        vision_analysis = AnalyzeImageTool().execute(
-            image_path=overlay_path, prompt=vision_prompt, auto_cleanup=False
+    # The full element text/roles/state are already in the structured list above,
+    # so vision's job is only a FAST, concise visual check: layout + blockers +
+    # what visibly changed. The short max_tokens keeps this off the critical path.
+    if include_vision:
+        vision_prompt = (
+            "Numbered colored boxes mark interactive elements (each number is that element's id; "
+            "the full element list is provided separately, so do NOT enumerate them). In 2-4 short "
+            f"sentences: describe the visual layout, state what visibly changed after '{action_desc}', "
+            "and explicitly flag any CAPTCHA / 'verify you are human' / cookie-or-consent wall / "
+            "login prompt / loading spinner blocking the page. Be concise."
         )
-    except Exception as e:
-        vision_analysis = f"Vision analysis unavailable: {e}"
+        try:
+            vision_analysis = AnalyzeImageTool().execute(
+                image_path=overlay_path, prompt=vision_prompt, auto_cleanup=False,
+                max_tokens=384, temperature=0.1,
+            )
+        except Exception as e:
+            vision_analysis = f"Vision analysis unavailable: {e}"
+    else:
+        vision_analysis = "(vision skipped this step for speed; call browser_read with include_vision=true for a visual check.)"
 
     return (
         f"--- BROWSER: {action_desc} (tab '{tab_id}') ---\n"
@@ -224,7 +226,7 @@ def process_browser_response(data, action_desc, session_id, tab_id):
     )
 
 
-def _post(endpoint, payload, action_desc, tab_id, timeout=90):
+def _post(endpoint, payload, action_desc, tab_id, timeout=90, include_vision=True):
     try:
         ensure_browser_running()
         resp = requests.post(f"{BROWSER_API_URL}/{endpoint}", json=payload, timeout=timeout)
@@ -235,7 +237,8 @@ def _post(endpoint, payload, action_desc, tab_id, timeout=90):
             except Exception:
                 detail = resp.text
             return f"Browser action failed ({action_desc}): HTTP {resp.status_code}: {detail}"
-        return process_browser_response(resp.json(), action_desc, payload.get("session_id"), tab_id)
+        return process_browser_response(resp.json(), action_desc, payload.get("session_id"),
+                                        tab_id, include_vision=include_vision)
     except Exception as e:
         return f"Error during {action_desc}: {type(e).__name__}: {e}"
 
@@ -244,11 +247,11 @@ class BrowserNavigateTool(BaseTool):
     def __init__(self, worker=None):
         super().__init__(name="browser_navigate", description=TOOL_DESC_BROWSER_NAVIGATE)
 
-    def execute(self, url: str, tab_id: str = "default", **kwargs) -> str:
+    def execute(self, url: str, tab_id: str = "default", include_vision: bool = True, **kwargs) -> str:
         if not url:
             return "Error: 'url' is required."
         return _post("navigate", {"session_id": _session_id(), "tab_id": tab_id, "url": url},
-                     f"Navigated to {url}", tab_id)
+                     f"Navigated to {url}", tab_id, include_vision=include_vision)
 
 
 class BrowserInteractTool(BaseTool):
@@ -260,7 +263,7 @@ class BrowserInteractTool(BaseTool):
                 value: str = None, file_path: str = None, amount: int = None,
                 direction: str = None, to_element_id: int = None,
                 clear_first: bool = True, then_enter: bool = False,
-                duration: int = 2000, **kwargs) -> str:
+                duration: int = 2000, include_vision: bool = True, **kwargs) -> str:
         if not action:
             return "Error: 'action' is required."
         # Friendly aliases so common phrasings just work.
@@ -283,7 +286,7 @@ class BrowserInteractTool(BaseTool):
             "clear_first": clear_first, "then_enter": then_enter, "duration": duration,
         }
         desc = f"{action}" + (f" on [{element_id}]" if element_id is not None else "")
-        return _post("interact", payload, desc, tab_id)
+        return _post("interact", payload, desc, tab_id, include_vision=include_vision)
 
 
 class BrowserReadTool(BaseTool):
@@ -295,12 +298,15 @@ class BrowserReadTool(BaseTool):
                 "scroll state, and a numbered screenshot. Use it after a page updates on its own, "
                 "when element ids feel stale, or to re-orient before choosing the next action.\n"
                 "Schema:\n  tab_id (str, optional, default='default'): the tab to read.\n"
+                "  include_vision (bool, optional, default true): set false to skip the screenshot "
+                "vision analysis for a faster read when the element list alone is enough.\n"
                 "Example: {\"tool_name\": \"browser_read\", \"parameters\": {\"tab_id\": \"gmail\"}}"
             ),
         )
 
-    def execute(self, tab_id: str = "default", **kwargs) -> str:
-        return _post("observe", {"session_id": _session_id(), "tab_id": tab_id}, "Read page", tab_id)
+    def execute(self, tab_id: str = "default", include_vision: bool = True, **kwargs) -> str:
+        return _post("observe", {"session_id": _session_id(), "tab_id": tab_id}, "Read page", tab_id,
+                     include_vision=include_vision)
 
 
 class BrowserCloseTabTool(BaseTool):

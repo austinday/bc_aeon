@@ -116,7 +116,8 @@ class AnalyzeImageTool(BaseTool):
         b64 = base64.b64encode(buffer.read()).decode('utf-8')
         return b64, 'image/jpeg'
 
-    def execute(self, image_path: str, prompt: str, auto_cleanup: bool = True) -> str:
+    def execute(self, image_path: str, prompt: str, auto_cleanup: bool = True,
+                max_tokens: int = 1024, temperature: float = 0.2) -> str:
         if not image_path:
             return "Error: 'image_path' parameter is required."
         if not prompt:
@@ -191,11 +192,15 @@ class AnalyzeImageTool(BaseTool):
                 }
             ]
 
+            # Generation length dominates vision latency. Callers that already
+            # have the page text (e.g. the browser's structured snapshot) pass a
+            # small max_tokens for a fast, concise visual summary; standalone
+            # image analysis keeps a larger budget.
             payload = {
                 'model': 'Qwen3.6-35B-A3B-VL',
                 'messages': messages,
-                'max_tokens': 2048,
-                'temperature': 0.3,
+                'max_tokens': int(max_tokens),
+                'temperature': float(temperature),
             }
 
             print("Sending request to vision server...")

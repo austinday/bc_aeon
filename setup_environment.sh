@@ -128,6 +128,24 @@ if [[ -f "$RAW_MTP_ASSISTANT" && ! -f "$NORM_MTP_ASSISTANT" ]]; then
         || { rm -f "$NORM_MTP_ASSISTANT"; echo "WARNING: MTP assistant normalization failed (will retry at runtime)"; }
 fi
 
+# Pre-cache the abliterated Gemma-4 NVFP4 build (the vLLM catalog entry) and its MTP
+# draft into the HF hub cache that the vLLM launcher mounts, so the first agent launch
+# doesn't pay a ~20 GB download. VRAM-gated like the catalog loop above; if skipped, the
+# vLLM launcher still fetches at runtime. The downloader's chown step also repairs the
+# (root-owned) ~/.cache/huggingface so the host user can manage it afterwards.
+# NOTE: google/gemma-4-31B-it-assistant may be gated -- accept its terms once with the
+# account that owns your HF token before running setup, or this phase will fail.
+if python3 -c "import sys; sys.exit(0 if float('${MIN_VRAM}')>0 else 1)" 2>/dev/null \
+   && python3 -c "import sys; sys.exit(0 if 21.0 <= 1.5*float('${MIN_VRAM}') else 1)" 2>/dev/null; then
+    log_step "PHASE 5.6c: Pre-cache Gemma-4-31B NVFP4 (abliterated) + assistant draft for vLLM"
+    HF_HUB_CACHE_DIR="$HOME/.cache/huggingface"
+    mkdir -p "$HF_HUB_CACHE_DIR"
+    GEMMA4_NVFP4_CMD="hf download aday777/gemma-4-31B-it-abliterated-NVFP4 && \
+         hf download google/gemma-4-31B-it-assistant"
+    run_downloader "$HF_HUB_CACHE_DIR/.aeon_gemma4_nvfp4_state" "$SETUP_VERSION:gemma4-nvfp4-vllm" \
+        "$HF_HUB_CACHE_DIR:/root/.cache/huggingface" "$GEMMA4_NVFP4_CMD"
+fi
+
 if [[ "$LITE_MODE" != "true" ]]; then
     log_step "PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF (Q4_K_M for the dedicated GPU1 vision server)"
     QWEN36_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
