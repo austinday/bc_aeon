@@ -986,14 +986,29 @@ def _execute_restart(session, worker=None):
 
 def cli():
     cleanup_ghost_llamacpp_containers()
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        prog='aeon',
+        description='Aeon — an autonomous, self-modifying agent harness. '
+                    'Runs a single LLM in a plan/act loop with collapsible tools, '
+                    'skills, sub-agents, and persistent memory.',
+        epilog='Examples:\n'
+               '  python3 -m aeon.main --model gemini-flash-latest --start "Summarize the repo"\n'
+               '  python3 -m aeon.main --start "Build X" --max-iterations 40\n',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument('--debug', action='store_true', help='Enable detailed LLM call logging to ~/')
     parser.add_argument('--debug-log', type=str, help='Path to the reasoning trace log file (JSONL)')
     parser.add_argument('--model', type=str, help='Model name - skips menu')
     parser.add_argument('--start', type=str, help='Initial objective to start immediately')
+    parser.add_argument('--max-iterations', type=int, default=None,
+                        help='Cap iterations per objective; the agent is forced to deliver a final '
+                             'report at the limit. Default: unbounded.')
     parser.add_argument('--no-warmup', action='store_true', help='Skip model warmup (faster startup, slower first query)')
     parser.add_argument('--resume', type=str, default=None, help='Path to restart state file (used internally by restart_aeon)')
     args = parser.parse_args()
+
+    if args.max_iterations is not None and args.max_iterations < 1:
+        parser.error('--max-iterations must be a positive integer')
 
     # --- Enumerate local models (start brain if needed) ---
     local_models = []
@@ -1116,7 +1131,7 @@ def cli():
                 obj = resume_state.get('objective', '')
                 print(f"[RESUME] State restored. Continuing objective: {obj}")
                 while obj:
-                    worker.run(obj)
+                    worker.run(obj, max_iterations=args.max_iterations)
                     obj = _execute_restart(session, worker)
             except Exception as e:
                 print(f"[RESUME] Failed to restore state: {e}. Starting fresh.")
@@ -1128,7 +1143,7 @@ def cli():
         if args.start:
             obj = args.start
             while obj:
-                worker.run(obj)
+                worker.run(obj, max_iterations=args.max_iterations)
                 obj = _execute_restart(session, worker)
 
         while True:
@@ -1137,7 +1152,7 @@ def cli():
                 if obj.strip(): 
                     if obj.strip() in ['exit', 'quit']: break
                     while obj:
-                        worker.run(obj)
+                        worker.run(obj, max_iterations=args.max_iterations)
                         obj = _execute_restart(session, worker)
             except (KeyboardInterrupt, EOFError):
                 print("\n")
