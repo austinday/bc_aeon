@@ -1098,7 +1098,22 @@ class Worker:
                     self.print_func(f"{C_RED}No actions returned by agent.{C_RESET}")
                     self.last_observation = "Error: You returned an empty action list. You must take at least one action."
                     continue
-                
+
+                # A terminal tool (task_complete/restart_aeon) returns immediately
+                # and drops any actions queued AFTER it. Models often place
+                # task_complete first with the deliverable (say_to_user) after it,
+                # which would lose the deliverable. Stably move terminal tools to
+                # the END so every other action this turn still runs first.
+                def _is_terminal(a):
+                    return (a.get("tool_name") or "").strip() in terminal_tools
+
+                if any(_is_terminal(a) for a in actions) and not _is_terminal(actions[-1]):
+                    non_terminal = [a for a in actions if not _is_terminal(a)]
+                    terminal = [a for a in actions if _is_terminal(a)]
+                    if non_terminal:
+                        self.print_func(f"{C_YELLOW}Reordered: running {len(non_terminal)} action(s) before the terminal tool so nothing queued after it is lost.{C_RESET}")
+                    actions = non_terminal + terminal
+
                 self.effective_iterations += 1
 
                 # Resolve pending iteration state now that we have the summary
