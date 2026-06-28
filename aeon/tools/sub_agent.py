@@ -128,14 +128,47 @@ class SpawnSubAgent(BaseTool):
                 n += 1
         return n
 
+    def _running_objective_match(self, norm_objective):
+        """Return the short id of a still-running sub-agent whose objective
+        normalizes to the same text, or None. Guards against duplicate spawns."""
+        if not self.output_dir.exists():
+            return None
+        for d in self.output_dir.iterdir():
+            if not (d.is_dir() and (d / "pid.txt").exists() and not resolve(d)[0]):
+                continue
+            obj_file = d / "objective.txt"
+            if not obj_file.exists():
+                continue
+            try:
+                existing = " ".join(obj_file.read_text(encoding="utf-8").split()).lower()
+            except OSError:
+                continue
+            if existing == norm_objective:
+                return d.name[:8]
+        return None
+
     def execute(self, objective, time_budget_minutes=None, max_iterations=None, stall_timeout_seconds=None):
         if not self.worker:
             return "COMMAND FAILED: Worker context missing."
+
+        if not objective or not str(objective).strip():
+            return ("COMMAND FAILED: 'objective' is empty. A sub-agent needs a complete, self-contained "
+                    "task description (what to do, where, and what 'done' looks like).")
+        objective = str(objective)
 
         running = self._running_count()
         if running >= self.MAX_CONCURRENT:
             return (f"COMMAND FAILED: Maximum concurrent sub-agents ({self.MAX_CONCURRENT}) reached. "
                     f"Wait/collect with gather_sub_agents or free one with kill_sub_agent.")
+
+        # Prevent accidentally spawning a duplicate of work already in flight.
+        norm = " ".join(objective.split()).lower()
+        dup = self._running_objective_match(norm)
+        if dup:
+            return (f"COMMAND FAILED: a sub-agent ('{dup}') is already running this exact objective. "
+                    f"Watch it in the SUB-AGENTS section, steer_sub_agent it, or advance other work — "
+                    f"do not spawn a duplicate. Use a DIFFERENT, orthogonal objective if you meant to "
+                    f"parallelize further.")
 
         model_cfg = getattr(self.worker, "model_config", None)
         if not model_cfg:
@@ -163,6 +196,12 @@ class SpawnSubAgent(BaseTool):
         agent_id = str(uuid.uuid4())
         agent_dir = self.output_dir / agent_id
         agent_dir.mkdir(parents=True, exist_ok=True)
+        # Persist the objective so duplicate-spawn detection (and humans reading
+        # the output dir) can see what each sub-agent was tasked with.
+        try:
+            rt.atomic_write_text(agent_dir / "objective.txt", objective)
+        except Exception:
+            pass
 
         workspace_path = Path(os.getcwd())
         symlink_path = agent_dir / "workspace"
