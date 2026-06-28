@@ -137,6 +137,34 @@ class TestTokenEstimation(unittest.TestCase):
         self.assertGreater(long, short)
 
 
+class TestToolNameResolution(unittest.TestCase):
+    def _worker(self):
+        from aeon.core.worker import Worker
+        w = Worker.__new__(Worker)
+        w.tools = {"run_command": object(), "write_file": object(), "task_complete": object()}
+        return w
+
+    def test_exact_case_variant_autocorrects(self):
+        w = self._worker()
+        self.assertEqual(w._resolve_tool_name("Run_Command"), "run_command")
+        self.assertEqual(w._resolve_tool_name("run-command"), "run_command")
+        self.assertEqual(w._resolve_tool_name("WRITE FILE"), "write_file")
+
+    def test_unknown_does_not_autocorrect(self):
+        w = self._worker()
+        self.assertIsNone(w._resolve_tool_name("frobnicate"))
+
+    def test_suggestion_lists_close_match(self):
+        w = self._worker()
+        hint = w._suggest_tools("run_comand")
+        self.assertIn("run_command", hint)
+
+    def test_suggestion_when_no_match(self):
+        w = self._worker()
+        hint = w._suggest_tools("zzzzzz")
+        self.assertIn("expand_tool_category", hint)
+
+
 def load_tests(loader, standard_tests, pattern):
     return standard_tests
 

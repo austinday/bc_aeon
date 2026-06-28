@@ -698,6 +698,29 @@ class Worker:
             f"--- BEGIN PROTOCOL ---\n{content}\n--- END PROTOCOL ---\n"
         )
 
+    def _resolve_tool_name(self, tool_name: str) -> Optional[str]:
+        """Auto-correct a tool name only when there is exactly ONE unambiguous
+        normalized match (case/dash/space differences). Returns the canonical
+        name, or None if there is no safe single match."""
+        if not tool_name:
+            return None
+
+        def norm(s):
+            return s.lower().replace('-', '_').replace(' ', '_')
+
+        target = norm(tool_name)
+        matches = [name for name in self.tools if norm(name) == target]
+        return matches[0] if len(matches) == 1 else None
+
+    def _suggest_tools(self, tool_name: str, n: int = 3) -> str:
+        """Return a ' Did you mean: ...' hint listing the closest real tool
+        names, so the model can self-correct a hallucinated tool in one turn."""
+        import difflib
+        close = difflib.get_close_matches(tool_name, list(self.tools.keys()), n=n, cutoff=0.5)
+        if not close:
+            return " Use expand_tool_category to discover available tools."
+        return f" Did you mean: {', '.join(close)}?"
+
     def _summarize_action(self, tool_name: str, params) -> str:
         """One-line, readable summary of a tool call for terminal display.
 
@@ -1023,10 +1046,20 @@ class Worker:
                     
                     # Normalize tool name to prevent whitespace/case issues
                     tool_name = tool_name.strip()
-                    
+
                     if tool_name not in self.tools:
-                        combined_summary_parts.append(f"Action {idx+1}: Tool '{tool_name}' not found.")
-                        continue
+                        resolved = self._resolve_tool_name(tool_name)
+                        if resolved:
+                            # Unambiguous case/format variant (e.g. "Run_Command",
+                            # "run-command") -> auto-correct so a trivial typo doesn't
+                            # waste a whole iteration.
+                            self.print_func(f"{C_YELLOW}Auto-corrected tool name '{tool_name}' -> '{resolved}'.{C_RESET}")
+                            tool_name = resolved
+                        else:
+                            hint = self._suggest_tools(tool_name)
+                            combined_summary_parts.append(
+                                f"Action {idx+1}: Tool '{tool_name}' not found.{hint}")
+                            continue
 
                     # Track active engagement with sub-agents so the idle nudge can
                     # tell when students are being left to drift unsupervised.
