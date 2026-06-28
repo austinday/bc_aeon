@@ -179,6 +179,50 @@ class TestToolNameResolution(unittest.TestCase):
         self.assertEqual(w._tool_signature_hint("missing"), "")
 
 
+class TestToolLoader(unittest.TestCase):
+    def test_all_tool_modules_import_cleanly(self):
+        # With empty deps, dependency-bearing tools skip silently; any entry in
+        # errors_out therefore signals a genuine import/instantiation bug.
+        from aeon.tools.loader import load_tools_from_directory
+        errors = []
+        tools = load_tools_from_directory('aeon.tools', dependencies={}, errors_out=errors)
+        names = [t.name for t in tools]
+        self.assertIn('run_command', names)
+        self.assertEqual(errors, [], f"tool loader reported errors: {errors}")
+
+    def test_instantiation_failure_is_reported(self):
+        # Build a throwaway on-disk tool package with one tool whose __init__
+        # raises, and confirm the loader reports it (instead of swallowing it).
+        import tempfile
+        import importlib
+        from aeon.tools.loader import load_tools_from_directory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp) / "broken_pkg"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("")
+            (pkg / "bad.py").write_text(
+                "from aeon.tools.base import BaseTool\n"
+                "class BadTool(BaseTool):\n"
+                "    def __init__(self):\n"
+                "        raise RuntimeError('boom')\n"
+                "    def execute(self, *a, **k):\n"
+                "        pass\n"
+            )
+            sys.path.insert(0, tmp)
+            try:
+                importlib.invalidate_caches()
+                errors = []
+                tools = load_tools_from_directory("broken_pkg", dependencies={}, errors_out=errors)
+                self.assertEqual(tools, [])
+                self.assertTrue(any("BadTool" in e or "instantiate" in e for e in errors), errors)
+            finally:
+                sys.path.remove(tmp)
+                for m in list(sys.modules):
+                    if m == "broken_pkg" or m.startswith("broken_pkg."):
+                        del sys.modules[m]
+
+
 def load_tests(loader, standard_tests, pattern):
     return standard_tests
 
