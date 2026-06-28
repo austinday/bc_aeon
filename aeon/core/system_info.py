@@ -253,29 +253,50 @@ def get_directory_tree_str(startpath='.', max_depth=None):
     return '\n'.join(lines)
 
 
+# NVML is initialized at most once per process; re-running nvmlInit() every
+# iteration is wasteful. None = not yet tried, True = ready, False = unavailable.
+_NVML_READY = None
+
+
+def _ensure_nvml():
+    global _NVML_READY
+    if _NVML_READY is None:
+        try:
+            from pynvml import nvmlInit
+            nvmlInit()
+            _NVML_READY = True
+        except Exception:
+            _NVML_READY = False
+    return _NVML_READY
+
+
 def get_runtime_info():
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    cpu_percent = psutil.cpu_percent(interval=0.1)
+    # interval=None is non-blocking and reports utilization since the previous
+    # call (~one iteration ago) — both faster (no 100ms/turn stall) and a more
+    # meaningful per-iteration figure than a 0.1s sample.
+    cpu_percent = psutil.cpu_percent(interval=None)
     svmem = psutil.virtual_memory()
     parts = [
         f'datetime: {now_str}',
         f'cpu: {cpu_percent}%',
         f'mem: {svmem.percent}% ({svmem.available / (1024 ** 3):.1f}gb free)',
     ]
-    try:
-        from pynvml import nvmlInit, nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates, nvmlDeviceGetMemoryInfo
-        nvmlInit()
-        for i in range(nvmlDeviceGetCount()):
-            try:
-                handle = nvmlDeviceGetHandleByIndex(i)
-                util = nvmlDeviceGetUtilizationRates(handle)
-                mem = nvmlDeviceGetMemoryInfo(handle)
-                parts.append(f'gpu{i}: {util.gpu}% ({mem.free / (1024 ** 3):.1f}gb free)')
-            except Exception:
-                parts.append(f'gpu{i}: n/a')
-    except ImportError:
-        parts.append('gpu: n/a (pynvml not installed)')
-    except Exception:
+    if _ensure_nvml():
+        try:
+            from pynvml import (nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex,
+                                nvmlDeviceGetUtilizationRates, nvmlDeviceGetMemoryInfo)
+            for i in range(nvmlDeviceGetCount()):
+                try:
+                    handle = nvmlDeviceGetHandleByIndex(i)
+                    util = nvmlDeviceGetUtilizationRates(handle)
+                    mem = nvmlDeviceGetMemoryInfo(handle)
+                    parts.append(f'gpu{i}: {util.gpu}% ({mem.free / (1024 ** 3):.1f}gb free)')
+                except Exception:
+                    parts.append(f'gpu{i}: n/a')
+        except Exception:
+            parts.append('gpu: n/a')
+    else:
         parts.append('gpu: n/a')
     dir_tree = get_directory_tree_str('.')
     return f"**STATS**\n{' | '.join(parts)}\n\n**WORKSPACE**\n{STARTUP_DIR}\n\n**PROJECT TREE**\n{dir_tree}"
