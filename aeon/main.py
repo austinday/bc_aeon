@@ -1069,8 +1069,13 @@ def cli():
     if model_name:
         model_config = find_model_config(model_name, menu)
         if not model_config:
+            available = [e['model'] for e in menu if not e.get('is_header')]
             print(f"[ERROR] Model '{model_name}' not found.")
-            print(f"  Available: {[e['model'] for e in menu if not e.get('is_header')]}")
+            import difflib
+            close = difflib.get_close_matches(model_name, available, n=3, cutoff=0.4)
+            if close:
+                print(f"  Did you mean: {', '.join(close)}?")
+            print(f"  Available: {available}")
             sys.exit(1)
     else:
         model_config = select_model(menu, 'Select Model')
