@@ -134,8 +134,26 @@ class BlackboardRead(BaseTool):
             entries.append(obj)
 
         if not entries:
-            scope = f" under topic '{topic}'" if topic else ""
-            return f"No blackboard findings{scope} yet."
+            if topic:
+                # The board has content but nothing under this exact tag. Topic
+                # match is exact, so surface the available topics to spare the
+                # agent from guessing (e.g. 'auth' vs 'authentication').
+                all_topics = []
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        t = json.loads(line).get("topic")
+                    except json.JSONDecodeError:
+                        continue
+                    if t and t not in all_topics:
+                        all_topics.append(t)
+                if all_topics:
+                    return (f"No blackboard findings under topic '{topic}'. "
+                            f"Available topics: {', '.join(all_topics)}. "
+                            f"Retry with one of these, or omit 'topic' to read everything.")
+            return "No blackboard findings yet."
 
         total = len(entries)
         shown = entries[-MAX_READ_ENTRIES:]
