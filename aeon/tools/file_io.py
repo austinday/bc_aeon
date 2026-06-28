@@ -201,9 +201,24 @@ class OpenFileTool(BaseTool):
             content = '\n'.join(parts)
 
         if len(content) > MAX_FILE_READ_SIZE:
+            # Too big to load into working memory, but a flat refusal leaves the
+            # agent blind. Return a head+tail PREVIEW (not registered in OPEN
+            # FILES) so it gets a foothold, plus guidance for targeted access.
+            lines = content.splitlines()
+            head = lines[:150]
+            tail = lines[-50:] if len(lines) > 200 else []
+            preview_parts = [f"{i}: {ln}" for i, ln in enumerate(head, 1)]
+            if tail:
+                tail_start = len(lines) - len(tail) + 1
+                preview_parts.append(f"... [{len(lines) - len(head) - len(tail):,} lines omitted] ...")
+                preview_parts.extend(f"{tail_start + j}: {ln}" for j, ln in enumerate(tail))
+            preview = "\n".join(preview_parts)
             return (
-                f"File '{file_path}' content is too large ({len(content):,} chars) to open directly. "
-                f"Limit is {MAX_FILE_READ_SIZE:,} chars. Use a script to analyze this file."
+                f"File '{file_path}' is too large to load fully ({len(content):,} chars, "
+                f"{len(lines):,} lines; limit {MAX_FILE_READ_SIZE:,} chars), so it was NOT "
+                f"added to OPEN FILES. Below is a head+tail PREVIEW. For targeted access use "
+                f"run_command (e.g. grep -n PATTERN, sed -n 'START,ENDp', tail -n N).\n\n"
+                f"--- PREVIEW: {file_path} ---\n{preview}"
             )
 
         self.worker.update_open_file(abs_path, content)
