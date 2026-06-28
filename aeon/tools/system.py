@@ -85,10 +85,13 @@ class RunCommandTool(BaseTool):
         omitted = len(text) - self.MAX_RETURN_CHARS
         head = self.MAX_RETURN_CHARS // 4
         tail = self.MAX_RETURN_CHARS - head
+        # The agent cannot scroll the terminal in later turns, so point it at a
+        # retrievable way to get the omitted middle instead of a dead reference.
         return (
             text[:head]
-            + f"\n\n... [{omitted:,} characters truncated to protect context; "
-              f"the full output was streamed to the terminal above] ...\n\n"
+            + f"\n\n... [{omitted:,} characters truncated to protect context — showing head+tail. "
+              f"To inspect the omitted middle, re-run capturing to a file "
+              f"(`<cmd> > /tmp/out.log 2>&1`) then read specific parts with grep -n / sed -n / tail.] ...\n\n"
             + text[len(text) - tail:]
         )
 
