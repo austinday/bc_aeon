@@ -39,6 +39,17 @@ if [ -n "${AEON_MTP_DRAFT_MODEL}" ]; then
     SPEC_ARGS=(--speculative-config "{\"method\": \"${AEON_MTP_METHOD:-draft_model}\", \"model\": \"${AEON_MTP_DRAFT_MODEL}\", \"num_speculative_tokens\": ${AEON_MTP_NMAX:-5}}")
 fi
 
+# Blackwell perf knobs (local, no re-quant):
+#  - FP8 KV cache when the plan requests it (catalog kv_quant -> AEON_KV_QUANT, e.g. "fp8"):
+#    ~halves KV memory so more context/batch fits and decode is faster at long ctx.
+#  - FlashInfer attention backend: Blackwell-tuned FP8 attention kernels (NVFP4 only
+#    accelerates the GEMMs; this puts attention on the FP8 units too). Override-able.
+KV_ARGS=()
+if [ -n "${AEON_KV_QUANT:-}" ]; then
+    KV_ARGS=(--kv-cache-dtype "${AEON_KV_QUANT}")
+fi
+export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
+
 wait_for_health() {
     local name=$1 port=$2 count=0
     while true; do
@@ -58,11 +69,13 @@ launch_node() {
                 --enable-prefix-caching --enable-chunked-prefill --max-model-len "${MAX_MODEL_LEN:-$ctx}")
     [ -n "$cpu_offload" ] && [ "$cpu_offload" != "0.0" ] && [ "$cpu_offload" != "0" ] && args+=(--cpu-offload-gb "$cpu_offload")
     args+=("${SPEC_ARGS[@]}")
+    args+=("${KV_ARGS[@]}")
     echo "[adaptive-vllm] launch $name (GPU $devices, port $port, TP=$tp, util $UTIL, ctx $ctx${cpu_offload:+, cpu_offload ${cpu_offload}GiB})"
     docker run -d --name "$name" --gpus "\"device=${devices}\"" --ipc=host -p "${port}:${port}" \
         -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
         -v "$HOME/.cache/triton:/root/.triton" -v "$HOME/.cache/vllm:/root/.cache/vllm" \
         -e TRITON_CACHE_DIR=/root/.triton -e VLLM_CACHE_ROOT=/root/.cache/vllm \
+        -e VLLM_ATTENTION_BACKEND="$VLLM_ATTENTION_BACKEND" \
         "$IMAGE" "${args[@]}" >/dev/null 2>/tmp/aeon_${name}.err || {
             echo "[adaptive-vllm] docker run failed for $name:"; cat /tmp/aeon_${name}.err; return 1; }
 }

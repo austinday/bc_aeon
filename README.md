@@ -86,9 +86,16 @@ Actions (`browser_interact`) cover the full human repertoire by id: click /
 double / right-click, hover, type (real keystrokes, optional submit), press_key,
 **scroll** (page or within a specific scroll container — e.g. an inbox list),
 drag, press-and-hold, select_option, check/uncheck, upload_file, back/forward/
-reload, wait_for. Clicks can pass `expected_text`, which is verified against the
-target before clicking to prevent wrong-element clicks. `browser_read` re-observes
-without acting; popups/OAuth windows are captured as switchable tabs.
+reload, wait_for, and `read_text` (clean readability extraction). Clicks can pass
+`expected_text`, which is verified against the target before clicking to prevent
+wrong-element clicks. `browser_read` re-observes without acting.
+
+It also handles the things real sites throw at you: the element index descends
+into **iframes and shadow DOM** (marked «in iframe»); native JS **dialogs**
+(alert/confirm/prompt/beforeunload) are auto-handled and reported; **downloads**
+are captured to `~/.aeon/browser_profiles/downloads` and their path reported;
+button-triggered **file pickers** work for uploads; **popups/OAuth windows** are
+captured as switchable tabs; and a crashed browser is transparently relaunched.
 
 ## Self-modification
 

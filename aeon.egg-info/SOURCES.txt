@@ -1,3 +1,4 @@
+README.md
 setup.py
 aeon/__init__.py
 aeon/main.py
@@ -18,6 +19,7 @@ aeon/core/llm_utils.py
 aeon/core/logger.py
 aeon/core/model_catalog.py
 aeon/core/paths.py
+aeon/core/prompt_enhancer.py
 aeon/core/runtime_signals.py
 aeon/core/session.py
 aeon/core/sub_agent_state.py
@@ -128,6 +130,8 @@ aeon/services/browser/__init__.py
 aeon/services/browser/server.py
 aeon/services/comfyui/__init__.py
 aeon/services/vllm/__init__.py
+aeon/tests/__init__.py
+aeon/tests/test_core.py
 aeon/tools/__init__.py
 aeon/tools/base.py
 aeon/tools/browser.py

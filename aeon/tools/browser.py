@@ -120,8 +120,9 @@ def _format_elements(elements):
         st = f" ({', '.join(states)})" if states else ""
         val = f" value='{e['value']}'" if e.get("value") else ""
         sc = f" {{scroll-group {e['scrollContainer']}}}" if e.get("scrollContainer") else ""
+        fr = " «in iframe»" if e.get("inFrame") else ""
         name = e.get("name") or "(no text)"
-        line = f"[{e['id']}] {e.get('role', '?')} \"{name}\"{val}{st}{sc}"
+        line = f"[{e['id']}] {e.get('role', '?')} \"{name}\"{val}{st}{sc}{fr}"
         (on if e.get("inViewport") else off).append(line)
 
     parts = []
@@ -212,12 +213,18 @@ def process_browser_response(data, action_desc, session_id, tab_id, include_visi
     else:
         vision_analysis = "(vision skipped this step for speed; call browser_read with include_vision=true for a visual check.)"
 
+    # Dialogs auto-handled and files downloaded since the last step are reported
+    # here so the agent always knows they happened (and where downloads landed).
+    events = data.get("events") or []
+    events_str = ("\n=== EVENTS ===\n" + "\n".join(f"- {e}" for e in events) + "\n") if events else ""
+
     return (
         f"--- BROWSER: {action_desc} (tab '{tab_id}') ---\n"
         f"URL: {page_url}\n"
         f"Title: {page_title}\n"
         f"Open tabs: [{open_tabs_str}]\n"
-        f"{scroll_str}\n\n"
+        f"{scroll_str}\n"
+        f"{events_str}\n"
         f"=== INTERACTIVE ELEMENTS (act on these by [id]) ===\n"
         f"{elements_str}\n\n"
         f"=== VISUAL ANALYSIS (Qwen-VL on the numbered screenshot) ===\n"

@@ -2,6 +2,8 @@ Interacts with the page like a human, then returns a fresh observation (indexed 
 
 WORKFLOW: read the element list -> pick the [id] of the element you want -> act on it -> read the new observation -> repeat. If element ids feel stale (the page changed on its own), call browser_read first.
 
+The element list INCLUDES elements inside iframes and shadow DOM (marked «in iframe»). Native JS dialogs (alert/confirm/prompt) are auto-accepted and reported under EVENTS; files you trigger are auto-downloaded and their saved path is reported under EVENTS.
+
 Schema:
   action (str, required): one of:
     click | double_click | right_click  -> element_id required.
@@ -14,10 +16,11 @@ Schema:
     clear                                -> element_id (empties a field).
     drag                                 -> element_id (source) + to_element_id (target).
     press_and_hold                       -> element_id + optional duration (ms).
-    upload_file                          -> element_id (a file input) + file_path.
+    upload_file                          -> element_id + file_path. Works for a real file input OR a button that opens the OS file picker.
     go_back | go_forward | reload        -> no element.
     wait_for                             -> text (wait until that text appears) and/or duration (ms).
     get_text                             -> element_id (text of one element) or none (whole page body text).
+    read_text                            -> no element. Returns the page's clean MAIN-CONTENT text (readability) for reading/extracting an article or document.
   element_id (int): the [id] from the element list.
   text (str): for 'type'. expected_text (str): for clicks — a substring you expect in the target's name; the click is REFUSED if it doesn't match, preventing wrong-element clicks.
   tab_id (str, default 'default'): which tab to act on.

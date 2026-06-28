@@ -52,7 +52,7 @@ class CatalogEntry:
     hf_model: Optional[str] = None
     served_name: Optional[str] = None
     mtp: Optional[Mtp] = None
-    kv_quant: Optional[str] = None        # llamacpp -ctk/-ctv (e.g. 'q4_0'); None = default f16
+    kv_quant: Optional[str] = None        # llamacpp -ctk/-ctv ('q4_0'); vLLM --kv-cache-dtype ('fp8'); None=f16
     force_split: bool = False             # never dual-copy (e.g. always-too-big MoE)
     # setup download
     download_dir: Optional[str] = None    # relative to $AEON_HOME/models
@@ -115,12 +115,13 @@ CATALOG: List[CatalogEntry] = [
         provider="vllm",
         image="aeon_vllm:latest",
         weights_gib=21.0,            # 20.4 NVFP4 target + 0.9 assistant draft
-        kv_gib_per_64k=6.0,          # f16 KV, vLLM (sliding-window keeps this modest)
+        kv_gib_per_64k=3.0,          # fp8 KV (Blackwell), ~half f16; sliding-window keeps it modest
         max_ctx=262144,
         ports={"lb": 8016, "node0": 8017, "node1": 8018},
         hf_model="aday777/gemma-4-31B-it-abliterated-NVFP4",
         served_name="Gemma-4-31B-NVFP4",
         mtp=Mtp(draft_model="google/gemma-4-31B-it-assistant", method="mtp", n_max=5),
+        kv_quant="fp8",              # vLLM --kv-cache-dtype fp8 on Blackwell FP8 units
         # No download_cmd: vLLM fetches at runtime; setup PHASE 5.6c warms the HF cache.
     ),
     CatalogEntry(
