@@ -311,6 +311,64 @@ class TestStrReplaceMatchLocations(unittest.TestCase):
         self.assertIn("more)", hint)
 
 
+class TestImageDimNormalization(unittest.TestCase):
+    def setUp(self):
+        from aeon.tools.generate_image import ComfyUITool
+        self.f = ComfyUITool._norm_dim
+
+    def test_passthrough_valid(self):
+        self.assertEqual(self.f(1024), 1024)
+
+    def test_string_number(self):
+        self.assertEqual(self.f("512"), 512)
+
+    def test_rounds_to_multiple(self):
+        self.assertEqual(self.f(1000) % 16, 0)
+
+    def test_clamps_high_and_low(self):
+        self.assertEqual(self.f(5000), 2048)
+        self.assertEqual(self.f(10), 256)
+
+    def test_garbage_falls_back(self):
+        self.assertEqual(self.f("abc"), 1024)
+        self.assertEqual(self.f(None), 1024)
+
+
+class TestBrowserMarkdownBound(unittest.TestCase):
+    def test_short_unchanged(self):
+        from aeon.tools.browser import _bound_markdown
+        self.assertEqual(_bound_markdown("hello"), "hello")
+
+    def test_empty(self):
+        from aeon.tools.browser import _bound_markdown
+        self.assertEqual(_bound_markdown(""), "")
+
+    def test_long_is_capped_with_note(self):
+        from aeon.tools.browser import _bound_markdown, MAX_PAGE_MARKDOWN
+        out = _bound_markdown("x" * (MAX_PAGE_MARKDOWN * 3))
+        self.assertLess(len(out), MAX_PAGE_MARKDOWN + 300)
+        self.assertIn("truncated", out)
+
+
+class TestOscillationLogic(unittest.TestCase):
+    """Mirrors the worker's 2-cycle detection predicate."""
+    @staticmethod
+    def _osc(cmds, outs):
+        if len(cmds) >= 4:
+            a, b, c, d = list(zip(cmds[-4:], outs[-4:]))
+            return a == c and b == d and a != b
+        return False
+
+    def test_abab_detected(self):
+        self.assertTrue(self._osc(['A', 'B', 'A', 'B'], ['1', '2', '1', '2']))
+
+    def test_steady_not_detected(self):
+        self.assertFalse(self._osc(['A', 'A', 'A', 'A'], ['1', '1', '1', '1']))
+
+    def test_progressing_not_detected(self):
+        self.assertFalse(self._osc(['A', 'B', 'C', 'D'], ['1', '2', '3', '4']))
+
+
 def load_tests(loader, standard_tests, pattern):
     return standard_tests
 
