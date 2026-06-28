@@ -23,6 +23,33 @@ class VerifySelfModificationTool(BaseTool):
         )
         self.worker = worker
 
+    def _run_test_gate(self, workspace: str, timeout: int = 120):
+        """Run smoke_test then test_core. Returns None if both pass (or are
+        absent), or a failure message string to short-circuit verification."""
+        gates = [
+            ("smoke test", [sys.executable, "-B", "-m", "aeon.smoke_test"], "aeon/smoke_test.py"),
+            ("unit tests", [sys.executable, "-B", "-m", "aeon.tests.test_core"], "aeon/tests/test_core.py"),
+        ]
+        for label, cmd, marker in gates:
+            if not os.path.exists(os.path.join(workspace, marker)):
+                continue  # gate not present in this code version — skip gracefully
+            print(f"{self.C_CYAN}[VERIFY] Running {label}...{self.C_RESET}")
+            try:
+                res = subprocess.run(cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return (f"VERIFICATION FAILED: the {label} timed out after {timeout}s — your change likely "
+                        f"introduced a hang at import/collection time. Fix it before retrying.")
+            if res.returncode != 0:
+                out = ((res.stdout or "") + (res.stderr or "")).strip()
+                return (
+                    f"VERIFICATION FAILED at the {label} (before any sub-agent ran).\n\n"
+                    f"--- Output (tail) ---\n{out[-1500:]}\n\n"
+                    f"Action Required: fix the failure above with str_replace/write_file, then run "
+                    f"verify_self_modification again. (Caught cheaply — no sub-agent was spawned.)"
+                )
+            print(f"{self.C_GREEN}[VERIFY] {label} passed.{self.C_RESET}")
+        return None
+
     def execute(self, test_objective: str, timeout: int = 180) -> str:
         if not self.worker:
             return "Error: Worker context missing."
@@ -37,6 +64,14 @@ class VerifySelfModificationTool(BaseTool):
         )
         if pip_res.returncode != 0:
             return f"Verification failed during pip install:\n{pip_res.stderr}\nFix the syntax/build errors before continuing."
+
+        # 1b. FAIL FAST: run the cheap, deterministic test gate (smoke + unit
+        # tests) BEFORE spinning up an expensive sub-agent (LLM + GPU). A syntax
+        # error, broken import, or parser regression is caught here in ~1s with
+        # a precise message instead of after a multi-minute sub-agent run.
+        gate = self._run_test_gate(workspace, timeout=120)
+        if gate is not None:
+            return gate
 
         # 2. Setup isolated sub-agent output directory
         agent_id = f"verify_{uuid.uuid4().hex[:8]}"
