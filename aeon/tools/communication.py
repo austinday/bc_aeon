@@ -39,6 +39,12 @@ class SayToUserTool(BaseTool):
         )
 
     def execute(self, message: str):
+        if not message:
+            return "Error: message parameter is required."
         # Print a newline to ensure the message starts below the tool call line
         print(f"\n{C_GREEN}{message}{C_RESET}")
-        return f"Message delivered to user: {message}"
+        # Return only a concise confirmation, NOT the full message: the message
+        # text is already in this action's parameters, so echoing it back would
+        # duplicate a potentially long report into the agent's context every turn.
+        chars = len(message)
+        return f"Message delivered to user ({chars:,} chars)."
