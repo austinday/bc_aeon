@@ -7,6 +7,7 @@ import subprocess
 from .base import BaseTool
 from ..core.prompts import TOOL_DESC_GENERATE_IMAGE, TOOL_DESC_EDIT_IMAGE
 from ..core.gpu_queue import wait_for_vram, release_vram
+from ..core.prompt_enhancer import enhance_prompt
 
 class ComfyUITool(BaseTool):
     """Base class for tools using ComfyUI to handle VRAM and registry management."""
@@ -118,12 +119,13 @@ class ComfyUITool(BaseTool):
 
 class GenerateImageTool(ComfyUITool):
     """A tool to generate images using FLUX GGUF via a local ComfyUI instance."""
-    def __init__(self):
+    def __init__(self, llm_client=None):
         super().__init__(
             name="generate_image",
             description=TOOL_DESC_GENERATE_IMAGE,
             underlying_model='FLUX.2-klein-9B uncensored GGUF'
         )
+        self.llm_client = llm_client
 
     def _resolve(self, subdir: str, patterns, default: str) -> str:
         """Basename of the first model in comfyui/<subdir> matching any pattern; else default."""
@@ -146,12 +148,13 @@ class GenerateImageTool(ComfyUITool):
                             "flux2-vae.safetensors")
         return unet, clip, vae
 
-    def execute(self, prompt: str, output_path: str, width: int = 1024, height: int = 1024) -> str:
+    def execute(self, prompt: str, output_path: str, width: int = 1024, height: int = 1024, enhance: bool = None) -> str:
         if not prompt:
             return "Error: 'prompt' parameter is required."
         if not output_path:
             return "Error: 'output_path' parameter is required."
 
+        prompt = enhance_prompt(self.llm_client, prompt, "image", force=enhance)
         abs_output_path = os.path.abspath(output_path)
         os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
 
@@ -237,14 +240,15 @@ class GenerateImageTool(ComfyUITool):
 
 class EditImageTool(ComfyUITool):
     """A tool to edit images using Qwen-Image-Edit GGUF via a local ComfyUI instance."""
-    def __init__(self):
+    def __init__(self, llm_client=None):
         super().__init__(
             name="edit_image",
             description=TOOL_DESC_EDIT_IMAGE,
             underlying_model='Qwen-Image-Edit-Rapid'
         )
+        self.llm_client = llm_client
 
-    def execute(self, input_path: str, prompt: str, output_path: str, denoise: float = 0.75) -> str:
+    def execute(self, input_path: str, prompt: str, output_path: str, denoise: float = 0.75, enhance: bool = None) -> str:
         if not input_path:
             return "Error: 'input_path' parameter is required."
         if not prompt:
@@ -252,6 +256,7 @@ class EditImageTool(ComfyUITool):
         if not output_path:
             return "Error: 'output_path' parameter is required."
 
+        prompt = enhance_prompt(self.llm_client, prompt, "image_edit", force=enhance)
         abs_input_path = os.path.abspath(input_path)
         abs_output_path = os.path.abspath(output_path)
 

@@ -591,28 +591,24 @@ class SessionManager:
         self._models_used = []
         self._llamacpp_configs = []  # llama.cpp model configs used by this agent
 
-    def enter(self, strong_config=None, weak_config=None, skip_warmup=False):
+    def enter(self, model_config=None, skip_warmup=False):
         """Enter the session: coordinate startup, warm models, acquire locks.
         
         Only starts/warms the local brain if at least one selected model is local.
         Cloud-only configurations skip brain management entirely.
         llama.cpp models get their own container lifecycle.
         """
-        # Determine which models are local Ollama (need brain + registry)
+        # Determine if the selected model is local Ollama (needs brain + registry)
         local_models = []
-        if strong_config and strong_config.get('provider') == 'local':
-            local_models.append(strong_config['model'])
-        if weak_config and weak_config.get('provider') == 'local':
-            local_models.append(weak_config['model'])
+        if model_config and model_config.get('provider') == 'local':
+            local_models.append(model_config['model'])
         local_models = list(dict.fromkeys(local_models))  # deduplicate
         self._models_used = list(local_models)
 
-        # Determine which models are llama.cpp served
+        # Determine if the model is llama.cpp served
         llamacpp_configs = []
-        for cfg in [strong_config, weak_config]:
-            if cfg and is_llamacpp_model(cfg):
-                if cfg not in llamacpp_configs:
-                    llamacpp_configs.append(cfg)
+        if model_config and is_llamacpp_model(model_config):
+            llamacpp_configs.append(model_config)
         self._llamacpp_configs = llamacpp_configs
 
         needs_brain = len(local_models) > 0
@@ -969,9 +965,7 @@ def cli():
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true', help='Enable detailed LLM call logging to ~/')
     parser.add_argument('--debug-log', type=str, help='Path to the reasoning trace log file (JSONL)')
-    parser.add_argument('--strong', type=str, dest='model', help='Model name - skips menu')
-    parser.add_argument('--model', type=str, help='Model name - skips menu (alias for --strong)')
-    parser.add_argument('--weak', type=str, help=argparse.SUPPRESS)
+    parser.add_argument('--model', type=str, help='Model name - skips menu')
     parser.add_argument('--start', type=str, help='Initial objective to start immediately')
     parser.add_argument('--no-warmup', action='store_true', help='Skip model warmup (faster startup, slower first query)')
     parser.add_argument('--resume', type=str, default=None, help='Path to restart state file (used internally by restart_aeon)')
@@ -994,28 +988,26 @@ def cli():
     menu = build_model_menu(local_models)
 
     # --- Select model (used for both planning and utility tasks) ---
-    model_name = args.model or args.weak  # --weak kept for backward compat
+    model_name = args.model
     if model_name:
-        strong_config = find_model_config(model_name, menu)
-        if not strong_config:
+        model_config = find_model_config(model_name, menu)
+        if not model_config:
             print(f"[ERROR] Model '{model_name}' not found.")
             print(f"  Available: {[e['model'] for e in menu if not e.get('is_header')]}")
             sys.exit(1)
     else:
-        strong_config = select_model(menu, 'Select Model')
+        model_config = select_model(menu, 'Select Model')
 
-    weak_config = strong_config
-
-    print(f"[CONFIG] Model: {strong_config['model']} ({strong_config['provider']})")
+    print(f"[CONFIG] Model: {model_config['model']} ({model_config['provider']})")
 
     session = SessionManager()
 
     try:
-        session.enter(strong_config=strong_config, weak_config=weak_config, skip_warmup=args.no_warmup)
-        llm_client = LLMClient(strong_config=strong_config, weak_config=weak_config)
+        session.enter(model_config=model_config, skip_warmup=args.no_warmup)
+        llm_client = LLMClient(model_config)
         worker = Worker(llm_client=llm_client, debug_mode=args.debug, debug_log_path=args.debug_log)
-        worker.model_name = strong_config['model']
-        worker.model_config = strong_config
+        worker.model_name = model_config['model']
+        worker.model_config = model_config
         deps = {'llm_client': llm_client, 'worker': worker}
         tools = load_tools_from_directory("aeon.tools", dependencies=deps)
         
@@ -1059,7 +1051,7 @@ def cli():
                 print(f"\n[SYSTEM] Skills directory not found at: {skills_dir}", file=sys.stderr)
         except Exception as e:
             print(f"\n[SYSTEM] Failed to load skills summary: {e}")
-        prov = strong_config['provider'].upper()
+        prov = model_config['provider'].upper()
 
         # --- Startup Tool Summary ---
         try:
@@ -1087,7 +1079,7 @@ def cli():
             print(f"\n[SYSTEM] Failed to load tools summary: {e}")
 
         # --- Startup Visibility ---
-        print(f"\n\033[93mAeon Ready (Model: {strong_config['model']} [{prov}], Debug: {args.debug})\033[0m")
+        print(f"\n\033[93mAeon Ready (Model: {model_config['model']} [{prov}], Debug: {args.debug})\033[0m")
 
         # --- Resume from restart if applicable ---
         if args.resume and os.path.exists(args.resume):

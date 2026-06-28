@@ -119,33 +119,21 @@ class VertexAIClient:
 class LLMClient:
     """A client for interacting with Large Language Models (Cloud or Local).
 
-    Uses two model tiers:
-    - Primary (strong): Powers the main agent loop (reasoning + action selection).
-    - Utility (weak): Powers summarization, interruption analysis, and other support tasks.
+    One model powers everything: the main agent loop (reasoning + action
+    selection) and all support tasks (summarization, prompt enhancement, etc.).
     """
-    def __init__(self, strong_config: dict, weak_config: dict):
+    def __init__(self, config: dict):
         self.logger = get_logger()
         self.debug_path: Optional[pathlib.Path] = None
         self.current_iteration = 0
 
-        if strong_config is None:
-            raise ValueError("strong_config is required. Select a model at startup or provide --strong flag.")
-        if weak_config is None:
-            raise ValueError("weak_config is required. Select a model at startup or provide --weak flag.")
+        if config is None:
+            raise ValueError("config is required. Select a model at startup or provide --model.")
 
-        # Primary model (strong) - used for the main agent loop
-        self.primary_provider = strong_config['provider']
-        self.primary_client = self._create_client(strong_config)
-        self.primary_model = strong_config['model']
-
-        # Utility model (weak) - used for summarization, analysis, etc.
-        self.utility_client = self._create_client(weak_config)
-        self.utility_model = weak_config['model']
-
-        self.context_limit = min(
-            strong_config.get('context_limit', 128000),
-            weak_config.get('context_limit', 128000)
-        )
+        self.provider = config['provider']
+        self.client = self._create_client(config)
+        self.model = config['model']
+        self.context_limit = config.get('context_limit', 128000)
 
     def _create_client(self, config: dict):
         """Create an OpenAI-compatible client from a model config dict."""
@@ -217,8 +205,8 @@ class LLMClient:
                 "Respond with ONLY a valid JSON object, no prose, no markdown fences:\n"
                 '{\"skill\": \"<category>/<skill_name>\" or null, \"reason\": \"<one sentence>\"}'
             )
-            resp = self.utility_client.chat.completions.create(
-                model=self.utility_model,
+            resp = self.client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
             )
@@ -496,8 +484,8 @@ class LLMClient:
         )
         
         try:
-            resp = self.utility_client.chat.completions.create(
-                model=self.utility_model,
+            resp = self.client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": recovery_prompt}],
                 temperature=0.1
             )
@@ -510,7 +498,7 @@ class LLMClient:
                 else:
                     content = content.strip("`")
                     
-            self._log_to_debug("BLOCK_RECOVERY", self.utility_model, recovery_prompt, content)
+            self._log_to_debug("BLOCK_RECOVERY", self.model, recovery_prompt, content)
             return content
         except Exception as e:
             self.logger.warning(f"Block recovery failed for {missing_key}: {e}")
@@ -531,13 +519,13 @@ class LLMClient:
         )
         
         try:
-            resp = self.utility_client.chat.completions.create(
-                model=self.utility_model,
+            resp = self.client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("JSON_REPAIR", self.utility_model, prompt, content)
+            self._log_to_debug("JSON_REPAIR", self.model, prompt, content)
             return self._clean_json_response(content)
         except Exception as e:
             self.logger.warning(f"JSON repair failed: {e}")
@@ -553,12 +541,12 @@ class LLMClient:
         llamacpp_config = None
         try:
             from aeon.main import get_llamacpp_config
-            llamacpp_config = get_llamacpp_config(self.primary_model)
+            llamacpp_config = get_llamacpp_config(self.model)
         except ImportError:
             pass
         
         if llamacpp_config:
-            self.logger.info(f"Local model {self.primary_model} detected. Pausing for 5 minutes before attempting self-healing...")
+            self.logger.info(f"Local model {self.model} detected. Pausing for 5 minutes before attempting self-healing...")
             time.sleep(300)
             delay = 60
             max_delay = 600
@@ -575,7 +563,7 @@ class LLMClient:
                     from aeon.main import start_llamacpp_server
                     from aeon.core.gpu_queue import get_real_vram
                     
-                    self.logger.info(f"Preparing to self-heal {self.primary_model}...")
+                    self.logger.info(f"Preparing to self-heal {self.model}...")
                     
                     # Kill potentially hung containers first to free VRAM
                     containers_to_kill = [llamacpp_config['container_name']] + llamacpp_config.get('additional_containers', [])
@@ -594,7 +582,7 @@ class LLMClient:
                         success = start_llamacpp_server(llamacpp_config)
                         if success:
                             # Verify API works
-                            self.primary_client.models.list()
+                            self.client.models.list()
                             self.logger.info("Self-healing successful! Resuming agent...")
                             return True
                         else:
@@ -602,14 +590,14 @@ class LLMClient:
                     else:
                         self.logger.info(f"Not enough VRAM to self-heal (Max free: {max_free:.1f}GB). Waiting...")
                 else:
-                    if isinstance(self.primary_client, VertexAIClient):
+                    if isinstance(self.client, VertexAIClient):
                         # Vertex AI check: try a minimal call
-                        self.primary_client.Chat(self.primary_client).Completions(self.primary_client).create(
-                            model=self.primary_model, messages=[{"role": "user", "content": "hi"}], temperature=0
+                        self.client.Chat(self.client).Completions(self.client).create(
+                            model=self.model, messages=[{"role": "user", "content": "hi"}], temperature=0
                         )
                     else:
                         # OpenAI-compatible client check: list models
-                        self.primary_client.models.list()
+                        self.client.models.list()
                     
                     self.logger.info("Server recovery detected! Resuming agent...")
                     return True
@@ -633,10 +621,10 @@ class LLMClient:
             try:
                 start_time = time.time()
                 
-                if not isinstance(self.primary_client, VertexAIClient):
+                if not isinstance(self.client, VertexAIClient):
                     # Stream the response to accurately measure TTFT vs pure generation time
-                    resp_stream = self.primary_client.chat.completions.create(
-                        model=self.primary_model,
+                    resp_stream = self.client.chat.completions.create(
+                        model=self.model,
                         messages=[{"role": "user", "content": current_prompt}],
                         temperature=0.2,
                         stream=True
@@ -661,12 +649,12 @@ class LLMClient:
                     comp_tokens = estimate_tokens(raw)
                     
                     tps = comp_tokens / gen_time if gen_time > 0 else 0
-                    print(f"\033[96m[Performance] {self.primary_model} speed: {tps:.2f} t/s (TTFT: {ttft:.2f}s | {comp_tokens} tokens in {gen_time:.2f}s)\033[0m")
+                    print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s (TTFT: {ttft:.2f}s | {comp_tokens} tokens in {gen_time:.2f}s)\033[0m")
                     
                 else:
                     # Fallback for Vertex AI (mock doesn't support streaming)
-                    resp = self.primary_client.chat.completions.create(
-                        model=self.primary_model,
+                    resp = self.client.chat.completions.create(
+                        model=self.model,
                         messages=[{"role": "user", "content": current_prompt}],
                         temperature=0.2,
                     )
@@ -678,12 +666,12 @@ class LLMClient:
                     except AttributeError:
                         comp_tokens = estimate_tokens(raw)
                     tps = comp_tokens / elapsed if elapsed > 0 else 0
-                    print(f"\033[96m[Performance] {self.primary_model} speed: {tps:.2f} t/s (TTFT: N/A | {comp_tokens} tokens in {elapsed:.2f}s)\033[0m")
+                    print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s (TTFT: N/A | {comp_tokens} tokens in {elapsed:.2f}s)\033[0m")
 
                 if self.debug_path:
                     print(f"{C_YELLOW}[LLM RAW - PRIMARY AGENT]\n{raw}{C_RESET}")
 
-                self._log_to_debug("PRIMARY_AGENT", self.primary_model, current_prompt, raw)
+                self._log_to_debug("PRIMARY_AGENT", self.model, current_prompt, raw)
 
                 # Step 1: Find where the JSON object ends
                 json_end = self._find_json_end(raw)
@@ -738,7 +726,7 @@ class LLMClient:
                     
                     if is_decode_error and not is_empty_error:
                         if self.debug_path:
-                            print(f"{C_YELLOW}[LLM] Malformed JSON detected. Routing to Fixer Agent ({self.utility_model})...{C_RESET}")
+                            print(f"{C_YELLOW}[LLM] Malformed JSON detected. Routing to Fixer Agent ({self.model})...{C_RESET}")
                         
                         repaired_json_str = self._repair_json(json_str, str(e))
                         if repaired_json_str:
@@ -769,14 +757,14 @@ class LLMClient:
                     continue # Recovery successful, retry the request
                 raise
             except Exception as e:
-                self._log_to_debug("PRIMARY_AGENT_ERR", self.primary_model, current_prompt, str(e))
+                self._log_to_debug("PRIMARY_AGENT_ERR", self.model, current_prompt, str(e))
                 self.logger.error(f"Primary Agent LLM call failed: {e}")
                 
                 # Force token refresh on authentication failures
-                if "401" in str(e) and isinstance(self.primary_client, VertexAIClient):
+                if "401" in str(e) and isinstance(self.client, VertexAIClient):
                     try:
                         import google.auth.transport.requests
-                        self.primary_client.credentials.refresh(google.auth.transport.requests.Request())
+                        self.client.credentials.refresh(google.auth.transport.requests.Request())
                     except Exception:
                         pass
                 
@@ -800,12 +788,12 @@ class LLMClient:
         """Compress a long action log down to ~25% of its size using the utility model."""
         prompt = COMPRESS_ACTION_LOG_PROMPT.format(log=log_text)
         try:
-            resp = self.utility_client.chat.completions.create(
-                model=self.utility_model,
+            resp = self.client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("COMPRESS_ACTION_LOG", self.utility_model, prompt, content)
+            self._log_to_debug("COMPRESS_ACTION_LOG", self.model, prompt, content)
             return content
         except Exception as e:
             self.logger.warning(f"Action log compression failed: {e}")
@@ -815,13 +803,13 @@ class LLMClient:
         """Compresses the persistent memories using the utility model and returns a dictionary."""
         prompt = COMPRESS_MEMORIES_PROMPT.format(memories=memories_text)
         try:
-            resp = self.utility_client.chat.completions.create(
-                model=self.utility_model,
+            resp = self.client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"}
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("COMPRESS_MEMORIES", self.utility_model, prompt, content)
+            self._log_to_debug("COMPRESS_MEMORIES", self.model, prompt, content)
             
             cleaned = self._clean_json_response(content)
             return json.loads(cleaned)
@@ -833,13 +821,13 @@ class LLMClient:
         """Analyze user interruption to classify intent."""
         prompt = ANALYZE_INTERRUPTION_PROMPT.format(obj=obj, inp=inp)
         try:
-            resp = self.utility_client.chat.completions.create(
-                model=self.utility_model,
+            resp = self.client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"}
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("ANALYZE_INTERRUPTION", self.utility_model, prompt, content)
+            self._log_to_debug("ANALYZE_INTERRUPTION", self.model, prompt, content)
             cleaned = self._clean_json_response(content)
             return json.loads(cleaned)
         except Exception as e:
@@ -849,12 +837,12 @@ class LLMClient:
     def reason(self, prompt: str) -> str:
         """General reasoning/thinking call (uses primary/strong model)."""
         try:
-            resp = self.primary_client.chat.completions.create(
-                model=self.primary_model,
+            resp = self.client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("REASONING (THINK TOOL)", self.primary_model, prompt, content)
+            self._log_to_debug("REASONING (THINK TOOL)", self.model, prompt, content)
             return content
         except Exception as e:
             self.logger.error(f"Reason call failed: {e}")
@@ -864,12 +852,12 @@ class LLMClient:
         """Summarize text in context of a query."""
         prompt = SUMMARIZE_TEXT_PROMPT.format(query=query, text=text)
         try:
-            resp = self.utility_client.chat.completions.create(
-                model=self.utility_model,
+            resp = self.client.chat.completions.create(
+                model=self.model,
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("SUMMARIZE_TEXT (WEB SEARCH)", self.utility_model, prompt, content)
+            self._log_to_debug("SUMMARIZE_TEXT (WEB SEARCH)", self.model, prompt, content)
             return content
         except Exception as e:
             self.logger.warning(f"Summarize text failed: {e}")

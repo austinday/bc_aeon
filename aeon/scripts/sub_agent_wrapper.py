@@ -205,7 +205,7 @@ def main():
     try:
         log(f"Initializing sub-agent {args.agent_id}...")
         config = json.loads(args.model_config)
-        llm_client = LLMClient(strong_config=config, weak_config=config)
+        llm_client = LLMClient(config)
 
         from aeon.main import register_models_for_agent, unregister_models_for_agent
         register_models_for_agent([config.get("model")])

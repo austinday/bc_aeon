@@ -405,7 +405,7 @@ class GetSubAgentReport(BaseTool):
                 "  specific_question (str, optional): a targeted question about a running agent's progress.\n"
                 "Example: {\"tool_name\": \"get_sub_agent_report\", \"parameters\": {\"agent_id\": \"a44fa909\"}}"
             ),
-            underlying_model=llm_client.utility_model if llm_client else None,
+            underlying_model=llm_client.model if llm_client else None,
         )
         self.worker = worker
         self.llm_client = llm_client
@@ -457,8 +457,8 @@ class GetSubAgentReport(BaseTool):
                 prompt += f"\nAlso answer this specific question: {specific_question}\n"
             prompt += f"\n--- RECENT LOG TAIL ---\n{log_tail}\n--- END LOG ---"
             try:
-                resp = self.llm_client.utility_client.chat.completions.create(
-                    model=self.llm_client.utility_model,
+                resp = self.llm_client.client.chat.completions.create(
+                    model=self.llm_client.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.3,
                 )

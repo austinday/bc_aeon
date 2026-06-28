@@ -16,7 +16,7 @@ class ThinkTool(BaseTool):
         super().__init__(
             name="think",
             description=TOOL_DESC_THINK,
-            underlying_model=llm_client.primary_model if llm_client else None
+            underlying_model=llm_client.model if llm_client else None
         )
         self.llm_client = llm_client
         self.worker = worker

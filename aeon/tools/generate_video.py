@@ -10,6 +10,7 @@ import requests
 
 from aeon.tools.generate_image import ComfyUITool
 from aeon.core.gpu_queue import release_vram
+from aeon.core.prompt_enhancer import enhance_prompt
 from aeon.core.prompts import TOOL_DESC_GENERATE_VIDEO
 
 
@@ -46,9 +47,10 @@ class GenerateVideoTool(ComfyUITool):
     SINGLE_PASS_MAX = 121          # frames renderable in one LTX pass on a 48 GB GPU
     DEFAULT_FRAMES = 97
 
-    def __init__(self):
+    def __init__(self, llm_client=None):
         super().__init__(name="generate_video", description=TOOL_DESC_GENERATE_VIDEO)
         self.comfy_models_dir = os.path.join(_aeon_home(), "models", "comfyui")
+        self.llm_client = llm_client
 
     # ---------- model + asset resolution ----------
     def _resolve_model(self, subdir: str, patterns: List[str], default: str) -> str:
@@ -233,6 +235,7 @@ class GenerateVideoTool(ComfyUITool):
         work_dir = os.path.join(_aeon_home(), "temp", "video_work", str(os.getpid()))
         os.makedirs(work_dir, exist_ok=True)
         prompt_text = prompt[0] if isinstance(prompt, list) and prompt else (prompt or "")
+        prompt_text = enhance_prompt(self.llm_client, prompt_text, "video", force=kwargs.get("enhance"))
         neg = negative_prompt or "low quality, blurry, distorted, static, flickering, watermark, text"
         w, h, length = self._round32(width), self._round32(height), self._valid_len(min(frames, self.SINGLE_PASS_MAX))
         init_image_name = None
