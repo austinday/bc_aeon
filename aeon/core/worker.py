@@ -1369,6 +1369,27 @@ class Worker:
                         self.last_observation += loop_warning
                         self.print_func(f"{C_RED}{loop_warning}{C_RESET}")
 
+                # --- OSCILLATION (2-CYCLE) DETECTION ---
+                # The check above only catches CONSECUTIVE identical turns. An agent
+                # ping-ponging between two states (A,B,A,B) — e.g. toggling a setting
+                # back and forth — never has two identical turns in a row, so it
+                # slips through. Detect a repeated 2-cycle over the last 4 turns.
+                if not loop_detected and len(self._recent_commands) >= 4:
+                    pairs = list(zip(self._recent_commands[-4:], self._recent_outputs[-4:]))
+                    a, b, c, d = pairs
+                    if a == c and b == d and a != b:
+                        loop_detected = True
+                        self.stuck_reason = ("self-reported oscillation: alternating between two "
+                                             "states (A,B,A,B) with no net progress.")
+                        osc_warning = (
+                            "\n\n** OSCILLATION DETECTED: You are alternating between TWO actions/states "
+                            "(A, B, A, B) and making no net progress — each undoes or ignores the other. **\n"
+                            "Stop the back-and-forth. Use the `think` tool to identify why these two steps "
+                            "conflict, then choose a THIRD, different approach that breaks the cycle."
+                        )
+                        self.last_observation += osc_warning
+                        self.print_func(f"{C_RED}{osc_warning}{C_RESET}")
+
                 # --- INTENT-LEVEL STALL DETECTION ---
                 # The hard loop above only fires on byte-identical command+output.
                 # This complementary check catches spinning on the same GOAL across
