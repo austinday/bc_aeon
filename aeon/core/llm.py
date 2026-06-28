@@ -524,6 +524,78 @@ class LLMClient:
             self.logger.warning(f"Block recovery failed for {missing_key}: {e}")
             return None
 
+    def _local_json_repair(self, raw_string: str) -> Optional[str]:
+        """Deterministically fix the most common, low-risk JSON malformations
+        WITHOUT an LLM round-trip: trailing commas before } or ], and Python
+        literals (True/False/None) leaking in as bare words. Returns a valid
+        JSON string if the repair parses, else None. Strings are respected so
+        commas/words inside values are never touched.
+
+        This is tried before the utility-model repair, turning the common case
+        into a fast, free, deterministic fix.
+        """
+        if not raw_string:
+            return None
+        out = []
+        in_string = False
+        escape = False
+        n = len(raw_string)
+        literals = {'True': 'true', 'False': 'false', 'None': 'null'}
+        i = 0
+        while i < n:
+            ch = raw_string[i]
+            if escape:
+                out.append(ch)
+                escape = False
+                i += 1
+                continue
+            if ch == '\\' and in_string:
+                out.append(ch)
+                escape = True
+                i += 1
+                continue
+            if ch == '"':
+                in_string = not in_string
+                out.append(ch)
+                i += 1
+                continue
+            if in_string:
+                out.append(ch)
+                i += 1
+                continue
+            # --- outside any string value below ---
+            if ch == ',':
+                # Drop a comma immediately followed (ignoring whitespace) by } or ]
+                j = i + 1
+                while j < n and raw_string[j] in ' \t\r\n':
+                    j += 1
+                if j < n and raw_string[j] in '}]':
+                    i += 1  # skip the trailing comma
+                    continue
+            # Replace a bare Python literal (word-bounded) with its JSON form.
+            if ch in ('T', 'F', 'N'):
+                prev = raw_string[i - 1] if i > 0 else ''
+                matched = False
+                for word, repl in literals.items():
+                    if raw_string.startswith(word, i):
+                        nxt = raw_string[i + len(word)] if i + len(word) < n else ''
+                        if not (prev.isalnum() or prev == '_') and not (nxt.isalnum() or nxt == '_'):
+                            out.append(repl)
+                            i += len(word)
+                            matched = True
+                            break
+                if matched:
+                    continue
+            out.append(ch)
+            i += 1
+        candidate = ''.join(out)
+
+        try:
+            json.loads(candidate)
+            return candidate
+        except (json.JSONDecodeError, ValueError):
+            return None
+
     def _repair_json(self, raw_string: str, error_msg: str) -> Optional[str]:
         """Attempt to use the isolated utility model to fix malformed JSON."""
         prompt = (
@@ -754,9 +826,24 @@ class LLMClient:
                     is_empty_error = "Empty JSON" in str(e)
                     
                     if is_decode_error and not is_empty_error:
+                        # FAST PATH: try a deterministic local repair (trailing
+                        # commas, Python literals) before spending a utility-model
+                        # call. Handles the most common malformations for free.
+                        local_fix = self._local_json_repair(json_str)
+                        if local_fix:
+                            try:
+                                parsed = json.loads(local_fix)
+                                if parsed and 'actions' in parsed:
+                                    parsed = self._substitute_blocks(parsed, blocks)
+                                    if self.debug_path:
+                                        print(f"{C_YELLOW}[LLM] Local JSON repair succeeded (no model call).{C_RESET}")
+                                    return json.dumps(parsed)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+
                         if self.debug_path:
                             print(f"{C_YELLOW}[LLM] Malformed JSON detected. Routing to Fixer Agent ({self.model})...{C_RESET}")
-                        
+
                         repaired_json_str = self._repair_json(json_str, str(e))
                         if repaired_json_str:
                             try:

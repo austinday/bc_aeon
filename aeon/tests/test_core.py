@@ -104,6 +104,39 @@ class TestBlockSubstitution(unittest.TestCase):
         self.assertEqual(blocks['BLOCK_1'], '{"nested": "json", "with": ["braces"]}')
 
 
+class TestLocalJsonRepair(unittest.TestCase):
+    def setUp(self):
+        self.c = _bare_llm_client()
+
+    def test_trailing_comma_in_object(self):
+        import json
+        fixed = self.c._local_json_repair('{"a": 1, "b": 2,}')
+        self.assertEqual(json.loads(fixed), {"a": 1, "b": 2})
+
+    def test_trailing_comma_in_array(self):
+        import json
+        fixed = self.c._local_json_repair('{"a": [1, 2, 3,]}')
+        self.assertEqual(json.loads(fixed), {"a": [1, 2, 3]})
+
+    def test_python_literals(self):
+        import json
+        fixed = self.c._local_json_repair('{"a": True, "b": False, "c": None}')
+        self.assertEqual(json.loads(fixed), {"a": True, "b": False, "c": None})
+
+    def test_comma_inside_string_preserved(self):
+        import json
+        fixed = self.c._local_json_repair('{"a": "x, y, z", "b": 1,}')
+        self.assertEqual(json.loads(fixed), {"a": "x, y, z", "b": 1})
+
+    def test_literal_word_inside_string_preserved(self):
+        import json
+        fixed = self.c._local_json_repair('{"msg": "set flag to True now",}')
+        self.assertEqual(json.loads(fixed), {"msg": "set flag to True now"})
+
+    def test_unrepairable_returns_none(self):
+        self.assertIsNone(self.c._local_json_repair('{"a": "unterminated'))
+
+
 class TestTruncation(unittest.TestCase):
     def test_short_text_untouched(self):
         from aeon.core.worker_utils import truncate_output
