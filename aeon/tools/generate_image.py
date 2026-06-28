@@ -27,6 +27,16 @@ class ComfyUITool(BaseTool):
         v = max(lo, min(hi, v))
         return max(lo, (v // multiple) * multiple)
 
+    @staticmethod
+    def _norm_unit(value, default=0.75):
+        """Coerce a 0..1 strength/denoise value: tolerate strings, clamp to [0,1],
+        fall back to default on garbage."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(0.0, min(1.0, v))
+
     def _check_comfyui_health(self):
         try:
             res = requests.get(f"{self.comfy_url}/system_stats", timeout=2)
@@ -272,6 +282,7 @@ class EditImageTool(ComfyUITool):
         if not output_path:
             return "Error: 'output_path' parameter is required."
 
+        denoise = self._norm_unit(denoise, default=0.75)
         prompt = enhance_prompt(self.llm_client, prompt, "image_edit", force=enhance)
         abs_input_path = os.path.abspath(input_path)
         abs_output_path = os.path.abspath(output_path)
@@ -279,7 +290,7 @@ class EditImageTool(ComfyUITool):
         if not os.path.exists(abs_input_path):
             return f"Error: Input image not found at {abs_input_path}"
 
-        os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
+        os.makedirs(os.path.dirname(abs_output_path) or ".", exist_ok=True)
 
         try:
             # Register this agent as an active user and ensure server is running on allocated VRAM
