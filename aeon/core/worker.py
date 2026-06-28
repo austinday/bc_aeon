@@ -1429,6 +1429,25 @@ class Worker:
                 self.logger.error(f"Iteration failed: {e}", exc_info=True)
                 if "Context limit exceeded" in str(e):
                     raise
+                # Surface the failure to the model so the NEXT turn can adapt
+                # instead of re-sending the identical prompt and looping (which
+                # silently burns API calls). Formatting/JSON failures get targeted
+                # guidance; other errors get a generic recovery note.
+                err_str = str(e)
+                if "Primary Agent failed" in err_str or "JSON" in err_str:
+                    self.last_observation = (
+                        "SYSTEM: Your previous response could not be parsed into a valid action plan after "
+                        "several attempts. SIMPLIFY your next response: emit a SMALL, strictly-valid JSON "
+                        "object and put ALL multi-line code/text in --- BEGIN BLOCK_N --- blocks AFTER the "
+                        "JSON (never inline code, quotes, or escapes in JSON values). Start with a single "
+                        "simple action.\n"
+                        f"(Underlying error: {err_str[:300]})"
+                    )
+                else:
+                    self.last_observation = (
+                        f"SYSTEM: The previous iteration failed with an error and was skipped. "
+                        f"Reassess and try a different, simpler next step.\n(Error: {err_str[:300]})"
+                    )
                 time.sleep(2)
 
             except KeyboardInterrupt:
