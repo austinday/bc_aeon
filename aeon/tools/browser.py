@@ -17,6 +17,21 @@ from ..core.prompts import (
 
 BROWSER_API_URL = "http://localhost:8030"
 
+# Page markdown can be enormous (long articles, docs, search results). Injecting
+# it raw bloats the agent's context and, because the whole observation is later
+# head+tail truncated, can push the critical INTERACTIVE ELEMENTS section out of
+# view. Bound it here so the structured sections always survive.
+MAX_PAGE_MARKDOWN = 8000
+
+
+def _bound_markdown(markdown: str) -> str:
+    if not markdown or len(markdown) <= MAX_PAGE_MARKDOWN:
+        return markdown
+    omitted = len(markdown) - MAX_PAGE_MARKDOWN
+    return (markdown[:MAX_PAGE_MARKDOWN]
+            + f"\n\n... [{omitted:,} chars of page text truncated — scroll or use "
+              f"browser_interact to reach more, or open the saved screenshot] ...")
+
 def _print_image_to_terminal(image_bytes, target_width=80):
     """Renders an image directly in the terminal using ANSI truecolor and half-block characters."""
     try:
@@ -121,7 +136,7 @@ def process_browser_response(data, action_desc, session_id, tab_id):
     elements = data.get("elements", [])
     element_str = "\n".join([f"[{el['id']}] <{el['tag']}>: {el['text']}" for el in elements])
     
-    markdown = data.get("markdown", "")
+    markdown = _bound_markdown(data.get("markdown", ""))
     page_title = data.get("title", "Unknown")
     page_url = data.get("url", "Unknown")
     
