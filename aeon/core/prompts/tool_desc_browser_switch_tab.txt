@@ -1,6 +1,5 @@
-Switch to an already open browser tab without reloading the page. 
-
-CRITICAL: Use this tool instead of 'browser_navigate' when returning to a tab you have already used. 'browser_switch_tab' preserves the current state of the page (e.g., text typed into forms, scroll position, and session state), whereas 'browser_navigate' will reload the URL and cause any unsaved state to be lost.
+Switch to an already-open tab (or a popup/OAuth window the browser captured) WITHOUT reloading it, and return a fresh observation of that tab. Preserves the page's live state (typed text, scroll position, session), unlike browser_navigate which reloads. Popup/login windows opened by a site appear in the "Open tabs" list as 'popup_N' — switch to one to drive it (e.g. a Google sign-in window).
 
 Parameters:
-- tab_id: The unique identifier for the tab you wish to switch to.
+- tab_id (str, required): the tab name (or 'popup_N') to switch to.
+Example: {"tool_name": "browser_switch_tab", "parameters": {"tab_id": "popup_1"}}

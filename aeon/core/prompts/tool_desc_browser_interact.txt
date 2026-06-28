@@ -1,12 +1,30 @@
-Interacts with a specific tab in the browser. All interactions are performed with human-like mouse movements and typing delays to avoid bot detection.
-Schema:
-action (str, required): The action to perform. Must be one of: 'click', 'type', 'enter', 'hover', 'scroll_down', 'scroll_up'.
-element_id (int, optional): The ID of the interactive element to target. Required for 'click', 'type', and 'hover'.
-text (str, optional): The text to input. Required only if action is 'type'.
-expected_text (str, optional): REQUIRED for 'click'. A substring of the text you expect this element to contain to prevent accidental clicks.
-tab_id (str, optional, default="default"): The unique name of the tab to interact with (e.g., 'quora', 'gmail'). Must match the tab_id you used in browser_navigate.
+Interacts with the page like a human, then returns a fresh observation (indexed element list + scroll state + numbered screenshot + vision analysis). You address elements by the [id] shown in the INTERACTIVE ELEMENTS list; every id maps to the exact node (it is stamped onto the DOM), so there is no wrong-element ambiguity. All input is human-like (eased mouse moves, real keystrokes with natural delays).
 
-Notes:
-- 'hover': Use this to trigger dropdown menus or tooltips that only appear on mouse-over.
-- All actions include natural jitter and variable delays.
-Example: {"tool_name": "browser_interact", "parameters": {"action": "hover", "element_id": 14, "tab_id": "amazon"}}
+WORKFLOW: read the element list -> pick the [id] of the element you want -> act on it -> read the new observation -> repeat. If element ids feel stale (the page changed on its own), call browser_read first.
+
+Schema:
+  action (str, required): one of:
+    click | double_click | right_click  -> element_id required.
+    hover                                -> element_id required (reveals menus/tooltips).
+    type                                 -> element_id + text. Optional: clear_first (default true), then_enter (submit after typing).
+    press_key                            -> key (e.g. 'Enter','Tab','Escape','ArrowDown','PageDown','Control+A'); element_id optional.
+    scroll                               -> direction ('down'|'up'|'top'|'bottom') and optional amount (pixels, default 600). Give element_id to scroll the SCROLL CONTAINER that holds that element (e.g. an inbox/list/chat pane) instead of the whole page; use direction='to_element' with element_id to bring an off-screen element into view.
+    select_option                        -> element_id + value (option value or visible label).
+    check | uncheck                      -> element_id (checkboxes/switches).
+    clear                                -> element_id (empties a field).
+    drag                                 -> element_id (source) + to_element_id (target).
+    press_and_hold                       -> element_id + optional duration (ms).
+    upload_file                          -> element_id (a file input) + file_path.
+    go_back | go_forward | reload        -> no element.
+    wait_for                             -> text (wait until that text appears) and/or duration (ms).
+    get_text                             -> element_id (text of one element) or none (whole page body text).
+  element_id (int): the [id] from the element list.
+  text (str): for 'type'. expected_text (str): for clicks — a substring you expect in the target's name; the click is REFUSED if it doesn't match, preventing wrong-element clicks.
+  tab_id (str, default 'default'): which tab to act on.
+
+Aliases accepted: scroll_down, scroll_up, scroll_to_top, scroll_to_bottom, enter.
+
+Examples:
+  {"tool_name":"browser_interact","parameters":{"action":"type","element_id":7,"text":"flights to Tokyo","then_enter":true,"tab_id":"search"}}
+  {"tool_name":"browser_interact","parameters":{"action":"click","element_id":23,"expected_text":"Project update","tab_id":"gmail"}}
+  {"tool_name":"browser_interact","parameters":{"action":"scroll","element_id":23,"direction":"down","tab_id":"gmail"}}

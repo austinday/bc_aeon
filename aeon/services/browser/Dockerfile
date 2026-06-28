@@ -12,6 +12,13 @@ WORKDIR /app
 # service files are at the root of the context — reference them by bare name.
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
+# Ensure the pip-pinned Playwright's Chromium build is present (the base image
+# ships browsers, but this guarantees a version match with playwright==1.60.0).
+RUN python3 -m playwright install chromium
+
+# Persistent profile mount point: a host volume is mounted here at run time so
+# logins/cookies survive container restarts (see start_browser.sh).
+RUN mkdir -p /profiles
 
 COPY . .
 

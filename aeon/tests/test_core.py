@@ -334,20 +334,43 @@ class TestImageDimNormalization(unittest.TestCase):
         self.assertEqual(self.f(None), 1024)
 
 
-class TestBrowserMarkdownBound(unittest.TestCase):
-    def test_short_unchanged(self):
-        from aeon.tools.browser import _bound_markdown
-        self.assertEqual(_bound_markdown("hello"), "hello")
+class TestBrowserSnapshotFormat(unittest.TestCase):
+    """The structured element snapshot is the agent's primary, lossless view."""
 
-    def test_empty(self):
-        from aeon.tools.browser import _bound_markdown
-        self.assertEqual(_bound_markdown(""), "")
+    def _els(self):
+        return [
+            {"id": 1, "role": "link", "name": "Inbox", "states": [], "inViewport": True,
+             "scrollContainer": None, "value": ""},
+            {"id": 23, "role": "row", "name": "Jane — Project update", "states": ["collapsed"],
+             "inViewport": True, "scrollContainer": 2, "value": ""},
+            {"id": 50, "role": "button", "name": "Archive", "states": ["disabled"],
+             "inViewport": False, "scrollContainer": None, "value": ""},
+        ]
 
-    def test_long_is_capped_with_note(self):
-        from aeon.tools.browser import _bound_markdown, MAX_PAGE_MARKDOWN
-        out = _bound_markdown("x" * (MAX_PAGE_MARKDOWN * 3))
-        self.assertLess(len(out), MAX_PAGE_MARKDOWN + 300)
-        self.assertIn("truncated", out)
+    def test_groups_in_view_vs_offscreen(self):
+        from aeon.tools.browser import _format_elements
+        out = _format_elements(self._els())
+        self.assertIn("IN VIEW", out)
+        self.assertIn("OFF-SCREEN", out)
+        self.assertIn("[23] row", out)
+        self.assertIn("(collapsed)", out)
+        self.assertIn("scroll-group 2", out)
+
+    def test_empty_elements_message(self):
+        from aeon.tools.browser import _format_elements
+        self.assertIn("no interactive elements", _format_elements([]).lower())
+
+    def test_element_list_is_bounded(self):
+        from aeon.tools.browser import _format_elements, MAX_ELEMENTS_CHARS
+        big = [{"id": i, "role": "button", "name": "x" * 200, "states": [],
+                "inViewport": True, "scrollContainer": None, "value": ""} for i in range(2000)]
+        out = _format_elements(big)
+        self.assertLessEqual(len(out), MAX_ELEMENTS_CHARS + 200)
+
+    def test_scroll_state(self):
+        from aeon.tools.browser import _format_scroll
+        self.assertIn("more below", _format_scroll({"scrollY": 0, "scrollHeight": 3000, "clientHeight": 1000}))
+        self.assertIn("fits in view", _format_scroll({"scrollY": 0, "scrollHeight": 800, "clientHeight": 1000}))
 
 
 class TestOscillationLogic(unittest.TestCase):

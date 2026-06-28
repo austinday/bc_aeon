@@ -1,5 +1,5 @@
-Navigates to a URL using a stealth browser. Returns the visible text (markdown), a list of interactive elements with assigned IDs, and saves screenshots of the page. You can manage multiple tabs by providing a custom tab_id.
+Opens a URL in a real, human-like Chromium browser (headed, stealthed, with a PERSISTENT profile — so logins and cookies survive across steps and runs; if you logged into a site before, you are likely still logged in). Returns an observation: the page's INTERACTIVE ELEMENTS as a stable numbered list you act on by [id], the scroll state, a numbered ("Set-of-Mark") screenshot, and a vision analysis. Use distinct tab_ids to keep several pages open at once.
 Schema:
-  url (str, required): The full URL to navigate to (e.g., 'https://en.wikipedia.org').
-  tab_id (str, optional, default="default"): A unique name for this browser tab (e.g., 'quora', 'gmail'). Use different tab_ids to keep multiple pages open simultaneously without losing state.
-Example: {"tool_name": "browser_navigate", "parameters": {"url": "https://news.ycombinator.com", "tab_id": "hackernews"}}
+  url (str, required): The URL to open (scheme optional; 'https://' is added if missing).
+  tab_id (str, optional, default="default"): A name for this tab (e.g. 'gmail', 'search'). Reuse the same tab_id with browser_interact/browser_read to keep working on that page; use browser_switch_tab to return to it without reloading.
+Example: {"tool_name": "browser_navigate", "parameters": {"url": "https://mail.google.com", "tab_id": "gmail"}}

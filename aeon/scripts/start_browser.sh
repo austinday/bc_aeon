@@ -20,8 +20,19 @@ fi
 echo "[Browser] Removing old container if exists..."
 docker rm -f $CONTAINER_NAME >/dev/null 2>&1 || true
 
-echo "[Browser] Starting container..."
-docker run -d --name $CONTAINER_NAME -p $PORT:8030 -e PORT=8030 --shm-size=2g $IMAGE_NAME
+# Persistent browser profile on the HOST so logins/cookies survive container
+# restarts (the headed Chromium runs as a persistent context in /profiles).
+PROFILE_HOST_DIR="${AEON_HOME:-$HOME/.aeon}/browser_profiles"
+mkdir -p "$PROFILE_HOST_DIR"
+
+echo "[Browser] Starting container (headed Chromium under Xvfb, persistent profile)..."
+docker run -d --name $CONTAINER_NAME \
+    -p $PORT:8030 \
+    -e PORT=8030 \
+    -e AEON_BROWSER_PROFILE=/profiles/default \
+    -v "$PROFILE_HOST_DIR":/profiles \
+    --shm-size=2g \
+    $IMAGE_NAME
 
 echo "[Browser] Waiting for service to become healthy (timeout 60s)..."
 for i in {1..60}; do

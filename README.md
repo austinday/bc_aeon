@@ -63,6 +63,30 @@ Tools are grouped into collapsible categories to save context; top-level tools
 video, browser, sub-agent coordination, …). Skills are pinned step-by-step
 protocols the agent activates for matching objectives.
 
+## Web browsing (human-grade)
+
+The `web_browser` tools drive a real, **headed Chromium** running under Xvfb in a
+container (`aeon/services/browser/`), with a **persistent profile** so logins and
+cookies survive across steps and restarts, plus stealth + human-like mouse/keyboard
+input so it looks and acts like a person.
+
+Every observation gives the agent two aligned channels:
+- a **stable, indexed element list** built from the accessibility tree — each
+  interactable/meaningful node is stamped with a `data-aeon-id` and described by
+  its role, accessible name, value, and state (`expanded`/`collapsed`, `selected`,
+  `checked`, `disabled`, off-screen, scroll-group). The agent acts on elements by
+  `[id]`, which resolves to the exact node (no selector guessing).
+- a **Set-of-Mark screenshot** with numbered boxes that match those same ids,
+  analyzed by the vision model.
+
+Actions (`browser_interact`) cover the full human repertoire by id: click /
+double / right-click, hover, type (real keystrokes, optional submit), press_key,
+**scroll** (page or within a specific scroll container — e.g. an inbox list),
+drag, press-and-hold, select_option, check/uncheck, upload_file, back/forward/
+reload, wait_for. Clicks can pass `expected_text`, which is verified against the
+target before clicking to prevent wrong-element clicks. `browser_read` re-observes
+without acting; popups/OAuth windows are captured as switchable tabs.
+
 ## Self-modification
 
 Aeon can edit its own source. The workflow is: change the code →
