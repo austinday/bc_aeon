@@ -1,3 +1,6 @@
+import os
+import queue
+import signal
 import subprocess
 import time
 import shutil
@@ -54,6 +57,28 @@ class RunCommandTool(BaseTool):
             description=TOOL_DESC_RUN_COMMAND
         )
 
+    @staticmethod
+    def _kill_process_tree(process):
+        """Kill the command's entire process group, not just the bash shell.
+
+        With shell=True the bash spawns children (builds, training scripts,
+        servers); killing only the shell leaves those running as orphans that
+        keep holding GPU/CPU on a shared box. We launch the command in its own
+        session (start_new_session=True) so the whole tree shares a process
+        group we can signal here.
+        """
+        if process is None:
+            return
+        try:
+            pgid = os.getpgid(process.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            # Group already gone, or no permission -> fall back to the shell PID.
+            try:
+                process.kill()
+            except Exception:
+                pass
+
     def _truncate(self, text: str) -> str:
         if len(text) <= self.MAX_RETURN_CHARS:
             return text
@@ -109,11 +134,28 @@ class RunCommandTool(BaseTool):
                 encoding='utf-8',
                 errors='replace',
                 bufsize=1,
+                start_new_session=True,  # own process group -> killable as a tree
             )
+
+            # Read stdout on a dedicated thread so the wall-clock timeout is
+            # enforced even when the command produces NO output (a silent hang
+            # used to block readline() past the timeout indefinitely). The
+            # reader pushes lines onto a queue and a None sentinel at EOF.
+            line_q: "queue.Queue" = queue.Queue()
+
+            def _reader():
+                try:
+                    for ln in iter(process.stdout.readline, ''):
+                        line_q.put(ln)
+                finally:
+                    line_q.put(None)
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
 
             while True:
                 if time.time() - start_time > effective_timeout:
-                    process.kill()
+                    self._kill_process_tree(process)
                     partial = self._truncate("".join(output_lines))
                     return (
                         f"COMMAND TIMED OUT after {effective_timeout}s (process killed).\n\n"
@@ -122,15 +164,22 @@ class RunCommandTool(BaseTool):
                         f"{self.HARD_MAX_TIMEOUT}s), run it in the background, or bound its runtime."
                     )
 
-                line = process.stdout.readline()
-                if not line and process.poll() is not None:
-                    break
-                if line:
-                    print(line, end='', flush=True)
-                    output_lines.append(line)
-                    rt.touch()
+                try:
+                    line = line_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue  # no output yet — loop back and re-check the timeout
+                if line is None:
+                    break  # EOF: command finished and stdout closed
+                print(line, end='', flush=True)
+                output_lines.append(line)
+                rt.touch()
 
-            return_code = process.poll()
+            # stdout is closed; give the process a moment to be reaped so we read
+            # a real exit code rather than None.
+            try:
+                return_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                return_code = process.poll()
             output = "".join(output_lines)
 
             if return_code != 0:
@@ -143,10 +192,10 @@ class RunCommandTool(BaseTool):
             return f"COMMAND SUCCESS\n\nOUTPUT:\n{self._truncate(output)}"
 
         except KeyboardInterrupt:
-            print("\n[RunCommand] Interrupted! Stopping subprocess...", flush=True)
+            print("\n[RunCommand] Interrupted! Stopping subprocess tree...", flush=True)
             if process:
+                self._kill_process_tree(process)
                 try:
-                    process.kill()
                     process.wait(timeout=1)
                 except Exception:
                     pass
