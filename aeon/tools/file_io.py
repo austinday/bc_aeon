@@ -58,6 +58,7 @@ def _suggest_paths(missing_path: str) -> str:
         target_lower = target.lower()
 
         exact, fuzzy = [], []
+        all_basenames = {}  # basename -> full path, for an edit-distance fallback
         scanned = 0
         for dirpath, dirnames, filenames in os.walk(root):
             # Prune heavy/duplicate/junk dirs in-place so os.walk skips them entirely.
@@ -69,6 +70,7 @@ def _suggest_paths(missing_path: str) -> str:
                 scanned += 1
                 if scanned > _SUGGEST_MAX_FILES_SCANNED:
                     break
+                all_basenames.setdefault(fn, os.path.join(dirpath, fn))
                 if fn == target:
                     exact.append(os.path.join(dirpath, fn))
                 elif fn.lower() == target_lower:
@@ -82,6 +84,12 @@ def _suggest_paths(missing_path: str) -> str:
                 break
 
         hits = exact if exact else fuzzy
+        if not hits:
+            # Edit-distance fallback catches transposition/typo cases that neither
+            # an exact nor a substring match would find (e.g. 'wrokflow.py').
+            import difflib
+            close = difflib.get_close_matches(target, list(all_basenames), n=_SUGGEST_MAX_HITS, cutoff=0.7)
+            hits = [all_basenames[b] for b in close]
         if not hits:
             return (f"\nNo file named '{target}' exists anywhere in the project "
                     f"({root}). The path you used does not exist - re-check the "
