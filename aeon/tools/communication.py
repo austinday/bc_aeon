@@ -21,11 +21,19 @@ class ThinkTool(BaseTool):
         self.llm_client = llm_client
         self.worker = worker
 
+    # Per-file cap for the working-memory snapshot fed to think. Without a bound,
+    # several large open files could blow the context window and slow the call;
+    # the agent already has the files in its main context, so think only needs a
+    # generous-but-bounded view.
+    THINK_FILE_CAP = 60000
+
     def execute(self, query: str):
+        if not query or not str(query).strip():
+            return "Error: 'query' parameter is required (what should I think about?)."
         working_memory = "No working memory available."
         if self.worker:
-             working_memory = self.worker._format_open_files()
-        
+            working_memory = self.worker._format_open_files(max_content_len=self.THINK_FILE_CAP)
+
         prompt = THINK_TOOL_PROMPT.format(working_memory=working_memory, query=query)
         return self.llm_client.reason(prompt=prompt)
 
