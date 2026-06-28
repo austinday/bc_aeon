@@ -102,6 +102,28 @@ CATALOG: List[CatalogEntry] = [
         download_state="gemma4-q8_0-mtp-v2",
     ),
     CatalogEntry(
+        # vLLM NVFP4 path: the SAME abliterated Gemma-4, self-quantized to *plain* NVFP4
+        # (4-bit weights + activations, compressed-tensors) so it runs on native FP4
+        # tensor cores on x86 Blackwell (sm_120) under vLLM 0.23 -- the "durable NVFP4
+        # route" the Q8_0 entry above anticipated. Distinct from the rejected NVFP4_AWQ
+        # builds. Native MTP via the official assistant draft (method "mtp"; passing
+        # "draft_model" for a gemma-4 assistant silently disables MTP -- vLLM #42005).
+        # vLLM fetches the weights from the hub at runtime; setup PHASE 5.6c pre-caches
+        # them into ~/.cache/huggingface so first launch isn't a ~20 GB wait.
+        name="Gemma-4-31B-NVFP4-MTP",
+        family="Gemma-4",
+        provider="vllm",
+        image="aeon_vllm:latest",
+        weights_gib=21.0,            # 20.4 NVFP4 target + 0.9 assistant draft
+        kv_gib_per_64k=6.0,          # f16 KV, vLLM (sliding-window keeps this modest)
+        max_ctx=262144,
+        ports={"lb": 8016, "node0": 8017, "node1": 8018},
+        hf_model="aday777/gemma-4-31B-it-abliterated-NVFP4",
+        served_name="Gemma-4-31B-NVFP4",
+        mtp=Mtp(draft_model="google/gemma-4-31B-it-assistant", method="mtp", n_max=5),
+        # No download_cmd: vLLM fetches at runtime; setup PHASE 5.6c warms the HF cache.
+    ),
+    CatalogEntry(
         name="Qwen3.6-35B-A3B-Uncensored",
         family="Qwen3.6",
         provider="llamacpp",

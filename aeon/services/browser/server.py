@@ -2,9 +2,12 @@
 Aeon browser service — a human-grade web agent backend.
 
 Design (rewritten):
-  * One HEADED Chromium running under the container's Xvfb display, launched as a
-    PERSISTENT context (user-data-dir) so logins/cookies survive across steps and
-    restarts. Stealth tweaks + human-like input make it look and act like a person.
+  * REAL Google Chrome (not Chromium) driven by Patchright (a patched, API-compatible
+    Playwright that removes the CDP automation tells), running HEADED under the
+    container's Xvfb display as a PERSISTENT context (user-data-dir) so logins/cookies
+    survive. No spoofed UA/viewport and no detectable evasion shims — combined with
+    human-like mouse/keyboard input and the host's residential IP, it aims to be
+    indistinguishable from a person at a normal browser.
   * Every observation builds a STABLE, semantic element index: each visible
     interactable/meaningful node is stamped with a `data-aeon-id` attribute (so an
     action targets the EXACT node, never a guessed CSS selector) and described by
@@ -33,17 +36,20 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from playwright.async_api import async_playwright, Page, BrowserContext, Error as PWError
+# Patchright is a drop-in, API-compatible Playwright fork that PATCHES the
+# automation tells real bot-detection probes for: it avoids the CDP
+# `Runtime.enable` leak, removes the console/runtime fingerprints, and does not
+# inject detectable evasion shims. Combined with real headed Chrome + a
+# persistent profile + human-like input, this is about as close to a real human
+# at a real browser as we can get. (Import name mirrors playwright exactly.)
+from patchright.async_api import async_playwright, Page, BrowserContext, Error as PWError
 
 app = FastAPI()
 
 # --- Configuration ----------------------------------------------------------
 PROFILE_DIR = os.environ.get("AEON_BROWSER_PROFILE", "/profiles/default")
-DEFAULT_VIEWPORT = {"width": 1280, "height": 1024}
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+TIMEZONE = os.environ.get("AEON_BROWSER_TZ", "America/Los_Angeles")
+LOCALE = os.environ.get("AEON_BROWSER_LOCALE", "en-US")
 MAX_INDEXED_ELEMENTS = 250
 NAV_SETTLE_MS = 2500          # bounded "networkidle" wait so SPAs never hang us
 ACTION_SETTLE_MS = 600        # let the DOM react after an action before re-reading
@@ -259,33 +265,46 @@ _OVERLAY_CLEAR_JS = "() => { const o = document.getElementById('__aeon_som__'); 
 # ============================================================================
 
 async def _ensure_browser():
+    """Launch the most human-indistinguishable browser we can.
+
+    Maximum realism, in order of importance:
+      1. REAL Google Chrome (channel='chrome') — correct branding, build flags,
+         fonts, codecs and TLS/JA3 fingerprint, not open-source Chromium (which
+         leaks 'HeadlessChrome'/Chromium build signals).
+      2. HEADED under Xvfb — headless has dozens of detectable differences.
+      3. Patchright's patched driver — no CDP `Runtime.enable` leak, the single
+         biggest automation tell; it also injects NO detectable evasion shim, so
+         we deliberately do NOT add manual navigator.webdriver hacks (those are
+         themselves fingerprinted).
+      4. NO user_agent / viewport override — the real browser reports a perfectly
+         self-consistent UA + userAgentData + window size; spoofing either
+         creates a mismatch detectors look for. We use the real window (no_viewport).
+      5. Persistent profile — real cookies/history/login state, like a person's
+         everyday browser.
+    Behavioral realism (eased mouse paths, real per-key typing delays) is in the
+    action helpers. The container uses the host's residential IP.
+    """
     global _playwright, context
     if context is not None:
         return context
     os.makedirs(PROFILE_DIR, exist_ok=True)
     _playwright = await async_playwright().start()
-    context = await _playwright.chromium.launch_persistent_context(
+    launch_kwargs = dict(
         user_data_dir=PROFILE_DIR,
-        headless=False,  # headed under Xvfb so we look like a real browser
-        viewport=DEFAULT_VIEWPORT,
-        user_agent=USER_AGENT,
-        locale="en-US",
-        timezone_id="America/Los_Angeles",
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--start-maximized",
-        ],
-        ignore_default_args=["--enable-automation"],
+        headless=False,
+        no_viewport=True,           # use the real OS window size, no viewport tell
+        locale=LOCALE,
+        timezone_id=TIMEZONE,
+        # Keep args minimal: patchright strips the automation flags. --no-sandbox
+        # is required to run Chrome as root in a container; the rest aid Xvfb.
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--start-maximized"],
     )
-    # Stealth: hide the automation fingerprints sites probe for.
-    await context.add_init_script(
-        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-        "window.chrome={runtime:{}};"
-        "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
-        "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
-    )
+    try:
+        context = await _playwright.chromium.launch_persistent_context(channel="chrome", **launch_kwargs)
+    except Exception as e:
+        # Fall back to the patched Chromium if real Chrome isn't present.
+        print(f"[browser] real Chrome channel unavailable ({e}); using patched Chromium.")
+        context = await _playwright.chromium.launch_persistent_context(**launch_kwargs)
     # Capture popups/new tabs (OAuth windows, target=_blank) automatically.
     context.on("page", _register_popup)
     return context

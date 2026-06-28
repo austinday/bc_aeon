@@ -65,10 +65,13 @@ protocols the agent activates for matching objectives.
 
 ## Web browsing (human-grade)
 
-The `web_browser` tools drive a real, **headed Chromium** running under Xvfb in a
-container (`aeon/services/browser/`), with a **persistent profile** so logins and
-cookies survive across steps and restarts, plus stealth + human-like mouse/keyboard
-input so it looks and acts like a person.
+The `web_browser` tools drive **real Google Chrome** (not Chromium) via
+**Patchright** (a patched Playwright that removes the CDP automation tells most
+bot-detectors probe for), running **headed** under Xvfb in a container
+(`aeon/services/browser/`) with a **persistent profile** so logins/cookies
+survive. It uses no spoofed user-agent/viewport and no detectable evasion shims —
+combined with human-like mouse/keyboard input and the host's residential IP, the
+goal is to be indistinguishable from a person at a normal browser.
 
 Every observation gives the agent two aligned channels:
 - a **stable, indexed element list** built from the accessibility tree — each

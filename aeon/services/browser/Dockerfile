@@ -1,10 +1,15 @@
 FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 
+# Install REAL Google Chrome (for channel='chrome' max-stealth browsing) plus
+# Xvfb so Chrome can run HEADED (far less detectable than headless).
 RUN apt-get update && apt-get install -y \
-    xvfb \
-    curl \
-    python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+    xvfb curl wget gnupg python3-pip \
+ && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+      | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+ && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+      > /etc/apt/sources.list.d/google-chrome.list \
+ && apt-get update && apt-get install -y google-chrome-stable \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -12,9 +17,8 @@ WORKDIR /app
 # service files are at the root of the context — reference them by bare name.
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
-# Ensure the pip-pinned Playwright's Chromium build is present (the base image
-# ships browsers, but this guarantees a version match with playwright==1.60.0).
-RUN python3 -m playwright install chromium
+# Patchright's patched Chromium is the fallback if real Chrome is ever absent.
+RUN python3 -m patchright install chromium
 
 # Persistent profile mount point: a host volume is mounted here at run time so
 # logins/cookies survive container restarts (see start_browser.sh).
