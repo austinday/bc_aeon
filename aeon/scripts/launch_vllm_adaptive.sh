@@ -33,7 +33,10 @@ UTIL="${GPU_MEM_UTIL:-$DEF_UTIL}"
 
 SPEC_ARGS=()
 if [ -n "${AEON_MTP_DRAFT_MODEL}" ]; then
-    SPEC_ARGS=(--speculative-config "{\"method\": \"draft_model\", \"model\": \"${AEON_MTP_DRAFT_MODEL}\", \"num_speculative_tokens\": ${AEON_MTP_NMAX:-5}}")
+    # method is plan-driven: gemma-4 assistant => "mtp" (native MTP speculator), other
+    # drafts => "draft_model". Passing "draft_model" for a gemma-4 assistant silently
+    # disables MTP (vLLM #42005), so the catalog sets this explicitly.
+    SPEC_ARGS=(--speculative-config "{\"method\": \"${AEON_MTP_METHOD:-draft_model}\", \"model\": \"${AEON_MTP_DRAFT_MODEL}\", \"num_speculative_tokens\": ${AEON_MTP_NMAX:-5}}")
 fi
 
 wait_for_health() {
@@ -52,7 +55,7 @@ launch_node() {
     docker rm -f "$name" >/dev/null 2>&1 || true
     local args=(--model "$HF_MODEL" --served-model-name "$SERVED" --host 0.0.0.0 --port "$port"
                 --tensor-parallel-size "$tp" --gpu-memory-utilization "$UTIL"
-                --enable-prefix-caching --max-model-len "${MAX_MODEL_LEN:-$ctx}")
+                --enable-prefix-caching --enable-chunked-prefill --max-model-len "${MAX_MODEL_LEN:-$ctx}")
     [ -n "$cpu_offload" ] && [ "$cpu_offload" != "0.0" ] && [ "$cpu_offload" != "0" ] && args+=(--cpu-offload-gb "$cpu_offload")
     args+=("${SPEC_ARGS[@]}")
     echo "[adaptive-vllm] launch $name (GPU $devices, port $port, TP=$tp, util $UTIL, ctx $ctx${cpu_offload:+, cpu_offload ${cpu_offload}GiB})"

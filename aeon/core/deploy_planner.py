@@ -190,6 +190,7 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo], mode: Optional[str] = None) -
         "AEON_SERVED_NAME": entry.served_name or entry.name,
         "AEON_MTP_DRAFT_FILE": (entry.mtp.draft_file if entry.mtp and entry.mtp.draft_file else ""),
         "AEON_MTP_DRAFT_MODEL": (entry.mtp.draft_model if entry.mtp and entry.mtp.draft_model else ""),
+        "AEON_MTP_METHOD": (entry.mtp.method if entry.mtp else "draft_model"),
         "AEON_MTP_NMAX": str(entry.mtp.n_max if entry.mtp else 0),
         "AEON_KV_QUANT": entry.kv_quant or "",
     }
