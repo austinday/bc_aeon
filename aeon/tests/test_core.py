@@ -170,6 +170,39 @@ class TestTokenEstimation(unittest.TestCase):
         self.assertGreater(long, short)
 
 
+class TestNormalizeActions(unittest.TestCase):
+    def _worker(self):
+        from aeon.core.worker import Worker
+        return Worker.__new__(Worker)
+
+    def test_list_passthrough(self):
+        w = self._worker()
+        acts = [{"tool_name": "x", "parameters": {}}]
+        self.assertEqual(w._normalize_actions(acts), acts)
+
+    def test_single_dict_wrapped(self):
+        w = self._worker()
+        out = w._normalize_actions({"tool_name": "run_command", "parameters": {"command": "ls"}})
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["tool_name"], "run_command")
+
+    def test_key_aliases(self):
+        w = self._worker()
+        out = w._normalize_actions([{"tool": "run_command", "args": {"command": "ls"}}])
+        self.assertEqual(out[0]["tool_name"], "run_command")
+        self.assertEqual(out[0]["parameters"], {"command": "ls"})
+
+    def test_dropping_non_dicts(self):
+        w = self._worker()
+        out = w._normalize_actions(["garbage", {"tool_name": "x"}, 5])
+        self.assertEqual(len(out), 1)
+
+    def test_dict_of_actions(self):
+        w = self._worker()
+        out = w._normalize_actions({"1": {"tool_name": "a"}, "2": {"tool_name": "b"}})
+        self.assertEqual(len(out), 2)
+
+
 class TestToolNameResolution(unittest.TestCase):
     def _worker(self):
         from aeon.core.worker import Worker

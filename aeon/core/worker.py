@@ -698,6 +698,42 @@ class Worker:
             f"--- BEGIN PROTOCOL ---\n{content}\n--- END PROTOCOL ---\n"
         )
 
+    def _normalize_actions(self, actions) -> list:
+        """Coerce the model's `actions` field into a clean list of action dicts.
+
+        Tolerates two common model mistakes: emitting a single action object
+        instead of a one-element array, and wrapping the call as
+        {"tool_name": ..., "parameters": ...} vs {"tool": ..., "args": ...}.
+        Drops entries that aren't dicts so the executor never iterates over
+        stray strings.
+        """
+        if isinstance(actions, dict):
+            # A single action object, or a dict-of-actions keyed by index/name.
+            if "tool_name" in actions or "tool" in actions:
+                actions = [actions]
+            else:
+                actions = list(actions.values())
+        if not isinstance(actions, list):
+            return []
+
+        normalized = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            # Accept a few common key aliases for robustness.
+            if "tool_name" not in a:
+                if "tool" in a:
+                    a["tool_name"] = a.get("tool")
+                elif "name" in a:
+                    a["tool_name"] = a.get("name")
+            if "parameters" not in a:
+                if "args" in a:
+                    a["parameters"] = a.get("args")
+                elif "params" in a:
+                    a["parameters"] = a.get("params")
+            normalized.append(a)
+        return normalized
+
     def _resolve_tool_name(self, tool_name: str) -> Optional[str]:
         """Auto-correct a tool name only when there is exactly ONE unambiguous
         normalized match (case/dash/space differences). Returns the canonical
@@ -995,7 +1031,7 @@ class Worker:
                 previous_result_summary = response_data.get("previous_result_summary", "N/A (first turn)")
                 intent = response_data.get("intent", "(No intent provided)")
                 updated_plan = response_data.get("updated_plan")
-                actions = response_data.get("actions", [])
+                actions = self._normalize_actions(response_data.get("actions", []))
 
                 if self.debug_mode and hasattr(self, 'debug_path'):
                     try:
