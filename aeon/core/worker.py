@@ -1298,6 +1298,26 @@ class Worker:
                         )
                         self.last_observation += loop_warning
                         self.print_func(f"{C_RED}{loop_warning}{C_RESET}")
+
+                # --- INTENT-LEVEL STALL DETECTION ---
+                # The hard loop above only fires on byte-identical command+output.
+                # This complementary check catches spinning on the same GOAL across
+                # turns even when the exact commands or outputs vary slightly.
+                norm_intent = re.sub(r"\s+", " ", (intent or "").strip().lower())[:160]
+                self.recent_intents.append(norm_intent)
+                if (not loop_detected and norm_intent
+                        and len(self.recent_intents) == self.recent_intents.maxlen
+                        and len(set(self.recent_intents)) == 1):
+                    stall_note = (
+                        f"\n\n** STALL WARNING: your stated intent has been essentially the same "
+                        f"for {self.recent_intents.maxlen} turns ('{intent[:120]}') without resolving it. "
+                        f"You may be making no real progress on this goal. Re-read your ATTEMPT LOG, "
+                        f"question the assumption behind this intent, and either change approach or switch "
+                        f"to a different sub-task. **"
+                    )
+                    self.last_observation += stall_note
+                    self.print_func(f"{C_YELLOW}{stall_note}{C_RESET}")
+
                 if not loop_detected:
                     # Progress was made (commands/outputs changed) -> clear any prior
                     # loop flag so a recovered sub-agent stops showing as LOOPING.
