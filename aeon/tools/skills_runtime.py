@@ -16,8 +16,23 @@ Both are BaseTool subclasses, so the dynamic loader picks them up automatically
 registration is required.
 """
 
+import difflib
+
 from aeon.tools.base import BaseTool
 from aeon.core.skills.manager import SkillsManager
+
+
+def _all_skill_paths(sm):
+    """Best-effort list of every '<category>/<skill>' path (empty on failure)."""
+    paths = []
+    try:
+        categories = [d.name for d in sm.base_dir.iterdir() if d.is_dir() and not d.name.startswith('__')]
+        for cat in categories:
+            for skill in sm.get_skills_in_category(cat):
+                paths.append(f"{cat}/{skill}")
+    except Exception:
+        pass
+    return paths
 
 
 class ActivateSkillTool(BaseTool):
@@ -53,10 +68,11 @@ class ActivateSkillTool(BaseTool):
                     f"Error: Skill '{skill_name}' not found in category '{category}'. "
                     f"Available in '{category}': {', '.join(sorted(available))}"
                 )
-            return (
-                f"Error: No skill found at '{skill_path}'. "
-                f"Check the SKILLS section for valid '<category>/<skill_name>' paths."
-            )
+            # Category itself is likely mistyped — suggest the closest real paths.
+            close = difflib.get_close_matches(skill_path, _all_skill_paths(sm), n=3, cutoff=0.4)
+            hint = f" Did you mean: {', '.join(close)}?" if close else \
+                   " Check the SKILLS section for valid '<category>/<skill_name>' paths."
+            return f"Error: No skill found at '{skill_path}'.{hint}"
 
         self.worker.active_skill = {"path": skill_path, "content": content}
         self.worker.expanded_categories.add(f"skill:{category}")
