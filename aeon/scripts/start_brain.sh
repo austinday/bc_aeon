@@ -36,25 +36,42 @@ if [ ! -z "$CID" ]; then
   docker rm -f $CID >/dev/null
 fi
 
-# --- 2. START BRAIN NODE (GPU 0 - Port 8000) ---
-echo "[2/2] Launching Brain Node (GPU 0 -> :8000)..."
+# --- 2. START BRAIN NODE (GPU 1 - Port 8000) ---
+echo "[2/2] Launching Brain Node (GPU 1 -> :8000)..."
 
-# Configuration:
-# - OLLAMA_MAX_LOADED_MODELS=2: Allows Strong & Weak to coexist in VRAM if they fit.
-# - OLLAMA_NUM_PARALLEL=4: Allows queueing and parallel requests.
-# - device=0: Strictly use GPU 0, leaving GPU 1 free.
+# The brain hosts the small "utility" model that handles the agent's high-frequency
+# support tasks (skill routing, JSON repair, summarization, log/memory compression,
+# interruption analysis). It runs on GPU 1 so those tasks stop contending with the
+# strong LLM (+ sub-agents) on GPU 0. A small model + modest ctx keeps GPU 1 mostly
+# free for the image/video/vision tools that also live there.
+#   - device=1: pin to GPU 1.
+#   - OLLAMA_NUM_PARALLEL=2: utility calls can overlap a little without thrashing.
+#   - OLLAMA_NUM_CTX=65536: enough for long summaries/compressions; light KV on a 3B.
+UTILITY_MODEL="${AEON_UTILITY_MODEL:-huihui_ai/qwen2.5-abliterate:3b}"
 
 docker run -d \
     --name aeon_brain_node \
-    --gpus all \
+    --gpus '"device=1"' \
     -v "$HOST_OLLAMA_DIR:/root/.ollama" \
     -e OLLAMA_KEEP_ALIVE=-1 \
     -e OLLAMA_MAX_LOADED_MODELS=2 \
-    -e OLLAMA_NUM_PARALLEL=1 \
-    -e OLLAMA_NUM_CTX=131072 \
+    -e OLLAMA_NUM_PARALLEL=2 \
+    -e OLLAMA_NUM_CTX=65536 \
     -p 8000:11434 \
     ollama/ollama:latest
 
+# Wait for the Ollama API, then ensure the utility model is present (one-time pull).
+echo "   >> Waiting for Ollama API on :8000..."
+for i in $(seq 1 30); do
+    curl -s -o /dev/null http://localhost:8000/api/tags && break
+    sleep 2
+done
+if ! curl -s http://localhost:8000/api/tags | grep -q "${UTILITY_MODEL%%:*}"; then
+    echo "   >> Pulling utility model ${UTILITY_MODEL} (one-time)..."
+    docker exec aeon_brain_node ollama pull "${UTILITY_MODEL}" || \
+        echo "   >> WARNING: utility model pull failed; agent will fall back to the strong model."
+fi
+
 echo "=================================================="
-echo "    BRAIN ONLINE (GPU 0). READY ON PORT 8000.     "
+echo "    BRAIN ONLINE (GPU 1). READY ON PORT 8000.     "
 echo "=================================================="

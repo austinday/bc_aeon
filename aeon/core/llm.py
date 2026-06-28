@@ -135,6 +135,26 @@ class LLMClient:
         self.model = config['model']
         self.context_limit = config.get('context_limit', 128000)
 
+        # Optional "utility" tier for high-frequency support tasks (skill routing,
+        # JSON repair/recovery, summarization, log/memory compression, interruption
+        # analysis). When AEON_UTILITY_BASE_URL + AEON_UTILITY_MODEL are set (by main.py
+        # when the GPU1 brain is up), these tasks run on that small model instead of the
+        # strong GPU0 model -- so they stop contending with the principal + sub-agents on
+        # the main node. Env-driven so spawned sub-agents inherit it too. Falls back to the
+        # strong model when unset or unreachable, keeping behavior identical to before.
+        util_base = os.environ.get("AEON_UTILITY_BASE_URL")
+        util_model = os.environ.get("AEON_UTILITY_MODEL")
+        if util_base and util_model and not isinstance(self.client, VertexAIClient):
+            try:
+                self.utility_client = openai.OpenAI(base_url=util_base, api_key="no-key-needed")
+                self.utility_model = util_model
+                self.logger.info(f"[Utility tier] support tasks -> {util_model} @ {util_base}")
+            except Exception as e:
+                self.logger.warning(f"[Utility tier] init failed ({e}); using strong model for support tasks")
+                self.utility_client, self.utility_model = self.client, self.model
+        else:
+            self.utility_client, self.utility_model = self.client, self.model
+
     def _create_client(self, config: dict):
         """Create an OpenAI-compatible client from a model config dict."""
         if config['provider'] == 'local':
@@ -205,8 +225,8 @@ class LLMClient:
                 "Respond with ONLY a valid JSON object, no prose, no markdown fences:\n"
                 '{\"skill\": \"<category>/<skill_name>\" or null, \"reason\": \"<one sentence>\"}'
             )
-            resp = self.client.chat.completions.create(
-                model=self.model,
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
             )
@@ -484,8 +504,8 @@ class LLMClient:
         )
         
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
                 messages=[{"role": "user", "content": recovery_prompt}],
                 temperature=0.1
             )
@@ -498,7 +518,7 @@ class LLMClient:
                 else:
                     content = content.strip("`")
                     
-            self._log_to_debug("BLOCK_RECOVERY", self.model, recovery_prompt, content)
+            self._log_to_debug("BLOCK_RECOVERY", self.utility_model, recovery_prompt, content)
             return content
         except Exception as e:
             self.logger.warning(f"Block recovery failed for {missing_key}: {e}")
@@ -519,13 +539,13 @@ class LLMClient:
         )
         
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("JSON_REPAIR", self.model, prompt, content)
+            self._log_to_debug("JSON_REPAIR", self.utility_model, prompt, content)
             return self._clean_json_response(content)
         except Exception as e:
             self.logger.warning(f"JSON repair failed: {e}")
@@ -627,27 +647,36 @@ class LLMClient:
                         model=self.model,
                         messages=[{"role": "user", "content": current_prompt}],
                         temperature=0.2,
-                        stream=True
+                        stream=True,
+                        # Ask the server for a final usage chunk so we can report the
+                        # model's REAL generated-token count, not a tiktoken estimate
+                        # (cl100k mis-counts Gemma tokens, making t/s look far too low).
+                        stream_options={"include_usage": True},
                     )
-                    
+
                     first_token_time = None
                     raw_chunks =[]
-                    
+                    server_completion_tokens = None
+
                     for chunk in resp_stream:
-                        if first_token_time is None:
-                            first_token_time = time.time()
-                        
+                        # The final usage-only chunk has empty choices; don't let it set TTFT.
                         if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                            if first_token_time is None:
+                                first_token_time = time.time()
                             delta = chunk.choices[0].delta
                             if hasattr(delta, 'content') and delta.content:
                                 raw_chunks.append(delta.content)
-                                
+                        usage = getattr(chunk, 'usage', None)
+                        if usage is not None and getattr(usage, 'completion_tokens', None):
+                            server_completion_tokens = usage.completion_tokens
+
                     end_time = time.time()
                     raw = "".join(raw_chunks)
                     ttft = (first_token_time - start_time) if first_token_time else 0
                     gen_time = (end_time - first_token_time) if first_token_time else 0
-                    comp_tokens = estimate_tokens(raw)
-                    
+                    # Prefer the server's real token count; fall back to the estimate.
+                    comp_tokens = server_completion_tokens or estimate_tokens(raw)
+
                     tps = comp_tokens / gen_time if gen_time > 0 else 0
                     print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s (TTFT: {ttft:.2f}s | {comp_tokens} tokens in {gen_time:.2f}s)\033[0m")
                     
@@ -788,12 +817,12 @@ class LLMClient:
         """Compress a long action log down to ~25% of its size using the utility model."""
         prompt = COMPRESS_ACTION_LOG_PROMPT.format(log=log_text)
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("COMPRESS_ACTION_LOG", self.model, prompt, content)
+            self._log_to_debug("COMPRESS_ACTION_LOG", self.utility_model, prompt, content)
             return content
         except Exception as e:
             self.logger.warning(f"Action log compression failed: {e}")
@@ -803,13 +832,13 @@ class LLMClient:
         """Compresses the persistent memories using the utility model and returns a dictionary."""
         prompt = COMPRESS_MEMORIES_PROMPT.format(memories=memories_text)
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"}
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("COMPRESS_MEMORIES", self.model, prompt, content)
+            self._log_to_debug("COMPRESS_MEMORIES", self.utility_model, prompt, content)
             
             cleaned = self._clean_json_response(content)
             return json.loads(cleaned)
@@ -821,13 +850,13 @@ class LLMClient:
         """Analyze user interruption to classify intent."""
         prompt = ANALYZE_INTERRUPTION_PROMPT.format(obj=obj, inp=inp)
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"}
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("ANALYZE_INTERRUPTION", self.model, prompt, content)
+            self._log_to_debug("ANALYZE_INTERRUPTION", self.utility_model, prompt, content)
             cleaned = self._clean_json_response(content)
             return json.loads(cleaned)
         except Exception as e:
@@ -852,12 +881,12 @@ class LLMClient:
         """Summarize text in context of a query."""
         prompt = SUMMARIZE_TEXT_PROMPT.format(query=query, text=text)
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
+            resp = self.utility_client.chat.completions.create(
+                model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("SUMMARIZE_TEXT (WEB SEARCH)", self.model, prompt, content)
+            self._log_to_debug("SUMMARIZE_TEXT (WEB SEARCH)", self.utility_model, prompt, content)
             return content
         except Exception as e:
             self.logger.warning(f"Summarize text failed: {e}")

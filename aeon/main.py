@@ -191,6 +191,30 @@ def warm_up_models(local_model_names):
             print(f" Error: {e}")
     print("[SYSTEM] Model warmup complete.")
 
+def enable_utility_tier_if_available(model_config):
+    """Route the agent's high-frequency support tasks (skill routing, JSON repair,
+    summarization, log/memory compression, interruption analysis) to the small utility
+    model on the GPU1 brain, so they stop contending with the strong model + sub-agents
+    on GPU0. Sets AEON_UTILITY_* env vars that LLMClient reads (inherited by sub-agents).
+
+    Skipped in dual-GPU mode (GPU1 already hosts a strong node) and when the brain/model
+    isn't reachable -- LLMClient then falls back to the strong model, unchanged.
+    """
+    if "[dual" in str(model_config.get("model", "")).lower():
+        print("[CONFIG] Dual-GPU mode: support tasks stay on the strong model (no GPU1 brain).")
+        return
+    util_model = os.environ.get("AEON_UTILITY_MODEL", "huihui_ai/qwen2.5-abliterate:3b")
+    try:
+        tags = requests.get("http://localhost:8000/api/tags", timeout=3).json().get("models", [])
+        if any(util_model.split(":")[0] in m.get("name", "") for m in tags):
+            os.environ["AEON_UTILITY_BASE_URL"] = "http://localhost:8000/v1"
+            os.environ["AEON_UTILITY_MODEL"] = util_model
+            print(f"[CONFIG] Utility tier -> {util_model} on the GPU1 brain (:8000).")
+        else:
+            print("[CONFIG] Utility model not on brain; support tasks use the strong model.")
+    except Exception:
+        print("[CONFIG] Brain unreachable; support tasks use the strong model.")
+
 def cleanup_transient_tools():
     print("[SYSTEM] Cleaning up transient tool containers...")
     try:
@@ -1004,6 +1028,7 @@ def cli():
 
     try:
         session.enter(model_config=model_config, skip_warmup=args.no_warmup)
+        enable_utility_tier_if_available(model_config)
         llm_client = LLMClient(model_config)
         worker = Worker(llm_client=llm_client, debug_mode=args.debug, debug_log_path=args.debug_log)
         worker.model_name = model_config['model']

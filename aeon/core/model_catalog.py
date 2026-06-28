@@ -74,32 +74,32 @@ MIN_CTX = 65536  # never deploy below 64k context
 # Port allocation (lb = the port the agent connects to; node0/node1 = dual-copy backends).
 CATALOG: List[CatalogEntry] = [
     CatalogEntry(
-        # Canonical Gemma-4 path: abliterated (uncensored) NVFP4 served on vLLM, with
-        # native Gemma-4 MTP speculative decoding. NVFP4 (4-bit, native Blackwell FP4)
-        # ~halves the weight footprint and roughly doubles throughput vs the old Q8_0
-        # llama.cpp path on discrete Blackwell GPUs (RTX 5000/6000). The ~0.5B MTP
-        # assistant supplies the draft; on vLLM this MUST use method="mtp" (the gemma-4
-        # assistant is an MTP speculator, not a generic draft_model -- see vLLM #42005).
-        name="Gemma-4-31B-NVFP4",
+        # Canonical Gemma-4 path: abliterated (uncensored) Q8_0 GGUF on llama.cpp with
+        # native MTP (draft-mtp) speculative decoding. This is the working uncensored path
+        # on x86 + discrete Blackwell. (An NVFP4 swap was attempted but every abliterated
+        # Gemma-4 NVFP4 build is either NVFP4_AWQ -- which stock vLLM 0.23 rejects -- or
+        # only ships in an ARM-only image for DGX Spark, so it can't run on these x86 hosts.
+        # The durable NVFP4 route would be self-quantizing a bf16 abliterate to plain NVFP4.)
+        name="Gemma-4-31B-MTP-Q8_0",
         family="Gemma-4",
-        provider="vllm",
-        image="aeon_vllm:latest",
-        weights_gib=21.5,            # ~20.5 NVFP4 target + ~1.0 bf16 MTP assistant draft
-        kv_gib_per_64k=15.0,         # vLLM f16 KV (deliberately conservative): biases the
-                                     # planner low so max-model-len's KV + weights + spec
-                                     # draft + activations fit the 0.85 gpu-mem-util budget
-                                     # on the 48 GB machine without a startup OOM. On 96 GB
-                                     # it still hits the 256k cap. Raise real ctx per machine
-                                     # with the MAX_MODEL_LEN env override once validated.
+        provider="llamacpp",
+        image="aeon_gemma4_mtp:latest",
+        weights_gib=30.7,            # 30.4 target + 0.33 normalized assistant
+        kv_gib_per_64k=3.0,          # q4_0 KV, 48 layers
         max_ctx=262144,
-        ports={"lb": 8016, "node0": 8017, "node1": 8018},
-        hf_model="AEON-7/Gemma-4-31B-it-DECKARD-HERETIC-Uncensored-NVFP4",
-        served_name="Gemma-4-31B-NVFP4",
-        # Native Gemma-4 MTP via the official ~0.5B assistant speculator.
-        mtp=Mtp(draft_model="google/gemma-4-31B-it-assistant", n_max=5, method="mtp"),
-        # vLLM auto-detects the NVFP4 (modelopt) quant from the checkpoint config and
-        # fetches both target + assistant from the HF hub on first launch (cached under
-        # ~/.cache/huggingface), so no setup pre-download is wired here.
+        ports={"lb": 8013, "node0": 8014, "node1": 8015},
+        model_dir="gguf_models/Gemma-4",
+        target_glob="gemma-4-31b-abliterated-Q8_0.gguf",
+        mtp=Mtp(draft_file="gemma-4-31B-it-assistant.aeon.Q4_K_M.gguf", n_max=6),
+        kv_quant="q4_0",
+        download_dir="gguf_models/Gemma-4",
+        download_cmd=(
+            "hf download paperscarecrow/Gemma-4-31B-it-abliterated "
+            "gemma-4-31b-abliterated-Q8_0.gguf --local-dir /models && "
+            "hf download AtomicChat/gemma-4-31B-it-assistant-GGUF "
+            "--include '*assistant*4_*.gguf' --local-dir /models"
+        ),
+        download_state="gemma4-q8_0-mtp-v2",
     ),
     CatalogEntry(
         name="Qwen3.6-35B-A3B-Uncensored",
