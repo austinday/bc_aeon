@@ -36,18 +36,37 @@ class SearchWebTool(BaseTool):
             return "Error: Tavily API key not found in ~/tavily_api_key.txt or tavily-python is not installed. The search_web tool is not available."
         
         try:
-            search_results = self.tavily_client.search(query=query, search_depth="advanced", max_results=5)
-            
+            search_results = self.tavily_client.search(
+                query=query, search_depth="advanced", max_results=5, include_answer=True)
+
             context = ""
+            sources = []
             if 'results' in search_results:
                 for result in search_results['results']:
-                    context += f"URL: {result.get('url')}\nContent: {result.get('content')}\n---\n"
-            
+                    url = result.get('url')
+                    title = (result.get('title') or '').strip()
+                    context += f"URL: {url}\nContent: {result.get('content')}\n---\n"
+                    if url:
+                        sources.append(f"- {url}" + (f" — {title}" if title else ""))
+
             if not context:
                 return f"No search results found for the query: '{query}'"
 
             # Fixed: use correct parameter names (text, query) not (text_to_summarize, query)
             summary = self.llm_client.summarize_text(text=context, query=query)
+
+            # Preserve provenance: the summary loses the URLs, but the agent often
+            # needs to cite a source or open the most relevant page with the
+            # browser tool, so list the sources alongside the summary.
+            if sources:
+                summary = f"{summary}\n\nSOURCES:\n" + "\n".join(sources)
+
+            # Surface a direct answer from Tavily when present (often the most
+            # precise response to a factual query).
+            answer = search_results.get('answer') if isinstance(search_results, dict) else None
+            if answer:
+                summary = f"DIRECT ANSWER: {answer}\n\n{summary}"
+
             return summary
 
         except Exception as e:
