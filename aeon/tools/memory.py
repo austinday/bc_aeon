@@ -59,7 +59,15 @@ class ForgetTool(BaseTool):
                 print(f"{self.C_CYAN}🧠 Memory Category Erased: {category} ({len(keys_to_delete)} items){self.C_RESET}")
 
         if count == 0:
-            return f"No memories found matching key='{key}' or category='{category}'."
+            hint = ""
+            if key:
+                import difflib
+                close = difflib.get_close_matches(str(key), list(self.worker.memories.keys()), n=3, cutoff=0.5)
+                if close:
+                    hint = f" Did you mean: {', '.join(close)}?"
+                elif self.worker.memories:
+                    hint = f" Stored keys: {', '.join(list(self.worker.memories.keys())[:10])}."
+            return f"No memories found matching key='{key}' or category='{category}'.{hint}"
         return f"Successfully erased {count} memory item(s)."
 
 class ListMemoriesTool(BaseTool):
