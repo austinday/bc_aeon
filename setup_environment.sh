@@ -194,14 +194,18 @@ log_step "PHASE 9: Build aeon_browser_service:latest Docker image"
 build_image "aeon_browser_service:latest" "$PROJECT_ROOT/aeon/services/browser/Dockerfile" "$PROJECT_ROOT/aeon/services/browser/"
 
 if [[ "$LITE_MODE" != "true" ]]; then
-    log_step "PHASE 10: LTX-2.3 Video Generation Models"
-    # Quantized unet (Q4_K_M, ~14 GiB) so ComfyUI fits one Blackwell GPU alongside
-    # the VAE + Gemma text encoder. F16 (~42 GiB) does not fit a 48 GB card.
-    # generate_video.py auto-resolves whichever ltx unet quant is present.
-    # VAE and text-encoder connectors live in repo subfolders; flatten them into
-    # models/vae and models/text_encoders so ComfyUI lists them by basename
-    # (matching the names generate_video.py resolves).
-    CMD="hf download unsloth/LTX-2.3-GGUF ltx-2.3-22b-dev-Q4_K_M.gguf --local-dir /models/unet && \
+    log_step "PHASE 10: LTX-2.3 Video Generation Models (UNCENSORED 10Eros NSFW finetune)"
+    # The video unet is the NSFW-finetuned LTX-2.3 "10Eros" (vantagewithai), which bakes
+    # in explicit-motion ("sulphur") weights + tuned connectors -- the real diffusion-level
+    # uncensoring (stock LTX base only lightly knows NSFW). It is the same LTX-2.3 arch, so
+    # it still uses the standard LTX VAE + connectors + Gemma-3 encoder downloaded below and
+    # drops into generate_video.py's UnetLoaderGGUF node.
+    # GPU-adaptive quant: Q8_0 (~23 GiB) on big cards (>=80 GiB), else Q4_K_M (~14 GiB) so it
+    # still fits one 48 GB Blackwell alongside the vision server.
+    LTX_QUANT="Q4_K_M"
+    if python3 -c "import sys; sys.exit(0 if float('${MIN_VRAM}')>=80 else 1)" 2>/dev/null; then LTX_QUANT="Q8_0"; fi
+    log_step "  -> 10Eros video unet quant: ${LTX_QUANT} (min per-GPU VRAM ${MIN_VRAM} GiB)"
+    CMD="hf download vantagewithai/LTX2.3-10Eros-1.2-GGUF --include '*${LTX_QUANT}*.gguf' --local-dir /models/unet && \
          hf download unsloth/LTX-2.3-GGUF vae/ltx-2.3-22b-dev_video_vae.safetensors --local-dir /models/tmp_vae && \
          mv /models/tmp_vae/vae/*.safetensors /models/vae/ && rm -rf /models/tmp_vae && \
          hf download unsloth/LTX-2.3-GGUF text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors --local-dir /models/tmp_te && \
@@ -211,7 +215,7 @@ if [[ "$LITE_MODE" != "true" ]]; then
          hf download unsloth/gemma-3-12b-it-FP8-Dynamic tokenizer.model --local-dir /models/tmp && \
          mv /models/tmp/tokenizer.model /models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.model && \
          rm -rf /models/tmp"
-    run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_comfyui_q4km" "$COMFY_MODELS_DIR:/models" "$CMD"
+    run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_10eros_v12_${LTX_QUANT}" "$COMFY_MODELS_DIR:/models" "$CMD"
 
     # PHASE 11 (CyberNeurova DeepSeek V4) is now handled by the GPU-adaptive
     # catalog loop in PHASE 5.6: it downloads DeepSeek only on machines whose

@@ -105,7 +105,9 @@ class GenerateVideoTool(ComfyUITool):
         return max(9, int(round((frames - 1) / 8.0)) * 8 + 1)
 
     def _loaders_and_cond(self, prompt: str, neg: str) -> Dict[str, Any]:
-        unet = self._resolve_model("unet", ["ltx*dev*.gguf", "ltx*.gguf"], "ltx-2.3-22b-dev-Q4_K_M.gguf")
+        # Prefer the uncensored 10Eros NSFW LTX-2.3 finetune; fall back to stock LTX if present.
+        unet = self._resolve_model("unet", ["*10Eros*.gguf", "*[Ee]ros*.gguf", "ltx*dev*.gguf", "ltx*.gguf"],
+                                   "10Eros_v1.210Eros_v1.2-Q4_K_M.gguf")
         gemma = self._resolve_model("text_encoders", ["gemma-3*.gguf"], "gemma-3-12b-it-qat-UD-Q4_K_XL.gguf")
         connectors = self._resolve_model("text_encoders", ["*connectors*.safetensors", "*projection*.safetensors"],
                                          "ltx-2.3-22b-dev_embeddings_connectors.safetensors")

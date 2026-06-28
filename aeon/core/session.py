@@ -75,18 +75,9 @@ LLAMACPP_MODELS = [
         'start_script': 'start_gemma4_mtp.sh',
         'health_port': 8013,
     },
-    {
-        'model': 'Gemma-4-31B-NVFP4',
-        'family': 'Gemma-4',
-        'label': 'Gemma-4-31B NVFP4 Turbo | vLLM MTP | ~100+ t/s | 128k ctx | Abliterated: Yes | Local/vLLM',
-        'provider': 'vllm',
-        'base_url': 'http://localhost:8018/v1',
-        'context_limit': 131072,
-        'container_name': 'aeon_gemma_vllm_lb',
-        'additional_containers': ['gemma_node0', 'gemma_node1'],
-        'start_script': '0_launch_gemma_nvfp4.sh',
-        'health_port': 8018,
-    },
+    # Gemma-4-31B-NVFP4 (vLLM) removed: its source LilaRest/gemma-4-31B-it-NVFP4-turbo
+    # is the STOCK/censored model and was mislabeled "Abliterated: Yes". The abliterated
+    # Q8_0 MTP entry above is the canonical uncensored Gemma path.
 ]
 
 def is_container_running(name):

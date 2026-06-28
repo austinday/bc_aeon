@@ -94,20 +94,12 @@ CATALOG: List[CatalogEntry] = [
         ),
         download_state="gemma4-q8_0-mtp-v2",
     ),
-    CatalogEntry(
-        name="Gemma-4-31B-NVFP4",
-        family="Gemma-4",
-        provider="vllm",
-        image="aeon_vllm:latest",
-        weights_gib=18.0,            # NVFP4 ~4-bit of 31B (estimate)
-        kv_gib_per_64k=3.0,
-        max_ctx=262144,
-        ports={"lb": 8018, "node0": 8016, "node1": 8017},
-        hf_model="LilaRest/gemma-4-31B-it-NVFP4-turbo",
-        served_name="Gemma-4-31B-NVFP4",
-        mtp=Mtp(draft_model="google/gemma-4-31B-it-assistant", n_max=5),
-        # vLLM fetches weights from the HF hub at runtime; no setup download needed.
-    ),
+    # NOTE: the former "Gemma-4-31B-NVFP4" vLLM entry was REMOVED because its only
+    # available source (LilaRest/gemma-4-31B-it-NVFP4-turbo) is the STOCK/censored
+    # model -- it was mislabeled "Abliterated: Yes". This harness keeps every model
+    # uncensored; the abliterated Q8_0 MTP entry above is the canonical Gemma path
+    # (best quality, fits 48 GB solo / 96 GB easily). If a fast uncensored vLLM path
+    # is wanted later, self-quantize wangzhang/gemma-4-31B-it-abliterated to NVFP4.
     CatalogEntry(
         name="Qwen3.6-35B-A3B-Uncensored",
         family="Qwen3.6",
