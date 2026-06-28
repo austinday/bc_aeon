@@ -944,6 +944,44 @@ def _execute_restart(session, worker=None):
         else:
             print('[RESTART] WARNING: No smoke test found, skipping validation.')
 
+        # Phase 4b: Unit tests (catch logic regressions smoke test can't, e.g. a
+        # broken JSON/block parser that still imports fine). Same fail-safe path:
+        # restore the backup and keep the old code running on failure.
+        unit_test_path = os.path.join(aeon_code_dir, 'aeon', 'tests', 'test_core.py')
+        if os.path.exists(unit_test_path):
+            print('[RESTART] Running unit tests...')
+            try:
+                unit_result = subprocess.run(
+                    [sys.executable, '-B', '-m', 'aeon.tests.test_core'],
+                    capture_output=True, text=True, timeout=60, cwd=aeon_code_dir
+                )
+            except subprocess.TimeoutExpired:
+                unit_result = None
+                print('[RESTART] WARNING: unit tests timed out; treating as failure.')
+            if unit_result is None or unit_result.returncode != 0:
+                unit_output = '' if unit_result is None else (unit_result.stdout or '') + (unit_result.stderr or '')
+                print('[RESTART] UNIT TESTS FAILED. Restoring backup and aborting restart...')
+                if unit_output:
+                    print(unit_output[-2000:])
+                _restore_backup(aeon_code_dir, backup_created)
+                subprocess.run(
+                    [sys.executable, '-m', 'pip', 'install', '.', '--quiet'],
+                    cwd=aeon_code_dir, capture_output=True
+                )
+                os.remove(RESTART_STATE_PATH)
+                print('[RESTART] Backup restored. Agent will continue with old code.')
+                if worker:
+                    worker.last_observation = (
+                        f'RESTART FAILED: Unit tests detected a regression in your code. '
+                        f'Backup restored, old code is running.\n'
+                        f'Unit test output (tail):\n{unit_output[-1000:]}\n'
+                        f'Fix the failing tests, then call restart_aeon again.'
+                    )
+                    worker.action_log.append(f'[RESTART FAILED] Unit tests failed. Backup restored. Tail: {unit_output[-300:]}')
+                    return objective
+                return None
+            print('[RESTART] Unit tests passed.')
+
         # Phase 5: Re-exec with --resume
         original_cwd = state.get('original_cwd', os.getcwd())
         os.chdir(original_cwd)
