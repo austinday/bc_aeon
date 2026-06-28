@@ -1,9 +1,28 @@
+import difflib
 from .base import BaseTool
 from .categories import (
     get_category_at_path, get_all_category_paths,
     count_tools_in_category,
 )
 from ..core.prompts import TOOL_DESC_EXPAND_CATEGORY, TOOL_DESC_COLLAPSE_CATEGORY
+
+
+def _skill_category_names():
+    """Best-effort list of skill category names (empty on any failure)."""
+    try:
+        from aeon.core.skills.manager import SkillsManager
+        sm = SkillsManager()
+        return [d.name for d in sm.base_dir.iterdir() if d.is_dir() and not d.name.startswith('__')]
+    except Exception:
+        return []
+
+
+def _suggest_category(category_path, candidates):
+    """Return a ' Did you mean: ...' hint for the closest known categories."""
+    close = difflib.get_close_matches(category_path, candidates, n=3, cutoff=0.4)
+    if close:
+        return f" Did you mean: {', '.join(close)}?"
+    return f" Available: {', '.join(candidates)}" if candidates else ""
 
 
 class ExpandToolCategoryTool(BaseTool):
@@ -46,13 +65,11 @@ class ExpandToolCategoryTool(BaseTool):
             self.worker.expanded_categories.add(f"skill:{category_path}")
             return f"Expanded skill category '{category_path}'. Revealed:\n" + "\n".join(skills)
         
-        pass
-
-        # 3. Not found in either
-        all_tool_paths = get_all_category_paths()
+        # 3. Not found in either — suggest the closest tool OR skill category.
+        candidates = get_all_category_paths() + _skill_category_names()
         return (
-            f"Error: Category '{category_path}' not found in tools or skills.\n"
-            f"Available tool categories: {', '.join(all_tool_paths)}"
+            f"Error: Category '{category_path}' not found in tools or skills."
+            f"{_suggest_category(category_path, candidates)}"
         )
 
 
@@ -71,10 +88,10 @@ class CollapseToolCategoryTool(BaseTool):
 
         cat = get_category_at_path(category_path)
         if cat is None:
-            all_paths = get_all_category_paths()
+            candidates = get_all_category_paths() + _skill_category_names()
             return (
-                f"Error: Category '{category_path}' not found.\n"
-                f"Available categories: {', '.join(all_paths)}"
+                f"Error: Category '{category_path}' not found."
+                f"{_suggest_category(category_path, candidates)}"
             )
 
         # Remove this path and all sub-paths (for both tools and skills)
