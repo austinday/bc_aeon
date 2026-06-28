@@ -72,9 +72,30 @@ class AnalyzeImageTool(BaseTool):
 
             return len(cleaned_pids)
 
+    @staticmethod
+    def _validate_image(image_path: str):
+        """Return None if the path is a decodable image, else an error string.
+
+        Run BEFORE starting the (expensive, slow-to-boot) vision server so a
+        non-image or corrupt file fails fast without spinning up the GPU.
+        """
+        try:
+            if os.path.getsize(image_path) == 0:
+                return f'Error: Image file is empty (0 bytes): {image_path}'
+        except OSError as e:
+            return f'Error: cannot stat image {image_path}: {e}'
+        try:
+            with Image.open(image_path) as img:
+                img.verify()  # cheap integrity check; does not decode pixels
+            return None
+        except Exception as e:
+            return (f"Error: '{image_path}' is not a valid/decodable image "
+                    f"({type(e).__name__}: {e}). Provide a real image file (png/jpg/webp/...).")
+
     def _load_and_encode_image(self, image_path: str) -> tuple:
         """Load an image, resize if needed, and return (base64_str, mime_type)."""
-        img = Image.open(image_path)
+        with Image.open(image_path) as img:
+            img.load()  # decode now so the file handle can be released
 
         # Convert RGBA/palette to RGB for JPEG compatibility
         if img.mode in ('RGBA', 'P', 'LA'):
@@ -104,6 +125,11 @@ class AnalyzeImageTool(BaseTool):
         abs_image_path = os.path.abspath(image_path)
         if not os.path.exists(abs_image_path):
             return f'Error: Image not found at {abs_image_path}'
+
+        # Fail fast on a bad image BEFORE booting the GPU vision server.
+        validation_error = self._validate_image(abs_image_path)
+        if validation_error:
+            return validation_error
 
         try:
             self._manage_registry('register')
