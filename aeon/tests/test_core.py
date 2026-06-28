@@ -256,6 +256,28 @@ class TestToolLoader(unittest.TestCase):
                         del sys.modules[m]
 
 
+class TestStrReplaceMatchLocations(unittest.TestCase):
+    def _tool(self):
+        from aeon.tools.file_io import StrReplaceTool
+        return StrReplaceTool.__new__(StrReplaceTool)
+
+    def test_lists_all_match_lines(self):
+        t = self._tool()
+        content = "a\nfoo\nb\nfoo\nc\nfoo\n"
+        hint = t._match_locations(content, "foo")
+        self.assertIn("2, 4, 6", hint)
+
+    def test_no_match_empty(self):
+        t = self._tool()
+        self.assertEqual(t._match_locations("abc", "xyz"), "")
+
+    def test_caps_with_more_suffix(self):
+        t = self._tool()
+        content = "x\n" * 20
+        hint = t._match_locations(content, "x", max_show=3)
+        self.assertIn("more)", hint)
+
+
 def load_tests(loader, standard_tests, pattern):
     return standard_tests
 

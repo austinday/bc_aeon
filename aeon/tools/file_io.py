@@ -282,6 +282,28 @@ class StrReplaceTool(BaseTool):
 
         return None, best_score
 
+    def _match_locations(self, content, needle, max_show=6):
+        """Return ' Matches at lines: ...' listing the 1-based start line of each
+        occurrence of needle in content, so the model can see which copy is which
+        and add the right disambiguating context."""
+        if not needle:
+            return ''
+        lines = []
+        start = 0
+        while True:
+            pos = content.find(needle, start)
+            if pos == -1:
+                break
+            lines.append(content.count('\n', 0, pos) + 1)
+            start = pos + 1
+            if len(lines) > max_show:
+                break
+        if not lines:
+            return ''
+        shown = ', '.join(str(n) for n in lines[:max_show])
+        more = '' if len(lines) <= max_show else f' (+{len(lines) - max_show} more)'
+        return f' Matches start at line(s): {shown}{more}.'
+
     def _apply_single_replace(self, file_path, content, old_str, new_str):
         """Apply one replacement. Returns (new_content, method_used, error)."""
         stripped_old = old_str.strip()
@@ -332,6 +354,7 @@ class StrReplaceTool(BaseTool):
             return content, None, (
                 f'Error: The SEARCH block matched {count} times in {file_path}. '
                 f'It must be unique. Add more surrounding context to narrow the match.'
+                f'{self._match_locations(content, processed_old_str)}'
             )
         else:
             count_orig = content.count(old_str)
@@ -341,6 +364,7 @@ class StrReplaceTool(BaseTool):
                 return content, None, (
                     f'Error: The SEARCH block matched {count_orig} times in {file_path}. '
                     f'It must be unique. Add more surrounding context to narrow the match.'
+                    f'{self._match_locations(content, old_str)}'
                 )
 
         if matched_text is None:
