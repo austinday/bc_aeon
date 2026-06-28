@@ -10,14 +10,25 @@ class MemorizeTool(BaseTool):
     def execute(self, key: str, value: str, category: str = "general") -> str:
         if not key or not value:
             return "Error: Both 'key' and 'value' are required."
-        
+
+        key = str(key)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.worker.memories[str(key)] = {
+
+        # Note when an existing key is being overwritten so the agent realizes it
+        # replaced a fact rather than adding one.
+        prev = self.worker.memories.get(key)
+        prev_value = prev.get("value") if isinstance(prev, dict) else prev
+
+        self.worker.memories[key] = {
             "value": str(value),
             "category": str(category),
-            "timestamp": timestamp
+            "timestamp": timestamp,
         }
         print(f"{self.C_CYAN}🧠 Memory Saved: [{category}] {key} = {value}{self.C_RESET}")
+
+        if prev_value is not None and str(prev_value) != str(value):
+            return (f"Updated memory '{key}' [{category}] = {value} "
+                    f"(replaced previous value: {str(prev_value)[:120]}).")
         return f"Memorized: [{category}] {key} = {value}"
 
 class ForgetTool(BaseTool):
