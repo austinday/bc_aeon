@@ -15,6 +15,18 @@ class ComfyUITool(BaseTool):
         super().__init__(*args, **kwargs)
         self.comfy_url = "http://localhost:8188"
 
+    @staticmethod
+    def _norm_dim(value, default=1024, lo=256, hi=2048, multiple=16):
+        """Coerce a model-supplied width/height into a valid int: tolerate string
+        numbers, clamp to [lo, hi], and round to a multiple the model accepts.
+        Falls back to `default` on garbage input."""
+        try:
+            v = int(round(float(value)))
+        except (TypeError, ValueError):
+            return default
+        v = max(lo, min(hi, v))
+        return max(lo, (v // multiple) * multiple)
+
     def _check_comfyui_health(self):
         try:
             res = requests.get(f"{self.comfy_url}/system_stats", timeout=2)
@@ -154,9 +166,13 @@ class GenerateImageTool(ComfyUITool):
         if not output_path:
             return "Error: 'output_path' parameter is required."
 
+        # Tolerate string/odd dimensions from the model (e.g. "1024" or 1000).
+        width = self._norm_dim(width)
+        height = self._norm_dim(height)
+
         prompt = enhance_prompt(self.llm_client, prompt, "image", force=enhance)
         abs_output_path = os.path.abspath(output_path)
-        os.makedirs(os.path.dirname(abs_output_path), exist_ok=True)
+        os.makedirs(os.path.dirname(abs_output_path) or ".", exist_ok=True)
 
         try:
             # Register this agent as an active user and ensure server is running on allocated VRAM
