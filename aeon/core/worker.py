@@ -1051,9 +1051,17 @@ class Worker:
                 user_input_handled = False
                 completion_blocked = False
 
-                if len(actions) > 15:
-                    actions = actions[:15]
-                    self.logger.warning("Truncated actions to 15")
+                MAX_ACTIONS = 15
+                dropped_actions = 0
+                if len(actions) > MAX_ACTIONS:
+                    dropped_actions = len(actions) - MAX_ACTIONS
+                    actions = actions[:MAX_ACTIONS]
+                    warn = (f"SYSTEM: You queued {dropped_actions + MAX_ACTIONS} actions; only the first "
+                            f"{MAX_ACTIONS} run this turn. The remaining {dropped_actions} were dropped — "
+                            f"re-issue them next turn after seeing these results.")
+                    self.logger.warning(warn)
+                    self.print_func(f"{C_YELLOW}{warn}{C_RESET}")
+                    combined_summary_parts.append(warn)
 
                 # Show the agent's summarized tool-call choices for this turn up front,
                 # before the (already-visible) tool output streams in below.
