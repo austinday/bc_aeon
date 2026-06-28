@@ -712,6 +712,33 @@ class Worker:
         matches = [name for name in self.tools if norm(name) == target]
         return matches[0] if len(matches) == 1 else None
 
+    def _tool_signature_hint(self, tool_name: str) -> str:
+        """Return ' Expected parameters: ...' describing the tool's execute()
+        signature, so a mis-shaped call can be corrected in the next turn."""
+        tool = self.tools.get(tool_name)
+        if tool is None:
+            return ""
+        try:
+            import inspect
+            sig = inspect.signature(tool.execute)
+            required, optional = [], []
+            for pname, p in sig.parameters.items():
+                if pname == 'self' or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                    continue
+                if p.default is inspect.Parameter.empty:
+                    required.append(pname)
+                else:
+                    optional.append(pname)
+            parts = []
+            if required:
+                parts.append(f"required: {', '.join(required)}")
+            if optional:
+                parts.append(f"optional: {', '.join(optional)}")
+            spec = '; '.join(parts) if parts else 'no parameters'
+            return f" Expected parameters for {tool_name} ({spec})."
+        except (ValueError, TypeError):
+            return ""
+
     def _suggest_tools(self, tool_name: str, n: int = 3) -> str:
         """Return a ' Did you mean: ...' hint listing the closest real tool
         names, so the model can self-correct a hallucinated tool in one turn."""
@@ -1182,9 +1209,14 @@ class Worker:
                     else:
                         try:
                             tool = self.tools[tool_name]
+                            if not isinstance(params, dict):
+                                raise TypeError(
+                                    f"'parameters' must be a JSON object, got {type(params).__name__}")
                             raw_result = tool.execute(**params)
                         except TypeError as e:
-                            raw_result = f"Tool Parameter Error: {e}"
+                            # Surface the tool's real signature so the model can fix
+                            # the call this turn instead of guessing again.
+                            raw_result = f"Tool Parameter Error: {e}.{self._tool_signature_hint(tool_name)}"
                         except Exception as e:
                             raw_result = f"Tool Execution Error: {type(e).__name__}: {e}"
 

@@ -164,6 +164,20 @@ class TestToolNameResolution(unittest.TestCase):
         hint = w._suggest_tools("zzzzzz")
         self.assertIn("expand_tool_category", hint)
 
+    def test_signature_hint_lists_required_and_optional(self):
+        from aeon.core.worker import Worker
+        w = Worker.__new__(Worker)
+
+        class T:
+            def execute(self, file_path, content, mode='w'):
+                pass
+
+        w.tools = {"write_file": T()}
+        hint = w._tool_signature_hint("write_file")
+        self.assertIn("required: file_path, content", hint)
+        self.assertIn("optional: mode", hint)
+        self.assertEqual(w._tool_signature_hint("missing"), "")
+
 
 def load_tests(loader, standard_tests, pattern):
     return standard_tests
