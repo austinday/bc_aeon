@@ -1010,7 +1010,41 @@ class Worker:
                         self.print_func(f"{C_YELLOW}Suggestion: Consider closing old/large files: {suggestions}{C_RESET}")
 
                     if prompt_tokens > ctx_limit * 0.95:
-                        raise RuntimeError(f"Context limit exceeded ({prompt_tokens} > {ctx_limit * 0.95} limit). Throwing error as requested.")
+                        # GRACEFUL CONTEXT RECOVERY: rather than crash the whole
+                        # run, shed the largest/oldest open files until we are back
+                        # under 90%, then continue. The agent is told what was
+                        # closed so it can re-open or memorize as needed. We only
+                        # raise if there is nothing left to shed.
+                        target = ctx_limit * 0.90
+                        shed = []
+                        while prompt_tokens > target and self.open_files_access_order:
+                            scored = sorted(
+                                ((len(self.open_files.get(p, "")) / (i + 1), p)
+                                 for i, p in enumerate(self.open_files_access_order)),
+                                reverse=True)
+                            victim = scored[0][1]
+                            self.close_file(victim)
+                            shed.append(os.path.basename(victim))
+                            open_files_str = self._format_open_files(max_content_len=dyn_limit)
+                            prompt = self._build_primary_agent_context(
+                                tool_list_str, system_specs, memories_str, objective, open_files_str,
+                                active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
+                                sub_agent_digest=sub_agent_digest)
+                            prompt_tokens = estimate_tokens(prompt)
+
+                        if shed:
+                            note = (f"SYSTEM: Context exceeded 95% of the {ctx_limit}-token limit. "
+                                    f"Auto-closed {len(shed)} large/old file(s) to recover: {', '.join(shed)}. "
+                                    f"Re-open any you still need with open_file, and memorize key facts so "
+                                    f"they survive future context pressure.")
+                            prompt += f"\n\n{note}"
+                            prompt_tokens = estimate_tokens(prompt)
+                            self.print_func(f"{C_YELLOW}{note}{C_RESET}")
+
+                        if prompt_tokens > ctx_limit * 0.95:
+                            raise RuntimeError(
+                                f"Context limit exceeded ({prompt_tokens} > {ctx_limit * 0.95:.0f}) "
+                                f"with no open files left to shed.")
 
                 self.print_func("Thinking (Primary Agent)...")
 
