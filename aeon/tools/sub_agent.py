@@ -258,12 +258,21 @@ class SpawnSubAgent(BaseTool):
         rt.atomic_write_text(agent_dir / "status.txt", "RUNNING")
 
         short_id = agent_id[:8]
-        return (f"Sub-agent spawned. Agent ID: {agent_id} (refer to it as '{short_id}' in steer/report/kill). "
-                f"Budget: {max_wallclock // 60} min wall-clock, {stall}s stall, {iters} max iterations. "
-                f"It will now appear LIVE in the SUB-AGENTS section of your context every turn -- watch it "
-                f"there, steer_sub_agent if it drifts, and meanwhile advance your own orthogonal work. You "
-                f"must collect its report with get_sub_agent_report (or kill_sub_agent if you no longer need "
-                f"it) before you can task_complete.")
+        msg = (f"Sub-agent spawned. Agent ID: {agent_id} (refer to it as '{short_id}' in steer/report/kill). "
+               f"Budget: {max_wallclock // 60} min wall-clock, {stall}s stall, {iters} max iterations. "
+               f"It will now appear LIVE in the SUB-AGENTS section of your context every turn -- watch it "
+               f"there, steer_sub_agent if it drifts, and meanwhile advance your own orthogonal work. You "
+               f"must collect its report with get_sub_agent_report (or kill_sub_agent if you no longer need "
+               f"it) before you can task_complete.")
+        # `running` was counted BEFORE this spawn, so 0 means this is now your only
+        # student. A lone sub-agent buys no parallelism — push the principal to
+        # either fan out or get to work itself, NOT to sit and supervise one agent.
+        if running == 0:
+            msg += ("\nThis is your ONLY running sub-agent. A single student is no faster than doing the work "
+                    "yourself — it only pays off if you ALSO work a different thread in parallel. Right now: "
+                    "spawn more sub-agents for other independent sub-tasks you identified, or start your own "
+                    "orthogonal work this turn. Do not spend the next turns merely polling this one agent.")
+        return msg
 
 
 class GatherSubAgents(BaseTool):

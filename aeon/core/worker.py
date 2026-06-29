@@ -38,6 +38,20 @@ SUB_AGENT_TOOLS = {
     "kill_sub_agent", "steer_sub_agent", "get_sub_agent_status",
 }
 
+# Read-only observation of background/passive state (sub-agents, jobs, blackboard).
+# A turn made up ENTIRELY of these is the principal *watching* (polling) rather
+# than *doing*. Two consequences: (1) such a turn must NOT trip loop detection —
+# the background state is genuinely advancing even when the poll output looks
+# byte-identical, so repeated check-ins are legitimate, not a stuck loop; (2) a
+# run of such turns is the idle-babysitting anti-pattern we steer against.
+OBSERVATION_TOOLS = {
+    "gather_sub_agents", "get_sub_agent_report", "get_sub_agent_status",
+    "job_output", "blackboard_read",
+}
+# Observation plus reflection/communication: none of these advance the actual
+# task. A turn whose every action is passive means the principal did no real work.
+PASSIVE_TOOLS = OBSERVATION_TOOLS | {"think", "say_to_user"}
+
 
 class Worker:
     def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False, debug_log_path: Optional[str] = None):
@@ -74,6 +88,7 @@ class Worker:
         self.stuck_reason = None  # Set by loop-detection; a sub-agent publishes this so its principal sees it's looping
         self._blackboard_seen = 0  # Line count of the shared blackboard at last digest, to report new findings
         self._last_sub_agent_action_iter = 0  # Iteration the principal last engaged a sub-agent tool (for the idle nudge)
+        self._consecutive_passive_turns = 0  # Run of turns doing only observation/think/say (idle-babysitting detector)
         self.open_files_access_order = []  # Tracks order of file access for LRU suggestions
         self.recent_intents = deque(maxlen=3)  # Tracks recent intents for loop detection
         self.prev_prompt_tokens = 0  # Tracks context size of previous iteration for growth metrics
@@ -458,6 +473,23 @@ class Worker:
         except Exception:
             pass
 
+        # Lone-student anti-pattern: a SINGLE running sub-agent gives zero
+        # parallelism — whatever it is doing, you (the principal) could be doing
+        # that one thread yourself. The only reason to run one is if you are
+        # ALSO working a different thread in parallel right now. Steer toward
+        # either fanning out (more students for other independent threads) or
+        # doing your own orthogonal work alongside it — never just watching it.
+        if running == 1:
+            out.append("→ You have only ONE student running. A lone sub-agent is no faster than doing "
+                       "the work yourself — it only pays off if YOU are working a different thread in "
+                       "parallel. So this turn: spawn additional sub-agents for other independent sub-tasks, "
+                       "OR drive your own orthogonal work forward. Do NOT spend turns merely supervising a "
+                       "single student.")
+
+        # NOTE: the idle-poll anti-pattern (several turns of only watching/thinking)
+        # is steered from the run loop's IDLE WARNING, which also covers background
+        # jobs and the no-background-work case — not duplicated here.
+
         # Engagement nudge: students running but unsupervised for several turns.
         idle_turns = current_iteration - self._last_sub_agent_action_iter
         if running and idle_turns >= 3:
@@ -614,6 +646,7 @@ class Worker:
         self.stuck_reason = None
         self._blackboard_seen = 0
         self._last_sub_agent_action_iter = 0
+        self._consecutive_passive_turns = 0
 
     def serialize_state(self) -> dict:
         """Serialize worker state for persistence across restarts."""
@@ -1275,6 +1308,7 @@ class Worker:
                 combined_summary_parts = []
                 actions_taken_str = []
                 full_actions_taken_str = []
+                turn_tool_names = []  # Resolved tool names actually run this turn (for loop/idle classification)
                 user_input_handled = False
                 completion_blocked = False
 
@@ -1332,6 +1366,7 @@ class Worker:
                     display_action_desc = f"{tool_name}({str(params)[:40]}...)" if params else f"{tool_name}()"
                     actions_taken_str.append(display_action_desc)
                     full_actions_taken_str.append(full_action_desc)
+                    turn_tool_names.append(tool_name)
 
                     # Per-action marker so each tool's streamed output sits under its own header.
                     self.print_func(f"{C_BLUE}\u25B6 [{idx+1}/{len(actions)}] {self._summarize_action(tool_name, params)}{C_RESET}")
@@ -1487,90 +1522,145 @@ class Worker:
                 actions_list = ", ".join(actions_taken_str) if actions_taken_str else "none"
                 self.last_observation = f"Actions: [{actions_list}]\nOutput:\n{raw_output}"
 
-                # --- LOOP DETECTION ---
-                # Build a fingerprint of the commands executed this iteration
-                cmd_fingerprint = "|".join(full_actions_taken_str)
-                output_fingerprint = raw_output.strip()[:2000]  # First 2k chars for comparison
-                self._recent_commands.append(cmd_fingerprint)
-                self._recent_outputs.append(output_fingerprint)
-                # Keep only the rolling window
-                if len(self._recent_commands) > self.MAX_REPEAT_WINDOW:
-                    self._recent_commands.pop(0)
-                    self._recent_outputs.pop(0)
-                # Check for repeated identical command+output pairs
+                # --- TURN CLASSIFICATION (loop/idle detection) ---
+                # An "observation-only" turn polls background state (sub-agents,
+                # jobs, blackboard) and nothing else. Its output is naturally
+                # near-identical turn-to-turn while work proceeds in the
+                # background, so it must NOT feed loop detection (that produced
+                # the false "LOOP DETECTED" on a principal legitimately checking
+                # in on its students). A "passive" turn additionally counts pure
+                # think/say turns as doing-no-real-work, for the idle-babysitting
+                # detector below.
+                ran = [t for t in turn_tool_names if t]
+                observation_only = bool(ran) and all(t in OBSERVATION_TOOLS for t in ran)
+                passive_turn = bool(ran) and all(t in PASSIVE_TOOLS for t in ran)
+                if passive_turn:
+                    self._consecutive_passive_turns += 1
+                else:
+                    self._consecutive_passive_turns = 0
+
                 loop_detected = False
-                if len(self._recent_commands) >= self.REPEAT_THRESHOLD:
-                    recent_pairs = list(zip(self._recent_commands[-self.REPEAT_THRESHOLD:], self._recent_outputs[-self.REPEAT_THRESHOLD:]))
-                    if len(set(recent_pairs)) == 1:
-                        loop_detected = True
-                        repeat_count = self.REPEAT_THRESHOLD
-                        # Count actual streak length
-                        for i in range(len(self._recent_commands) - 1, -1, -1):
-                            if (self._recent_commands[i], self._recent_outputs[i]) == recent_pairs[0]:
-                                repeat_count = len(self._recent_commands) - i
+                # Polling background state is legitimate even when its output is
+                # byte-identical turn after turn, so skip the entire loop /
+                # oscillation / stall machinery on observation-only turns. This is
+                # what stops a principal that is correctly checking in on its
+                # students (or background jobs) from being falsely flagged STUCK.
+                if not observation_only:
+                    # --- LOOP DETECTION ---
+                    # Build a fingerprint of the commands executed this iteration
+                    cmd_fingerprint = "|".join(full_actions_taken_str)
+                    output_fingerprint = raw_output.strip()[:2000]  # First 2k chars for comparison
+                    self._recent_commands.append(cmd_fingerprint)
+                    self._recent_outputs.append(output_fingerprint)
+                    # Keep only the rolling window
+                    if len(self._recent_commands) > self.MAX_REPEAT_WINDOW:
+                        self._recent_commands.pop(0)
+                        self._recent_outputs.pop(0)
+                    # Check for repeated identical command+output pairs
+                    if len(self._recent_commands) >= self.REPEAT_THRESHOLD:
+                        recent_pairs = list(zip(self._recent_commands[-self.REPEAT_THRESHOLD:], self._recent_outputs[-self.REPEAT_THRESHOLD:]))
+                        if len(set(recent_pairs)) == 1:
+                            loop_detected = True
+                            repeat_count = self.REPEAT_THRESHOLD
+                            # Count actual streak length
+                            for i in range(len(self._recent_commands) - 1, -1, -1):
+                                if (self._recent_commands[i], self._recent_outputs[i]) == recent_pairs[0]:
+                                    repeat_count = len(self._recent_commands) - i
+                                else:
+                                    break
+                            # Graduated response: the first repeat (2x) gets a measured
+                            # nudge, not a five-line alarm — a command can legitimately
+                            # repeat once (e.g. a re-run after an unrelated edit). Only
+                            # escalate to the hard STUCK protocol at 3x+, where it really
+                            # is spinning. This keeps the detector from feeling trigger-happy.
+                            if repeat_count <= 2:
+                                loop_warning = (
+                                    f"\n\n** REPEAT NOTICE: you ran the same command(s) twice with identical output — "
+                                    f"no change. Before repeating again, confirm a repeat will actually do something "
+                                    f"different; if not, change the input, the approach, or the sub-task. **"
+                                )
+                                warn_color = C_YELLOW
                             else:
-                                break
-                        # Publish the loop so that, IF this worker is a sub-agent, its
-                        # principal sees a LOOPING flag in the digest (a fast loop keeps
-                        # the heartbeat fresh, so it would otherwise look healthy).
-                        self.stuck_reason = (f"self-reported loop: ran the same command(s) {repeat_count}x "
-                                             f"with identical output.")
-                        loop_warning = (
-                            f"\n\n** LOOP DETECTED: You have run the SAME command(s) {repeat_count} times in a row "
-                            f"and received IDENTICAL output each time. The situation is NOT changing. **\n"
-                            f"You MUST do something DIFFERENT now. You are STUCK.\n"
-                            f"- You MUST use the `think` tool on your next turn to explicitly analyze WHY the previous command failed.\n"
-                            f"- Write out the exact error message, list three possible root causes, and select the most likely one before taking any further action.\n"
-                            f"- Zoom out and target a different part of the problem, or try a completely different approach.\n"
-                            f"- DO NOT run the same command again."
-                        )
-                        self.last_observation += loop_warning
-                        self.print_func(f"{C_RED}{loop_warning}{C_RESET}")
+                                # Publish the loop so that, IF this worker is a sub-agent, its
+                                # principal sees a LOOPING flag in the digest (a fast loop keeps
+                                # the heartbeat fresh, so it would otherwise look healthy). Only
+                                # at the escalated level — a single repeat is not "looping".
+                                self.stuck_reason = (f"self-reported loop: ran the same command(s) {repeat_count}x "
+                                                     f"with identical output.")
+                                loop_warning = (
+                                    f"\n\n** LOOP DETECTED: You have run the SAME command(s) {repeat_count} times in a row "
+                                    f"and received IDENTICAL output each time. The situation is NOT changing. **\n"
+                                    f"You MUST do something DIFFERENT now. You are STUCK.\n"
+                                    f"- You MUST use the `think` tool on your next turn to explicitly analyze WHY the previous command failed.\n"
+                                    f"- Write out the exact error message, list three possible root causes, and select the most likely one before taking any further action.\n"
+                                    f"- Zoom out and target a different part of the problem, or try a completely different approach.\n"
+                                    f"- DO NOT run the same command again."
+                                )
+                                warn_color = C_RED
+                            self.last_observation += loop_warning
+                            self.print_func(f"{warn_color}{loop_warning}{C_RESET}")
 
-                # --- OSCILLATION (2-CYCLE) DETECTION ---
-                # The check above only catches CONSECUTIVE identical turns. An agent
-                # ping-ponging between two states (A,B,A,B) — e.g. toggling a setting
-                # back and forth — never has two identical turns in a row, so it
-                # slips through. Detect a repeated 2-cycle over the last 4 turns.
-                if not loop_detected and len(self._recent_commands) >= 4:
-                    pairs = list(zip(self._recent_commands[-4:], self._recent_outputs[-4:]))
-                    a, b, c, d = pairs
-                    if a == c and b == d and a != b:
-                        loop_detected = True
-                        self.stuck_reason = ("self-reported oscillation: alternating between two "
-                                             "states (A,B,A,B) with no net progress.")
-                        osc_warning = (
-                            "\n\n** OSCILLATION DETECTED: You are alternating between TWO actions/states "
-                            "(A, B, A, B) and making no net progress — each undoes or ignores the other. **\n"
-                            "Stop the back-and-forth. Use the `think` tool to identify why these two steps "
-                            "conflict, then choose a THIRD, different approach that breaks the cycle."
-                        )
-                        self.last_observation += osc_warning
-                        self.print_func(f"{C_RED}{osc_warning}{C_RESET}")
+                    # --- OSCILLATION (2-CYCLE) DETECTION ---
+                    # The check above only catches CONSECUTIVE identical turns. An agent
+                    # ping-ponging between two states (A,B,A,B) — e.g. toggling a setting
+                    # back and forth — never has two identical turns in a row, so it
+                    # slips through. Detect a repeated 2-cycle over the last 4 turns.
+                    if not loop_detected and len(self._recent_commands) >= 4:
+                        pairs = list(zip(self._recent_commands[-4:], self._recent_outputs[-4:]))
+                        a, b, c, d = pairs
+                        if a == c and b == d and a != b:
+                            loop_detected = True
+                            self.stuck_reason = ("self-reported oscillation: alternating between two "
+                                                 "states (A,B,A,B) with no net progress.")
+                            osc_warning = (
+                                "\n\n** OSCILLATION DETECTED: You are alternating between TWO actions/states "
+                                "(A, B, A, B) and making no net progress — each undoes or ignores the other. **\n"
+                                "Stop the back-and-forth. Use the `think` tool to identify why these two steps "
+                                "conflict, then choose a THIRD, different approach that breaks the cycle."
+                            )
+                            self.last_observation += osc_warning
+                            self.print_func(f"{C_RED}{osc_warning}{C_RESET}")
 
-                # --- INTENT-LEVEL STALL DETECTION ---
-                # The hard loop above only fires on byte-identical command+output.
-                # This complementary check catches spinning on the same GOAL across
-                # turns even when the exact commands or outputs vary slightly.
-                norm_intent = re.sub(r"\s+", " ", (intent or "").strip().lower())[:160]
-                self.recent_intents.append(norm_intent)
-                if (not loop_detected and norm_intent
-                        and len(self.recent_intents) == self.recent_intents.maxlen
-                        and len(set(self.recent_intents)) == 1):
-                    stall_note = (
-                        f"\n\n** STALL WARNING: your stated intent has been essentially the same "
-                        f"for {self.recent_intents.maxlen} turns ('{intent[:120]}') without resolving it. "
-                        f"You may be making no real progress on this goal. Re-read your ATTEMPT LOG, "
-                        f"question the assumption behind this intent, and either change approach or switch "
-                        f"to a different sub-task. **"
+                    # --- INTENT-LEVEL STALL DETECTION ---
+                    # The hard loop above only fires on byte-identical command+output.
+                    # This complementary check catches spinning on the same GOAL across
+                    # turns even when the exact commands or outputs vary slightly.
+                    norm_intent = re.sub(r"\s+", " ", (intent or "").strip().lower())[:160]
+                    self.recent_intents.append(norm_intent)
+                    if (not loop_detected and norm_intent
+                            and len(self.recent_intents) == self.recent_intents.maxlen
+                            and len(set(self.recent_intents)) == 1):
+                        stall_note = (
+                            f"\n\n** STALL WARNING: your stated intent has been essentially the same "
+                            f"for {self.recent_intents.maxlen} turns ('{intent[:120]}') without resolving it. "
+                            f"You may be making no real progress on this goal. Re-read your ATTEMPT LOG, "
+                            f"question the assumption behind this intent, and either change approach or switch "
+                            f"to a different sub-task. **"
+                        )
+                        self.last_observation += stall_note
+                        self.print_func(f"{C_YELLOW}{stall_note}{C_RESET}")
+
+                    if not loop_detected:
+                        # Progress was made (commands/outputs changed) -> clear any prior
+                        # loop flag so a recovered sub-agent stops showing as LOOPING.
+                        self.stuck_reason = None
+
+                # --- IDLE-BABYSITTING DETECTION ---
+                # The distinct failure the loop detector should NOT own: the
+                # principal spends turn after turn only watching background work
+                # (polling/think/say) and doing none of its own. Surfaced as a
+                # hard steer here AND in the SUB-AGENTS digest; especially wrong
+                # when there is a single lone sub-agent it is merely supervising.
+                if self._consecutive_passive_turns >= 2:
+                    idle_note = (
+                        f"\n\n** IDLE WARNING: your last {self._consecutive_passive_turns} turns did NO real work "
+                        f"— only watching/polling background agents or thinking. Supervising is not a substitute "
+                        f"for working. THIS turn either advance your OWN orthogonal sub-task (edit/run/write), "
+                        f"spawn additional sub-agents for other independent threads, or collect a finished "
+                        f"report — do not poll again. **"
                     )
-                    self.last_observation += stall_note
-                    self.print_func(f"{C_YELLOW}{stall_note}{C_RESET}")
-
-                if not loop_detected:
-                    # Progress was made (commands/outputs changed) -> clear any prior
-                    # loop flag so a recovered sub-agent stops showing as LOOPING.
-                    self.stuck_reason = None
+                    self.last_observation += idle_note
+                    self.print_func(f"{C_YELLOW}{idle_note}{C_RESET}")
 
                 # Cache the pending iteration state to be finalized next iteration
                 self.pending_iteration_state = {
