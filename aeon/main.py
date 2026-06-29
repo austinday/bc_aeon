@@ -90,6 +90,11 @@ def _local_model_available(entry, gpus):
 def _config_from_plan(entry, p, model_name):
     return {
         'model': model_name,
+        # The id to send to the inference server. vLLM enforces --served-model-name, so a
+        # request for the catalog/display name ('model') 404s; it must be the served name.
+        # llama.cpp ignores the field, and API providers use 'model' directly -> fall back.
+        'api_model': getattr(entry, 'served_name', None) or entry.name,
+        'multimodal': getattr(entry, 'multimodal', False),
         'family': entry.family,
         'label': p.label,
         'provider': entry.provider,
@@ -192,28 +197,16 @@ def warm_up_models(local_model_names):
     print("[SYSTEM] Model warmup complete.")
 
 def enable_utility_tier_if_available(model_config):
-    """Route the agent's high-frequency support tasks (skill routing, JSON repair,
-    summarization, log/memory compression, interruption analysis) to the small utility
-    model on the GPU1 brain, so they stop contending with the strong model + sub-agents
-    on GPU0. Sets AEON_UTILITY_* env vars that LLMClient reads (inherited by sub-agents).
-
-    Skipped in dual-GPU mode (GPU1 already hosts a strong node) and when the brain/model
-    isn't reachable -- LLMClient then falls back to the strong model, unchanged.
+    """Support tasks (skill routing, JSON repair, summarization, log/memory compression,
+    interruption analysis) run on the selected strong model -- there is no separate small
+    utility model. The previous GPU1 "brain" (qwen2.5:3b) was removed: the strong model is
+    capable and already loaded, and dropping it frees GPU1 entirely for image/video/vision
+    tools. LLMClient already falls back to the strong model when AEON_UTILITY_* are unset,
+    so we simply make sure they are unset (also clears anything inherited from a stale env).
     """
-    if "[dual" in str(model_config.get("model", "")).lower():
-        print("[CONFIG] Dual-GPU mode: support tasks stay on the strong model (no GPU1 brain).")
-        return
-    util_model = os.environ.get("AEON_UTILITY_MODEL", "huihui_ai/qwen2.5-abliterate:3b")
-    try:
-        tags = requests.get("http://localhost:8000/api/tags", timeout=3).json().get("models", [])
-        if any(util_model.split(":")[0] in m.get("name", "") for m in tags):
-            os.environ["AEON_UTILITY_BASE_URL"] = "http://localhost:8000/v1"
-            os.environ["AEON_UTILITY_MODEL"] = util_model
-            print(f"[CONFIG] Utility tier -> {util_model} on the GPU1 brain (:8000).")
-        else:
-            print("[CONFIG] Utility model not on brain; support tasks use the strong model.")
-    except Exception:
-        print("[CONFIG] Brain unreachable; support tasks use the strong model.")
+    os.environ.pop("AEON_UTILITY_BASE_URL", None)
+    os.environ.pop("AEON_UTILITY_MODEL", None)
+    print("[CONFIG] Support tasks run on the strong model (no separate utility model).")
 
 def cleanup_transient_tools():
     print("[SYSTEM] Cleaning up transient tool containers...")
@@ -528,8 +521,14 @@ def get_ollama_models():
 # UNIFIED MODEL MENU
 # =============================================================================
 
+# Ollama models that are infrastructure, not user-selectable primaries -- e.g. the old
+# qwen2.5:3b utility/"brain" model. Hidden from the menu (matched by name prefix).
+HIDDEN_OLLAMA_MODELS = ("huihui_ai/qwen2.5-abliterate",)
+
 def build_model_menu(local_models):
     """Build a unified menu of all available models (local + cloud + llamacpp)."""
+    local_models = [m for m in local_models
+                    if not any(m.startswith(h) for h in HIDDEN_OLLAMA_MODELS)]
     entries = []
     entries.append({'label': '--- Local Models ---', 'is_header': True})
     for m in local_models:
@@ -668,10 +667,12 @@ class SessionManager:
             self._models_used.append(model_name)
             if not start_llamacpp_server(lcfg):
                 raise RuntimeError(
-                    f"Failed to start the required llama.cpp server for '{model_name}'. "
-                    f"Aborting startup. Inspect 'docker logs {lcfg['container_name']}' for the "
-                    f"root cause (a common one is the cached aeon_llamacpp image lacking support "
-                    f"for the model architecture -- rebuild with ./setup_environment.sh)."
+                    f"Failed to start the required server for '{model_name}'. Aborting startup. "
+                    f"The container's last log lines were saved to "
+                    f"/tmp/aeon_{lcfg['container_name']}.crash.log (the live container is removed "
+                    f"during cleanup, so 'docker logs' won't find it). A common root cause is the "
+                    f"cached image lacking support for the model architecture -- rebuild with "
+                    f"./setup_environment.sh."
                 )
 
         # --- PHASE 2: Register local Ollama models for reference counting ---
@@ -1087,6 +1088,17 @@ def cli():
     try:
         session.enter(model_config=model_config, skip_warmup=args.no_warmup)
         enable_utility_tier_if_available(model_config)
+        # Vision reuse: when the selected primary is multimodal (Gemma-4 serves images on its
+        # own chat endpoint), point analyze_image at it instead of spinning up a separate
+        # vision model on GPU1. Inherited by sub-agents via env. Text-only primaries leave
+        # these unset and analyze_image falls back to the dedicated Qwen vision server.
+        os.environ.pop("AEON_VISION_BASE_URL", None)
+        os.environ.pop("AEON_VISION_MODEL", None)
+        if model_config.get('multimodal') and model_config.get('base_url'):
+            os.environ["AEON_VISION_BASE_URL"] = model_config['base_url']
+            os.environ["AEON_VISION_MODEL"] = model_config.get('api_model') or model_config['model']
+            print(f"[CONFIG] Vision -> reusing the loaded multimodal model "
+                  f"({os.environ['AEON_VISION_MODEL']}); no separate vision server.")
         llm_client = LLMClient(model_config)
         worker = Worker(llm_client=llm_client, debug_mode=args.debug, debug_log_path=args.debug_log)
         worker.model_name = model_config['model']

@@ -45,6 +45,15 @@ Built-in robustness:
 - **Context pressure** is estimated every turn; the attempt log and memories are
   auto-compressed, and at >95% of the limit the largest/oldest open files are
   shed automatically instead of crashing.
+- **Cross-run persistence**: memories, the plan, and the attempt log are written
+  to `aeon_output/session_state.json` after every iteration. A fresh process
+  restores durable memories (and, when the objective matches, the plan and log)
+  instead of starting from amnesia — surviving a crash or clean exit, not just an
+  in-process `restart_aeon`.
+- **Verified edits**: `write_file` / `str_replace` return a compact unified diff
+  of what actually changed (so a fuzzy/whitespace match landing in the wrong
+  region is visible), plus a non-blocking syntax warning when a written
+  `.py`/`.json`/`.yaml` file no longer parses.
 - **Loop & stall detection**: identical command+output repeats, and the same
   intent repeated across turns, both trigger corrective nudges.
 - **JSON recovery**: malformed output is repaired locally (trailing commas,

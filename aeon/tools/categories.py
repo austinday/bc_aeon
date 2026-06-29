@@ -18,6 +18,7 @@ TOP_LEVEL_TOOLS = {
     'think', 'say_to_user', 'get_user_input',
     'open_file', 'close_file', 'write_file', 'str_replace',
     'search_web', 'run_command', 'task_complete',
+    'run_command_async', 'job_output', 'kill_job',
     'memorize', 'forget',
     'verify_self_modification', 'restart_aeon',
     'expand_tool_category', 'collapse_tool_category',

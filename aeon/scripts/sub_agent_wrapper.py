@@ -22,6 +22,12 @@ SUB_AGENT_FORBIDDEN_TOOLS = {
     "get_sub_agent_status",
     "verify_self_modification",
     "restart_aeon",
+    # No detached background jobs either: a sub-agent is short-lived and exists to
+    # return a report, so a job that would outlive it (and whose workload group
+    # would orphan when the wrapper exits) has no owner. Use run_command instead.
+    "run_command_async",
+    "job_output",
+    "kill_job",
 }
 
 

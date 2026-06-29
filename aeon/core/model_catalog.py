@@ -54,6 +54,7 @@ class CatalogEntry:
     mtp: Optional[Mtp] = None
     kv_quant: Optional[str] = None        # llamacpp -ctk/-ctv ('q4_0'); vLLM --kv-cache-dtype ('fp8'); None=f16
     force_split: bool = False             # never dual-copy (e.g. always-too-big MoE)
+    multimodal: bool = False              # serves vision on its chat endpoint (analyze_image can reuse it)
     # setup download
     download_dir: Optional[str] = None    # relative to $AEON_HOME/models
     download_cmd: Optional[str] = None    # hf download ... (run inside aeon_downloader)
@@ -74,38 +75,11 @@ MIN_CTX = 65536  # never deploy below 64k context
 # Port allocation (lb = the port the agent connects to; node0/node1 = dual-copy backends).
 CATALOG: List[CatalogEntry] = [
     CatalogEntry(
-        # Canonical Gemma-4 path: abliterated (uncensored) Q8_0 GGUF on llama.cpp with
-        # native MTP (draft-mtp) speculative decoding. This is the working uncensored path
-        # on x86 + discrete Blackwell. (An NVFP4 swap was attempted but every abliterated
-        # Gemma-4 NVFP4 build is either NVFP4_AWQ -- which stock vLLM 0.23 rejects -- or
-        # only ships in an ARM-only image for DGX Spark, so it can't run on these x86 hosts.
-        # The durable NVFP4 route would be self-quantizing a bf16 abliterate to plain NVFP4.)
-        name="Gemma-4-31B-MTP-Q8_0",
-        family="Gemma-4",
-        provider="llamacpp",
-        image="aeon_gemma4_mtp:latest",
-        weights_gib=30.7,            # 30.4 target + 0.33 normalized assistant
-        kv_gib_per_64k=3.0,          # q4_0 KV, 48 layers
-        max_ctx=262144,
-        ports={"lb": 8013, "node0": 8014, "node1": 8015},
-        model_dir="gguf_models/Gemma-4",
-        target_glob="gemma-4-31b-abliterated-Q8_0.gguf",
-        mtp=Mtp(draft_file="gemma-4-31B-it-assistant.aeon.Q4_K_M.gguf", n_max=6),
-        kv_quant="q4_0",
-        download_dir="gguf_models/Gemma-4",
-        download_cmd=(
-            "hf download paperscarecrow/Gemma-4-31B-it-abliterated "
-            "gemma-4-31b-abliterated-Q8_0.gguf --local-dir /models && "
-            "hf download AtomicChat/gemma-4-31B-it-assistant-GGUF "
-            "--include '*assistant*4_*.gguf' --local-dir /models"
-        ),
-        download_state="gemma4-q8_0-mtp-v2",
-    ),
-    CatalogEntry(
-        # vLLM NVFP4 path: the SAME abliterated Gemma-4, self-quantized to *plain* NVFP4
-        # (4-bit weights + activations, compressed-tensors) so it runs on native FP4
-        # tensor cores on x86 Blackwell (sm_120) under vLLM 0.23 -- the "durable NVFP4
-        # route" the Q8_0 entry above anticipated. Distinct from the rejected NVFP4_AWQ
+        # Canonical Gemma-4 path: the abliterated (uncensored) Gemma-4, self-quantized to
+        # *plain* NVFP4 (4-bit weights + activations, compressed-tensors) so it runs on
+        # native FP4 tensor cores on x86 Blackwell (sm_120) under vLLM 0.23. This is the
+        # optimal local path (4-bit is the sweet spot here); the older Q8_0 GGUF/llama.cpp
+        # entry was redundant and has been removed. Distinct from the rejected NVFP4_AWQ
         # builds. Native MTP via the official assistant draft (method "mtp"; passing
         # "draft_model" for a gemma-4 assistant silently disables MTP -- vLLM #42005).
         # vLLM fetches the weights from the hub at runtime; setup PHASE 5.6c pre-caches
@@ -122,22 +96,9 @@ CATALOG: List[CatalogEntry] = [
         served_name="Gemma-4-31B-NVFP4",
         mtp=Mtp(draft_model="google/gemma-4-31B-it-assistant", method="mtp", n_max=5),
         kv_quant="fp8",              # vLLM --kv-cache-dtype fp8 on Blackwell FP8 units
+        multimodal=True,             # Gemma4ForConditionalGeneration (vision tower): serves images
+                                     # on /v1/chat/completions -> analyze_image reuses it (no 2nd GPU model)
         # No download_cmd: vLLM fetches at runtime; setup PHASE 5.6c warms the HF cache.
-    ),
-    CatalogEntry(
-        name="Qwen3.6-35B-A3B-Uncensored",
-        family="Qwen3.6",
-        provider="llamacpp",
-        image="aeon_llamacpp:latest",
-        weights_gib=21.0,            # 35B-A3B MoE Q4_K_M (estimate)
-        kv_gib_per_64k=2.5,
-        max_ctx=262144,
-        ports={"lb": 8009, "node0": 8010, "node1": 8011},
-        model_dir="vl_models/Qwen3.6-35B-A3B-GGUF",
-        target_glob="*Q4_K_M*.gguf",
-        # No MTP draft available for this model yet. The GGUF is fetched by the
-        # vision-server phase (setup PHASE 5.7) into the same dir, so no separate
-        # download here; this entry just locates it for text-chat serving.
     ),
     CatalogEntry(
         name="CyberNeurova-DeepSeek-V4-Flash",

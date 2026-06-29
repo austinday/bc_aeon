@@ -95,8 +95,6 @@ log_step "PHASE 5.6: Local model catalog (GPU-adaptive, VRAM-gated downloads)"
 # aeon/core/model_catalog.py). The same catalog drives runtime auto-deployment,
 # so setup and the agent agree on what is available. Portable across the 48 GB
 # (RTX 5000) and 96 GB (RTX 6000) Blackwell machines.
-GEMMA4_GGUF_DIR="$AEON_HOME/models/gguf_models/Gemma-4"
-mkdir -p "$GEMMA4_GGUF_DIR"
 MIN_VRAM=$(python3 -m aeon.core.gpu 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('min_total_gib',0))" 2>/dev/null || echo 0)
 log_step "Detected min per-GPU VRAM: ${MIN_VRAM} GiB"
 LITE_FLAG=""; [[ "$LITE_MODE" == "true" ]] && LITE_FLAG="--lite"
@@ -114,18 +112,6 @@ if python3 -c "import sys; sys.exit(0 if float('${MIN_VRAM}')>0 else 1)" 2>/dev/
     done < <(python3 -m aeon.core.model_catalog --emit-downloads "$MIN_VRAM" $LITE_FLAG)
 else
     log_step "WARNING: no GPU detected; skipping local model downloads."
-fi
-
-# The published MTP assistant GGUF uses a naming convention the fork's
-# gemma4-assistant loader rejects. Normalize it once into *.aeon.* so the MTP
-# cluster can load it. Idempotent; the adaptive launcher also self-heals at runtime.
-RAW_MTP_ASSISTANT="$GEMMA4_GGUF_DIR/gemma-4-31B-it-assistant.Q4_K_M.gguf"
-NORM_MTP_ASSISTANT="$GEMMA4_GGUF_DIR/gemma-4-31B-it-assistant.aeon.Q4_K_M.gguf"
-if [[ -f "$RAW_MTP_ASSISTANT" && ! -f "$NORM_MTP_ASSISTANT" ]]; then
-    log_step "PHASE 5.6b: Normalize Gemma-4 MTP assistant GGUF for fork compatibility"
-    python3 "$PROJECT_ROOT/aeon/scripts/normalize_gemma4_assistant.py" \
-        "$RAW_MTP_ASSISTANT" "$NORM_MTP_ASSISTANT" \
-        || { rm -f "$NORM_MTP_ASSISTANT"; echo "WARNING: MTP assistant normalization failed (will retry at runtime)"; }
 fi
 
 # Pre-cache the abliterated Gemma-4 NVFP4 build (the vLLM catalog entry) and its MTP
@@ -146,23 +132,16 @@ if python3 -c "import sys; sys.exit(0 if float('${MIN_VRAM}')>0 else 1)" 2>/dev/
         "$HF_HUB_CACHE_DIR:/root/.cache/huggingface" "$GEMMA4_NVFP4_CMD"
 fi
 
-if [[ "$LITE_MODE" != "true" ]]; then
-    log_step "PHASE 5.7: Qwen3.6-35B-A3B-Uncensored GGUF (Q4_K_M for the dedicated GPU1 vision server)"
-    QWEN36_VL_DIR="$AEON_HOME/models/vl_models/Qwen3.6-35B-A3B-GGUF"
-    mkdir -p "$QWEN36_VL_DIR"
-    CMD="hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*Q4_K_M*.gguf' --local-dir /models && \
-         hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive --include '*mmproj*.gguf' --local-dir /models"
-    run_downloader "$QWEN36_VL_DIR/.setup_state" "$SETUP_VERSION:qwen36-vl-q4_k_m" "$QWEN36_VL_DIR:/models" "$CMD"
-fi
+# (Removed) PHASE 5.7 used to download the Qwen3.6-35B-A3B GGUF for a dedicated GPU1
+# vision server. Vision now runs on the multimodal Gemma-4 already loaded on GPU0
+# (analyze_image reuses it), so that ~21 GB download is no longer needed.
 
 log_step "PHASE 6: Build aeon_vllm:latest Docker image"
 build_image "aeon_vllm:latest" "$PROJECT_ROOT/aeon/services/vllm/Dockerfile" "$PROJECT_ROOT/aeon/services/vllm/"
 
-log_step "PHASE 6.8: Build aeon_llamacpp:latest Docker image"
-build_image "aeon_llamacpp:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile" "$PROJECT_ROOT/aeon/llamacpp/"
-
-log_step "PHASE 6.8b: Build aeon_gemma4_mtp:latest Docker image"
-build_image "aeon_gemma4_mtp:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile.mtp" "$PROJECT_ROOT/aeon/llamacpp/"
+# (Removed) aeon_llamacpp + aeon_gemma4_mtp builds: the only catalog entries that used
+# them (Qwen3.6-35B text and Gemma-4 Q8_0) were retired in favor of Gemma-4 NVFP4 (vLLM).
+# DeepSeek-V4-Flash uses its own aeon_ds4 image, built below on 96 GB machines.
 
 if [[ "$LITE_MODE" != "true" ]]; then
     log_step "PHASE 6.8c: Build aeon_ds4:latest (DeepSeek-V4-Flash fork) Docker image"

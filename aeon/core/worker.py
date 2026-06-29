@@ -70,6 +70,7 @@ class Worker:
         self._recent_outputs = []   # Corresponding outputs for loop detection
         self.expanded_categories = set()  # Tracks which tool categories are currently expanded
         self.notified_sub_agents = set()  # Tracks which sub-agent terminal results the principal has actively collected (read/gathered)
+        self.notified_jobs = set()  # Tracks which background-job terminal results have been read (so the digest flags each once)
         self.stuck_reason = None  # Set by loop-detection; a sub-agent publishes this so its principal sees it's looping
         self._blackboard_seen = 0  # Line count of the shared blackboard at last digest, to report new findings
         self._last_sub_agent_action_iter = 0  # Iteration the principal last engaged a sub-agent tool (for the idle nudge)
@@ -469,6 +470,61 @@ class Worker:
 
         return "\n".join(out)
 
+    def _format_background_jobs_digest(self) -> str:
+        """Build the always-on BACKGROUND JOBS block (the run_command_async
+        counterpart to the SUB-AGENTS digest). Each turn the agent passively sees
+        every running job's command + elapsed time, and any finished/failed job
+        ONCE (until it reads it with job_output, which marks it notified). No
+        blocking call. Returns '' when there is nothing to report."""
+        from aeon.tools.jobs import resolve_job, read_command, status_keyword
+        base = Path(os.getcwd()) / "aeon_output" / self.instance_id / "jobs"
+        if not base.exists():
+            return ""
+        dirs = [d for d in base.iterdir() if d.is_dir() and (d / "pid.txt").exists()]
+        if not dirs:
+            return ""
+
+        running = 0
+        lines = []
+        for d in sorted(dirs, key=lambda p: p.name):
+            jid = d.name.split("-")[0]
+            cmd = read_command(d)
+            cmd_short = (cmd[:70] + "…") if len(cmd) > 70 else cmd
+            is_term, status, _ = resolve_job(d)
+            if is_term:
+                kw = status_keyword(status)
+                if f"{d.name}_{kw}" in self.notified_jobs:
+                    continue  # already read -> don't clutter the digest
+                if kw == "COMPLETED":
+                    lines.append(f"- [{jid}] ✓ DONE (exit 0) — `{cmd_short}` — "
+                                 f"read with job_output(job_id='{jid}').")
+                elif kw == "KILLED":
+                    lines.append(f"- [{jid}] KILLED — `{cmd_short}`.")
+                elif kw == "TIMEOUT":
+                    lines.append(f"- [{jid}] ⚠ {status} — `{cmd_short}` — "
+                                 f"job_output(job_id='{jid}'); re-run with a larger timeout if needed.")
+                else:
+                    lines.append(f"- [{jid}] ✗ {status} — `{cmd_short}` — "
+                                 f"job_output(job_id='{jid}').")
+                continue
+            running += 1
+            try:
+                el = time.time() - (d / "pid.txt").stat().st_mtime
+                el_str = f"{el:.0f}s"
+            except Exception:
+                el_str = "?"
+            lines.append(f"- [{jid}] RUNNING ({el_str}) — `{cmd_short}`.")
+
+        if not lines:
+            return ""
+        out = [
+            "**BACKGROUND JOBS** (detached commands you launched with run_command_async; non-blocking). "
+            "A finished or failed job is flagged here ONCE — read it with job_output before relying on its "
+            "result. Running jobs keep going while you work; kill_job to stop one. Don't idle-poll."
+        ]
+        out.extend(lines)
+        return "\n".join(out)
+
     def _format_memories(self) -> str:
         if not self.memories:
             return "No memories recorded yet."
@@ -552,6 +608,7 @@ class Worker:
         self._recent_outputs.clear()
         self.expanded_categories.clear()
         self.notified_sub_agents.clear()
+        self.notified_jobs.clear()
         self.active_skill = None
         self.effective_iterations = 0
         self.stuck_reason = None
@@ -568,6 +625,7 @@ class Worker:
             'objective': self.current_objective or '',
             'expanded_categories': list(self.expanded_categories),
             'notified_sub_agents': list(self.notified_sub_agents),
+            'notified_jobs': list(self.notified_jobs),
             'active_skill': self.active_skill,
             'instance_id': self.instance_id,
             'open_files_list': list(self.open_files.keys()),
@@ -581,6 +639,7 @@ class Worker:
         self.action_log_summary = state.get('action_log_summary', "")
         self.expanded_categories = set(state.get('expanded_categories', []))
         self.notified_sub_agents = set(state.get('notified_sub_agents', []))
+        self.notified_jobs = set(state.get('notified_jobs', []))
         self.active_skill = state.get('active_skill', None)
         self.open_files_access_order = state.get('open_files_access_order', [])
         
@@ -618,6 +677,83 @@ class Worker:
             f'CRITICAL: The restart is FINISHED. Do NOT call restart_aeon again.\n'
             f'Your code changes are ALREADY LIVE. Proceed with verifying them or completing the task.'
         )
+
+    # --- CROSS-RUN PERSISTENCE ---
+    # serialize_state/restore_state above cover the in-process restart_aeon hop
+    # (via a /tmp pid file). These persist the same state to a STABLE, project-local
+    # path so memories — and, for a resumed objective, the plan and attempt log —
+    # survive the process exiting entirely. Without this a fresh `aeon.main` starts
+    # with total amnesia despite "persistent memory" being a headline feature.
+
+    def _session_state_path(self) -> Path:
+        # aeon_output/ is gitignored and already the per-workspace output root, so
+        # the file is naturally scoped to the project the agent is working in.
+        return Path(os.getcwd()) / "aeon_output" / "session_state.json"
+
+    def _persist_session_state(self):
+        """Atomically write the current state to the stable session file. Best-effort:
+        any failure is logged and swallowed so persistence never breaks the loop."""
+        try:
+            path = self._session_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = self.serialize_state()
+            data['saved_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            fd, tmp = None, str(path) + ".tmp"
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:
+            self.logger.warning(f"Failed to persist session state: {e}")
+
+    def _maybe_load_persisted_state(self, objective: str):
+        """Once per process, hydrate from the stable session file if present.
+
+        Memories (durable facts that transcend a single objective) are always
+        restored. The plan and attempt log are objective-specific, so they are
+        only restored when the persisted objective matches the one we are
+        resuming — otherwise a brand-new task would inherit a stale plan and loop.
+        Skipped entirely if state is already populated (e.g. a restart_aeon resume
+        already ran restore_state), so we never clobber live state.
+        """
+        if getattr(self, '_persisted_loaded', False):
+            return
+        self._persisted_loaded = True
+        # A restart resume (or any prior population) already set up state — don't touch it.
+        if self.memories or self.action_log:
+            return
+        path = self._session_state_path()
+        if not path.exists():
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Failed to load persisted session state: {e}")
+            return
+
+        restored = []
+        mems = data.get('memories')
+        if isinstance(mems, dict) and mems:
+            self.memories = mems
+            restored.append(f"{len(mems)} memorie(s)")
+
+        prev_obj = (data.get('objective') or '').strip()
+        if prev_obj and prev_obj == (objective or '').strip():
+            if data.get('action_log'):
+                self.action_log = list(data['action_log'])
+                self.action_log_summary = data.get('action_log_summary', "")
+                restored.append(f"{len(self.action_log)} attempt-log entr(ies)")
+            if data.get('current_plan'):
+                self.current_plan = data['current_plan']
+                restored.append("plan")
+
+        if restored:
+            saved_at = data.get('saved_at', 'a previous session')
+            note = (f"SYSTEM: Restored persistent state from {saved_at} "
+                    f"({', '.join(restored)}). Review your PERSISTENT MEMORIES before acting; "
+                    f"some facts (paths, IDs, decisions) may be from earlier work.")
+            self.last_observation = f"{self.last_observation}\n\n{note}" if self.last_observation else note
+            self.print_func(f"{C_GREEN}\U0001F4BE {note}{C_RESET}")
 
     def _save_objective(self, objective: str):
         self.current_objective = objective
@@ -832,6 +968,7 @@ class Worker:
 
         iteration = 0
         self.last_observation = f"User input received: {objective}"
+        self._maybe_load_persisted_state(objective)
         self.print_func(f"{C_GREEN}Objective: {objective}{C_RESET}\n")
 
         graceful_exit_triggered = False
@@ -895,6 +1032,11 @@ class Worker:
                 # "collected". notified_sub_agents is now set ONLY when the principal
                 # actively reads a report (gather/get_sub_agent_report).
                 sub_agent_digest = self._format_sub_agent_digest(iteration)
+                # Background jobs ride the same always-on awareness channel as
+                # sub-agents (same injection point, same auto-recovery rebuilds).
+                jobs_digest = self._format_background_jobs_digest()
+                if jobs_digest:
+                    sub_agent_digest = f"{sub_agent_digest}\n\n{jobs_digest}" if sub_agent_digest else jobs_digest
 
                 # --- PRE-PROMPT CONTEXT ANALYSIS ---
                 # We estimate the prompt size first to determine pressure and dynamic limits
@@ -1244,7 +1386,8 @@ class Worker:
                         finished_entry = f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {acts_str}\n- Result: Task marked complete. {result_str}"
                         self.action_log.append(finished_entry)
                         self.pending_iteration_state = None
-                        
+
+                        self._persist_session_state()
                         if step_callback: step_callback(iteration, display_max, "Complete")
                         return
 
@@ -1435,6 +1578,10 @@ class Worker:
                     'intent': intent,
                     'actions': actions_taken_str
                 }
+
+                # Persist after each completed iteration so memories/plan/log survive
+                # a crash or a clean exit, not just an in-process restart_aeon.
+                self._persist_session_state()
 
                 iter_duration = time.time() - iter_start_time
                 self.print_func(f"{C_CYAN}Iter {iteration} | {iter_duration:.2f}s | Prompt:{prompt_tokens} ({growth_str}) | Pressure:{pressure}{C_RESET}")

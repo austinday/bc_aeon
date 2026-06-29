@@ -106,10 +106,14 @@ launch_with_backoff() {
         if [ $rc -eq 1 ] && [ $try -lt 2 ] && [ $((ctx/2)) -ge $MIN_CTX ]; then
             ctx=$((ctx/2)); try=$((try+1))
             echo "[adaptive-llamacpp] $name died (likely OOM); retrying at ctx $ctx"
-            docker logs "$name" --tail 8 2>/dev/null || true
+            docker logs --tail 8 "$name" 2>&1 || true
             continue
         fi
-        echo "[adaptive-llamacpp] ERROR: $name failed to start (rc=$rc). Logs:"; docker logs "$name" --tail 30 2>/dev/null || true
+        crash_log="/tmp/aeon_${name}.crash.log"
+        echo "[adaptive-llamacpp] ERROR: $name failed to start (rc=$rc). Last 80 log lines (also saved to ${crash_log}):"
+        # --tail must precede the container name (trailing flags are rejected); tee to a
+        # host file so the reason survives the teardown that removes the container.
+        docker logs --tail 80 "$name" 2>&1 | tee "$crash_log" || true
         return 1
     done
 }

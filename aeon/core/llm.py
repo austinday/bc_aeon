@@ -132,7 +132,8 @@ class LLMClient:
 
         self.provider = config['provider']
         self.client = self._create_client(config)
-        self.model = config['model']
+        self.model = config['model']            # catalog/display name: logging, llama.cpp self-heal lookup
+        self.api_model = config.get('api_model') or self.model  # id sent to the server (vLLM served name)
         self.context_limit = config.get('context_limit', 128000)
 
         # Optional "utility" tier for high-frequency support tasks (skill routing,
@@ -151,9 +152,9 @@ class LLMClient:
                 self.logger.info(f"[Utility tier] support tasks -> {util_model} @ {util_base}")
             except Exception as e:
                 self.logger.warning(f"[Utility tier] init failed ({e}); using strong model for support tasks")
-                self.utility_client, self.utility_model = self.client, self.model
+                self.utility_client, self.utility_model = self.client, self.api_model
         else:
-            self.utility_client, self.utility_model = self.client, self.model
+            self.utility_client, self.utility_model = self.client, self.api_model
 
     def _create_client(self, config: dict):
         """Create an OpenAI-compatible client from a model config dict."""
@@ -716,7 +717,7 @@ class LLMClient:
                 if not isinstance(self.client, VertexAIClient):
                     # Stream the response to accurately measure TTFT vs pure generation time
                     resp_stream = self.client.chat.completions.create(
-                        model=self.model,
+                        model=self.api_model,
                         messages=[{"role": "user", "content": current_prompt}],
                         temperature=0.2,
                         stream=True,
@@ -954,7 +955,7 @@ class LLMClient:
         """General reasoning/thinking call (uses primary/strong model)."""
         try:
             resp = self.client.chat.completions.create(
-                model=self.model,
+                model=self.api_model,
                 messages=[{"role": "user", "content": prompt}]
             )
             content = resp.choices[0].message.content

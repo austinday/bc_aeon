@@ -140,6 +140,78 @@ def _atomic_write(abs_path: str, content, binary: bool = False):
         pass
 
 
+def _unified_diff(old: str, new: str, path: str, max_lines: int = 80) -> str:
+    """Return a compact unified diff of an applied edit, or '' if nothing useful.
+
+    Gives the model an objective view of WHAT changed and WHERE, so a fuzzy or
+    whitespace-normalized match that landed in the wrong region is visible
+    instead of being hidden behind a bare 'success' message. Bounded so a large
+    rewrite never floods the context: past max_lines it degrades to a +adds/-dels
+    summary line.
+    """
+    try:
+        if old == new:
+            return ''
+        old_lines = old.splitlines()
+        new_lines = new.splitlines()
+        diff = list(difflib.unified_diff(
+            old_lines, new_lines,
+            fromfile=f'a/{path}', tofile=f'b/{path}', lineterm='', n=2,
+        ))
+        if not diff:
+            return ''
+        adds = sum(1 for d in diff if d.startswith('+') and not d.startswith('+++'))
+        dels = sum(1 for d in diff if d.startswith('-') and not d.startswith('---'))
+        if len(diff) > max_lines:
+            body = '\n'.join(diff[:max_lines])
+            return (f"\n--- DIFF (+{adds}/-{dels} lines, truncated to first {max_lines}) ---\n"
+                    f"{body}\n... [diff truncated] ...")
+        return f"\n--- DIFF (+{adds}/-{dels} lines) ---\n" + '\n'.join(diff)
+    except Exception:
+        return ''
+
+
+def _syntax_warning(abs_path: str, content) -> str:
+    """Return a non-blocking '⚠ syntax warning' for a just-written file whose
+    content is statically parseable-checkable (.py/.json/.yaml), or '' otherwise.
+
+    This never blocks or reverts the write — it only surfaces breakage the moment
+    it is introduced, so the agent fixes it now instead of discovering it later
+    when something tries to run the file. Binary content and unknown extensions
+    are skipped.
+    """
+    if not isinstance(content, str):
+        return ''
+    ext = os.path.splitext(abs_path)[1].lower()
+    try:
+        if ext == '.py':
+            try:
+                compile(content, abs_path, 'exec')
+            except SyntaxError as e:
+                return (f"\n\n⚠ SYNTAX WARNING: the file was written, but it does NOT parse as "
+                        f"valid Python: {e.msg} (line {e.lineno}). Fix this before running it.")
+        elif ext == '.json':
+            try:
+                json.loads(content)
+            except ValueError as e:
+                return (f"\n\n⚠ SYNTAX WARNING: the file was written, but it is NOT valid JSON: {e}. "
+                        f"Fix this before relying on it.")
+        elif ext in ('.yaml', '.yml'):
+            try:
+                import yaml  # PyYAML is optional; skip the check if unavailable
+            except ImportError:
+                return ''
+            try:
+                yaml.safe_load(content)
+            except yaml.YAMLError as e:
+                first = str(e).splitlines()[0] if str(e) else 'parse error'
+                return (f"\n\n⚠ SYNTAX WARNING: the file was written, but it is NOT valid YAML: "
+                        f"{first}. Fix this before relying on it.")
+    except Exception:
+        return ''
+    return ''
+
+
 def _edit_failures(worker):
     """Per-file failure counter, stored on the worker so str_replace and write_file
     can coordinate escalation/reset across separate tool instances."""
@@ -543,7 +615,10 @@ class StrReplaceTool(BaseTool):
 
         method_str = ", ".join(dict.fromkeys(methods_used)) if methods_used else "exact"
         block_count = len(methods_used) if patch else 1
-        return f"Successfully applied {block_count} edit block(s) to {file_path} (matched via {method_str})."
+        diff_str = _unified_diff(content, current_content, os.path.basename(file_path))
+        syntax_str = _syntax_warning(abs_path, current_content)
+        return (f"Successfully applied {block_count} edit block(s) to {file_path} "
+                f"(matched via {method_str}).{diff_str}{syntax_str}")
 
 
 class WriteFileTool(BaseTool):
@@ -578,6 +653,18 @@ class WriteFileTool(BaseTool):
         if os.path.isdir(abs_path):
             return f'Error: {file_path} is a directory, not a file.'
 
+        # Capture prior text content (bounded) so we can show the model a diff of
+        # what its overwrite actually changed. New file -> existed stays False.
+        existed = os.path.exists(abs_path)
+        old_content = None
+        if existed and not is_binary:
+            try:
+                if os.path.getsize(abs_path) <= MAX_FILE_READ_SIZE:
+                    with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
+                        old_content = f.read()
+            except Exception:
+                old_content = None
+
         try:
             _atomic_write(abs_path, content_decoded, binary=is_binary)
         except PermissionError:
@@ -592,5 +679,14 @@ class WriteFileTool(BaseTool):
 
         if is_binary:
             return f'Successfully wrote {file_path} ({len(content_decoded):,} bytes, binary).'
+
         line_count = content_decoded.count('\n') + 1 if content_decoded else 0
-        return f'Successfully wrote {file_path} ({line_count:,} lines).'
+        if not existed:
+            verb = f'Created {file_path} ({line_count:,} lines)'
+            diff_str = ''
+        else:
+            verb = f'Overwrote {file_path} ({line_count:,} lines)'
+            diff_str = (_unified_diff(old_content, content_decoded, os.path.basename(file_path))
+                        if old_content is not None else '')
+        syntax_str = _syntax_warning(abs_path, content_decoded)
+        return f'Successfully {verb}.{diff_str}{syntax_str}'

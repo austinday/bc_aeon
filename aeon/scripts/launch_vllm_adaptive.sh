@@ -50,13 +50,23 @@ if [ -n "${AEON_KV_QUANT:-}" ]; then
 fi
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
 
+# FlashInfer JIT-compiles the NVFP4 (sm_120 / Blackwell) FP4 GEMM kernels on first
+# launch. Those CUTLASS templates are RAM-hungry to compile and FlashInfer fans out
+# one ninja job per CPU by default -- on a 24-core box with no swap that runs ~24
+# concurrent nvcc, each several GiB, and the compiler dies with "catastrophic error:
+# out of memory", taking engine-core init down with it. Cap the concurrency (the
+# compile is one-time and then cached). Override with AEON_JIT_MAX_JOBS if desired.
+JIT_MAX_JOBS="${AEON_JIT_MAX_JOBS:-4}"
+
 wait_for_health() {
     local name=$1 port=$2 count=0
     while true; do
         if ! docker ps --format '{{.Names}}' | grep -q "^${name}$"; then return 1; fi
         if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${port}/health 2>/dev/null || true)" = "200" ]; then return 0; fi
         sleep 5; count=$((count+1))
-        [ $count -ge 240 ] && return 2
+        # First launch JIT-compiles FP4 kernels at capped parallelism (see JIT_MAX_JOBS),
+        # which is slow but one-time/cached; allow ~35 min before giving up.
+        [ $count -ge 420 ] && return 2
         [ $((count % 6)) -eq 0 ] && echo "[adaptive-vllm] ${name} still loading... ($((count*5))s)"
     done
 }
@@ -71,11 +81,16 @@ launch_node() {
     args+=("${SPEC_ARGS[@]}")
     args+=("${KV_ARGS[@]}")
     echo "[adaptive-vllm] launch $name (GPU $devices, port $port, TP=$tp, util $UTIL, ctx $ctx${cpu_offload:+, cpu_offload ${cpu_offload}GiB})"
+    # Persist ~/.cache/flashinfer too: otherwise the JIT-compiled FP4 kernels are lost
+    # when the container is removed and every launch recompiles (slow + the OOM risk).
+    mkdir -p "$HOME/.cache/flashinfer"
     docker run -d --name "$name" --gpus "\"device=${devices}\"" --ipc=host -p "${port}:${port}" \
         -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
         -v "$HOME/.cache/triton:/root/.triton" -v "$HOME/.cache/vllm:/root/.cache/vllm" \
+        -v "$HOME/.cache/flashinfer:/root/.cache/flashinfer" \
         -e TRITON_CACHE_DIR=/root/.triton -e VLLM_CACHE_ROOT=/root/.cache/vllm \
         -e VLLM_ATTENTION_BACKEND="$VLLM_ATTENTION_BACKEND" \
+        -e MAX_JOBS="$JIT_MAX_JOBS" -e NVCC_THREADS=1 \
         "$IMAGE" "${args[@]}" >/dev/null 2>/tmp/aeon_${name}.err || {
             echo "[adaptive-vllm] docker run failed for $name:"; cat /tmp/aeon_${name}.err; return 1; }
 }
@@ -99,7 +114,15 @@ done <<< "$NODE_LINES"
 echo "[adaptive-vllm] Waiting for vLLM node(s) to load (several minutes on first run)..."
 while IFS='|' read -r name devices port ctx tp cpu_offload; do
     [ -z "$name" ] && continue
-    wait_for_health "$name" "$port" || { echo "[adaptive-vllm] ERROR: $name failed:"; docker logs "$name" --tail 30 2>/dev/null; exit 1; }
+    wait_for_health "$name" "$port" || {
+        crash_log="/tmp/aeon_${name}.crash.log"
+        echo "[adaptive-vllm] ERROR: $name failed. Last 80 log lines (also saved to ${crash_log}):"
+        # NOTE: --tail must precede the container name; trailing flags are rejected by
+        # the docker CLI and were silently swallowed. tee to a host file so the reason
+        # survives the session teardown that removes the container moments later.
+        docker logs --tail 80 "$name" 2>&1 | tee "$crash_log"
+        exit 1
+    }
     echo "[adaptive-vllm] $name READY"
 done <<< "$NODE_LINES"
 

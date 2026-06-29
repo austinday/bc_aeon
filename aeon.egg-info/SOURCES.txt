@@ -141,6 +141,7 @@ aeon/tools/communication.py
 aeon/tools/file_io.py
 aeon/tools/generate_image.py
 aeon/tools/generate_video.py
+aeon/tools/jobs.py
 aeon/tools/loader.py
 aeon/tools/memory.py
 aeon/tools/restart.py

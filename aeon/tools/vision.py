@@ -11,31 +11,24 @@ from ..core.prompts import TOOL_DESC_ANALYZE_IMAGE
 
 
 class AnalyzeImageTool(BaseTool):
-    """A tool to analyze images using Qwen3.6-35B-A3B-Uncensored via a local vLLM server."""
+    """Analyze images on the selected multimodal primary model (e.g. Gemma-4, already
+    loaded on GPU0). main.py exports its endpoint as AEON_VISION_*; there is no separate
+    vision server."""
 
     # Max image dimension before resizing (keeps VRAM usage reasonable)
     MAX_IMAGE_DIM = 640
-    # Port for the dedicated vision llama.cpp server
-    VLLM_PORT = 8020
 
     def __init__(self):
         super().__init__(
             name='analyze_image',
             description=TOOL_DESC_ANALYZE_IMAGE,
-            underlying_model='Qwen3.6-35B-A3B-VL'
+            underlying_model='multimodal-primary'
         )
-        self.vllm_url = f'http://localhost:{self.VLLM_PORT}'
-
-    def _check_health(self):
-        """Check if the vLLM vision server is healthy."""
-        try:
-            resp = requests.get(f'{self.vllm_url}/health', timeout=3)
-            return resp.status_code == 200
-        except requests.exceptions.RequestException:
-            return False
 
     def _manage_registry(self, action: str):
-        """Manage active users of the vision server using a lockfile and JSON registry."""
+        """Legacy ref-count registry (lockfile + JSON). The dedicated vision server it once
+        guarded is retired; kept because browser.py still register/unregisters here. Harmless
+        bookkeeping -- no server is started or torn down based on it anymore."""
         import fcntl
         registry_path = '/tmp/aeon_vision_vllm_registry.json'
         lock_path = '/tmp/aeon_vision_vllm_registry.lock'
@@ -132,41 +125,20 @@ class AnalyzeImageTool(BaseTool):
         if validation_error:
             return validation_error
 
+        # Vision runs on the selected multimodal primary (e.g. Gemma-4, already loaded on
+        # GPU0), which main.py exports as AEON_VISION_*. The old standalone Qwen3.6-VL
+        # server was retired, so a non-multimodal primary (e.g. a cloud text model) has no
+        # local vision backend -> return a clear, actionable error instead of failing oddly.
+        primary_base = os.environ.get('AEON_VISION_BASE_URL')
+        primary_model = os.environ.get('AEON_VISION_MODEL')
+        if not (primary_base and primary_model):
+            return ("Error: image analysis requires a multimodal model. The current model does "
+                    "not serve vision and the standalone vision server has been removed. "
+                    "Restart Aeon and select the multimodal Gemma-4 model to use analyze_image.")
+        vision_url = primary_base.rstrip('/') + '/chat/completions'  # base already ends in /v1
+        vision_model = primary_model
+
         try:
-            self._manage_registry('register')
-
-            # Start server if not running
-            if not self._check_health():
-                # Try package directory first, then fallback to local project root
-                pkg_script_path = os.path.abspath(
-                    os.path.join(os.path.dirname(__file__), '..', 'scripts', 'start_qwen36_vl_35b.sh')
-                )
-                if os.path.exists(pkg_script_path):
-                    script_path = pkg_script_path
-                else:
-                    # Fallback to current working directory (assuming we are at project root)
-                    local_script_path = os.path.abspath(
-                        os.path.join(os.getcwd(), 'aeon', 'scripts', 'start_qwen36_vl_35b.sh')
-                    )
-                    if os.path.exists(local_script_path):
-                        script_path = local_script_path
-                    else:
-                        return f'Error: Vision start script not found. Tried {pkg_script_path} and {local_script_path}'
-
-                env = os.environ.copy()
-                env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
-                env["VISION_GPU"] = "1"
-                res = subprocess.run(['bash', script_path], capture_output=True, text=True, env=env)
-                if res.returncode != 0:
-                    return f'Error starting vision server: {res.stderr}'
-
-            for attempt in range(60):  # Up to 3 minutes for Q4 GGUF loading
-                if self._check_health():
-                    break
-                time.sleep(3)
-            else:
-                return 'Error: Vision server failed to become healthy after 3 minutes. Check: docker logs aeon_qwen36_vl'
-
             # Load and encode image
             try:
                 b64_image, mime_type = self._load_and_encode_image(abs_image_path)
@@ -197,15 +169,15 @@ class AnalyzeImageTool(BaseTool):
             # small max_tokens for a fast, concise visual summary; standalone
             # image analysis keeps a larger budget.
             payload = {
-                'model': 'Qwen3.6-35B-A3B-VL',
+                'model': vision_model,
                 'messages': messages,
                 'max_tokens': int(max_tokens),
                 'temperature': float(temperature),
             }
 
-            print("Sending request to vision server...")
+            print(f"Sending request to vision endpoint ({vision_model})...")
             resp = requests.post(
-                f'{self.vllm_url}/v1/chat/completions',
+                vision_url,
                 json=payload,
                 timeout=120
             )
@@ -233,10 +205,6 @@ class AnalyzeImageTool(BaseTool):
             return full_output
 
         except Exception as e:
-            return self.format_error_message(e, 'analyzing image via Qwen3.6-35B', 'checking vision server logs (docker logs aeon_qwen36_vl)')
-
-        finally:
-            if auto_cleanup:
-                remaining_users = self._manage_registry('unregister')
-                if remaining_users == 0:
-                    subprocess.run(['docker', 'rm', '-f', 'aeon_qwen36_vl'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return self.format_error_message(e, 'analyzing image on the multimodal model',
+                                             'confirming a multimodal model (Gemma-4) is selected')
+        # No teardown: the multimodal primary is owned by the session, not this tool.
