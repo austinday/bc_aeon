@@ -212,6 +212,16 @@ def _syntax_warning(abs_path: str, content) -> str:
     return ''
 
 
+def _protected_guard(abs_path: str):
+    """Return a refusal message if abs_path is a protected self-improvement
+    guardrail, else None. Fully guarded so a missing module never breaks editing."""
+    try:
+        from ..core.protected import guard
+        return guard(abs_path)
+    except Exception:
+        return None
+
+
 def _edit_failures(worker):
     """Per-file failure counter, stored on the worker so str_replace and write_file
     can coordinate escalation/reset across separate tool instances."""
@@ -551,6 +561,10 @@ class StrReplaceTool(BaseTool):
         if os.path.isdir(abs_path):
             return f'Error: {file_path} is a directory, not a file.'
 
+        blocked = _protected_guard(abs_path)
+        if blocked:
+            return blocked
+
         failures = _edit_failures(self.worker)
 
         if failures.get(abs_path, 0) >= self.MAX_FAILURES_BEFORE_ESCALATION:
@@ -652,6 +666,10 @@ class WriteFileTool(BaseTool):
         abs_path = os.path.abspath(file_path)
         if os.path.isdir(abs_path):
             return f'Error: {file_path} is a directory, not a file.'
+
+        blocked = _protected_guard(abs_path)
+        if blocked:
+            return blocked
 
         # Capture prior text content (bounded) so we can show the model a diff of
         # what its overwrite actually changed. New file -> existed stays False.

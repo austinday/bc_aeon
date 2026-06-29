@@ -20,7 +20,7 @@ TOP_LEVEL_TOOLS = {
     'search_web', 'run_command', 'task_complete',
     'run_command_async', 'job_output', 'kill_job',
     'memorize', 'forget',
-    'verify_self_modification', 'restart_aeon',
+    'verify_self_modification', 'restart_aeon', 'revert_aeon', 'run_self_benchmark',
     'expand_tool_category', 'collapse_tool_category',
 }
 

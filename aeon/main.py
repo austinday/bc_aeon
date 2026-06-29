@@ -838,6 +838,7 @@ def _execute_restart(session, worker=None):
 
     aeon_code_dir = None
     backup_created = False
+    ckpt_ref = ""
 
     try:
         with open(RESTART_STATE_PATH, 'r', encoding='utf-8') as f:
@@ -876,6 +877,21 @@ def _execute_restart(session, worker=None):
             print(f'[RESTART] Backup created ({backup_size / 1024:.0f} KB).')
         except Exception as e:
             print(f'[RESTART] WARNING: Backup failed: {e}. Proceeding without safety net.')
+
+        # Phase 1b: Durable git checkpoint (in addition to the PID-scoped tarball).
+        # Unlike the tarball — which is deleted on success and protects only this one
+        # transition — a git checkpoint persists as a recoverable, diffable lineage and
+        # is what the boot handshake (and the revert_aeon tool) roll back to.
+        try:
+            from aeon.core import checkpoint as _ckpt
+            ck = _ckpt.create_checkpoint(aeon_code_dir, label=state.get('reason', 'self-mod'))
+            if ck.get('ok'):
+                ckpt_ref = ck['tag']
+                print(f"[RESTART] Git checkpoint created: {ckpt_ref}")
+            else:
+                print(f"[RESTART] No git checkpoint ({ck.get('reason')}); relying on tarball backup.")
+        except Exception as e:
+            print(f"[RESTART] WARNING: git checkpoint failed: {e}.")
 
         # Phase 2: Clear bytecode caches
         print(f'[RESTART] Clearing __pycache__ directories...')
@@ -1002,6 +1018,16 @@ def _execute_restart(session, worker=None):
         if backup_created and os.path.exists(RESTART_BACKUP_PATH):
             os.remove(RESTART_BACKUP_PATH)
 
+        # Boot handshake: the smoke/unit gates above ran the new code as a SUBPROCESS,
+        # but execv relaunches through the (untested) --resume path. Mark the boot as
+        # pending and name the checkpoint to roll back to; the relaunched process clears
+        # this once it boots healthy, and any fresh start that still sees it auto-reverts.
+        try:
+            from aeon.core import bootguard
+            bootguard.mark_pending(aeon_code_dir, ckpt_ref, reason=state.get('reason', ''))
+        except Exception as e:
+            print(f"[RESTART] WARNING: could not write boot marker: {e}.")
+
         print(f'[RESTART] Relaunching: {" ".join(new_args)}')
         os.execv(sys.executable, new_args)
         # os.execv never returns on success
@@ -1082,6 +1108,17 @@ def cli():
         model_config = select_model(menu, 'Select Model')
 
     print(f"[CONFIG] Model: {model_config['model']} ({model_config['provider']})")
+
+    # Boot handshake recovery: on a FRESH start (not the --resume relaunch), a still-
+    # pending marker means a previous restart booted broken code and never went healthy.
+    # Roll it back to its checkpoint before doing anything else. Skipped under --resume,
+    # which IS the relaunch that is expected to clear the marker once it boots.
+    if not args.resume:
+        try:
+            from aeon.core import bootguard
+            bootguard.check_and_recover()
+        except Exception as e:
+            print(f"[BOOTGUARD] recovery check failed: {e}")
 
     session = SessionManager()
 
@@ -1183,6 +1220,13 @@ def cli():
                     resume_state = json.load(f)
                 os.remove(args.resume)
                 worker.restore_state(resume_state)
+                # The relaunched code booted, imported, and restored state successfully —
+                # clear the pending marker so it is treated as the new known-good generation.
+                try:
+                    from aeon.core import bootguard
+                    bootguard.mark_boot_ok()
+                except Exception:
+                    pass
                 obj = resume_state.get('objective', '')
                 print(f"[RESUME] State restored. Continuing objective: {obj}")
                 while obj:

@@ -72,6 +72,40 @@ Tools are grouped into collapsible categories to save context; top-level tools
 video, browser, sub-agent coordination, …). Skills are pinned step-by-step
 protocols the agent activates for matching objectives.
 
+## Self-modification & self-improvement
+
+Aeon can edit its own source, restart onto the new code, and measure whether the
+change actually made it better — a guarded, reversible loop rather than a blind
+overwrite.
+
+- **Durable git checkpoints.** Every `restart_aeon` first tags the working tree as
+  a recoverable checkpoint (`aeon/core/checkpoint.py`), capturing tracked *and*
+  untracked files. Restores reconcile modifications, deletions, and additions so
+  the `aeon/` package matches the checkpoint exactly, and never touch files
+  outside it. Checkpoints persist as a diffable lineage (not a one-shot tarball).
+- **Boot handshake (no bricking).** The pip/smoke/unit gates run the new code as a
+  *subprocess*, but `execv` relaunches through the untested `--resume` path. A
+  pending-boot marker (`aeon/core/bootguard.py`) names the checkpoint to roll back
+  to; the relaunched process clears it only once it boots healthy, and any fresh
+  start that still sees it auto-reverts. A resume-path crash can no longer leave
+  broken code installed with no way back.
+- **`revert_aeon`.** An agent-callable rollback to any checkpoint, for the case the
+  gates can't catch: a change that passes tests but, once live, is a behavioural
+  regression. Roll back, restart, continue.
+- **Protected core.** A small constitution (`aeon/core/protected.py`) — the
+  benchmark/scorer, the checkpoint & rollback engine, the boot handshake, the test
+  gates — is refused by the edit tools unless a human sets
+  `AEON_ALLOW_PROTECTED_EDIT=1`, so a self-modification can't quietly weaken the
+  machinery that measures and reverts it.
+- **A fitness signal.** `aeon/selfimprove/` turns one-off editing into a measurable
+  loop: a scored **benchmark** of capability tasks run against a candidate in an
+  isolated sandbox copy (`evaluate.py`), a **scorer** that accepts a change only if
+  it holds or improves the score with no regressions (the ratchet), and a durable
+  experiment **ledger**. `run_self_benchmark` exposes the score to the agent, so it
+  can baseline before a change and confirm improvement (or trigger `revert_aeon`)
+  after. Deterministic tasks need no model; model-driven behavioural tasks plug
+  into the same registry.
+
 ## Web browsing (human-grade)
 
 The `web_browser` tools drive **real Google Chrome** (not Chromium) via

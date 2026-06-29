@@ -18,6 +18,10 @@ _root = Path(__file__).resolve().parents[2]
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
+# Pull in the self-modification / self-improvement substrate tests so they run as
+# part of this same pre-restart gate (loadTestsFromModule discovers imported cases).
+from aeon.tests.test_selfimprove import *  # noqa: F401,F403,E402
+
 
 def _bare_llm_client():
     """Build an LLMClient without running __init__ (which needs a model config).
