@@ -12,6 +12,7 @@ from aeon.tools.generate_image import ComfyUITool
 from aeon.core.gpu_queue import release_vram
 from aeon.core.prompt_enhancer import enhance_prompt
 from aeon.core.prompts import TOOL_DESC_GENERATE_VIDEO
+from aeon.core.paths import resolve_output_path
 
 
 def _aeon_home() -> str:
@@ -224,9 +225,6 @@ class GenerateVideoTool(ComfyUITool):
                 init_video: Optional[str] = None, denoise: float = 0.6,
                 negative_prompt: Optional[str] = None, seed: int = 42,
                 input_path_1: Optional[str] = None, **kwargs) -> str:
-        if not output_path:
-            return "Error: 'output_path' is required."
-
         # Validate mode up front: an unrecognized mode previously fell through to
         # text_to_video, silently ignoring init_image/init_video/keyframes.
         valid_modes = {"text_to_video", "image_to_video", "extend_video", "edit_video", "keyframes"}
@@ -250,7 +248,9 @@ class GenerateVideoTool(ComfyUITool):
         if input_path_1 and not init_image and not init_video:
             (init_video, init_image) = (input_path_1, None) if mode in ("extend_video", "edit_video") else (None, input_path_1)
 
-        abs_output = os.path.abspath(output_path)
+        # Resolve relative to the workspace (where aeon was launched), or
+        # auto-name at the workspace base when no path is given.
+        abs_output = str(resolve_output_path(output_path, time.strftime("aeon_video_%Y%m%d_%H%M%S.mp4")))
         os.makedirs(os.path.dirname(abs_output) or ".", exist_ok=True)
         work_dir = os.path.join(_aeon_home(), "temp", "video_work", str(os.getpid()))
         os.makedirs(work_dir, exist_ok=True)

@@ -32,10 +32,14 @@ _SUGGEST_MAX_FILES_SCANNED = 20000
 
 
 def _project_root():
-    """Resolve the canonical project root, falling back to cwd. Never raises."""
+    """Resolve the workspace root for path suggestions. Never raises.
+
+    File operations are workspace-relative, so 'did you mean' hints must search
+    the user's current workspace, not the aeon install/source tree.
+    """
     try:
-        from ..core.paths import PROJECT_ROOT
-        root = str(PROJECT_ROOT)
+        from ..core.paths import get_workspace_root
+        root = str(get_workspace_root())
         if root and os.path.isdir(root):
             return root
     except Exception:

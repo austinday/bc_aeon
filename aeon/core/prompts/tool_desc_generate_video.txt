@@ -12,7 +12,7 @@ Schema:
      'extend_video'   — continue an existing clip (init_video); seeds from its last frame.
      'edit_video'     — restyle/edit an existing clip (init_video) at `denoise` strength.
   prompt (str, required for most modes): detailed visual description; richer is better.
-  output_path (str, required): where to save the .mp4 (absolute or relative).
+  output_path (str, optional): where to save the .mp4. A relative path is resolved against the current workspace; an absolute path is honored as-is. If omitted, it is saved with an auto-generated name at the base of the current workspace. Do NOT invent nested output dirs like 'aeon_output/...'.
   init_image (str): path to the start image — for image_to_video.
   init_video (str): path to the source video — for extend_video / edit_video.
   keyframes (list): for 'keyframes' mode, a list of {"image": path, "at_frame": int,

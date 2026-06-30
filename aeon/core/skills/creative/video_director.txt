@@ -44,7 +44,8 @@
      each shot so the subject reads as the same across cuts.
 
 5. ASSEMBLE
-   - Save shots to a working dir (e.g. aeon_output/video/<project>/shotNN.mp4).
+   - Save shots to a working dir under the current workspace (e.g. <project>/shotNN.mp4),
+     then deliver the final cut at the workspace base. Don't invent an aeon_output/... path.
    - Stitch the ordered shots into the final cut by calling extend_video to chain, or by
      concatenating the mp4s (ffmpeg). Deliver the final path to the user with say_to_user.
 

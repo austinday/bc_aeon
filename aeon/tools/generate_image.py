@@ -8,6 +8,7 @@ from .base import BaseTool
 from ..core.prompts import TOOL_DESC_GENERATE_IMAGE, TOOL_DESC_EDIT_IMAGE
 from ..core.gpu_queue import wait_for_vram, release_vram
 from ..core.prompt_enhancer import enhance_prompt
+from ..core.paths import resolve_output_path
 
 class ComfyUITool(BaseTool):
     """Base class for tools using ComfyUI to handle VRAM and registry management."""
@@ -170,18 +171,18 @@ class GenerateImageTool(ComfyUITool):
                             "flux2-vae.safetensors")
         return unet, clip, vae
 
-    def execute(self, prompt: str, output_path: str, width: int = 1024, height: int = 1024, enhance: bool = None) -> str:
+    def execute(self, prompt: str, output_path: str = None, width: int = 1024, height: int = 1024, enhance: bool = None) -> str:
         if not prompt:
             return "Error: 'prompt' parameter is required."
-        if not output_path:
-            return "Error: 'output_path' parameter is required."
 
         # Tolerate string/odd dimensions from the model (e.g. "1024" or 1000).
         width = self._norm_dim(width)
         height = self._norm_dim(height)
 
         prompt = enhance_prompt(self.llm_client, prompt, "image", force=enhance)
-        abs_output_path = os.path.abspath(output_path)
+        # Resolve relative to the workspace (where aeon was launched), or
+        # auto-name at the workspace base when no path is given.
+        abs_output_path = str(resolve_output_path(output_path, time.strftime("aeon_image_%Y%m%d_%H%M%S.png")))
         os.makedirs(os.path.dirname(abs_output_path) or ".", exist_ok=True)
 
         try:
@@ -274,18 +275,18 @@ class EditImageTool(ComfyUITool):
         )
         self.llm_client = llm_client
 
-    def execute(self, input_path: str, prompt: str, output_path: str, denoise: float = 0.75, enhance: bool = None) -> str:
+    def execute(self, input_path: str, prompt: str, output_path: str = None, denoise: float = 0.75, enhance: bool = None) -> str:
         if not input_path:
             return "Error: 'input_path' parameter is required."
         if not prompt:
             return "Error: 'prompt' parameter is required."
-        if not output_path:
-            return "Error: 'output_path' parameter is required."
 
         denoise = self._norm_unit(denoise, default=0.75)
         prompt = enhance_prompt(self.llm_client, prompt, "image_edit", force=enhance)
         abs_input_path = os.path.abspath(input_path)
-        abs_output_path = os.path.abspath(output_path)
+        # Default: '<input-name>_edited.png' at the workspace base.
+        default_name = os.path.splitext(os.path.basename(abs_input_path))[0] + "_edited.png"
+        abs_output_path = str(resolve_output_path(output_path, default_name))
 
         if not os.path.exists(abs_input_path):
             return f"Error: Input image not found at {abs_input_path}"
