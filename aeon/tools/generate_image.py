@@ -308,7 +308,11 @@ class EditImageTool(ComfyUITool):
 
             workflow = {
                 "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf"}},
-                "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors", "type": "qwen_image"}},
+                # ABLITERATED Qwen2.5-VL text encoder (was stock qwen_2.5_vl_7b_fp8_scaled,
+                # the last censored component). CLIPLoaderGGUF auto-pairs the matching
+                # mmproj-*.gguf alongside it (needed because Qwen-Image-Edit reads the input
+                # image in vision-language mode), and ignores the unrelated gemma-3 mmproj.
+                "2": {"class_type": "CLIPLoaderGGUF", "inputs": {"clip_name": "Qwen2.5-VL-7B-Instruct-abliterated.Q8_0.gguf", "type": "qwen_image"}},
                 "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
                 "10": {"class_type": "LoadImage", "inputs": {"image": uploaded_filename}},
                 "4": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"prompt": prompt, "clip": ["2", 0], "vae": ["3", 0], "image1": ["10", 0]}},

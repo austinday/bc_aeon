@@ -1,73 +1,95 @@
 import os
-import pathlib
+import subprocess
+import requests
 from .base import BaseTool
 from ..core.llm import LLMClient
 from ..core.prompts import TOOL_DESC_SEARCH_WEB
 
+SEARXNG_PORT = os.environ.get("AEON_SEARXNG_PORT", "8095")
+SEARXNG_URL = f"http://localhost:{SEARXNG_PORT}"
+
+
 class SearchWebTool(BaseTool):
-    """A tool to search the web for up-to-date information."""
+    """Quick web lookups via a LOCAL SearXNG metasearch container.
+
+    Aeon is local-only: this hits an on-machine SearXNG instance that aggregates
+    public search engines, so no third-party search API/SaaS (e.g. Tavily) sees or
+    filters the queries. SafeSearch is forced off (uncensored). Best for shallow,
+    public, easily-found information; deep digging into a specific site or dataset
+    is the browser tools' job.
+    """
     def __init__(self, llm_client: LLMClient):
         super().__init__(
             name="search_web",
             description=TOOL_DESC_SEARCH_WEB,
-            underlying_model="Tavily"
+            underlying_model="SearXNG (local metasearch)",
         )
         self.llm_client = llm_client
-        self.tavily_client = None
-        
+
+    def _ensure_searxng(self):
+        """Start the local SearXNG container if it isn't already healthy."""
         try:
-            from tavily import TavilyClient
-            api_key_path = pathlib.Path.home() / "tavily_api_key.txt"
-            api_key = None
-            if api_key_path.is_file():
-                with open(api_key_path, 'r') as f:
-                    api_key = f.readline().strip()
+            if requests.get(f"{SEARXNG_URL}/healthz", timeout=2).status_code == 200:
+                return
+        except requests.exceptions.RequestException:
+            pass
+        script = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "start_searxng.sh"))
+        try:
+            subprocess.run(["bash", script], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to start local SearXNG: {(e.stderr or e.stdout or '').strip()}")
 
-            if api_key:
-                self.tavily_client = TavilyClient(api_key=api_key)
-        except ImportError:
-            pass # tavily_client remains None
+    @staticmethod
+    def _instant_answers(data: dict) -> str:
+        """SearXNG may return engine 'answers' (instant answers / infoboxes).
+        Normalize the list (strings in some versions, dicts in others) to text."""
+        out = []
+        for a in data.get("answers") or []:
+            if isinstance(a, dict):
+                out.append((a.get("answer") or a.get("content") or "").strip())
+            elif a:
+                out.append(str(a).strip())
+        return " ".join(t for t in out if t)
 
-    def execute(self, query: str) -> str:
+    def execute(self, query: str, max_results: int = 5) -> str:
         if not query:
             return "Error: query parameter is required."
-            
-        if not self.tavily_client:
-            return "Error: Tavily API key not found in ~/tavily_api_key.txt or tavily-python is not installed. The search_web tool is not available."
-        
+
         try:
-            search_results = self.tavily_client.search(
-                query=query, search_depth="advanced", max_results=5, include_answer=True)
-
-            context = ""
-            sources = []
-            if 'results' in search_results:
-                for result in search_results['results']:
-                    url = result.get('url')
-                    title = (result.get('title') or '').strip()
-                    context += f"URL: {url}\nContent: {result.get('content')}\n---\n"
-                    if url:
-                        sources.append(f"- {url}" + (f" — {title}" if title else ""))
-
-            if not context:
-                return f"No search results found for the query: '{query}'"
-
-            # Fixed: use correct parameter names (text, query) not (text_to_summarize, query)
-            summary = self.llm_client.summarize_text(text=context, query=query)
-
-            # Preserve provenance: the summary loses the URLs, but the agent often
-            # needs to cite a source or open the most relevant page with the
-            # browser tool, so list the sources alongside the summary.
-            if sources:
-                summary = f"{summary}\n\nSOURCES:\n" + "\n".join(sources)
-
-            # Surface a direct answer from Tavily when present (often the most
-            # precise response to a factual query).
-            answer = search_results.get('answer') if isinstance(search_results, dict) else None
-            if answer:
-                summary = f"DIRECT ANSWER: {answer}\n\n{summary}"
-
-            return summary
-
+            self._ensure_searxng()
+            resp = requests.get(
+                f"{SEARXNG_URL}/search",
+                params={"q": query, "format": "json", "safesearch": 0,
+                        "categories": "general", "language": "en"},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                return (f"Error: local SearXNG returned HTTP {resp.status_code}. "
+                        f"{resp.text[:300]}")
+            data = resp.json()
         except Exception as e:
             return f"An error occurred during the web search: {type(e).__name__}: {e}"
+
+        results = (data.get("results") or [])[:max_results]
+        if not results:
+            return f"No search results found for the query: '{query}'"
+
+        context = ""
+        sources = []
+        for r in results:
+            url = r.get("url")
+            title = (r.get("title") or "").strip()
+            snippet = (r.get("content") or "").strip()
+            context += f"URL: {url}\nTitle: {title}\nContent: {snippet}\n---\n"
+            if url:
+                sources.append(f"- {url}" + (f" — {title}" if title else ""))
+
+        summary = self.llm_client.summarize_text(text=context, query=query)
+        if sources:
+            summary = f"{summary}\n\nSOURCES:\n" + "\n".join(sources)
+
+        answer = self._instant_answers(data)
+        if answer:
+            summary = f"DIRECT ANSWER: {answer}\n\n{summary}"
+
+        return summary

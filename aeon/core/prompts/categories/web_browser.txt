@@ -1,5 +1,10 @@
 Category-level directive for Web Browser tools:
 
+0. WHEN TO USE THE BROWSER (vs search_web):
+- `search_web` (local SearXNG) is for FAST, shallow lookups of public/common information where a summary plus links is enough. Reach for it first for facts, docs, and "where is the page that...".
+- Use the BROWSER when you must act like a human on a SPECIFIC site: reading a full page, gathering a dataset, extracting structured data, logging in, working through a multi-step flow, or exploring anything a search snippet won't reveal (interactive, gated, JS-rendered, or not easily browsable content).
+- Typical pattern: `search_web` to FIND the right page(s), then the browser to DIG IN and actually work the site.
+
 1. STRATEGIC APPROACH:
 - HYBRID ANALYSIS: Read the 'Page Title' and 'Visible Text (Markdown)' along with the Visual Layout. If the title says "Just a moment..." or "Cloudflare", the site is checking your browser. Use the `wait` action or interact with the challenge. If the text is empty or blank, the page may still be loading; use the `wait` action.
 - VISUAL-FIRST FOR INTERACTION: Always prioritize the 'Overlay' screenshot and the 'Interactive Elements' list to identify the correct `element_id`.

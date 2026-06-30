@@ -4,11 +4,14 @@ The local generators reward verbose, concrete prompts far more than terse ones:
 FLUX/Qwen images want composition/lighting/lens detail, and LTX/10Eros video has
 almost no self-reasoning -- any unstated motion, camera move, or detail simply
 does not happen. This rewrites a short prompt into the dialect each generator
-wants, using the single agent model. Because that model is uncensored, explicit
-intent is preserved (a censored rewriter would silently sanitize it).
+wants, using the single (uncensored, local) agent model, so explicit intent is
+preserved -- a censored rewriter would silently sanitize it.
 
-Best-effort by design: any error, a missing client, or an already-detailed
-prompt returns the original prompt unchanged.
+Fail loud, never fall back: if enhancement is requested but the local model is
+unreachable or errors, the exception propagates rather than silently passing the
+un-enhanced prompt through (which would be a silent degradation). Returning the
+prompt unchanged is reserved for the legitimate no-op cases: enhancement turned
+off (force=False) or an already-detailed prompt.
 """
 from __future__ import annotations
 
@@ -58,29 +61,33 @@ def enhance_prompt(llm_client, raw: str, media_type: str = "image",
     force=False -> never enhance (return raw).
     force=None  -> auto: enhance terse prompts, pass detailed ones through.
 
-    Falls back to `raw` on any error or when no client is available.
+    No-op (returns raw unchanged) only for the legitimate cases: empty prompt,
+    force=False, or an already-detailed prompt under auto mode. If enhancement is
+    actually attempted and the local model errors, the exception propagates --
+    there is no fallback model and no silent pass-through.
     """
     raw = (raw or "").strip()
-    if not raw or force is False or llm_client is None:
+    if not raw or force is False:
         return raw
     if force is None and len(raw.split()) >= _PASSTHROUGH_WORDS:
         return raw
+    if llm_client is None:
+        raise ValueError("enhance_prompt: enhancement requested but no llm_client was provided.")
 
     system = _SYSTEM.get(media_type, _SYSTEM["image"])
-    try:
-        resp = llm_client.client.chat.completions.create(
-            model=llm_client.model,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": raw}],
-            temperature=0.7,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        # Strip accidental wrapping quotes the model may add.
-        if len(out) >= 2 and out[0] in "\"'" and out[-1] == out[0]:
-            out = out[1:-1].strip()
-        if out and out != raw:
-            print(f"{C_CYAN}[prompt-enhancer:{media_type}] {out}{C_RESET}")
-            return out
-        return raw
-    except Exception:
-        return raw
+    resp = llm_client.client.chat.completions.create(
+        # Send the served model id (api_model), the same id the main agent loop
+        # uses -- the display name ('model') 404s against vLLM's served name.
+        model=llm_client.api_model,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": raw}],
+        temperature=0.7,
+    )
+    out = (resp.choices[0].message.content or "").strip()
+    # Strip accidental wrapping quotes the model may add.
+    if len(out) >= 2 and out[0] in "\"'" and out[-1] == out[0]:
+        out = out[1:-1].strip()
+    if out and out != raw:
+        print(f"{C_CYAN}[prompt-enhancer:{media_type}] {out}{C_RESET}")
+        return out
+    return raw

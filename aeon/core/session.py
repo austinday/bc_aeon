@@ -9,44 +9,8 @@ STARTUP_LOCK_PATH = "/tmp/aeon_brain_startup.lock"
 MODEL_REGISTRY_PATH = "/tmp/aeon_model_registry.json"
 MODEL_REGISTRY_LOCK_PATH = "/tmp/aeon_model_registry.lock"
 
-# =============================================================================
-# CLOUD MODEL DEFINITIONS
-# =============================================================================
-CLOUD_MODELS = [
-    {
-        'model': 'gemini-3.1-pro-preview',
-        'provider': 'vertex',
-        'project_id': 'trout-cricket-9761108088181001',
-        'context_limit': 2000000,
-    },
-    {
-        'model': 'gemini-3.1-pro-preview',
-        'provider': 'vertex',
-        'project_id': 'ai-ml-355015',
-        'context_limit': 2000000,
-    },
-    {
-        'model': 'grok-4.3-latest',
-        'provider': 'grok',
-        'api_key_file': 'grok_api_key.txt',
-        'base_url': 'https://api.x.ai/v1',
-        'context_limit': 128000,
-    },
-    {
-        'model': 'gemini-3-pro-preview',
-        'provider': 'gemini',
-        'api_key_file': 'gemini_api_key.txt',
-        'base_url': 'https://generativelanguage.googleapis.com/v1beta/openai/',
-        'context_limit': 1000000,
-    },
-    {
-        'model': 'gemini-flash-latest',
-        'provider': 'gemini',
-        'api_key_file': 'gemini_api_key.txt',
-        'base_url': 'https://generativelanguage.googleapis.com/v1beta/openai/',
-        'context_limit': 1000000,
-    },
-]
+# Aeon is LOCAL-ONLY: no cloud/API model definitions exist by design, so nothing
+# can leak prompts or context out to the web.
 
 # =============================================================================
 # LLAMA.CPP SERVED MODELS

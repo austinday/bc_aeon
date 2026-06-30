@@ -7,8 +7,6 @@ import json
 import re
 import subprocess
 import requests
-import google.auth
-import google.auth.transport.requests
 from datetime import datetime
 from typing import Dict, Optional
 sys.setrecursionlimit(2000)
@@ -26,101 +24,16 @@ from .prompts import (
 C_YELLOW = '\033[93m'
 C_RESET = '\033[0m'
 
-class VertexAIClient:
-    def __init__(self, project_id, model_id):
-        self.project_id = project_id
-        self.model_id = model_id
-        self.chat = self.Chat(self)
-        try:
-            self.credentials, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
-        except Exception as e:
-            print(f'\n{C_YELLOW}Error: Failed to load Google Application Default Credentials: {e}{C_RESET}')
-            print(f'{C_YELLOW}Please authenticate by running: gcloud auth application-default login{C_RESET}')
-            sys.exit(1)
-
-    def get_access_token(self):
-        if not self.credentials.valid:
-            request = google.auth.transport.requests.Request()
-            self.credentials.refresh(request)
-        return self.credentials.token
-
-    class Chat:
-        def __init__(self, parent):
-            self.parent = parent
-            self.completions = self.Completions(parent)
-
-        class Completions:
-            def __init__(self, parent):
-                self.parent = parent
-
-            def create(self, model, messages, temperature=0.7, response_format=None, stream=False):
-                contents = []
-                system_prompt = None
-                for msg in messages:
-                    if msg['role'] == 'system':
-                        system_prompt = msg['content']
-                    else:
-                        role = 'user' if msg['role'] == 'user' else 'model'
-                        contents.append({'role': role, 'parts': [{'text': msg['content']}]})
-                
-                url = f'https://aiplatform.googleapis.com/v1/projects/{self.parent.project_id}/locations/global/publishers/google/models/{self.parent.model_id}:generateContent'
-                headers = {
-                    'Authorization': f'Bearer {self.parent.get_access_token()}',
-                    'Content-Type': 'application/json'
-                }
-                
-                data = {
-                    'contents': contents,
-                    'generationConfig': {'temperature': temperature, 'maxOutputTokens': 8192},
-                    'safetySettings': [
-                        {'category': 'HARM_CATEGORY_HATE_SPEECH', 'threshold': 'OFF'},
-                        {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'OFF'}
-                    ]
-                }
-                if response_format and response_format.get('type') == 'json_object':
-                    data['generationConfig']['responseMimeType'] = 'application/json'
-                    
-                if system_prompt:
-                    data['systemInstruction'] = {
-                        'parts': [{'text': system_prompt}]
-                    }
-                    
-                response = requests.post(url, headers=headers, json=data)
-                if response.status_code != 200:
-                    raise Exception(f'Vertex AI API Error {response.status_code}: {response.text}')
-                
-                resp_json = response.json()
-                try:
-                    text = resp_json['candidates'][0]['content']['parts'][0]['text']
-                except (KeyError, IndexError):
-                    text = ''
-                
-                # Mock response object to match expected OpenAI schema
-                class MockChoice:
-                    def __init__(self, text):
-                        self.message = type('MockMessage', (), {'content': text})()
-                class MockResponse:
-                    def __init__(self, text):
-                        self.choices = [MockChoice(text)]
-                        self.usage = type('MockUsage', (), {'completion_tokens': len(text)//4})()
-                        
-                # Vertex Mock doesn't support actual streaming right now
-                if stream:
-                    class MockChunkChoice:
-                        def __init__(self, text):
-                            self.delta = type('MockDelta', (), {'content': text})()
-                    class MockChunk:
-                        def __init__(self, text):
-                            self.choices = [MockChunkChoice(text)]
-                    return [MockChunk(text)]
-                    
-                return MockResponse(text)
-
 class LLMClient:
-    """A client for interacting with Large Language Models (Cloud or Local).
+    """A client for interacting with a LOCAL Large Language Model.
 
     One model powers everything: the main agent loop (reasoning + action
     selection) and all support tasks (summarization, prompt enhancement, etc.).
+
+    Aeon is local-only: the client only ever talks to an on-machine inference
+    server (Ollama / llama.cpp / vLLM). There is no cloud/API path, and no
+    fallback to a different model -- if the configured model fails, the call
+    raises so the failure is visible rather than silently degraded.
     """
     def __init__(self, config: dict):
         self.logger = get_logger()
@@ -136,43 +49,28 @@ class LLMClient:
         self.api_model = config.get('api_model') or self.model  # id sent to the server (vLLM served name)
         self.context_limit = config.get('context_limit', 128000)
 
-        # Optional "utility" tier for high-frequency support tasks (skill routing,
-        # JSON repair/recovery, summarization, log/memory compression, interruption
-        # analysis). When AEON_UTILITY_BASE_URL + AEON_UTILITY_MODEL are set (by main.py
-        # when the GPU1 brain is up), these tasks run on that small model instead of the
-        # strong GPU0 model -- so they stop contending with the principal + sub-agents on
-        # the main node. Env-driven so spawned sub-agents inherit it too. Falls back to the
-        # strong model when unset or unreachable, keeping behavior identical to before.
-        util_base = os.environ.get("AEON_UTILITY_BASE_URL")
-        util_model = os.environ.get("AEON_UTILITY_MODEL")
-        if util_base and util_model and not isinstance(self.client, VertexAIClient):
-            try:
-                self.utility_client = openai.OpenAI(base_url=util_base, api_key="no-key-needed")
-                self.utility_model = util_model
-                self.logger.info(f"[Utility tier] support tasks -> {util_model} @ {util_base}")
-            except Exception as e:
-                self.logger.warning(f"[Utility tier] init failed ({e}); using strong model for support tasks")
-                self.utility_client, self.utility_model = self.client, self.api_model
-        else:
-            self.utility_client, self.utility_model = self.client, self.api_model
+        # Support tasks (skill routing, JSON repair/recovery, summarization,
+        # log/memory compression, interruption analysis, prompt enhancement) run
+        # on the same single local model as the main loop. There is no separate
+        # utility tier and no fallback model.
+        self.utility_client, self.utility_model = self.client, self.api_model
 
     def _create_client(self, config: dict):
-        """Create an OpenAI-compatible client from a model config dict."""
-        if config['provider'] == 'local':
+        """Create an OpenAI-compatible client for a LOCAL inference server.
+
+        Aeon is local-only: the only permitted providers are on-machine servers
+        (Ollama / llama.cpp / vLLM). Any other provider -- e.g. a cloud/API model
+        -- is rejected so prompts and context can never leave this machine.
+        """
+        provider = config['provider']
+        if provider == 'local':
             return openai.OpenAI(base_url='http://localhost:8013/v1', api_key='ollama')
-        elif config['provider'] in ['llamacpp', 'vllm']:
+        elif provider in ['llamacpp', 'vllm']:
             return openai.OpenAI(base_url=config['base_url'], api_key='no-key-needed')
-        elif config['provider'] == 'vertex':
-            return VertexAIClient(config['project_id'], config['model'])
-        else:
-            api_key_path = pathlib.Path.home() / config['api_key_file']
-            if not api_key_path.exists():
-                raise FileNotFoundError(f'API key file not found: {api_key_path}')
-            with open(api_key_path, 'r') as f:
-                api_key = f.readline().strip()
-            if not api_key:
-                raise ValueError(f'API key file is empty: {api_key_path}')
-            return openai.OpenAI(api_key=api_key, base_url=config['base_url'])
+        raise ValueError(
+            f"Unsupported provider '{provider}'. Aeon is local-only; only "
+            "'local', 'llamacpp', and 'vllm' models are allowed (no cloud/API)."
+        )
 
     def set_debug_path(self, path: pathlib.Path):
         self.debug_path = path
@@ -683,15 +581,8 @@ class LLMClient:
                     else:
                         self.logger.info(f"Not enough VRAM to self-heal (Max free: {max_free:.1f}GB). Waiting...")
                 else:
-                    if isinstance(self.client, VertexAIClient):
-                        # Vertex AI check: try a minimal call
-                        self.client.Chat(self.client).Completions(self.client).create(
-                            model=self.model, messages=[{"role": "user", "content": "hi"}], temperature=0
-                        )
-                    else:
-                        # OpenAI-compatible client check: list models
-                        self.client.models.list()
-                    
+                    # OpenAI-compatible local server check: list models
+                    self.client.models.list()
                     self.logger.info("Server recovery detected! Resuming agent...")
                     return True
             except Exception as e:
@@ -713,62 +604,44 @@ class LLMClient:
         for attempt in range(max_retries):
             try:
                 start_time = time.time()
-                
-                if not isinstance(self.client, VertexAIClient):
-                    # Stream the response to accurately measure TTFT vs pure generation time
-                    resp_stream = self.client.chat.completions.create(
-                        model=self.api_model,
-                        messages=[{"role": "user", "content": current_prompt}],
-                        temperature=0.2,
-                        stream=True,
-                        # Ask the server for a final usage chunk so we can report the
-                        # model's REAL generated-token count, not a tiktoken estimate
-                        # (cl100k mis-counts Gemma tokens, making t/s look far too low).
-                        stream_options={"include_usage": True},
-                    )
 
-                    first_token_time = None
-                    raw_chunks =[]
-                    server_completion_tokens = None
+                # Stream the response to accurately measure TTFT vs pure generation time
+                resp_stream = self.client.chat.completions.create(
+                    model=self.api_model,
+                    messages=[{"role": "user", "content": current_prompt}],
+                    temperature=0.2,
+                    stream=True,
+                    # Ask the server for a final usage chunk so we can report the
+                    # model's REAL generated-token count, not a tiktoken estimate
+                    # (cl100k mis-counts Gemma tokens, making t/s look far too low).
+                    stream_options={"include_usage": True},
+                )
 
-                    for chunk in resp_stream:
-                        # The final usage-only chunk has empty choices; don't let it set TTFT.
-                        if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
-                            if first_token_time is None:
-                                first_token_time = time.time()
-                            delta = chunk.choices[0].delta
-                            if hasattr(delta, 'content') and delta.content:
-                                raw_chunks.append(delta.content)
-                        usage = getattr(chunk, 'usage', None)
-                        if usage is not None and getattr(usage, 'completion_tokens', None):
-                            server_completion_tokens = usage.completion_tokens
+                first_token_time = None
+                raw_chunks =[]
+                server_completion_tokens = None
 
-                    end_time = time.time()
-                    raw = "".join(raw_chunks)
-                    ttft = (first_token_time - start_time) if first_token_time else 0
-                    gen_time = (end_time - first_token_time) if first_token_time else 0
-                    # Prefer the server's real token count; fall back to the estimate.
-                    comp_tokens = server_completion_tokens or estimate_tokens(raw)
+                for chunk in resp_stream:
+                    # The final usage-only chunk has empty choices; don't let it set TTFT.
+                    if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                        if first_token_time is None:
+                            first_token_time = time.time()
+                        delta = chunk.choices[0].delta
+                        if hasattr(delta, 'content') and delta.content:
+                            raw_chunks.append(delta.content)
+                    usage = getattr(chunk, 'usage', None)
+                    if usage is not None and getattr(usage, 'completion_tokens', None):
+                        server_completion_tokens = usage.completion_tokens
 
-                    tps = comp_tokens / gen_time if gen_time > 0 else 0
-                    print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s (TTFT: {ttft:.2f}s | {comp_tokens} tokens in {gen_time:.2f}s)\033[0m")
-                    
-                else:
-                    # Fallback for Vertex AI (mock doesn't support streaming)
-                    resp = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[{"role": "user", "content": current_prompt}],
-                        temperature=0.2,
-                    )
-                    elapsed = time.time() - start_time
-                    raw = resp.choices[0].message.content
+                end_time = time.time()
+                raw = "".join(raw_chunks)
+                ttft = (first_token_time - start_time) if first_token_time else 0
+                gen_time = (end_time - first_token_time) if first_token_time else 0
+                # Prefer the server's real token count; fall back to the estimate.
+                comp_tokens = server_completion_tokens or estimate_tokens(raw)
 
-                    try:
-                        comp_tokens = resp.usage.completion_tokens
-                    except AttributeError:
-                        comp_tokens = estimate_tokens(raw)
-                    tps = comp_tokens / elapsed if elapsed > 0 else 0
-                    print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s (TTFT: N/A | {comp_tokens} tokens in {elapsed:.2f}s)\033[0m")
+                tps = comp_tokens / gen_time if gen_time > 0 else 0
+                print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s (TTFT: {ttft:.2f}s | {comp_tokens} tokens in {gen_time:.2f}s)\033[0m")
 
                 if self.debug_path:
                     print(f"{C_YELLOW}[LLM RAW - PRIMARY AGENT]\n{raw}{C_RESET}")
@@ -876,15 +749,6 @@ class LLMClient:
             except Exception as e:
                 self._log_to_debug("PRIMARY_AGENT_ERR", self.model, current_prompt, str(e))
                 self.logger.error(f"Primary Agent LLM call failed: {e}")
-                
-                # Force token refresh on authentication failures
-                if "401" in str(e) and isinstance(self.client, VertexAIClient):
-                    try:
-                        import google.auth.transport.requests
-                        self.client.credentials.refresh(google.auth.transport.requests.Request())
-                    except Exception:
-                        pass
-                
                 last_error = f"API Error: {str(e)}"
                 if attempt < max_retries - 1:
                     time.sleep(2)

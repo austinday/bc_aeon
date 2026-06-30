@@ -1,8 +1,0 @@
-Interacts with the current webpage based on the elements retrieved from browser_navigate. You can click, type, or scroll.
-Schema:
-  action (str, required): The action to perform. Must be one of: 'click', 'type', 'enter', 'scroll_down', 'scroll_up'.
-  element_id (int, optional): The ID of the interactive element to target. Required for 'click' and 'type'.
-  text (str, optional): The text to input. Required only if action is 'type'.
-  expected_text (str, optional): REQUIRED for 'click'. A substring of the text you expect this element to contain (e.g., 'View Products' or 'Taco Belle'). This is a safety lock to prevent clicking the wrong element if the visual model hallucinates the ID.
-Example: {"tool_name": "browser_interact", "parameters": {"action": "click", "element_id": 14, "expected_text": "Taco Belle"}}
-Example: {"tool_name": "browser_interact", "parameters": {"action": "type", "element_id": 5, "text": "artificial intelligence"}}

@@ -28,12 +28,10 @@ setup(
     },
     install_requires=[
         "openai>=1.12.0",
-        "tavily-python",
         "psutil",
         "nvidia-ml-py3",
         "requests",
-        "huggingface_hub",
-        "google-auth"
+        "huggingface_hub"
     ],
     entry_points={
         "console_scripts": [

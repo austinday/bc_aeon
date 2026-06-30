@@ -1,4 +1,0 @@
-Navigates to a URL using a stealth browser. Returns the visible text (markdown), a list of interactive elements with assigned IDs, and saves screenshots of the page. Use this to start browsing or go to a new page.
-Schema:
-  url (str, required): The full URL to navigate to (e.g., 'https://en.wikipedia.org').
-Example: {"tool_name": "browser_navigate", "parameters": {"url": "https://news.ycombinator.com"}}

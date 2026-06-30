@@ -127,8 +127,8 @@ class AnalyzeImageTool(BaseTool):
 
         # Vision runs on the selected multimodal primary (e.g. Gemma-4, already loaded on
         # GPU0), which main.py exports as AEON_VISION_*. The old standalone Qwen3.6-VL
-        # server was retired, so a non-multimodal primary (e.g. a cloud text model) has no
-        # local vision backend -> return a clear, actionable error instead of failing oddly.
+        # server was retired, so a text-only primary has no local vision backend ->
+        # return a clear, actionable error instead of failing oddly.
         primary_base = os.environ.get('AEON_VISION_BASE_URL')
         primary_model = os.environ.get('AEON_VISION_MODEL')
         if not (primary_base and primary_model):

@@ -18,44 +18,10 @@ STARTUP_LOCK_PATH = "/tmp/aeon_brain_startup.lock"
 MODEL_REGISTRY_PATH = "/tmp/aeon_model_registry.json"
 MODEL_REGISTRY_LOCK_PATH = "/tmp/aeon_model_registry.lock"
 
-# =============================================================================
-# CLOUD MODEL DEFINITIONS
-# =============================================================================
-CLOUD_MODELS = [
-    {
-        'model': 'gemini-3.1-pro-preview',
-        'provider': 'vertex',
-        'project_id': 'trout-cricket-9761108088181001',
-        'context_limit': 2000000,
-    },
-    {
-        'model': 'gemini-3.1-pro-preview',
-        'provider': 'vertex',
-        'project_id': 'ai-ml-355015',
-        'context_limit': 2000000,
-    },
-    {
-        'model': 'grok-4.3-latest',
-        'provider': 'grok',
-        'api_key_file': 'grok_api_key.txt',
-        'base_url': 'https://api.x.ai/v1',
-        'context_limit': 128000,
-    },
-    {
-        'model': 'gemini-3-pro-preview',
-        'provider': 'gemini',
-        'api_key_file': 'gemini_api_key.txt',
-        'base_url': 'https://generativelanguage.googleapis.com/v1beta/openai/',
-        'context_limit': 1000000,
-    },
-    {
-        'model': 'gemini-flash-latest',
-        'provider': 'gemini',
-        'api_key_file': 'gemini_api_key.txt',
-        'base_url': 'https://generativelanguage.googleapis.com/v1beta/openai/',
-        'context_limit': 1000000,
-    },
-]
+# Aeon is LOCAL-ONLY. There are deliberately no cloud/API model definitions:
+# nothing may leak prompts, context, or generated content out to the web or to
+# third-party APIs. Every model runs on this machine (Ollama / llama.cpp / vLLM).
+# If a model fails, the agent errors out -- it never falls back to a remote model.
 
 # =============================================================================
 # LOCAL MODEL CATALOG -> per-machine adaptive deploy configs
@@ -140,6 +106,10 @@ def build_local_model_configs():
 
 
 LLAMACPP_MODELS = build_local_model_configs()
+
+# The abliterated Gemma-4-31B NVFP4 + native MTP build is Aeon's main model: it is
+# the default when no --model is passed (see cli()). Matches the catalog entry name.
+DEFAULT_MODEL = "Gemma-4-31B-NVFP4-MTP"
 
 def is_container_running(name):
     try: return bool(subprocess.check_output(["docker", "ps", "-q", "-f", f"name={name}"], stderr=subprocess.DEVNULL, text=True).strip())
@@ -526,7 +496,11 @@ def get_ollama_models():
 HIDDEN_OLLAMA_MODELS = ("huihui_ai/qwen2.5-abliterate",)
 
 def build_model_menu(local_models):
-    """Build a unified menu of all available models (local + cloud + llamacpp)."""
+    """Build the menu of available LOCAL models (Ollama + llama.cpp/vLLM).
+
+    Aeon is local-only: there are no cloud/API entries by design, so nothing can
+    leak out to the web.
+    """
     local_models = [m for m in local_models
                     if not any(m.startswith(h) for h in HIDDEN_OLLAMA_MODELS)]
     entries = []
@@ -538,7 +512,7 @@ def build_model_menu(local_models):
             'context_limit': 128000,
             'label': f'{m:<31} | GPU0: 100%, GPU1: 0%     | ~?? t/s | 128k ctx | Abliterated: ?   | Local/Ollama',
         })
-        
+
     last_family = None
     for lm in LLAMACPP_MODELS:
         family = lm.get('family', 'Other')
@@ -548,23 +522,6 @@ def build_model_menu(local_models):
         entry = dict(lm)
         entries.append(entry)
 
-    entries.append({'label': '', 'is_header': True})
-    entries.append({'label': '--- API Models ---', 'is_header': True})
-    vertex_models = []
-    for cm in CLOUD_MODELS:
-        entry = dict(cm)
-        if cm.get('provider') == 'vertex':
-            entry['label'] = f"Vertex AI - {cm['model']} (Billing: {cm['project_id']})"
-            vertex_models.append(entry)
-        else:
-            entry['label'] = f"{cm['model']:<31} | Req: Internet              | ~-- t/s | -- ctx   | Unrestricted: ?  | API/Cloud"
-            entries.append(entry)
-    
-    if vertex_models:
-        entries.append({'label': '', 'is_header': True})
-        entries.append({'label': '--- Vertex AI Models ---', 'is_header': True})
-        entries.extend(vertex_models)
-        
     return entries
 
 def select_model(menu_entries, label):
@@ -617,9 +574,8 @@ class SessionManager:
     def enter(self, model_config=None, skip_warmup=False):
         """Enter the session: coordinate startup, warm models, acquire locks.
         
-        Only starts/warms the local brain if at least one selected model is local.
-        Cloud-only configurations skip brain management entirely.
-        llama.cpp models get their own container lifecycle.
+        Only starts/warms the local brain if the selected model is an Ollama
+        model. llama.cpp / vLLM models get their own container lifecycle.
         """
         # Determine if the selected model is local Ollama (needs brain + registry)
         local_models = []
@@ -1057,7 +1013,7 @@ def cli():
                     'Runs a single LLM in a plan/act loop with collapsible tools, '
                     'skills, sub-agents, and persistent memory.',
         epilog='Examples:\n'
-               '  python3 -m aeon.main --model gemini-flash-latest --start "Summarize the repo"\n'
+               '  python3 -m aeon.main --model Gemma-4-31B-NVFP4-MTP --start "Summarize the repo"\n'
                '  python3 -m aeon.main --start "Build X" --max-iterations 40\n',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1088,10 +1044,14 @@ def cli():
         print("[WARN] No local models found via API.")
         local_models = []
 
-    # --- Build unified model menu (local + cloud) ---
+    # --- Build the local model menu ---
     menu = build_model_menu(local_models)
 
     # --- Select model (used for both planning and utility tasks) ---
+    # Gemma-4-31B-NVFP4-MTP (abliterated) is THE main model: when --model is not
+    # given we boot straight into it instead of prompting. We only drop to the
+    # interactive menu if this machine can't deploy it (e.g. won't fit the GPUs),
+    # so the default never silently becomes some other model.
     model_name = args.model
     if model_name:
         model_config = find_model_config(model_name, menu)
@@ -1105,7 +1065,12 @@ def cli():
             print(f"  Available: {available}")
             sys.exit(1)
     else:
-        model_config = select_model(menu, 'Select Model')
+        model_config = find_model_config(DEFAULT_MODEL, menu)
+        if model_config:
+            print(f"[CONFIG] No --model given; defaulting to main model: {DEFAULT_MODEL}")
+        else:
+            print(f"[CONFIG] Main model '{DEFAULT_MODEL}' not deployable on this machine; choose one:")
+            model_config = select_model(menu, 'Select Model')
 
     print(f"[CONFIG] Model: {model_config['model']} ({model_config['provider']})")
 

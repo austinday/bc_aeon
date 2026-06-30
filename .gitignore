@@ -27,3 +27,6 @@ aeon_output/
 .DS_Store
 .previous_objective.txt
 build/
+
+# Jupyter autosave shadow copies (never code we run)
+.ipynb_checkpoints/

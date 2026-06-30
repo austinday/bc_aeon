@@ -168,13 +168,20 @@ if [[ "$LITE_MODE" != "true" ]]; then
     run_downloader "$COMFY_MODELS_DIR/.flux_setup_state" "$SETUP_VERSION:flux2_klein_uncensored" "$COMFY_MODELS_DIR:/models" "$CMD"
 
     log_step "PHASE 7.5: Qwen-Image-Edit-2511 (ComfyUI Edit Models)"
+    # The Qwen-Image-Edit TEXT ENCODER is the ABLITERATED (uncensored) Qwen2.5-VL, not the
+    # stock Comfy-Org fp8_scaled safetensors (which is where this pipeline's prompt-level
+    # censorship lived). Edit reads the input image in vision-language mode, so we fetch the
+    # encoder GGUF AND its matching mmproj (vision projector) -- city96's CLIPLoaderGGUF
+    # auto-pairs the mmproj by basename. Phil2Sat ships both, pre-fixed for this exact
+    # Rapid-AIO pipeline. generate_image.py's EditImageTool loads it via CLIPLoaderGGUF.
     CMD="hf download Arunk25/Qwen-Image-Edit-Rapid-AIO-GGUF v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf --local-dir /models/unet && \
          hf download Comfy-Org/Qwen-Image_ComfyUI split_files/vae/qwen_image_vae.safetensors --local-dir /models/tmp && \
          mv /models/tmp/split_files/vae/qwen_image_vae.safetensors /models/vae/ && \
-         hf download Comfy-Org/Qwen-Image_ComfyUI split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors --local-dir /models/tmp && \
-         mv /models/tmp/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors /models/text_encoders/ && \
-         rm -rf /models/tmp"
-    run_downloader "$COMFY_MODELS_DIR/.qwen_edit_setup_state" "$SETUP_VERSION:qwen_edit_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
+         hf download Phil2Sat/Qwen-Image-Edit-Rapid-AIO-GGUF Qwen2.5-VL-7B-Instruct-abliterated/Qwen2.5-VL-7B-Instruct-abliterated.Q8_0.gguf --local-dir /models/tmp_qwen && \
+         hf download Phil2Sat/Qwen-Image-Edit-Rapid-AIO-GGUF Qwen2.5-VL-7B-Instruct-abliterated/Qwen2.5-VL-7B-Instruct-abliterated.mmproj-f16.gguf --local-dir /models/tmp_qwen && \
+         mv -f /models/tmp_qwen/Qwen2.5-VL-7B-Instruct-abliterated/*.gguf /models/text_encoders/ && \
+         rm -rf /models/tmp /models/tmp_qwen"
+    run_downloader "$COMFY_MODELS_DIR/.qwen_edit_setup_state" "$SETUP_VERSION:qwen_edit_ablit_comfyui" "$COMFY_MODELS_DIR:/models" "$CMD"
 
     log_step "PHASE 8: PuLID FLUX Models (Consistent Characters)"
     PULID_MODELS_DIR="$COMFY_MODELS_DIR/pulid"
@@ -190,6 +197,12 @@ fi
 log_step "PHASE 9: Build aeon_browser_service:latest Docker image"
 build_image "aeon_browser_service:latest" "$PROJECT_ROOT/aeon/services/browser/Dockerfile" "$PROJECT_ROOT/aeon/services/browser/"
 
+log_step "PHASE 9.5: Pull SearXNG image (local metasearch for the search_web tool)"
+# Local-only web search: aeon queries this on-machine SearXNG (no Tavily/cloud search
+# API). Pre-pull so the first search_web call isn't a cold image download. The tool's
+# start_searxng.sh writes the settings (JSON output + SafeSearch off) and runs it.
+docker pull searxng/searxng:latest || echo "[setup] WARNING: searxng image pull failed; search_web will pull on first use."
+
 if [[ "$LITE_MODE" != "true" ]]; then
     log_step "PHASE 10: LTX-2.3 Video Generation Models (UNCENSORED 10Eros NSFW finetune)"
     # The video unet is the NSFW-finetuned LTX-2.3 "10Eros" (vantagewithai), which bakes
@@ -197,6 +210,12 @@ if [[ "$LITE_MODE" != "true" ]]; then
     # uncensoring (stock LTX base only lightly knows NSFW). It is the same LTX-2.3 arch, so
     # it still uses the standard LTX VAE + connectors + Gemma-3 encoder downloaded below and
     # drops into generate_video.py's UnetLoaderGGUF node.
+    # The Gemma-3 TEXT ENCODER is the ABLITERATED (uncensored) build, not stock: stock Gemma-3
+    # is where the prompt-level restrictions live, so an uncensored unet fed by a censored
+    # encoder still under-represents explicit conditioning. Same QAT lineage/arch as the stock
+    # encoder (abliteration only orthogonalizes the refusal direction in the weights), so the
+    # stock mmproj + tokenizer.model sidecar remain compatible and the on-disk filename is kept
+    # identical -- generate_video.py's DualCLIPLoaderGGUF resolves it with no workflow change.
     # GPU-adaptive quant: Q8_0 (~23 GiB) on big cards (>=80 GiB), else Q4_K_M (~14 GiB) so it
     # still fits one 48 GB Blackwell alongside the vision server.
     LTX_QUANT="Q4_K_M"
@@ -207,12 +226,13 @@ if [[ "$LITE_MODE" != "true" ]]; then
          mv /models/tmp_vae/vae/*.safetensors /models/vae/ && rm -rf /models/tmp_vae && \
          hf download unsloth/LTX-2.3-GGUF text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors --local-dir /models/tmp_te && \
          mv /models/tmp_te/text_encoders/*.safetensors /models/text_encoders/ && rm -rf /models/tmp_te && \
-         hf download unsloth/gemma-3-12b-it-qat-GGUF gemma-3-12b-it-qat-UD-Q4_K_XL.gguf --local-dir /models/text_encoders && \
+         hf download mradermacher/gemma-3-12b-it-qat-abliterated-GGUF gemma-3-12b-it-qat-abliterated.Q4_K_M.gguf --local-dir /models/text_encoders && \
+         mv -f /models/text_encoders/gemma-3-12b-it-qat-abliterated.Q4_K_M.gguf /models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.gguf && \
          hf download unsloth/gemma-3-12b-it-qat-GGUF mmproj-BF16.gguf --local-dir /models/text_encoders && \
          hf download unsloth/gemma-3-12b-it-FP8-Dynamic tokenizer.model --local-dir /models/tmp && \
          mv /models/tmp/tokenizer.model /models/text_encoders/gemma-3-12b-it-qat-UD-Q4_K_XL.model && \
          rm -rf /models/tmp"
-    run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_10eros_v12_${LTX_QUANT}" "$COMFY_MODELS_DIR:/models" "$CMD"
+    run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_10eros_v12_ablit_${LTX_QUANT}" "$COMFY_MODELS_DIR:/models" "$CMD"
 
     # PHASE 11 (CyberNeurova DeepSeek V4) is now handled by the GPU-adaptive
     # catalog loop in PHASE 5.6: it downloads DeepSeek only on machines whose

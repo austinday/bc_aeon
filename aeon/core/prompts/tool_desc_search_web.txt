@@ -1,4 +1,10 @@
-Searches the web and returns a summarized result. Use for external documentation, current information, API references, or inspiration when stuck on a problem.
+Searches the web via a LOCAL SearXNG metasearch engine and returns a concise, summarized answer with the source URLs. Fast and cheap.
+
+USE search_web FOR shallow, public, easily-looked-up information: documentation, API references, current facts, definitions, "what is X / how do I Y", error-message lookups, package versions, and general research where a summary plus a few links is enough.
+
+DO NOT use search_web for deep work. If you need to actually READ a full page, gather a dataset, extract structured data, log into or navigate a site, or explore content a search snippet won't surface, expand the `web_browser` category and use the browser tools to act like a human (navigate, click, scroll, read). Good pattern: use search_web to FIND the right page, then the browser to DIG INTO it.
+
 Schema:
   query (str, required): The search query. Be specific and concise for best results.
+  max_results (int, optional): How many results to summarize. Default 5.
 Example: {"tool_name": "search_web", "parameters": {"query": "python asyncio gather exception handling"}}
