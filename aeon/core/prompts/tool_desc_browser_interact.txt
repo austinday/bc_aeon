@@ -1,4 +1,4 @@
-Interacts with the page like a human, then returns a fresh observation (indexed element list + scroll state + numbered screenshot + vision analysis). You address elements by the [id] shown in the INTERACTIVE ELEMENTS list; every id maps to the exact node (it is stamped onto the DOM), so there is no wrong-element ambiguity. All input is human-like (eased mouse moves, real keystrokes with natural delays).
+Interacts with the page like a human, then returns a fresh observation (indexed element list + scroll state) AND attaches a screenshot of the resulting page to your NEXT turn, so you SEE what your action did, exactly as a human would, before choosing the next step. You address elements by the [id] shown in the INTERACTIVE ELEMENTS list; every id maps to the exact node (it is stamped onto the DOM), so there is no wrong-element ambiguity. All input is physically human: the cursor follows curved, time-sampled paths with an accelerate-then-settle velocity (and a slight overshoot-and-correct on longer moves), keystrokes have per-key timing with inter-word hesitations, scrolling rolls in wheel notches, and drags press-pause-move-release — so behavioral bot-detectors see a person, not a script.
 
 WORKFLOW: read the element list -> pick the [id] of the element you want -> act on it -> read the new observation -> repeat. If element ids feel stale (the page changed on its own), call browser_read first.
 
@@ -10,7 +10,7 @@ Schema:
     hover                                -> element_id required (reveals menus/tooltips).
     type                                 -> element_id + text. Optional: clear_first (default true), then_enter (submit after typing).
     press_key                            -> key (e.g. 'Enter','Tab','Escape','ArrowDown','PageDown','Control+A'); element_id optional.
-    scroll                               -> direction ('down'|'up'|'top'|'bottom') and optional amount (pixels, default 600). Give element_id to scroll the SCROLL CONTAINER that holds that element (e.g. an inbox/list/chat pane) instead of the whole page; use direction='to_element' with element_id to bring an off-screen element into view.
+    scroll                               -> direction: vertical 'down'|'up'|'top'|'bottom' OR horizontal 'left'|'right'|'leftmost'|'rightmost', plus optional amount (pixels, default 600). Give element_id to scroll the SCROLL CONTAINER that holds that element (e.g. an inbox/list/chat pane, or a wide table horizontally) instead of the whole page; use direction='to_element' with element_id to bring an off-screen element into view. The SCROLL line in each observation reports both vertical and horizontal position and whether there is more content in each direction.
     select_option                        -> element_id + value (option value or visible label).
     check | uncheck                      -> element_id (checkboxes/switches).
     clear                                -> element_id (empties a field).
@@ -22,11 +22,14 @@ Schema:
     get_text                             -> element_id (text of one element) or none (whole page body text).
     read_text                            -> no element. Returns the page's clean MAIN-CONTENT text (readability) for reading/extracting an article or document.
   element_id (int): the [id] from the element list.
-  text (str): for 'type'. expected_text (str): for clicks — a substring you expect in the target's name; the click is REFUSED if it doesn't match, preventing wrong-element clicks.
+  text (str): for 'type'. expected_text (str): a substring you expect in the target element's name/label (e.g. 'Email', 'Search'); the action is REFUSED if it doesn't match. Honored for click/type/check/uncheck/select_option/clear/upload_file, so a click, keystroke, or toggle never lands on the wrong element.
   tab_id (str, default 'default'): which tab to act on.
-  include_vision (bool, default true): leave on when you need to SEE the page (layout, images, CAPTCHAs, visual state). Set false for a FASTER turn when the element list alone is enough (e.g. plain scrolling, typing, simple navigation) — it skips the screenshot vision analysis.
+  include_vision (bool, default true): whether to attach the resulting page screenshot to your next turn. KEEP IT ON by default — any action that changes what's on screen (scrolling reveals new content; typing can trigger autocomplete/validation/live results; clicks change the page) needs to be SEEN. Only set false for the rare action whose visual result you do NOT need before your next step (e.g. pressing Tab to move focus, or filling one field of a form you'll visually verify at the end). The element list, scroll state, and events are always returned either way — include_vision only controls the screenshot.
+  visual (str, default "overlay"): which screenshot you get — 'overlay' = render + numbered [id] marks (best for precise acting), 'clean' = pure render with no marks (bare human view), 'both'.
+  compare (bool, default false): attach the BEFORE and AFTER screenshots (two frames) so you can see exactly what your action changed. Use for verification-sensitive steps (did the menu open? did the modal close? did the value update?).
+Note: a native confirm/prompt dialog that looks destructive (delete/discard/overwrite…) is DISMISSED (not auto-confirmed) and reported under EVENTS — repeat the action deliberately if you truly intended it. Downloaded files are copied into ./downloads in your workspace automatically.
 
-Aliases accepted: scroll_down, scroll_up, scroll_to_top, scroll_to_bottom, enter.
+Aliases accepted: scroll_down, scroll_up, scroll_to_top, scroll_to_bottom, scroll_left, scroll_right, scroll_to_left, scroll_to_right, enter.
 
 Examples:
   {"tool_name":"browser_interact","parameters":{"action":"type","element_id":7,"text":"flights to Tokyo","then_enter":true,"tab_id":"search"}}

@@ -396,6 +396,253 @@ class TestOscillationLogic(unittest.TestCase):
         self.assertFalse(self._osc(['A', 'B', 'C', 'D'], ['1', '2', '3', '4']))
 
 
+class TestSelfModAutoDerive(unittest.TestCase):
+    """restart_aeon / verify_self_modification must resolve the agent's own source
+    root themselves (never force the model to supply it, never install the wrong
+    tree when run from a foreign workspace)."""
+
+    def test_restart_default_dir_is_source_root(self):
+        import os
+        from aeon.tools.restart import RestartAeonTool
+        d = RestartAeonTool(worker=object())._default_code_dir()
+        self.assertTrue(d and os.path.exists(os.path.join(d, 'setup.py')),
+                        f"restart default dir must contain setup.py: {d!r}")
+
+    def test_verify_source_root_is_source_root(self):
+        import os
+        from aeon.tools.verify_modification import VerifySelfModificationTool
+        d = VerifySelfModificationTool(worker=object())._aeon_source_root()
+        self.assertTrue(d and os.path.exists(os.path.join(d, 'setup.py')),
+                        f"verify source root must contain setup.py: {d!r}")
+
+
+class TestCreateSkillGuard(unittest.TestCase):
+    """create_skill must only accept safe single path components (no traversal)."""
+
+    def test_rejects_unsafe(self):
+        from aeon.tools.skills_runtime import _safe_component
+        for bad in ("../etc", "a/b", "a\\b", "", ".", "..", "no space", ".hidden"):
+            self.assertFalse(_safe_component(bad), f"should reject {bad!r}")
+
+    def test_accepts_safe(self):
+        from aeon.tools.skills_runtime import _safe_component
+        for ok in ("research", "web_research", "api-migration", "v2.step"):
+            self.assertTrue(_safe_component(ok), f"should accept {ok!r}")
+
+
+class TestSkillCrudTools(unittest.TestCase):
+    """Skills are self-modifiable: the full create/read/modify/delete surface must
+    be present and its path handling must reject malformed input."""
+
+    def test_crud_tools_are_discoverable(self):
+        from aeon.tools.loader import load_tools_from_directory
+        names = {t.name for t in load_tools_from_directory('aeon.tools', dependencies={})}
+        for n in ('create_skill', 'read_skill', 'delete_skill', 'activate_skill', 'deactivate_skill'):
+            self.assertIn(n, names, f"{n} must be discoverable by the loader")
+
+    def test_read_delete_require_category_path(self):
+        import types
+        from aeon.tools.skills_runtime import ReadSkillTool, DeleteSkillTool
+        w = types.SimpleNamespace(expanded_categories=set(), active_skill=None)
+        self.assertTrue(ReadSkillTool(w).execute(skill_path="noslash").startswith("Error:"))
+        self.assertTrue(DeleteSkillTool(w).execute(skill_path="noslash").startswith("Error:"))
+
+    def test_delete_rejects_traversal(self):
+        import types
+        from aeon.tools.skills_runtime import DeleteSkillTool
+        w = types.SimpleNamespace(expanded_categories=set(), active_skill=None)
+        self.assertIn("invalid", DeleteSkillTool(w).execute(skill_path="../etc/passwd").lower())
+
+
+class TestHumanMotion(unittest.TestCase):
+    """The browser's human-motion math (curved eased mouse paths, wheel-notch
+    scrolls, keystroke cadence) is Playwright-free and must behave correctly:
+    trajectories end EXACTLY on target (clicks/drags land) while looking human."""
+
+    def setUp(self):
+        import random
+        from aeon.services.browser import human_motion as hm
+        self.hm = hm
+        self.rng = random.Random(1234)  # deterministic
+
+    def test_ease_endpoints_and_monotonic(self):
+        e = self.hm.ease_in_out
+        self.assertEqual(e(0.0), 0.0)
+        self.assertEqual(e(1.0), 1.0)
+        prev = -1.0
+        for i in range(0, 101):
+            v = e(i / 100)
+            self.assertGreaterEqual(v, prev)  # non-decreasing
+            prev = v
+
+    def test_mouse_path_lands_exactly_on_target(self):
+        for end in [(400, 300), (10, 900), (1270, 5)]:
+            path = self.hm.mouse_path((640, 400), end, rng=self.rng)
+            self.assertEqual(path[-1], (float(end[0]), float(end[1])),
+                             "final point must be exactly the target")
+            self.assertLessEqual(len(path), self.hm._MAX_STEPS + 2)  # +overshoot pair
+            self.assertGreaterEqual(len(path), 1)
+
+    def test_mouse_path_is_curved_not_straight(self):
+        # A straight line would have every interior point collinear with the
+        # endpoints; a human arc must deviate from the segment somewhere.
+        start, end = (100.0, 100.0), (900.0, 700.0)
+        path = self.hm.mouse_path(start, end, rng=self.rng)
+        def dist_to_line(p):
+            (x1, y1), (x2, y2), (px, py) = start, end, p
+            num = abs((y2 - y1) * px - (x2 - x1) * py + x2 * y1 - y2 * x1)
+            import math
+            return num / math.hypot(y2 - y1, x2 - x1)
+        self.assertTrue(any(dist_to_line(p) > 2.0 for p in path[:-1]),
+                        "path should arc off the straight segment")
+
+    def test_mouse_path_tiny_move_is_single_point(self):
+        self.assertEqual(self.hm.mouse_path((10, 10), (10, 10), rng=self.rng), [(10.0, 10.0)])
+
+    def test_scroll_ticks_sum_and_sign(self):
+        for total in (600, -600, 150, -30, 2000):
+            ticks = self.hm.scroll_ticks(total, rng=self.rng)
+            self.assertEqual(sum(ticks), total, f"ticks must sum to {total}")
+            self.assertTrue(all((t >= 0) == (total >= 0) for t in ticks),
+                            "every tick shares the scroll's sign")
+        self.assertEqual(self.hm.scroll_ticks(0, rng=self.rng), [])
+        self.assertEqual(len(self.hm.scroll_ticks(120, rng=self.rng)), 1)  # small = one notch
+        self.assertGreater(len(self.hm.scroll_ticks(1000, rng=self.rng)), 1)  # long = several
+
+    def test_type_delays_shape(self):
+        d = self.hm.type_delays("hello world", rng=self.rng)
+        self.assertEqual(len(d), len("hello world"))
+        self.assertTrue(all(x > 0 for x in d))
+
+    def test_type_delays_is_human_speed_not_superhuman(self):
+        # Mean per-char delay should imply a human typing speed, not faster than
+        # the ~216 WPM human record. WPM = 60/(mean_sec_per_char*5).
+        text = "the quick brown fox jumps over the lazy dog several times over"
+        d = self.hm.type_delays(text, rng=self.rng)
+        mean = sum(d) / len(d)
+        wpm = 60.0 / (mean * 5)
+        self.assertLess(wpm, 180, f"typing too fast to be human: {wpm:.0f} WPM")
+        self.assertGreater(wpm, 40, f"implausibly slow: {wpm:.0f} WPM")
+
+    def test_idle_drift_stays_on_screen_and_near(self):
+        import math
+        for cur in [(960, 540), (5, 5), (1915, 1075)]:
+            for _ in range(50):
+                nx, ny = self.hm.idle_drift_target(cur, 1920, 1080, rng=self.rng)
+                self.assertTrue(8 <= nx <= 1912 and 8 <= ny <= 1072, "must stay on-screen with margin")
+        # From a center point (no clamping), drift is a small wander (<= ~140px).
+        for _ in range(50):
+            nx, ny = self.hm.idle_drift_target((960, 540), 1920, 1080, rng=self.rng)
+            self.assertLessEqual(math.hypot(nx - 960, ny - 540), 141)
+
+
+class TestMultimodalPerception(unittest.TestCase):
+    """The browser now hands the real screenshot to the deciding model. Verify the
+    plumbing: the user turn becomes multimodal only when images are present, and
+    the worker holds/consumes the current view without accumulating frames."""
+
+    def _client(self):
+        # Build an LLMClient without __init__ (needs a model config); the content
+        # builder only touches logger + the encoder.
+        from aeon.core.llm import LLMClient
+        import logging
+        c = LLMClient.__new__(LLMClient)
+        c.logger = logging.getLogger("test")
+        return c
+
+    def test_text_only_when_no_images(self):
+        c = self._client()
+        self.assertEqual(c._build_user_content("hello", None), "hello")
+        self.assertEqual(c._build_user_content("hello", []), "hello")
+
+    def test_multimodal_when_image_encodes(self):
+        import io, os, tempfile
+        from PIL import Image
+        c = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "shot.jpg")
+            Image.new("RGB", (64, 48), (10, 20, 30)).save(p, "JPEG")
+            content = c._build_user_content("look", [p])
+            self.assertIsInstance(content, list)
+            self.assertEqual(content[0], {"type": "text", "text": "look"})
+            self.assertEqual(content[1]["type"], "image_url")
+            self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+
+    def test_bad_image_falls_back_to_text(self):
+        c = self._client()
+        # Non-existent path -> encoder returns None -> plain string, never raises.
+        self.assertEqual(c._build_user_content("look", ["/no/such/file.png"]), "look")
+
+    def test_jpeg_passthrough_no_reencode(self):
+        # A right-sized JPEG (the browser case) must be base64'd verbatim — no
+        # second lossy re-encode. A PNG must be converted to JPEG (bytes differ).
+        import base64, os, tempfile
+        from PIL import Image
+        c = self._client()
+        with tempfile.TemporaryDirectory() as d:
+            jp = os.path.join(d, "shot.jpg")
+            Image.new("RGB", (200, 120), (30, 60, 90)).save(jp, "JPEG", quality=90)
+            with open(jp, "rb") as f:
+                raw = f.read()
+            url = c._encode_image_data_url(jp)
+            self.assertEqual(base64.b64decode(url.split(",", 1)[1]), raw, "JPEG should pass through unchanged")
+
+            pn = os.path.join(d, "shot.png")
+            Image.new("RGB", (200, 120), (30, 60, 90)).save(pn, "PNG")
+            purl = c._encode_image_data_url(pn)
+            self.assertTrue(purl.startswith("data:image/jpeg;base64,"), "PNG should be re-encoded to JPEG")
+
+    def test_worker_visual_context_replaces_not_accumulates(self):
+        from aeon.core.worker import Worker
+        w = Worker.__new__(Worker)
+        w.visual_context = []
+        w.set_visual_context("/tmp/a.jpg")
+        w.set_visual_context(["/tmp/b.jpg", "/tmp/c.jpg"])  # replace by default
+        self.assertEqual(w.visual_context, ["/tmp/b.jpg", "/tmp/c.jpg"])
+        w.set_visual_context("/tmp/d.jpg", replace=False)   # explicit append
+        self.assertEqual(w.visual_context, ["/tmp/b.jpg", "/tmp/c.jpg", "/tmp/d.jpg"])
+        w.set_visual_context([None, ""])                    # empties are dropped
+        self.assertEqual(w.visual_context, [])
+
+
+class TestBrowserUtil(unittest.TestCase):
+    """Pure browser-service decision logic (proxy parsing, destructive-dialog
+    detection, timezone/locale handling). This is the code that can't be exercised
+    live without the container, so it's especially important to unit-test."""
+
+    def setUp(self):
+        from aeon.services.browser import browser_util as bu
+        self.bu = bu
+
+    def test_parse_proxy(self):
+        p = self.bu.parse_proxy("http://user:pass@1.2.3.4:8080")
+        self.assertEqual(p, {"server": "http://1.2.3.4:8080", "username": "user", "password": "pass"})
+        self.assertEqual(self.bu.parse_proxy("socks5://host:1080"), {"server": "socks5://host:1080"})
+        self.assertIsNone(self.bu.parse_proxy(""))
+        self.assertIsNone(self.bu.parse_proxy("   "))
+        self.assertIsNone(self.bu.parse_proxy("not a url"))  # no hostname
+
+    def test_destructive_dialog(self):
+        for m in ["Delete this item?", "This CANNOT be undone", "Discard unsaved changes?",
+                  "Are you sure you want to remove it"]:
+            self.assertTrue(self.bu.is_destructive_dialog(m), m)
+        for m in ["Reload site?", "Allow notifications?", "", "Please confirm your email"]:
+            self.assertFalse(self.bu.is_destructive_dialog(m), m)
+
+    def test_valid_timezone(self):
+        self.assertTrue(self.bu.valid_timezone("America/New_York"))
+        self.assertTrue(self.bu.valid_timezone("Europe/Berlin"))
+        self.assertFalse(self.bu.valid_timezone("Mars/Olympus"))
+        self.assertFalse(self.bu.valid_timezone(""))
+        self.assertFalse(self.bu.valid_timezone(None))
+
+    def test_primary_locale(self):
+        self.assertEqual(self.bu.primary_locale("en-US,haw,fr"), "en-US")
+        self.assertEqual(self.bu.primary_locale("de-DE"), "de-DE")
+        self.assertEqual(self.bu.primary_locale("", "en-US"), "en-US")
+        self.assertIsNone(self.bu.primary_locale(""))
+
+
 def load_tests(loader, standard_tests, pattern):
     return standard_tests
 

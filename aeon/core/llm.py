@@ -1,4 +1,6 @@
 import os
+import io
+import base64
 import time
 import openai
 import pathlib
@@ -8,7 +10,7 @@ import re
 import subprocess
 import requests
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 sys.setrecursionlimit(2000)
 from .system_info import get_runtime_info
 from .logger import get_logger
@@ -596,10 +598,82 @@ class LLMClient:
             time.sleep(delay)
             delay = min(delay * 2, max_delay)
 
-    def get_primary_agent_response(self, prompt: str, max_retries: int = 3, diagnostic_str: Optional[str] = None) -> str:
-        """Get combined reasoning and action from the Primary Agent (Strong Model)."""
+    # Longest-side cap for a screenshot handed to the model. Set to the real
+    # browser viewport (1920x1080) so the page is NOT downscaled — the model reads
+    # exactly the pixels a human would. Gemma-4 pan-and-scans within this bound.
+    VISION_MAX_DIM = 1920
+
+    def _encode_image_data_url(self, image_path: str) -> Optional[str]:
+        """Return a JPEG data: URL for an OpenAI-style multimodal message, or None
+        (never raises) if the file is missing/undecodable or PIL is absent, so a
+        screenshot problem degrades to a text-only turn instead of crashing.
+
+        Fast path: a browser screenshot is ALREADY a right-sized JPEG, so we base64
+        its original bytes — no resize, no second lossy re-encode, less latency.
+        Only oversized or non-JPEG inputs are decoded, downscaled, and re-encoded."""
+        try:
+            if not image_path or not os.path.exists(image_path):
+                return None
+            from PIL import Image  # lazy: PIL ships with the vision/browser stack
+            with Image.open(image_path) as img:
+                fmt = (img.format or "").upper()
+                w, h = img.size  # available from open() without a full decode
+                if fmt in ("JPEG", "JPG") and max(w, h) <= self.VISION_MAX_DIM:
+                    with open(image_path, "rb") as f:
+                        raw = f.read()
+                    return "data:image/jpeg;base64," + base64.b64encode(raw).decode("utf-8")
+                img.load()
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                if max(w, h) > self.VISION_MAX_DIM:
+                    scale = self.VISION_MAX_DIM / max(w, h)
+                    img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=90)
+            return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+        except Exception as e:
+            self.logger.warning(f"Could not encode screenshot {image_path} for vision: {e}")
+            return None
+
+    def _content_with_images(self, text: str, image_urls: List[str]):
+        """Assemble the chat 'content' from a text part and PRE-ENCODED image data
+        URLs: a plain string when there are none, else a multimodal [text, image...]
+        list so the model SEES the page directly alongside its full text context."""
+        if not image_urls:
+            return text
+        parts = [{"type": "text", "text": text}]
+        for url in image_urls:
+            if url:
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+        return parts if len(parts) > 1 else text
+
+    def _build_user_content(self, text: str, images: Optional[List[str]]):
+        """Encode image FILE PATHS and build the user content (encodes each path).
+        Used by direct callers/tests; the main loop pre-encodes once and calls
+        _content_with_images to avoid re-encoding across retries."""
+        urls = [self._encode_image_data_url(p) for p in (images or [])]
+        return self._content_with_images(text, [u for u in urls if u])
+
+    def get_primary_agent_response(self, prompt: str, max_retries: int = 3,
+                                   diagnostic_str: Optional[str] = None,
+                                   images: Optional[List[str]] = None) -> str:
+        """Get combined reasoning and action from the Primary Agent (Strong Model).
+
+        When ``images`` (file paths) are supplied — e.g. the current browser
+        screenshot — they are attached to the user turn as a multimodal message so
+        the deciding model looks at the rendered page itself, not a text summary of
+        it. Requires a multimodal model (Gemma-4); a text-only model simply ignores
+        the image parts."""
         current_prompt = prompt
         last_error = None
+        # Encode attached screenshots ONCE, not once per retry attempt. If this
+        # model has already told us it can't accept images (a text-only build),
+        # don't even try — degrade to text-only instead of failing every turn.
+        if getattr(self, "_vision_supported", True):
+            image_urls = [self._encode_image_data_url(p) for p in (images or [])]
+            image_urls = [u for u in image_urls if u]
+        else:
+            image_urls = []
 
         for attempt in range(max_retries):
             try:
@@ -608,7 +682,7 @@ class LLMClient:
                 # Stream the response to accurately measure TTFT vs pure generation time
                 resp_stream = self.client.chat.completions.create(
                     model=self.api_model,
-                    messages=[{"role": "user", "content": current_prompt}],
+                    messages=[{"role": "user", "content": self._content_with_images(current_prompt, image_urls)}],
                     temperature=0.2,
                     stream=True,
                     # Ask the server for a final usage chunk so we can report the
@@ -746,6 +820,28 @@ class LLMClient:
                 if self._handle_connection_error(e):
                     continue # Recovery successful, retry the request
                 raise
+            except openai.BadRequestError as e:
+                # The server rejected the request. If it was because THIS model
+                # can't accept images (a text-only build served where a multimodal
+                # one was expected), degrade gracefully: stop sending screenshots
+                # for the rest of the session and retry text-only THIS turn, rather
+                # than crashing every browser turn with a 400.
+                msg = str(e).lower()
+                if image_urls and ("multimodal" in msg or "image" in msg):
+                    self.logger.warning("Model rejected image input; falling back to text-only for this session.")
+                    print(f"{C_YELLOW}[LLM] The served model is NOT multimodal — it cannot see screenshots. "
+                          f"Falling back to text-only browsing (element list) for the rest of this session. "
+                          f"To use vision, serve a multimodal Gemma-4 (Gemma4ForConditionalGeneration).{C_RESET}")
+                    self._vision_supported = False
+                    image_urls = []
+                    continue  # retry this attempt without the image
+                self._log_to_debug("PRIMARY_AGENT_ERR", self.model, current_prompt, str(e))
+                self.logger.error(f"Primary Agent bad request: {e}")
+                last_error = f"API Error: {str(e)}"
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                raise
             except Exception as e:
                 self._log_to_debug("PRIMARY_AGENT_ERR", self.model, current_prompt, str(e))
                 self.logger.error(f"Primary Agent LLM call failed: {e}")
@@ -798,22 +894,31 @@ class LLMClient:
             self.logger.warning(f"Memory compression failed: {e}")
             return {}
 
-    def analyze_interruption(self, obj, inp) -> Dict:
-        """Analyze user interruption to classify intent."""
-        prompt = ANALYZE_INTERRUPTION_PROMPT.format(obj=obj, inp=inp)
+    def integrate_interruption(self, obj, plan, progress, inp) -> Dict:
+        """Reason about a mid-run user interruption in full context (objective,
+        plan, progress so far, the message) and return how to fold it in:
+        a mode (REVISE / CONSULT / REPLACE), a reconciled objective and plan, and
+        a concrete directive for the agent's next turn. Uses the primary model —
+        interruptions are rare and the decision is high-stakes."""
+        prompt = ANALYZE_INTERRUPTION_PROMPT.format(obj=obj, plan=plan, progress=progress, inp=inp)
         try:
-            resp = self.utility_client.chat.completions.create(
-                model=self.utility_model,
+            resp = self.client.chat.completions.create(
+                model=self.api_model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"}
             )
             content = resp.choices[0].message.content
-            self._log_to_debug("ANALYZE_INTERRUPTION", self.utility_model, prompt, content)
+            self._log_to_debug("INTEGRATE_INTERRUPTION", self.api_model, prompt, content)
             cleaned = self._clean_json_response(content)
             return json.loads(cleaned)
         except Exception as e:
-            self.logger.warning(f"Interruption analysis failed: {e}")
-            return {"classification": "ADVICE", "updated_text": inp, "reasoning": f"Failed to analyze: {e}"}
+            self.logger.warning(f"Interruption integration failed: {e}")
+            # Safe fallback: treat as a course-correction that preserves context,
+            # surfacing the user's raw words rather than guessing a rewrite.
+            return {"mode": "CONSULT", "objective": obj, "plan": "",
+                    "directive": (f"The user interjected: \"{inp}\". Consider it, respond if it is a "
+                                  f"question, and decide whether to adjust your approach."),
+                    "reasoning": f"Integration failed ({e}); preserved context and surfaced input."}
 
     def reason(self, prompt: str) -> str:
         """General reasoning/thinking call (uses primary/strong model)."""

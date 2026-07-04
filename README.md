@@ -10,13 +10,15 @@ the detected GPUs, and cloud models (Gemini/Vertex/Grok) work out of the box.
 
 ```bash
 pip install .                      # installs the `aeon` console script
-python3 -m aeon.main               # interactive: pick a model, then type objectives
+python3 -m aeon.main               # boots the main model (Gemma-4, single-GPU/solo), then type objectives
+python3 -m aeon.main --menu        # interactive picker: choose solo vs dual-GPU, etc.
+python3 -m aeon.main --dual        # main model across BOTH GPUs (copy per GPU + routing)
 ```
 
 Common flags:
 
 ```bash
-python3 -m aeon.main --model gemini-flash-latest --start "Summarize this repo"
+python3 -m aeon.main --start "Summarize this repo"
 python3 -m aeon.main --start "Build X and test it" --max-iterations 40
 python3 -m aeon.main --help        # full flag list
 ```
@@ -24,6 +26,8 @@ python3 -m aeon.main --help        # full flag list
 | Flag | Purpose |
 |------|---------|
 | `--model NAME` | Skip the menu and use a specific model |
+| `--menu` / `-i` | Force the interactive model picker (choose solo vs dual-GPU, etc.) |
+| `--dual` | Deploy the main model across BOTH GPUs (a copy per GPU + routing) instead of the default single-GPU/solo placement |
 | `--start "..."` | Run an objective immediately, then drop into the REPL |
 | `--max-iterations N` | Cap iterations per objective (forces a final report at the limit) |
 | `--no-warmup` | Skip model warmup (faster startup) |
@@ -78,6 +82,19 @@ Aeon can edit its own source, restart onto the new code, and measure whether the
 change actually made it better — a guarded, reversible loop rather than a blind
 overwrite.
 
+- **Author skills by asking (full CRUD)**: `create_skill` (add), `read_skill`
+  (inspect without activating), `create_skill(..., overwrite=true)` (modify), and
+  `delete_skill` (remove). Every change is live the SAME session (skills are read
+  from disk each turn — no restart for a skill that needs no new tool) and persists
+  across restarts.
+- **Add tools by asking**: drop a `BaseTool` subclass under `aeon/tools/` and call
+  `restart_aeon`; the dynamic loader picks it up.
+- **Zero-path self-modification**: `restart_aeon` and `verify_self_modification`
+  auto-derive the agent's own source root from the installed package, so a
+  self-modification "just works" from any workspace — the model never has to know
+  or hand-supply the path to its own code, and verification always installs/tests
+  the aeon source (not whatever project directory it happens to be running in).
+
 - **Durable git checkpoints.** Every `restart_aeon` first tags the working tree as
   a recoverable checkpoint (`aeon/core/checkpoint.py`), capturing tracked *and*
   untracked files. Restores reconcile modifications, deletions, and additions so
@@ -110,20 +127,32 @@ overwrite.
 
 The `web_browser` tools drive **real Google Chrome** (not Chromium) via
 **Patchright** (a patched Playwright that removes the CDP automation tells most
-bot-detectors probe for), running **headed** under Xvfb in a container
-(`aeon/services/browser/`) with a **persistent profile** so logins/cookies
-survive. It uses no spoofed user-agent/viewport and no detectable evasion shims —
-combined with human-like mouse/keyboard input and the host's residential IP, the
-goal is to be indistinguishable from a person at a normal browser.
+bot-detectors probe for), running **headed** under Xvfb (at a real-world
+1920×1080) in a container (`aeon/services/browser/`) with a **persistent profile**
+so logins/cookies survive. It uses no spoofed user-agent/viewport and no
+detectable evasion shims; **every** action is physically human — the cursor
+follows curved, time-sampled Bézier paths with an accelerate-then-settle velocity
+and slight overshoot, clicks land on a randomized point within the element (not
+dead center), keystrokes type at a real ~110 WPM cadence with word-boundary pauses
+and occasional hesitations, scrolling rolls in wheel notches, drags
+press-pause-move-release, checkboxes/switches are *clicked* (not toggled
+programmatically), dropdowns are clicked open before selecting, fields are cleared
+with select-all+delete, and even the pointer drifts a little while "reading."
+Combined with the host's residential IP, the goal is to be indistinguishable from
+a person.
 
-Every observation gives the agent two aligned channels:
-- a **stable, indexed element list** built from the accessibility tree — each
-  interactable/meaningful node is stamped with a `data-aeon-id` and described by
-  its role, accessible name, value, and state (`expanded`/`collapsed`, `selected`,
-  `checked`, `disabled`, off-screen, scroll-group). The agent acts on elements by
-  `[id]`, which resolves to the exact node (no selector guessing).
-- a **Set-of-Mark screenshot** with numbered boxes that match those same ids,
-  analyzed by the vision model.
+Perception is **first-person**: the agent *is* the multimodal model (Gemma-4), so
+each browser action attaches the **actual rendered screenshot** to its next turn —
+it looks at the page exactly as a human would and decides from the pixels, not
+from a secondhand text caption. That view is paired with a **stable, indexed
+element list** built from the accessibility tree — each interactable/meaningful
+node stamped with a `data-aeon-id` and described by its role, accessible name,
+value, and state (`expanded`/`collapsed`, `selected`, `checked`, `disabled`,
+off-screen, scroll-group). So the model sees the page *and* has exact `[id]`s to
+act on (no selector guessing). By default the screenshot carries small numbered
+`[id]` marks (Set-of-Mark, for precise grounding); `visual="clean"` gives the pure
+render, `visual="both"` gives both, and `include_vision=false` skips the image for
+a faster element-list-only turn.
 
 Actions (`browser_interact`) cover the full human repertoire by id: click /
 double / right-click, hover, type (real keystrokes, optional submit), press_key,
@@ -134,11 +163,40 @@ reload, wait_for, and `read_text` (clean readability extraction). Clicks can pas
 wrong-element clicks. `browser_read` re-observes without acting.
 
 It also handles the things real sites throw at you: the element index descends
-into **iframes and shadow DOM** (marked «in iframe»); native JS **dialogs**
-(alert/confirm/prompt/beforeunload) are auto-handled and reported; **downloads**
-are captured to `~/.aeon/browser_profiles/downloads` and their path reported;
-button-triggered **file pickers** work for uploads; **popups/OAuth windows** are
-captured as switchable tabs; and a crashed browser is transparently relaunched.
+into **iframes and shadow DOM** (marked «in iframe»); native JS **dialogs** are
+handled — but a `confirm`/`prompt` that looks **destructive** (delete/discard/
+overwrite…) is *dismissed*, not auto-confirmed, and reported, so the agent never
+silently deletes something; **downloads** are captured and copied into the
+workspace `./downloads` so the agent can use them; **PDFs** (whose text isn't in
+the DOM) are fetched and saved for parsing on `read_text`; button-triggered **file
+pickers** work for uploads; **popups/OAuth windows** are captured as switchable
+tabs; and a crashed browser is transparently relaunched.
+
+More that keeps it human and capable:
+- **Identity matches the network.** On launch the browser's timezone, locale, and
+  `navigator.languages` are set from the **egress IP's geolocation** (with matching
+  geo-coordinates), so an IP-vs-clock/language mismatch — a top bot signal — never
+  shows. Override with `AEON_BROWSER_TZ` / `AEON_BROWSER_LOCALE`.
+- **Proxy + leak protection.** Set `AEON_BROWSER_PROXY`
+  (`http://user:pass@host:port` or `socks5://…`) to appear from anywhere; WebRTC
+  is prevented from leaking the real IP around the proxy.
+- **Idle motion + adaptive timing.** The cursor makes small "reading" drifts
+  between actions (behavioral realism), and each action waits only until the DOM
+  actually settles (fast on stable pages, patient on churning ones) instead of a
+  fixed sleep.
+- **See what changed.** `browser_interact(..., compare=true)` attaches the
+  before *and* after screenshots so the model can diff its own action.
+- **Per-agent isolation.** Each agent gets its OWN browser context (own cookie
+  jar, storage, history, fingerprint): the principal uses the persistent `default`
+  profile so logins survive across runs, while each sub-agent browses in an
+  isolated context (`agent-<id>`) — so parallel agents are independent identities
+  that never collide, and a sub-agent's context is torn down when it finishes.
+- **Full navigation.** Multiple named tabs with switch/close; site-opened
+  tabs/popups (target=_blank, window.open, OAuth) are captured, announced, and
+  usable/closable; self-closing popups (OAuth) are detected and pruned; scrolling
+  works both vertically AND horizontally, page-level or within a specific pane.
+- **Challenges.** A `web/solving_challenges` skill guides the vision model through
+  CAPTCHAs, image grids, sliders, and verification walls the human way.
 
 ## Self-modification
 

@@ -50,17 +50,33 @@ class VerifySelfModificationTool(BaseTool):
             print(f"{self.C_GREEN}[VERIFY] {label} passed.{self.C_RESET}")
         return None
 
+    def _aeon_source_root(self) -> str:
+        """The Aeon source/install root (dir containing setup.py), independent of
+        the current workspace. Self-modifications live here, so pip install and the
+        test gates MUST run against this tree — NOT os.getcwd(), which is the user's
+        project when aeon is run portably from another directory (installing that by
+        mistake, and testing an unchanged aeon)."""
+        try:
+            from ..core.paths import PROJECT_ROOT
+            return str(PROJECT_ROOT)
+        except Exception:
+            return os.getcwd()
+
     def execute(self, test_objective: str, timeout: int = 180) -> str:
         if not self.worker:
             return "Error: Worker context missing."
 
+        # The sub-agent runs in the user's workspace (where the real task lives),
+        # but the code under test — and thus pip install and the gates — is the
+        # aeon source tree, which may be a different directory entirely.
         workspace = os.getcwd()
+        aeon_root = self._aeon_source_root()
 
-        # 1. Pip install to ensure entry points/cache are updated for the subprocess
-        print(f"{self.C_CYAN}[VERIFY] Applying changes to sub-environment (pip install .)...{self.C_RESET}")
+        # 1. Pip install the AEON SOURCE so entry points/cache reflect the change.
+        print(f"{self.C_CYAN}[VERIFY] Applying changes to sub-environment (pip install . in {aeon_root})...{self.C_RESET}")
         pip_res = subprocess.run(
             [sys.executable, "-m", "pip", "install", ".", "--quiet"],
-            cwd=workspace, capture_output=True, text=True
+            cwd=aeon_root, capture_output=True, text=True
         )
         if pip_res.returncode != 0:
             return f"Verification failed during pip install:\n{pip_res.stderr}\nFix the syntax/build errors before continuing."
@@ -68,8 +84,9 @@ class VerifySelfModificationTool(BaseTool):
         # 1b. FAIL FAST: run the cheap, deterministic test gate (smoke + unit
         # tests) BEFORE spinning up an expensive sub-agent (LLM + GPU). A syntax
         # error, broken import, or parser regression is caught here in ~1s with
-        # a precise message instead of after a multi-minute sub-agent run.
-        gate = self._run_test_gate(workspace, timeout=120)
+        # a precise message instead of after a multi-minute sub-agent run. The
+        # gate files (smoke_test.py, tests/) live in the aeon source tree.
+        gate = self._run_test_gate(aeon_root, timeout=120)
         if gate is not None:
             return gate
 

@@ -22,6 +22,13 @@ TOP_LEVEL_TOOLS = {
     'memorize', 'forget',
     'verify_self_modification', 'restart_aeon', 'revert_aeon', 'run_self_benchmark',
     'expand_tool_category', 'collapse_tool_category',
+    'activate_skill', 'deactivate_skill', 'create_skill', 'read_skill', 'delete_skill',
+    # Browser tools are TOP-LEVEL (always visible with full descriptions). They are
+    # a core capability; hiding them in a collapsed category left the model unable
+    # to see HOW to use them, so it improvised (curl to "navigate", a hallucinated
+    # browser_driver module to type). Always-visible is worth the tokens here.
+    'browser_navigate', 'browser_interact', 'browser_read',
+    'browser_switch_tab', 'browser_close_tab',
 }
 
 # Hierarchical tool categories.
@@ -29,7 +36,7 @@ TOP_LEVEL_TOOLS = {
 # When expanded, subcategories and/or tool descriptions become visible.
 TOOL_CATEGORIES = {
     'image_tools': {
-        'description': 'AI image generation, editing, analysis, and print preprocessing (FLUX/ComfyUI, Qwen3.5 vision)',
+        'description': 'AI image generation, editing, analysis, and print preprocessing (FLUX/ComfyUI, Gemma-4 vision)',
         'tools': [
             'generate_image',
             'edit_image',
@@ -44,14 +51,8 @@ TOOL_CATEGORIES = {
             'generate_video',
         ],
     },
-    'web_browser': {
-        'description': 'Undetected web browsing, DOM extraction, and Set-of-Mark interaction',
-        'tools': [
-            'browser_navigate',
-            'browser_interact',
-            'browser_close_tab',
-        ],
-    },
+    # (web_browser category removed — the browser tools are now top-level so the
+    #  model always sees how to use them.)
 }
 
 

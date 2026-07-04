@@ -11,11 +11,15 @@ from ..core.prompts import TOOL_DESC_ANALYZE_IMAGE
 
 
 class AnalyzeImageTool(BaseTool):
-    """Analyze images on the selected multimodal primary model (e.g. Gemma-4, already
-    loaded on GPU0). main.py exports its endpoint as AEON_VISION_*; there is no separate
-    vision server."""
+    """Standalone image-analysis tool. Runs on the selected multimodal primary
+    model (Gemma-4), whose OpenAI-compatible endpoint main.py exports as
+    AEON_VISION_*. There is no separate vision server or GPU model — it reuses the
+    already-loaded primary. (The main browser loop no longer routes through this
+    tool; it attaches screenshots to the agent's own multimodal prompt directly.
+    This tool remains for explicit, one-off image analysis of any file on disk.)"""
 
-    # Max image dimension before resizing (keeps VRAM usage reasonable)
+    # Max image dimension before resizing (keeps the request small for standalone
+    # image Q&A). The browser path uses its own, larger cap for page legibility.
     MAX_IMAGE_DIM = 640
 
     def __init__(self):
@@ -25,53 +29,10 @@ class AnalyzeImageTool(BaseTool):
             underlying_model='multimodal-primary'
         )
 
-    def _manage_registry(self, action: str):
-        """Legacy ref-count registry (lockfile + JSON). The dedicated vision server it once
-        guarded is retired; kept because browser.py still register/unregisters here. Harmless
-        bookkeeping -- no server is started or torn down based on it anymore."""
-        import fcntl
-        registry_path = '/tmp/aeon_vision_vllm_registry.json'
-        lock_path = '/tmp/aeon_vision_vllm_registry.lock'
-        pid = os.getpid()
-        active_pids = []
-
-        with open(lock_path, 'w') as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            try:
-                if os.path.exists(registry_path):
-                    with open(registry_path, 'r') as f:
-                        active_pids = json.load(f)
-            except (json.JSONDecodeError, EOFError):
-                pass
-
-            # Clean up dead PIDs
-            cleaned_pids = []
-            for p in active_pids:
-                try:
-                    os.kill(p, 0)
-                    cleaned_pids.append(p)
-                except OSError:
-                    pass
-
-            if action == 'register':
-                if pid not in cleaned_pids:
-                    cleaned_pids.append(pid)
-            elif action == 'unregister':
-                if pid in cleaned_pids:
-                    cleaned_pids.remove(pid)
-
-            with open(registry_path, 'w') as f:
-                json.dump(cleaned_pids, f)
-
-            return len(cleaned_pids)
-
     @staticmethod
     def _validate_image(image_path: str):
         """Return None if the path is a decodable image, else an error string.
-
-        Run BEFORE starting the (expensive, slow-to-boot) vision server so a
-        non-image or corrupt file fails fast without spinning up the GPU.
-        """
+        Run BEFORE encoding/sending so a non-image or corrupt file fails fast."""
         try:
             if os.path.getsize(image_path) == 0:
                 return f'Error: Image file is empty (0 bytes): {image_path}'
@@ -120,21 +81,20 @@ class AnalyzeImageTool(BaseTool):
         if not os.path.exists(abs_image_path):
             return f'Error: Image not found at {abs_image_path}'
 
-        # Fail fast on a bad image BEFORE booting the GPU vision server.
+        # Fail fast on a bad image before encoding/sending.
         validation_error = self._validate_image(abs_image_path)
         if validation_error:
             return validation_error
 
-        # Vision runs on the selected multimodal primary (e.g. Gemma-4, already loaded on
-        # GPU0), which main.py exports as AEON_VISION_*. The old standalone Qwen3.6-VL
-        # server was retired, so a text-only primary has no local vision backend ->
-        # return a clear, actionable error instead of failing oddly.
+        # Runs on the selected multimodal primary (Gemma-4), whose endpoint main.py
+        # exports as AEON_VISION_*. If a text-only model is selected there is no
+        # local vision backend -> return a clear, actionable error.
         primary_base = os.environ.get('AEON_VISION_BASE_URL')
         primary_model = os.environ.get('AEON_VISION_MODEL')
         if not (primary_base and primary_model):
             return ("Error: image analysis requires a multimodal model. The current model does "
-                    "not serve vision and the standalone vision server has been removed. "
-                    "Restart Aeon and select the multimodal Gemma-4 model to use analyze_image.")
+                    "not serve vision. Restart Aeon and select the multimodal Gemma-4 model "
+                    "to use analyze_image.")
         vision_url = primary_base.rstrip('/') + '/chat/completions'  # base already ends in /v1
         vision_model = primary_model
 
@@ -183,13 +143,13 @@ class AnalyzeImageTool(BaseTool):
             )
 
             if resp.status_code != 200:
-                return f'Error from vision server (HTTP {resp.status_code}): {resp.text[:500]}'
+                return f'Error from vision endpoint (HTTP {resp.status_code}): {resp.text[:500]}'
 
             result = resp.json()
             try:
                 answer = result['choices'][0]['message']['content']
             except (KeyError, IndexError):
-                return f'Error: Unexpected response format from vision server: {json.dumps(result)[:500]}'
+                return f'Error: Unexpected response format from vision endpoint: {json.dumps(result)[:500]}'
 
             # Keep the full output, including thinking tags, as requested by the user.
             answer = answer.strip()

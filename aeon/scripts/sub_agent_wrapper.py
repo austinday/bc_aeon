@@ -31,6 +31,18 @@ SUB_AGENT_FORBIDDEN_TOOLS = {
 }
 
 
+def _release_browser_profile(agent_id):
+    """Best-effort: tell the browser service to close this sub-agent's isolated
+    context so its Chrome doesn't linger after the task ends. No-op if the sub
+    agent never browsed (service not running / profile never created)."""
+    try:
+        import requests
+        requests.post("http://localhost:8030/release_profile",
+                      json={"profile": f"agent-{agent_id}"}, timeout=5)
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="Aeon Sub-Agent Wrapper")
     parser.add_argument("--agent_id", required=True)
@@ -224,6 +236,10 @@ def main():
         worker = Worker(llm_client=llm_client, debug_mode=args.debug)
         worker.model_name = config.get("model", "unknown")
         worker.model_config = config
+        # Browse as an ISOLATED identity: each sub-agent gets its own browser
+        # context (own cookies/session/fingerprint) instead of sharing the
+        # principal's profile, so parallel agents don't collide.
+        worker.browser_profile = f"agent-{args.agent_id}"
 
         tools = load_tools_from_directory(
             "aeon.tools", dependencies={"llm_client": llm_client, "worker": worker}
@@ -256,6 +272,7 @@ def main():
         })
         log("Task completed successfully.")
         unregister_models_for_agent([config.get("model")])
+        _release_browser_profile(args.agent_id)
 
     except Exception as e:
         done_event.set()
@@ -270,6 +287,7 @@ def main():
             unregister_models_for_agent([json.loads(args.model_config).get("model")])
         except Exception:
             pass
+        _release_browser_profile(args.agent_id)
         sys.exit(1)
 
 

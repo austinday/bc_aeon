@@ -25,8 +25,22 @@ docker rm -f $CONTAINER_NAME >/dev/null 2>&1 || true
 PROFILE_HOST_DIR="${AEON_HOME:-$HOME/.aeon}/browser_profiles"
 mkdir -p "$PROFILE_HOST_DIR"
 
+# GPU-accelerated WebGL when the host has an NVIDIA GPU: without it, Chrome under
+# Xvfb uses the SwiftShader SOFTWARE renderer, which is a datacenter/headless
+# fingerprint tell ("WebGL Renderer: SwiftShader"). With the GPU it reports the
+# real NVIDIA renderer like a normal desktop. WebGL is lightweight, so sharing a
+# GPU with the model is fine. Falls back to software when no GPU is present.
+GPU_RUN_ARGS=""
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    GPU_RUN_ARGS="--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all -e AEON_BROWSER_GPU=1"
+    echo "[Browser] NVIDIA GPU detected -> GPU-accelerated WebGL (real renderer)."
+else
+    echo "[Browser] No NVIDIA GPU -> software WebGL (SwiftShader)."
+fi
+
 echo "[Browser] Starting container (headed Chromium under Xvfb, persistent profile)..."
 docker run -d --name $CONTAINER_NAME \
+    $GPU_RUN_ARGS \
     -p $PORT:8030 \
     -e PORT=8030 \
     -e AEON_BROWSER_PROFILE=/profiles/default \

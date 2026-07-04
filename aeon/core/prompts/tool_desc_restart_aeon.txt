@@ -6,11 +6,11 @@ WHEN TO USE:
 
 CRITICAL RULES:
 1. Save ALL important context to persistent memory (memorize) BEFORE calling this tool. Open files will NOT be preserved across restart.
-2. The aeon_code_dir parameter MUST point to the root of the Aeon source tree (the directory containing setup.py).
+2. aeon_code_dir is OPTIONAL. Omit it and the agent auto-derives its own source root (the directory containing setup.py) from the installed package — you do NOT need to know or type the path. Only pass it to point at a different source tree on purpose.
 3. After restart, you will resume with the same objective. You MUST now perform a live test by actually calling the modified tool or triggering the modified logic to prove it works in the agent's operational context. This is the only acceptable final validation for self-modifications.
 4. Do NOT call this tool unless you have actually changed files in the Aeon source tree. It is pointless otherwise.
 
 Schema:
-  aeon_code_dir (str, required): Absolute path to the Aeon source code directory (must contain setup.py).
+  aeon_code_dir (str, optional): Absolute path to the Aeon source code directory (must contain setup.py). Omit to auto-derive it from the installed package.
   reason (str, optional, default="Applying code changes"): Brief description of what changes are being applied.
-Example: {"tool_name": "restart_aeon", "parameters": {"aeon_code_dir": "/home/aday/bc_aeon", "reason": "Added new calculator tool and prompt"}}
+Example (typical): {"tool_name": "restart_aeon", "parameters": {"reason": "Added new calculator tool and prompt"}}

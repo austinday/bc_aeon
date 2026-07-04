@@ -91,6 +91,8 @@ class Worker:
         self._consecutive_passive_turns = 0  # Run of turns doing only observation/think/say (idle-babysitting detector)
         self.open_files_access_order = []  # Tracks order of file access for LRU suggestions
         self.recent_intents = deque(maxlen=3)  # Tracks recent intents for loop detection
+        self._loop_blocked_fingerprint = None  # Normalized command under a hard loop block (refused until it changes)
+        self._stuck_banner = ""  # Top-of-prompt STUCK banner, set by loop/oscillation detection
         self.prev_prompt_tokens = 0  # Tracks context size of previous iteration for growth metrics
         self.action_log_summary = ""  # Non-destructive summary of older action log entries
         self.instance_id = str(uuid.uuid4())[:8]  # Unique ID for this Aeon run instance
@@ -107,6 +109,14 @@ class Worker:
         self.current_objective = None
         self.model_name = None  # Set by main.py for restart persistence
         self.active_skill = None  # {'path': ..., 'content': ...} when a skill protocol is active
+        # Screenshot(s) to attach to the NEXT prompt so the multimodal model SEES
+        # the current page as a human would. Set by the browser tool, consumed once
+        # per turn, and never accumulated (only the latest view is ever attached).
+        self.visual_context = []
+        # Browser isolation unit: the principal uses the shared, persistent
+        # 'default' profile (logins survive); sub_agent_wrapper overrides this so
+        # each sub-agent browses in its own isolated context (own cookies/session).
+        self.browser_profile = "default"
 
     def _init_debug_logging(self):
         """Initialize debug logging once per worker instance."""
@@ -178,6 +188,19 @@ class Worker:
         for tool in tools_list:
             tool.worker = self
             self.tools[tool.name] = tool
+
+    def set_visual_context(self, image_paths, replace: bool = True):
+        """Register screenshot file path(s) for the multimodal model to look at on
+        the NEXT turn. The browser tool calls this so the deciding model sees the
+        rendered page directly. `replace=True` (default) keeps only the newest view
+        so frames never accumulate across turns (bounded context, one image/turn)."""
+        if isinstance(image_paths, str):
+            image_paths = [image_paths]
+        image_paths = [p for p in (image_paths or []) if p]
+        if replace:
+            self.visual_context = list(image_paths)
+        else:
+            self.visual_context.extend(image_paths)
 
     def update_open_file(self, path: str, content: str):
         abs_path = os.path.abspath(path)
@@ -585,12 +608,84 @@ class Worker:
             + text[-tail_budget:]
         )
 
+    @staticmethod
+    def _normalize_cmd(text: str) -> str:
+        """Normalize a command fingerprint so trivially reformatted-but-identical
+        commands compare equal (whitespace only — commands are case-sensitive)."""
+        return re.sub(r"\s+", " ", (text or "")).strip()
+
+    @staticmethod
+    def _normalize_output(text: str) -> str:
+        """Normalize command output for loop comparison by stripping volatile
+        tokens, so 'the same result' to a human compares equal even when a
+        timestamp / counter / pid / address differs.
+
+        Keying loop detection on raw byte-identity was too brittle: any single
+        varying token made real loops slip through undetected. Trade-off: output
+        whose only change is a genuinely-climbing counter also reads as
+        'unchanged'. We accept that — an agent re-running the identical command
+        3x is exactly the stuck pattern to break, and the hard block only forbids
+        that one command, never a different next step."""
+        if not text:
+            return ""
+        s = text[:2000]
+        s = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", s)   # ANSI escape sequences
+        s = re.sub(r"0x[0-9a-fA-F]+", "0xHEX", s)       # hex addresses / handles
+        s = re.sub(r"\b[0-9a-fA-F]{8,}\b", "HEX", s)    # long hashes / uuid chunks
+        s = re.sub(r"\d+", "N", s)                       # timestamps, pids, counters, elapsed
+        s = re.sub(r"\s+", " ", s)                       # collapse whitespace
+        return s.strip().lower()
+
+    _INTENT_STOPWORDS = frozenset(
+        "a an the is are was were be to of for and or why how i it this that on in "
+        "at do does with my your we you re-".split())
+
+    @classmethod
+    def _intent_similarity(cls, a: str, b: str) -> float:
+        """Jaccard overlap of the *content* words of two intent strings, in [0, 1].
+        Used for the stall detector: the model rewords the same goal every turn, so
+        exact string equality almost never fires. Stopwords are dropped first so
+        two rewordings of one goal score high while unrelated intents that merely
+        share filler words ('check the', 'do the') score low."""
+        sa = {w for w in a.split() if w not in cls._INTENT_STOPWORDS}
+        sb = {w for w in b.split() if w not in cls._INTENT_STOPWORDS}
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / len(sa | sb)
+
+    def _collapse_repeated_entries(self, lines: list) -> list:
+        """Collapse runs of attempt-log entries with the same actions AND result
+        into a single entry annotated with the repeat count, so the model can
+        literally SEE it has been repeating instead of inferring it from a long
+        log. Compares on Actions + Result (ignores iter number and intent wording)."""
+        def key(entry: str):
+            m_a = re.search(r"- Actions: (.*?)(?:\n- Result:|\Z)", entry, re.S)
+            m_r = re.search(r"- Result: (.*)\Z", entry, re.S)
+            a = re.sub(r"\s+", " ", (m_a.group(1) if m_a else "")).strip()
+            r = re.sub(r"\s+", " ", (m_r.group(1) if m_r else "")).strip()
+            return (a, r)
+
+        out, i = [], 0
+        while i < len(lines):
+            k = key(lines[i])
+            j = i + 1
+            while j < len(lines) and k != ("", "") and key(lines[j]) == k:
+                j += 1
+            count = j - i
+            if count > 1:
+                out.append(lines[i].rstrip() +
+                           f"\n- NOTE: this same action+result repeated {count}x in a row (no change).")
+            else:
+                out.append(lines[i])
+            i = j
+        return out
+
     def _format_attempt_log(self) -> str:
         """Format the full, uncompressed attempt log."""
         if not self.action_log and not self.pending_iteration_state:
             return "(No actions taken yet.)"
-        
-        lines = list(self.action_log)
+
+        lines = self._collapse_repeated_entries(list(self.action_log))
         if self.pending_iteration_state:
             p = self.pending_iteration_state
             actions_str = ", ".join(p['actions'])
@@ -615,12 +710,12 @@ class Worker:
         recent_map = {"Low": 12, "Moderate": 8, "High": 5, "CRITICAL": 3}
         recent_count = recent_map.get(pressure, 10)
         recent_entries = self.action_log[-recent_count:]
-        
+
         lines = []
         if self.action_log_summary:
             lines.append(f"[HISTORICAL SUMMARY]\n{self.action_log_summary}")
-        
-        lines.extend(recent_entries)
+
+        lines.extend(self._collapse_repeated_entries(recent_entries))
         
         if self.pending_iteration_state:
             p = self.pending_iteration_state
@@ -638,6 +733,9 @@ class Worker:
         self.pending_iteration_state = None
         self._recent_commands.clear()
         self._recent_outputs.clear()
+        self._loop_blocked_fingerprint = None
+        self._stuck_banner = ""
+        self.recent_intents.clear()
         self.expanded_categories.clear()
         self.notified_sub_agents.clear()
         self.notified_jobs.clear()
@@ -647,6 +745,7 @@ class Worker:
         self._blackboard_seen = 0
         self._last_sub_agent_action_iter = 0
         self._consecutive_passive_turns = 0
+        self.visual_context = []
 
     def serialize_state(self) -> dict:
         """Serialize worker state for persistence across restarts."""
@@ -798,6 +897,74 @@ class Worker:
         except Exception as e:
             self.logger.error(f"Failed to save objective to file: {e}")
 
+    def _recent_progress_digest(self, n: int = 6, max_chars: int = 3000) -> str:
+        """A short digest of what the agent has actually done, for the interruption
+        integrator to reason against so it never treats finished work as unstarted."""
+        if not self.action_log:
+            return "(nothing done yet)"
+        recent = self._collapse_repeated_entries(self.action_log[-n:])
+        return self._truncate_output("\n\n".join(recent), max_chars=max_chars)
+
+    def _integrate_user_input(self, objective: str, user_text: str, iteration: int):
+        """Fold a mid-run user interruption into the ongoing work intelligently
+        instead of the old erase-or-ignore binary. The integrator sees the
+        objective, plan and progress, then picks:
+          - REVISE : reconcile objective+plan with the input, keep all context;
+          - CONSULT: goal unchanged, make the agent think about the input and
+                     decide for itself whether to change course;
+          - REPLACE: rare clean break -> wipe and restart.
+        The user's message is also recorded durably in the action log so it is
+        not lost once last_observation rolls over next turn.
+        Returns (objective, reset_iteration)."""
+        analysis = self.llm_client.integrate_interruption(
+            objective, self.current_plan, self._recent_progress_digest(), user_text)
+        mode = (analysis.get('mode') or 'REVISE').strip().upper()
+        new_obj = (analysis.get('objective') or '').strip() or objective
+        new_plan = (analysis.get('plan') or '').strip()
+        directive = (analysis.get('directive') or '').strip()
+        reasoning = (analysis.get('reasoning') or '').strip()
+        self.print_func(f"{C_CYAN}Interruption -> {mode} | {reasoning}{C_RESET}")
+
+        reset_iteration = False
+        if mode == 'REPLACE':
+            self._reset_state()
+            objective = new_obj
+            self._save_objective(objective)
+            if new_plan:
+                self.current_plan = new_plan
+            self.last_observation = directive or f"New task: {objective}"
+            reset_iteration = True
+            self.print_func(f"{C_GREEN}New objective: {objective}{C_RESET}")
+        elif mode == 'CONSULT':
+            note = directive or (
+                f"The user said: \"{user_text}\". Consider it, answer if it is a question, "
+                f"then decide for yourself whether your current approach should change.")
+            self.last_observation = (
+                "** USER INTERJECTION (goal unchanged) **\n"
+                f"{note}\n"
+                "Use your `think` tool first to work through this before acting.")
+            self.print_func(f"{C_GREEN}Consulting on input; objective preserved.{C_RESET}")
+        else:  # REVISE (default)
+            objective = new_obj
+            self._save_objective(objective)
+            if new_plan:
+                self.current_plan = new_plan
+            note = directive or f"The user's input has been folded into the objective."
+            self.last_observation = (
+                "** OBJECTIVE REVISED from user input **\n"
+                f"{note}\n"
+                f"Updated objective: {objective}\n"
+                "Update your plan this turn (updated_plan) so it reflects BOTH what you have "
+                "already completed and this change — do not restart finished work.")
+            self.print_func(f"{C_GREEN}Objective revised: {objective}{C_RESET}")
+
+        # Durable record: survives last_observation being overwritten next turn.
+        self.action_log.append(
+            f"[Iter {iteration}] USER INTERRUPTION\n- User said: {user_text}\n"
+            f"- Handling: {mode} — {reasoning}")
+        self.pending_iteration_state = None
+        return objective, reset_iteration
+
     def _build_primary_agent_context(self, tool_list_str: str, system_specs: str,
                                      memories_str: str, objective: str, open_files_str: str,
                                      active_tool_directives: str, attempt_log_str: str,
@@ -815,7 +982,11 @@ class Worker:
 
         sub_agent_section = f"\n{sub_agent_digest}\n" if sub_agent_digest else ""
 
-        return f"""{self.base_directives}
+        # A STUCK banner (set by loop/oscillation detection on the previous turn)
+        # goes at the very TOP so a weak model can't miss it under the tool list.
+        banner = f"{self._stuck_banner}\n\n" if self._stuck_banner else ""
+
+        return f"""{banner}{self.base_directives}
 
 {self.docker_directives}
 
@@ -1145,10 +1316,15 @@ class Worker:
                     diagnostic_str = "\n".join(breakdown)
 
                 prompt = self._build_primary_agent_context(
-                    tool_list_str, system_specs, memories_str, objective, open_files_str, 
+                    tool_list_str, system_specs, memories_str, objective, open_files_str,
                     active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
                     sub_agent_digest=sub_agent_digest
                 )
+
+                # Screenshot(s) the browser produced last turn, to attach to THIS
+                # call so the model sees the page. (The guidance note is appended
+                # after context-shedding below, so a rebuilt prompt can't drop it.)
+                turn_images = list(self.visual_context)
 
                 if max_iterations is not None:
                     rem_iters = max_iterations - self.effective_iterations
@@ -1221,10 +1397,32 @@ class Worker:
                                 f"Context limit exceeded ({prompt_tokens} > {ctx_limit * 0.95:.0f}) "
                                 f"with no open files left to shed.")
 
+                # Append the screenshot guidance LAST — after any context-shedding
+                # rebuild above — so it is always present when an image is attached.
+                if turn_images:
+                    prompt += (
+                        "\n\n**ATTACHED SCREENSHOT (CURRENT BROWSER PAGE)**\n"
+                        "The image attached to this message is the page exactly as it renders in the "
+                        "browser right now — look at it directly, as a human would, to judge layout, read "
+                        "text, spot what changed, and catch anything visual (CAPTCHAs, consent walls, "
+                        "modals, errors). Then act using the [id]s in the INTERACTIVE ELEMENTS list, which "
+                        "index the exact same page. The screenshot and the element list describe ONE page; "
+                        "use both together."
+                    )
+
                 self.print_func("Thinking (Primary Agent)...")
 
                 # === PRIMARY AGENT CALL ===
-                response_str = self.llm_client.get_primary_agent_response(prompt=prompt, diagnostic_str=diagnostic_str)
+                # Attach the current page screenshot (if any) so the multimodal
+                # model sees the page itself. Consume it now: a view is shown for
+                # exactly the one decision that follows the browser action, never
+                # re-sent (the model re-looks by calling browser_read).
+                if turn_images:
+                    self.print_func(f"{C_CYAN}\U0001F441 Attaching {len(turn_images)} page screenshot(s) for the model to see.{C_RESET}")
+                self.visual_context = []
+                response_str = self.llm_client.get_primary_agent_response(
+                    prompt=prompt, diagnostic_str=diagnostic_str,
+                    images=turn_images or None)
                 if self.debug_mode:
                     pass
 
@@ -1332,6 +1530,37 @@ class Worker:
                     queued.append(self._summarize_action(tn, a.get("parameters", {})))
                 self.print_func(f"{C_CYAN}Tool calls ({len(actions)}): {' | '.join(queued)}{C_RESET}")
 
+                # --- HARD LOOP BLOCK (enforcement) ---
+                # The previous turn tripped the 3x repeat guard and armed a block on
+                # this exact command. A prose warning is not enough for a weak model,
+                # so we make the no-op impossible: if the proposed command is the
+                # byte-equivalent of the looping one, refuse to run it and force a
+                # different move. Any genuinely different command disarms the block.
+                if self._loop_blocked_fingerprint:
+                    proposed_fp = self._normalize_cmd("|".join(
+                        (f"{(a.get('tool_name') or '').strip()}({a.get('parameters', {})})"
+                         if a.get('parameters') else f"{(a.get('tool_name') or '').strip()}()")
+                        for a in actions))
+                    if proposed_fp and proposed_fp == self._loop_blocked_fingerprint:
+                        block_msg = (
+                            "** COMMAND BLOCKED (loop guard): this is the SAME command that just produced no "
+                            "change 3+ times, so it was NOT executed — running it again cannot help. **\n"
+                            "You MUST do something DIFFERENT this turn:\n"
+                            "- Use `think` to write the exact error, three candidate root causes, and pick one.\n"
+                            "- Then change the command, its inputs, or the approach — or switch to a different sub-task.\n"
+                            "Re-issuing the identical command will keep being blocked."
+                        )
+                        self.print_func(f"{C_RED}{block_msg}{C_RESET}")
+                        self.last_observation = block_msg
+                        self.action_log.append(
+                            f"[Iter {iteration}]\n- Intent: {intent}\n- Actions: {', '.join(queued)}\n"
+                            f"- Result: BLOCKED by loop guard (identical command repeated 3+x; not executed).")
+                        self._persist_session_state()
+                        continue
+                    # A different command was proposed -> loop broken; disarm.
+                    self._loop_blocked_fingerprint = None
+                    self._stuck_banner = ""
+
                 for idx, action_data in enumerate(actions):
                     tool_name = action_data.get("tool_name")
                     params = action_data.get("parameters", {})
@@ -1433,47 +1662,20 @@ class Worker:
                         except EOFError:
                             return
 
-                        self.print_func(f"{C_CYAN}Analyzing user input...{C_RESET}")
-                        analysis = self.llm_client.analyze_interruption(objective, user_in)
-                        classification = analysis.get('classification', 'ADVICE')
-                        updated_text = analysis.get('updated_text', user_in)
-                        reasoning = analysis.get('reasoning', '')
+                        self.print_func(f"{C_CYAN}Integrating user input...{C_RESET}")
+                        # Preserve any output produced earlier this same turn so it
+                        # isn't lost when the interruption rewrites last_observation.
+                        prior_outputs = ""
+                        if combined_summary_parts:
+                            raw_output = self._truncate_output("\n\n".join(combined_summary_parts))
+                            prior_outputs = f"Prior action outputs this turn:\n{raw_output}\n\n"
 
-                        self.print_func(f"{C_CYAN}Classification: {classification} | Reason: {reasoning}{C_RESET}")
-
-                        if classification == 'NEW_TASK':
-                            self._reset_state()
-                            objective = updated_text
-                            self._save_objective(objective)
-                            self.last_observation = f"New task received: {objective}"
-                            self.print_func(f"{C_GREEN}New objective: {objective}{C_RESET}")
+                        objective, reset_iter = self._integrate_user_input(objective, user_in, iteration)
+                        if prior_outputs:
+                            self.last_observation = prior_outputs + self.last_observation
+                        if reset_iter:
                             iteration = 0
-                        elif classification == 'MODIFY_OBJECTIVE':
-                            objective = updated_text
-                            self._save_objective(objective)
-                            self.last_observation = f"Objective modified: {objective}"
-                            self.print_func(f"{C_GREEN}Modified objective: {objective}{C_RESET}")
-                        else:  # ADVICE
-                            prior_outputs = ""
-                            if combined_summary_parts:
-                                raw_output = "\n\n".join(combined_summary_parts)
-                                raw_output = self._truncate_output(raw_output)
-                                prior_outputs = f"Prior Action Outputs:\n{raw_output}\n\n"
-                            
-                            self.last_observation = f"{prior_outputs}User responded to prompt '{params.get('prompt', '')}': {updated_text}"
-                            self.print_func(f"{C_GREEN}Input noted, continuing.{C_RESET}")
 
-                        self.pending_iteration_state = {
-                            'iter': iteration,
-                            'intent': intent,
-                            'actions': actions_taken_str
-                        }
-                        p = self.pending_iteration_state
-                        acts_str = ", ".join(p['actions'])
-                        finished_entry = f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {acts_str}\n- Result: User input handled."
-                        self.action_log.append(finished_entry)
-                        self.pending_iteration_state = None
-                        
                         user_input_handled = True
                         break  # Stop execution chain to process input
 
@@ -1546,59 +1748,83 @@ class Worker:
                 # what stops a principal that is correctly checking in on its
                 # students (or background jobs) from being falsely flagged STUCK.
                 if not observation_only:
-                    # --- LOOP DETECTION ---
-                    # Build a fingerprint of the commands executed this iteration
-                    cmd_fingerprint = "|".join(full_actions_taken_str)
-                    output_fingerprint = raw_output.strip()[:2000]  # First 2k chars for comparison
-                    self._recent_commands.append(cmd_fingerprint)
-                    self._recent_outputs.append(output_fingerprint)
-                    # Keep only the rolling window
+                    # --- LOOP / REPEAT DETECTION ---
+                    # Fingerprint the command (whitespace-normalized) and a
+                    # noise-normalized view of its output. Keying on raw byte-identity
+                    # was too brittle: a timestamp, elapsed time, pid, counter or ANSI
+                    # code made "the same result" compare unequal, so real loops never
+                    # tripped. We compare on the normalized command, with the output
+                    # only used to phrase the warning — re-running the identical
+                    # command is itself the smell, regardless of output churn.
+                    norm_cmd = self._normalize_cmd("|".join(full_actions_taken_str))
+                    norm_out = self._normalize_output(raw_output)
+                    self._recent_commands.append(norm_cmd)
+                    self._recent_outputs.append(norm_out)
                     if len(self._recent_commands) > self.MAX_REPEAT_WINDOW:
                         self._recent_commands.pop(0)
                         self._recent_outputs.pop(0)
-                    # Check for repeated identical command+output pairs
-                    if len(self._recent_commands) >= self.REPEAT_THRESHOLD:
-                        recent_pairs = list(zip(self._recent_commands[-self.REPEAT_THRESHOLD:], self._recent_outputs[-self.REPEAT_THRESHOLD:]))
-                        if len(set(recent_pairs)) == 1:
-                            loop_detected = True
-                            repeat_count = self.REPEAT_THRESHOLD
-                            # Count actual streak length
-                            for i in range(len(self._recent_commands) - 1, -1, -1):
-                                if (self._recent_commands[i], self._recent_outputs[i]) == recent_pairs[0]:
-                                    repeat_count = len(self._recent_commands) - i
-                                else:
-                                    break
-                            # Graduated response: the first repeat (2x) gets a measured
-                            # nudge, not a five-line alarm — a command can legitimately
-                            # repeat once (e.g. a re-run after an unrelated edit). Only
-                            # escalate to the hard STUCK protocol at 3x+, where it really
-                            # is spinning. This keeps the detector from feeling trigger-happy.
-                            if repeat_count <= 2:
-                                loop_warning = (
-                                    f"\n\n** REPEAT NOTICE: you ran the same command(s) twice with identical output — "
-                                    f"no change. Before repeating again, confirm a repeat will actually do something "
-                                    f"different; if not, change the input, the approach, or the sub-task. **"
-                                )
-                                warn_color = C_YELLOW
-                            else:
-                                # Publish the loop so that, IF this worker is a sub-agent, its
-                                # principal sees a LOOPING flag in the digest (a fast loop keeps
-                                # the heartbeat fresh, so it would otherwise look healthy). Only
-                                # at the escalated level — a single repeat is not "looping".
-                                self.stuck_reason = (f"self-reported loop: ran the same command(s) {repeat_count}x "
-                                                     f"with identical output.")
-                                loop_warning = (
-                                    f"\n\n** LOOP DETECTED: You have run the SAME command(s) {repeat_count} times in a row "
-                                    f"and received IDENTICAL output each time. The situation is NOT changing. **\n"
-                                    f"You MUST do something DIFFERENT now. You are STUCK.\n"
-                                    f"- You MUST use the `think` tool on your next turn to explicitly analyze WHY the previous command failed.\n"
-                                    f"- Write out the exact error message, list three possible root causes, and select the most likely one before taking any further action.\n"
-                                    f"- Zoom out and target a different part of the problem, or try a completely different approach.\n"
-                                    f"- DO NOT run the same command again."
-                                )
-                                warn_color = C_RED
-                            self.last_observation += loop_warning
-                            self.print_func(f"{warn_color}{loop_warning}{C_RESET}")
+
+                    # Consecutive run of the identical command (output may vary), and
+                    # of the identical command+output pair, counted back from this turn.
+                    cmd_streak = 0
+                    for c in reversed(self._recent_commands):
+                        if norm_cmd and c == norm_cmd:
+                            cmd_streak += 1
+                        else:
+                            break
+                    pair_streak = 0
+                    for c, o in zip(reversed(self._recent_commands), reversed(self._recent_outputs)):
+                        if norm_cmd and c == norm_cmd and o == norm_out:
+                            pair_streak += 1
+                        else:
+                            break
+
+                    if norm_cmd and cmd_streak >= self.REPEAT_THRESHOLD:
+                        loop_detected = True
+                        repeat_count = cmd_streak
+                        out_phrase = ("identical output each time" if pair_streak >= cmd_streak
+                                      else "no meaningful change in output")
+                        # Graduated: the first repeat (2x) gets a measured nudge — a
+                        # command can legitimately repeat once (e.g. a re-run after an
+                        # unrelated edit). Escalate to the hard STUCK protocol AND arm
+                        # an execution block only at 3x+, where it really is spinning.
+                        if repeat_count <= 2:
+                            loop_warning = (
+                                f"\n\n** REPEAT NOTICE: you ran the same command(s) twice with {out_phrase} — "
+                                f"no real change. Before repeating again, confirm a repeat will actually do "
+                                f"something different; if not, change the input, the approach, or the sub-task. **"
+                            )
+                            warn_color = C_YELLOW
+                        else:
+                            # Publish the loop so that, IF this worker is a sub-agent, its
+                            # principal sees a LOOPING flag in the digest (a fast loop keeps
+                            # the heartbeat fresh, so it would otherwise look healthy).
+                            self.stuck_reason = (f"self-reported loop: ran the same command(s) {repeat_count}x "
+                                                 f"with {out_phrase}.")
+                            # Arm a HARD block: next turn the byte-equivalent command is
+                            # refused outright (a weak model ignores prose nudges), and
+                            # raise a top-of-prompt banner it cannot miss.
+                            self._loop_blocked_fingerprint = norm_cmd
+                            self._stuck_banner = (
+                                "===[ ! STUCK — READ THIS FIRST ]===\n"
+                                f"You have run the SAME command {repeat_count}x in a row with {out_phrase}. "
+                                "Repeating it is now BLOCKED and will not execute. Do NOT try it again.\n"
+                                "This turn: use `think` to diagnose the failure, then change the command, its "
+                                "inputs, or the approach — or switch to a different sub-task.\n"
+                                "===[ END STUCK ]==="
+                            )
+                            loop_warning = (
+                                f"\n\n** LOOP DETECTED: You have run the SAME command(s) {repeat_count} times in a row "
+                                f"with {out_phrase}. The situation is NOT changing. **\n"
+                                f"You MUST do something DIFFERENT now. You are STUCK.\n"
+                                f"- Repeating this command is now BLOCKED — it will be refused, not executed.\n"
+                                f"- Use the `think` tool on your next turn to state the exact error, list three "
+                                f"possible root causes, and select the most likely one.\n"
+                                f"- Then change the command, its inputs, or the approach — or switch sub-tasks."
+                            )
+                            warn_color = C_RED
+                        self.last_observation += loop_warning
+                        self.print_func(f"{warn_color}{loop_warning}{C_RESET}")
 
                     # --- OSCILLATION (2-CYCLE) DETECTION ---
                     # The check above only catches CONSECUTIVE identical turns. An agent
@@ -1612,6 +1838,12 @@ class Worker:
                             loop_detected = True
                             self.stuck_reason = ("self-reported oscillation: alternating between two "
                                                  "states (A,B,A,B) with no net progress.")
+                            self._stuck_banner = (
+                                "===[ ! STUCK — READ THIS FIRST ]===\n"
+                                "You are alternating between TWO actions (A,B,A,B) and making no net progress. "
+                                "Break the cycle: use `think`, then choose a THIRD, different approach.\n"
+                                "===[ END STUCK ]==="
+                            )
                             osc_warning = (
                                 "\n\n** OSCILLATION DETECTED: You are alternating between TWO actions/states "
                                 "(A, B, A, B) and making no net progress — each undoes or ignores the other. **\n"
@@ -1622,28 +1854,34 @@ class Worker:
                             self.print_func(f"{C_RED}{osc_warning}{C_RESET}")
 
                     # --- INTENT-LEVEL STALL DETECTION ---
-                    # The hard loop above only fires on byte-identical command+output.
-                    # This complementary check catches spinning on the same GOAL across
-                    # turns even when the exact commands or outputs vary slightly.
+                    # Catches spinning on the same GOAL across turns even when the exact
+                    # commands/outputs vary. Uses fuzzy token overlap, not exact string
+                    # equality — the model rewords the same intent every turn, so exact
+                    # matching almost never fired.
                     norm_intent = re.sub(r"\s+", " ", (intent or "").strip().lower())[:160]
                     self.recent_intents.append(norm_intent)
                     if (not loop_detected and norm_intent
-                            and len(self.recent_intents) == self.recent_intents.maxlen
-                            and len(set(self.recent_intents)) == 1):
-                        stall_note = (
-                            f"\n\n** STALL WARNING: your stated intent has been essentially the same "
-                            f"for {self.recent_intents.maxlen} turns ('{intent[:120]}') without resolving it. "
-                            f"You may be making no real progress on this goal. Re-read your ATTEMPT LOG, "
-                            f"question the assumption behind this intent, and either change approach or switch "
-                            f"to a different sub-task. **"
-                        )
-                        self.last_observation += stall_note
-                        self.print_func(f"{C_YELLOW}{stall_note}{C_RESET}")
+                            and len(self.recent_intents) == self.recent_intents.maxlen):
+                        ints = [s for s in self.recent_intents if s]
+                        if len(ints) == self.recent_intents.maxlen and all(
+                                self._intent_similarity(ints[i], ints[i + 1]) >= 0.5
+                                for i in range(len(ints) - 1)):
+                            stall_note = (
+                                f"\n\n** STALL WARNING: your stated intent has been essentially the same "
+                                f"for {self.recent_intents.maxlen} turns ('{intent[:120]}') without resolving it. "
+                                f"You may be making no real progress on this goal. Re-read your ATTEMPT LOG, "
+                                f"question the assumption behind this intent, and either change approach or switch "
+                                f"to a different sub-task. **"
+                            )
+                            self.last_observation += stall_note
+                            self.print_func(f"{C_YELLOW}{stall_note}{C_RESET}")
 
                     if not loop_detected:
-                        # Progress was made (commands/outputs changed) -> clear any prior
-                        # loop flag so a recovered sub-agent stops showing as LOOPING.
+                        # Progress was made (command/output changed) -> clear any prior
+                        # loop flag and stuck banner so a recovered agent stops showing
+                        # as LOOPING / STUCK.
                         self.stuck_reason = None
+                        self._stuck_banner = ""
 
                 # --- IDLE-BABYSITTING DETECTION ---
                 # The distinct failure the loop detector should NOT own: the
@@ -1716,32 +1954,11 @@ class Worker:
                         self.print_func("Aborting task.")
                         break
 
-                    # Analyze the interruption using the LLM
-                    self.print_func(f"{C_CYAN}Analyzing guidance...{C_RESET}")
-                    analysis = self.llm_client.analyze_interruption(objective, user_guidance)
-                    classification = analysis.get('classification', 'ADVICE')
-                    updated_text = analysis.get('updated_text', user_guidance)
-                    reasoning = analysis.get('reasoning', '')
-
-                    self.print_func(f"{C_CYAN}Classification: {classification} | Reason: {reasoning}{C_RESET}")
-
-                    if classification == 'NEW_TASK':
-                        self._reset_state()
-                        objective = updated_text
-                        self._save_objective(objective)
-                        self.last_observation = f"New task received: {objective}"
-                        self.print_func(f"{C_GREEN}New objective: {objective}{C_RESET}")
+                    # Integrate the guidance in full context (objective/plan/progress).
+                    self.print_func(f"{C_CYAN}Integrating guidance...{C_RESET}")
+                    objective, reset_iter = self._integrate_user_input(objective, user_guidance, iteration)
+                    if reset_iter:
                         iteration = 0
-
-                    elif classification == 'MODIFY_OBJECTIVE':
-                        objective = updated_text
-                        self._save_objective(objective)
-                        self.last_observation = f"Objective modified: {objective}"
-                        self.print_func(f"{C_GREEN}Modified objective: {objective}{C_RESET}")
-
-                    else:  # ADVICE
-                        self.last_observation = f"USER GUIDANCE: {updated_text}"
-                        self.print_func(f"{C_GREEN}Guidance noted, continuing.{C_RESET}")
 
                 except (KeyboardInterrupt, EOFError):
                     self.print_func(f"\n{C_RED}Forced Exit.{C_RESET}")

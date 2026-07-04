@@ -13,9 +13,24 @@ To provide a deterministic, fail-safe process for extending the agent's capabili
    - Supporting Tool: `aeon/tools/[tool_module].py`
 
 ### PHASE 2: IMPLEMENTING THE SKILL PROTOCOL
-1. **Create Category Directory:** Ensure the category directory exists: `mkdir -p aeon/core/skills/[category]`.
-2. **Write Protocol:** Create the `.txt` file. Use a structured format (Objective, Process, Verification).
-3. **Verify Path:** Confirm the file is exactly at `aeon/core/skills/[category]/[skill_name].txt`. The `SkillsManager` relies on this specific path.
+PREFERRED: use the dedicated `create_skill` tool. Call `create_skill(category=..., skill_name=..., content=...)`
+and it writes the protocol to the correct location for you (no path guesswork), makes it visible in the
+SKILLS section IMMEDIATELY this session (activatable with `activate_skill` — NO restart needed for a
+skill that requires no new tool), and persists it across restarts. Start the content with one or two
+`# ` comment lines describing WHEN the skill applies (the skill router matches on those). Use a
+structured body (Objective, Process, Verification).
+
+Skills are fully self-modifiable — you have the whole CRUD surface, all live-effective and
+restart-persistent:
+  - `create_skill(category, skill_name, content)` — add a new protocol.
+  - `read_skill(skill_path)` — read a protocol's full text WITHOUT activating it (inspect before editing).
+  - `create_skill(..., overwrite=true)` — MODIFY: rewrite an existing protocol with corrected content.
+  - `delete_skill(skill_path)` — REMOVE a protocol you no longer want.
+(`skill_path` is `'<category>/<skill_name>'`.)
+
+MANUAL FALLBACK (only if these tools are unavailable): `mkdir -p aeon/core/skills/[category]`, then
+`write_file` the protocol to exactly `aeon/core/skills/[category]/[skill_name].txt` — the `SkillsManager`
+relies on this specific path.
 
 ### PHASE 3: IMPLEMENTING SUPPORTING TOOLS (The "Gotchas" Phase)
 If the skill requires a new tool, follow these strict rules to avoid registration failures:
@@ -33,8 +48,8 @@ If the skill requires a new tool, follow these strict rules to avoid registratio
 ### PHASE 4: VERIFICATION & ACTIVATION
 1. **Self-Modification Workflow:**
    - **Modify:** Use `write_file` or `str_replace` to implement the tool/skill.
-   - **Verify:** Call `verify_self_modification` with a specific objective that forces the agent to use the new tool/skill.
-   - **Restart:** Call `restart_aeon` to apply changes to the primary process.
+   - **Verify:** Call `verify_self_modification` with a specific objective that forces the agent to use the new tool/skill. (A skill with NO new tool needs no restart — it is already live; just `activate_skill` and test it.)
+   - **Restart:** If you added or changed a TOOL, call `restart_aeon` to load it. You do NOT need to pass a path — it auto-derives its own source root.
 2. **Live Test:**
    - Use `expand_skills_category` (if applicable) to verify the skill is visible.
    - Execute a task that requires the new skill to prove it is functional in the operational context.

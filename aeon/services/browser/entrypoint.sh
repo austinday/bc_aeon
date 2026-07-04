@@ -2,7 +2,11 @@
 set -e
 
 echo "Starting Xvfb on display :99..."
-Xvfb :99 -screen 0 1280x1024x24 -ac +extension GLX +render -noreset &
+# 1920x1080 is the single most common real-world screen resolution; the previous
+# 1280x1024 (5:4) is a CRT-era size almost no modern device reports, which is
+# itself a fingerprint. A common resolution + a larger viewport (more elements
+# visible per observation, fewer scrolls) is both more human and more capable.
+Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
 export DISPLAY=:99
 
 # Wait for X server to be ready

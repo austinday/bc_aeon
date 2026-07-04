@@ -16,9 +16,29 @@ class RestartAeonTool(BaseTool):
         )
         self.worker = worker
 
-    def execute(self, aeon_code_dir: str, reason: str = 'Applying code changes') -> str:
+    def _default_code_dir(self) -> str:
+        """The aeon source root, derived from the installed package location.
+
+        The agent should not have to know or supply the path to its own source;
+        aeon.core.paths already resolves the install/source root (the dir holding
+        setup.py) independent of the current workspace. Used when the caller omits
+        aeon_code_dir so a restart 'just works' from any workspace."""
+        try:
+            from ..core.paths import PROJECT_ROOT
+            return str(PROJECT_ROOT)
+        except Exception:
+            return ''
+
+    def execute(self, aeon_code_dir: str = None, reason: str = 'Applying code changes') -> str:
+        # aeon_code_dir is optional: when omitted, auto-derive the source root
+        # from the installed package so the model never has to hand-supply (and
+        # potentially mis-type) the path to its own code.
         if not aeon_code_dir:
-            return 'Error: aeon_code_dir is required.'
+            aeon_code_dir = self._default_code_dir()
+            if not aeon_code_dir:
+                return ('Error: aeon_code_dir was not provided and the source root could not be '
+                        'auto-derived. Pass the absolute path to the Aeon source tree (the directory '
+                        'containing setup.py).')
 
         abs_dir = os.path.abspath(aeon_code_dir)
         if not os.path.isdir(abs_dir):

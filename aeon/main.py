@@ -222,8 +222,7 @@ def cleanup_transient_tools():
                 pass
         
         _safe_cleanup("/tmp/aeon_comfyui_registry.json", "/tmp/aeon_comfyui_registry.lock", "aeon_comfyui")
-        _safe_cleanup("/tmp/aeon_vision_vllm_registry.json", "/tmp/aeon_vision_vllm_registry.lock", "aeon_qwen36_vl")
-        
+
         def _close_browser_session():
             try:
                 requests.post("http://localhost:8030/close_session", json={"session_id": str(my_pid)}, timeout=2)
@@ -364,7 +363,7 @@ def cleanup_ghost_llamacpp_containers():
     clusters are handled as a unit: when a model is a ghost, BOTH its primary
     container_name AND every entry in additional_containers are torn down. The
     previous version matched only container_name, which left orphaned cluster
-    nodes (e.g. aeon_gemma4_mtp_node0/node1) running after an agent was killed.
+    nodes (e.g. aeon_gemma_4_31b_nvfp4_mtp_node0/node1) running after an agent was killed.
     """
     print("[SYSTEM] Scanning for ghost llama.cpp containers...")
     try:
@@ -1019,7 +1018,13 @@ def cli():
     )
     parser.add_argument('--debug', action='store_true', help='Enable detailed LLM call logging to ~/')
     parser.add_argument('--debug-log', type=str, help='Path to the reasoning trace log file (JSONL)')
-    parser.add_argument('--model', type=str, help='Model name - skips menu')
+    parser.add_argument('--model', type=str, help='Model name - skips the menu')
+    parser.add_argument('--menu', '-i', action='store_true',
+                        help='Force the interactive model picker (choose solo vs dual-GPU, etc.) '
+                             'even when the default model is deployable.')
+    parser.add_argument('--dual', action='store_true',
+                        help='Deploy the main model in DUAL-GPU mode (a copy on each GPU + routing) '
+                             'instead of the default single-GPU (solo) placement.')
     parser.add_argument('--start', type=str, help='Initial objective to start immediately')
     parser.add_argument('--max-iterations', type=int, default=None,
                         help='Cap iterations per objective; the agent is forced to deliver a final '
@@ -1052,8 +1057,16 @@ def cli():
     # given we boot straight into it instead of prompting. We only drop to the
     # interactive menu if this machine can't deploy it (e.g. won't fit the GPUs),
     # so the default never silently becomes some other model.
+    # --dual is a convenience shortcut for the main model's dual-GPU variant, whose
+    # menu name is "<name> [dual-GPU]" (a copy on each GPU + adaptive_lb routing).
     model_name = args.model
-    if model_name:
+    if not model_name and args.dual:
+        model_name = f"{DEFAULT_MODEL} [dual-GPU]"
+
+    if args.menu and not model_name:
+        # Explicitly requested the interactive picker (choose solo vs dual, etc.).
+        model_config = select_model(menu, 'Select Model')
+    elif model_name:
         model_config = find_model_config(model_name, menu)
         if not model_config:
             available = [e['model'] for e in menu if not e.get('is_header')]
@@ -1067,7 +1080,8 @@ def cli():
     else:
         model_config = find_model_config(DEFAULT_MODEL, menu)
         if model_config:
-            print(f"[CONFIG] No --model given; defaulting to main model: {DEFAULT_MODEL}")
+            print(f"[CONFIG] No --model given; defaulting to main model: {DEFAULT_MODEL} "
+                  f"(single-GPU/solo). Use --dual for dual-GPU, or --menu to choose.")
         else:
             print(f"[CONFIG] Main model '{DEFAULT_MODEL}' not deployable on this machine; choose one:")
             model_config = select_model(menu, 'Select Model')
@@ -1090,10 +1104,11 @@ def cli():
     try:
         session.enter(model_config=model_config, skip_warmup=args.no_warmup)
         enable_utility_tier_if_available(model_config)
-        # Vision reuse: when the selected primary is multimodal (Gemma-4 serves images on its
-        # own chat endpoint), point analyze_image at it instead of spinning up a separate
-        # vision model on GPU1. Inherited by sub-agents via env. Text-only primaries leave
-        # these unset and analyze_image falls back to the dedicated Qwen vision server.
+        # Vision reuse: the selected primary (Gemma-4) is multimodal and serves images
+        # on its own chat endpoint, so both the browser loop and analyze_image use it
+        # directly — there is no separate vision model/server. main.py exports the
+        # endpoint as AEON_VISION_* (inherited by sub-agents via env). A text-only
+        # primary leaves these unset and analyze_image reports vision is unavailable.
         os.environ.pop("AEON_VISION_BASE_URL", None)
         os.environ.pop("AEON_VISION_MODEL", None)
         if model_config.get('multimodal') and model_config.get('base_url'):
