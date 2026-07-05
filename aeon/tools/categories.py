@@ -40,6 +40,7 @@ TOOL_CATEGORIES = {
         'tools': [
             'generate_image',
             'edit_image',
+            'composite_image',
             'analyze_image',
         ],
     },

@@ -253,6 +253,14 @@ class ComfyUITool(BaseTool):
             time.sleep(2)
         raise RuntimeError(f"ComfyUI timed out after {hard_timeout // 60} min (job still not complete).")
 
+    def _upload_image(self, abs_path: str) -> str:
+        """Upload a local image to ComfyUI and return the server-side filename."""
+        with open(abs_path, "rb") as f:
+            r = requests.post(f"{self.comfy_url}/upload/image", files={"image": f}, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to upload image to ComfyUI: {r.text[:200]}")
+        return r.json()["name"]
+
     def _download_comfy_output(self, info: dict, dest: str, timeout: int = 30):
         """Download a produced file (image or video) from ComfyUI's /view to
         `dest`; raise on failure. Larger timeout for big video files."""
@@ -424,7 +432,8 @@ class EditImageTool(ComfyUITool):
         )
         self.llm_client = llm_client
 
-    def execute(self, input_path: str, prompt: str, output_path: str = None, denoise: float = 0.75, enhance: bool = None) -> str:
+    def execute(self, input_path: str, prompt: str, input_path_2: str = None, input_path_3: str = None,
+                output_path: str = None, denoise: float = 0.75, enhance: bool = None) -> str:
         if not input_path:
             return "Error: 'input_path' parameter is required."
         if not prompt:
@@ -439,6 +448,20 @@ class EditImageTool(ComfyUITool):
 
         if not os.path.exists(abs_input_path):
             return f"Error: Input image not found at {abs_input_path}"
+        # Optional reference images (multi-image edit): image1 is the base that gets
+        # edited (its latent seeds the result); image2/image3 are references the
+        # model can pull content from — e.g. a brand logo or product to place into
+        # the base scene. Qwen-Image-Edit-2509 (TextEncodeQwenImageEditPlus) reads
+        # up to three images and follows a prompt like "add the logo from the second
+        # image to the top-right of the first image".
+        extra_paths = []
+        for p in (input_path_2, input_path_3):
+            if not p:
+                continue
+            ap = os.path.abspath(p)
+            if not os.path.exists(ap):
+                return f"Error: reference image not found at {ap}"
+            extra_paths.append(ap)
 
         os.makedirs(os.path.dirname(abs_output_path) or ".", exist_ok=True)
 
@@ -447,14 +470,17 @@ class EditImageTool(ComfyUITool):
             self._manage_registry('register')
             self._ensure_comfyui_running(required_vram=20.0)
 
-            print(f"{self.C_CYAN}Uploading input image to ComfyUI...{self.C_RESET}")
-            with open(abs_input_path, 'rb') as f:
-                upload_res = requests.post(f"{self.comfy_url}/upload/image", files={"image": f}, timeout=10)
-            
-            if upload_res.status_code != 200:
-                return f"Error uploading image to ComfyUI: {upload_res.text}"
-            
-            uploaded_filename = upload_res.json()["name"]
+            n_imgs = 1 + len(extra_paths)
+            print(f"{self.C_CYAN}Uploading {n_imgs} image(s) to ComfyUI...{self.C_RESET}")
+            base_name = self._upload_image(abs_input_path)
+            # LoadImage nodes: base is "10"; references get 15, 16. image_inputs maps
+            # each to image1/image2/image3 on the TextEncode nodes.
+            load_nodes = {"10": base_name}
+            image_inputs = {"image1": ["10", 0]}
+            for idx, ap in enumerate(extra_paths, start=2):
+                nid = str(13 + idx)  # 15, 16
+                load_nodes[nid] = self._upload_image(ap)
+                image_inputs[f"image{idx}"] = [nid, 0]
 
             workflow = {
                 "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "v23/Qwen-Rapid-NSFW-v23_Q8_0.gguf"}},
@@ -464,9 +490,8 @@ class EditImageTool(ComfyUITool):
                 # image in vision-language mode), and ignores the unrelated gemma-3 mmproj.
                 "2": {"class_type": "CLIPLoaderGGUF", "inputs": {"clip_name": "Qwen2.5-VL-7B-Instruct-abliterated.Q8_0.gguf", "type": "qwen_image"}},
                 "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
-                "10": {"class_type": "LoadImage", "inputs": {"image": uploaded_filename}},
-                "4": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"prompt": prompt, "clip": ["2", 0], "vae": ["3", 0], "image1": ["10", 0]}},
-                "5": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"prompt": "", "clip": ["2", 0], "vae": ["3", 0], "image1": ["10", 0]}},
+                "4": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"prompt": prompt, "clip": ["2", 0], "vae": ["3", 0], **image_inputs}},
+                "5": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"prompt": "", "clip": ["2", 0], "vae": ["3", 0], **image_inputs}},
                 "11": {"class_type": "VAEEncode", "inputs": {"pixels": ["10", 0], "vae": ["3", 0]}},
                 "7": {
                     "class_type": "KSampler",
@@ -492,6 +517,9 @@ class EditImageTool(ComfyUITool):
                     }
                 }
             }
+            # Attach the LoadImage node(s) for the base + any reference images.
+            for nid, nm in load_nodes.items():
+                workflow[nid] = {"class_type": "LoadImage", "inputs": {"image": nm}}
 
             print(f"{self.C_CYAN}Submitting image edit workflow to ComfyUI...{self.C_RESET}")
             req = requests.post(f"{self.comfy_url}/prompt", json={"prompt": workflow}, timeout=5)

@@ -1,8 +1,13 @@
-CRITICAL: MUST USE THIS TOOL for ANY image editing, alteration, or style transfer request. Whenever the user asks you to edit, change, or modify an existing image, you MUST call this tool. Do NOT write your own Python scripts, do NOT use curl, and do NOT try to interact with the ComfyUI API manually.
-Edits an existing image based on a text prompt using the FLUX.2 GGUF model via a local ComfyUI API and saves it to a specified file path.
+CRITICAL: MUST USE THIS TOOL for ANY image editing, alteration, style transfer, or combining/compositing content from multiple images with AI. Whenever the user asks you to edit, change, modify, or blend existing images, you MUST call this tool. Do NOT write your own Python scripts, do NOT use curl, and do NOT try to interact with the ComfyUI API manually.
+Edits an existing image (or composes from up to THREE images) based on a text prompt, using the abliterated Qwen-Image-Edit model via a local ComfyUI API, and saves it to a specified file path.
+Multi-image: give a reference in input_path_2 (and input_path_3) to pull content INTO the base image — e.g. place a brand logo or a product from a reference onto the base scene. Refer to them in the prompt as "the second image" / "the third image".
+NOTE: this is an AI edit — it REDRAWS content, so fine logo text/shapes may shift. For a PIXEL-EXACT, unaltered logo placement, use the composite_image tool instead (or use it as the final step after this).
 Schema:
-  input_path (str, required): The absolute or relative file path of the existing image to edit.
-  prompt (str, required): The detailed visual description of the desired output image.
-  output_path (str, optional): Where to save the edited image. A relative path is resolved against the current workspace; an absolute path is honored as-is. If omitted, it is saved next to the workspace base as '<input>_edited.png'. Do NOT invent nested output dirs like 'aeon_output/...'.
-  denoise (float, optional, default=0.75): How much to alter the image. 0.0 is no change, 1.0 is a completely new image. 0.6-0.8 is usually best for editing.
-Example: {"tool_name": "edit_image", "parameters": {"input_path": "photo.png", "prompt": "make it winter, snowy", "output_path": "photo_winter.png", "denoise": 0.75}}
+  input_path (str, required): The base image to edit. image1 — its content is the starting point of the result.
+  prompt (str, required): The detailed instruction describing the desired output (reference the extra images by position if used).
+  input_path_2 (str, optional): A second reference image (image2) to draw content from, e.g. a logo/product to add.
+  input_path_3 (str, optional): A third reference image (image3).
+  output_path (str, optional): Where to save. Relative resolves against the workspace; absolute is honored. If omitted, saved as '<input>_edited.png'. Do NOT invent nested output dirs like 'aeon_output/...'.
+  denoise (float, optional, default=0.75): How much to alter the base. 0.0 no change, 1.0 fully new. 0.6-0.8 is usually best for editing.
+Example (single): {"tool_name": "edit_image", "parameters": {"input_path": "photo.png", "prompt": "make it winter, snowy", "output_path": "photo_winter.png"}}
+Example (compose logo): {"tool_name": "edit_image", "parameters": {"input_path": "ad_scene.png", "prompt": "place the logo from the second image cleanly on the wall in the background", "input_path_2": "brand_logo.png", "output_path": "ad_with_logo.png"}}
