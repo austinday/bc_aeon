@@ -4,11 +4,23 @@ import time
 import random
 import requests
 import subprocess
+import threading
 from .base import BaseTool
 from ..core.prompts import TOOL_DESC_GENERATE_IMAGE, TOOL_DESC_EDIT_IMAGE
 from ..core.gpu_queue import wait_for_vram, release_vram
 from ..core.prompt_enhancer import enhance_prompt
 from ..core.paths import resolve_output_path
+
+# ComfyUI is a SHARED, VRAM-heavy service (image gen, image edit, and video all
+# hit one container). It must free its ~20GB for other tools when the agent moves
+# on — but tearing it down after every single call cold-started the model on each
+# image and caused an unreachable-server timeout loop. So we debounce: keep it
+# warm across a burst of comfy ops, then reap it once none has run for a grace
+# period. Tune with AEON_COMFYUI_IDLE_S (seconds).
+_COMFY_IDLE_GRACE_S = float(os.environ.get("AEON_COMFYUI_IDLE_S", "90"))
+_reaper_lock = threading.Lock()
+_reaper_timer = None  # module-global debounced timer, re-armed on each op finish
+
 
 class ComfyUITool(BaseTool):
     """Base class for tools using ComfyUI to handle VRAM and registry management."""
@@ -81,13 +93,62 @@ class ComfyUITool(BaseTool):
             elif action == 'unregister':
                 if pid in state["pids"]:
                     state["pids"].remove(pid)
-            
+            elif action == 'reap_if_idle':
+                # Atomic under the registry lock: if NO comfy op is in flight
+                # (across every agent/tool), free the shared container's VRAM.
+                # Registering happens under this same lock, so a starting op
+                # either bumps the count before we check (we skip) or starts a
+                # fresh container after our teardown (clean) — no half-dead race.
+                if not state["pids"]:
+                    subprocess.run(["docker", "rm", "-f", "aeon_comfyui"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    state["gpu_id"] = None
+                    state["reaped"] = True
+                else:
+                    state["reaped"] = False
+
+            reaped = state.pop("reaped", False)
             with open(registry_path, 'w') as f:
                 json.dump(state, f)
-            
+
             count = len(state["pids"])
-            pass
+            if action == 'reap_if_idle':
+                return count, reaped
             return count, state.get("gpu_id")
+
+    def _finish_comfy_session(self):
+        """Call from a tool's `finally`: drop our in-flight slot + VRAM reservation,
+        then arm a debounced idle reaper. ComfyUI stays warm across rapid
+        sequential ops (generate -> edit -> video reuse one loaded server) but is
+        torn down — freeing its VRAM for other tools — once no comfy op has run for
+        _COMFY_IDLE_GRACE_S. Restores the original bring-up/tear-down VRAM sharing
+        without the per-call cold-start thrash. Session-exit cleanup (main.py's
+        _safe_cleanup) remains the backstop."""
+        try:
+            self._manage_registry('unregister')
+        finally:
+            release_vram()
+        global _reaper_timer
+        with _reaper_lock:
+            if _reaper_timer is not None:
+                _reaper_timer.cancel()
+            _reaper_timer = threading.Timer(_COMFY_IDLE_GRACE_S, self._reap_if_idle)
+            _reaper_timer.daemon = True
+            _reaper_timer.start()
+        print(f"{self.C_CYAN}Comfy op done. ComfyUI stays warm for "
+              f"{int(_COMFY_IDLE_GRACE_S)}s of idle, then its VRAM is released.{self.C_RESET}")
+
+    def _reap_if_idle(self):
+        """Debounced-timer callback: tear the shared ComfyUI container down iff no
+        comfy op is in flight. A new op that arrived during the grace window keeps
+        it alive (its finish re-arms this timer)."""
+        try:
+            _, reaped = self._manage_registry('reap_if_idle')
+            if reaped:
+                print(f"{self.C_CYAN}ComfyUI idle for {int(_COMFY_IDLE_GRACE_S)}s — "
+                      f"container reaped, VRAM released for other tools.{self.C_RESET}")
+        except Exception:
+            pass
 
     def _ensure_comfyui_running(self, required_vram: float = 20.0):
         """Ensures ComfyUI is healthy and running on a GPU with sufficient VRAM."""
@@ -308,16 +369,11 @@ class GenerateImageTool(ComfyUITool):
             return self.format_error_message(e, "generating image via ComfyUI", "checking if ComfyUI is running correctly")
         
         finally:
-            # Release our VRAM reservation and drop our registry slot, but LEAVE
-            # ComfyUI running. Tearing the container down here (as this once did)
-            # cold-started the ~20GB model on EVERY image — so sequential
-            # generations, and the agent's own health checks between them, kept
-            # hitting an unreachable server and timing out. The container is a
-            # persistent service now; it is reaped at session exit by
-            # _safe_cleanup() in main.py, which is multi-agent-safe.
-            self._manage_registry('unregister')
-            release_vram()
-            print(f"{self.C_CYAN}Image complete. ComfyUI left warm for the next request.{self.C_RESET}")
+            # Keep ComfyUI warm across a burst of ops, reap it once idle (see
+            # _finish_comfy_session). Fixes the per-call teardown that cold-started
+            # the ~20GB model on every image, while still freeing VRAM for other
+            # tools when image work stops.
+            self._finish_comfy_session()
 
 
 class EditImageTool(ComfyUITool):
@@ -442,10 +498,7 @@ class EditImageTool(ComfyUITool):
             return self.format_error_message(e, "editing image via ComfyUI", "checking if ComfyUI is running correctly")
         
         finally:
-            # Leave ComfyUI warm (see GenerateImageTool.finally): the per-call
-            # teardown cold-started the model on every edit and caused the same
-            # "server unreachable" timeout loop. Session-exit cleanup handles the
-            # container. Only release VRAM + drop our registry slot here.
-            self._manage_registry('unregister')
-            release_vram()
-            print(f"{self.C_CYAN}Image edit complete. ComfyUI left warm for the next request.{self.C_RESET}")
+            # Warm across bursts, reap when idle (see _finish_comfy_session): the
+            # per-call teardown cold-started the model on every edit and caused the
+            # same "server unreachable" timeout loop.
+            self._finish_comfy_session()

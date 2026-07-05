@@ -9,7 +9,6 @@ from typing import List, Optional, Dict, Any, Union
 import requests
 
 from aeon.tools.generate_image import ComfyUITool
-from aeon.core.gpu_queue import release_vram
 from aeon.core.prompt_enhancer import enhance_prompt
 from aeon.core.prompts import TOOL_DESC_GENERATE_VIDEO
 from aeon.core.paths import resolve_output_path
@@ -300,11 +299,10 @@ class GenerateVideoTool(ComfyUITool):
             if staged_video:
                 try: os.remove(os.path.join(_comfy_output_host(), os.path.basename(staged_video)))
                 except Exception: pass
+            # Keep the shared ComfyUI warm across a burst of comfy ops, reap it once
+            # idle (frees VRAM for other tools). Same debounced policy as image gen;
+            # the per-call teardown here cold-started the model on every video.
             try:
-                remaining, _ = self._manage_registry('unregister')
-                release_vram()
-                if remaining == 0:
-                    subprocess.run(["docker", "rm", "-f", "aeon_comfyui"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._finish_comfy_session()
             except Exception:
                 pass
