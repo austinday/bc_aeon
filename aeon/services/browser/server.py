@@ -386,6 +386,82 @@ _OVERLAY_JS = r"""
 
 _OVERLAY_CLEAR_JS = "() => { const o = document.getElementById('__aeon_som__'); if (o) o.remove(); }"
 
+# Form-validation scrape. When a Submit click does nothing, the reason is almost
+# always here: a required field is empty/unset or a field is flagged invalid, and
+# the message is small red text a weak vision model can't read. This returns that
+# state as TEXT so the agent knows exactly what to fix. Covers native HTML5
+# constraint validation, aria-invalid + its described error text, visible
+# alert/error nodes, and unselected <select>s (the birthday/gender dropdown case).
+_VALIDATION_JS = r"""
+() => {
+  const vis = (el) => {
+    const s = window.getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity||'1') === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width >= 1 && r.height >= 1;
+  };
+  const labelFor = (el) => {
+    let t = '';
+    if (el.labels && el.labels.length) t = el.labels[0].innerText;
+    t = t || el.getAttribute('aria-label') || el.getAttribute('placeholder')
+          || el.getAttribute('name') || el.id || el.getAttribute('role') || el.tagName.toLowerCase();
+    return (t || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  };
+  const invalid = [];
+  const seen = new Set();
+  const push = (label, reason) => {
+    const key = label + '|' + reason;
+    if (label && !seen.has(key)) { seen.add(key); invalid.push({ label, reason }); }
+  };
+  const controls = Array.from(document.querySelectorAll('input, select, textarea, [contenteditable=""], [contenteditable="true"]'));
+  for (const el of controls) {
+    if (!vis(el) || el.disabled || el.type === 'hidden') continue;
+    // Native HTML5 constraint validation (read-only; does not fire events).
+    if (typeof el.checkValidity === 'function' && el.validity && el.validity.valid === false) {
+      push(labelFor(el), el.validationMessage || 'invalid');
+      continue;
+    }
+    // Explicitly flagged invalid by the site's own (JS) validation.
+    if (el.getAttribute('aria-invalid') === 'true') {
+      let msg = 'flagged invalid';
+      const d = el.getAttribute('aria-describedby');
+      if (d) {
+        const parts = d.split(/\s+/).map(id => { const n = document.getElementById(id); return n ? n.innerText : ''; });
+        const txt = parts.join(' ').replace(/\s+/g, ' ').trim();
+        if (txt) msg = txt.slice(0, 120);
+      }
+      push(labelFor(el), msg);
+      continue;
+    }
+    // Unselected dropdown — the classic silent Submit-blocker (birthday/gender).
+    // Key on an empty VALUE (the placeholder option), so a select showing a real
+    // default (e.g. a country already chosen) is not falsely flagged.
+    if (el.tagName === 'SELECT' && el.value === '') {
+      push(labelFor(el), 'no option selected');
+      continue;
+    }
+    // Required-but-empty text field. Read text from the right place: a
+    // contenteditable holds its text in innerText, not .value.
+    const req = el.required || el.getAttribute('aria-required') === 'true';
+    const empty = el.isContentEditable
+      ? !((el.innerText || '').trim())
+      : !(el.value && String(el.value).trim());
+    if (req && empty) push(labelFor(el), 'required, empty');
+  }
+  // Visible alert/error banners (site-rendered validation messages).
+  const alerts = [];
+  const aseen = new Set();
+  const nodes = Array.from(document.querySelectorAll('[role=alert], [aria-live=assertive]'));
+  for (const n of nodes) {
+    if (!vis(n)) continue;
+    const t = (n.innerText || '').replace(/\s+/g, ' ').trim();
+    if (t && t.length <= 200 && !aseen.has(t)) { aseen.add(t); alerts.push(t); }
+    if (alerts.length >= 8) break;
+  }
+  return { invalid: invalid.slice(0, 20), alerts };
+}
+"""
+
 # Readability: pick the main-content root and return title + clean text. Used by
 # the read_text action for reading/extraction tasks (the structured snapshot only
 # surfaces interactive/semantic elements, not full article prose).
@@ -1048,9 +1124,42 @@ async def _build_response(page: Page, profile: str, session_id: str, tab_id: str
         "overlay_b64": base64.b64encode(overlay_bytes).decode() if overlay_bytes is not None else None,
         "elements": extracted["elements"],
         "page_state": extracted["page"],
+        "validation": await _scrape_validation(page),
         "events": events,
         "open_tabs": _tabs_for(profile, session_id) + _tabs_for(profile, "_popups"),
     }
+
+
+async def _scrape_validation(page: Page) -> Dict[str, Any]:
+    """Return {'invalid': [{label, reason}], 'alerts': [str]} describing why a form
+    won't submit — empty required fields, unselected dropdowns, flagged-invalid
+    inputs, and visible error banners. Best-effort across the main frame and any
+    same-origin iframes; never raises (a scrape failure must not break an action)."""
+    invalid, alerts, seen, aseen = [], [], set(), set()
+    # Bound work on ad/tracker-heavy pages: cross-origin frames throw fast (caught),
+    # but same-origin ones each run the script, so cap how many we scan.
+    for frame in page.frames[:12]:
+        try:
+            res = await frame.evaluate(_VALIDATION_JS)
+        except Exception:
+            continue
+        if not isinstance(res, dict):
+            continue
+        for item in (res.get("invalid") or []):
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label")
+            key = f"{label}|{item.get('reason')}"
+            if label and key not in seen:
+                seen.add(key)
+                invalid.append({"label": label, "reason": item.get("reason", "invalid")})
+        for a in (res.get("alerts") or []):
+            if isinstance(a, str) and a not in aseen:
+                aseen.add(a)
+                alerts.append(a)
+        if len(invalid) >= 20 and len(alerts) >= 8:
+            break
+    return {"invalid": invalid[:20], "alerts": alerts[:8]}
 
 
 # ============================================================================

@@ -8,6 +8,7 @@ import json
 import fcntl
 import io
 import shutil
+from datetime import datetime
 from PIL import Image
 from .base import BaseTool
 from ..core.prompts import (
@@ -23,6 +24,147 @@ BROWSER_API_URL = "http://localhost:8030"
 # can scroll to reveal more; function is primary but context still must survive.
 MAX_ELEMENT_LINES = 160
 MAX_ELEMENTS_CHARS = 14000
+
+# --- Ground-truth diagnostics -------------------------------------------------
+# The agent's own "PREVIOUS RESULT SUMMARY" is model narration and, on a weak
+# model, cannot be trusted to say what the page really was. This log records the
+# RAW browser facts per action — real URL, whether the URL actually changed, the
+# actual element list, and whether the screenshot was a valid frame or blank — so
+# a stuck run can be diagnosed from ground truth. Location is fixed and printed to
+# the terminal on first use so it's easy to find.
+BROWSER_DIAG_LOG = os.path.expanduser("~/.aeon/logs/browser_diag.log")
+_diag_last_url = {}       # (session, tab) -> last URL, to flag actions that didn't navigate
+_diag_run_started = False  # so we stamp a "NEW RUN" banner once per process
+
+
+def _format_validation(validation):
+    """Turn the server's validation scrape into a short, actionable block for the
+    agent — this is what tells a weak model WHY a Submit click did nothing (a
+    required field is empty / a dropdown is unset) instead of leaving it to read
+    small red error text off a screenshot. Returns '' when the form looks clean."""
+    if not validation:
+        return ""
+    invalid = validation.get("invalid") or []
+    alerts = validation.get("alerts") or []
+    if not invalid and not alerts:
+        return ""
+    lines = ["=== FORM VALIDATION (fix these before the form will submit) ==="]
+    for item in invalid[:20]:
+        lines.append(f"- {item.get('label', '?')}: {item.get('reason', 'invalid')}")
+    for a in alerts[:8]:
+        lines.append(f"- error message: {a}")
+    return "\n".join(lines)
+
+
+def _screenshot_health(clean_bytes):
+    """Return (summary, is_blank). Tells whether the model was actually SEEING the
+    page or being handed a blank/degraded frame — the difference between "the site
+    blocked us" and "our vision pipeline was broken and the model confabulated"."""
+    if not clean_bytes:
+        return "MISSING (no screenshot bytes in response)", True
+    size = len(clean_bytes)
+    try:
+        img = Image.open(io.BytesIO(clean_bytes)).convert("L")
+        w, h = img.size
+        px = list(img.resize((32, 32)).getdata())
+        mean = sum(px) / len(px)
+        std = (sum((p - mean) ** 2 for p in px) / len(px)) ** 0.5
+        is_blank = std < 4.0
+        flag = "  <-- LIKELY BLANK/UNIFORM (model was flying blind)" if is_blank else ""
+        return f"bytes={size} dims={w}x{h} mean_lum={mean:.0f} pixel_std={std:.1f}{flag}", is_blank
+    except Exception as e:
+        tiny = size < 3000
+        note = "  <-- suspiciously small (possibly blank)" if tiny else ""
+        return f"bytes={size} (decode failed: {e}){note}", tiny
+
+
+def _compact_elements(elements, limit=80):
+    """One line per element: [id] role 'name' (states) — enough to see what the
+    agent was actually clicking (e.g. whether [7] was really a 'Continue' button)."""
+    if not elements:
+        return "   (none detected)"
+    lines = []
+    for e in elements[:limit]:
+        name = (e.get("name") or e.get("value") or "").replace("\n", " ").strip()
+        if len(name) > 70:
+            name = name[:70] + "…"
+        states = e.get("states") or []
+        st = f" ({', '.join(states)})" if states else ""
+        vp = "" if e.get("inViewport") else " [off-screen]"
+        lines.append(f"   [{e.get('id')}] {e.get('role', '?')} '{name}'{st}{vp}")
+    extra = len(elements) - limit
+    if extra > 0:
+        lines.append(f"   … (+{extra} more)")
+    return "\n".join(lines)
+
+
+def _log_browser_diag(data, action_desc, session_id, tab_id, clean_bytes=None):
+    """Append a raw, model-independent record of one browser action to
+    BROWSER_DIAG_LOG, and print a one-line summary to the terminal. Best-effort:
+    diagnostics must never break the browser tool."""
+    global _diag_run_started
+    try:
+        status = data.get("status", "ok")
+        if status == "error":
+            body = f"status    : ERROR — {data.get('msg')}"
+            term = f"[browser-diag] {action_desc}: ERROR — {str(data.get('msg'))[:120]}"
+        else:
+            url = data.get("url", "Unknown")
+            key = (session_id, tab_id)
+            prev = _diag_last_url.get(key)
+            if prev is None:
+                changed = "first observation"
+            elif prev == url:
+                changed = "UNCHANGED from previous call  <-- this action did NOT navigate"
+            else:
+                changed = "changed"
+            _diag_last_url[key] = url
+            els = data.get("elements") or []
+            if clean_bytes is None and data.get("clean_b64"):
+                try:
+                    clean_bytes = base64.b64decode(data["clean_b64"])
+                except Exception:
+                    clean_bytes = None
+            shot, is_blank = _screenshot_health(clean_bytes)
+            events = data.get("events") or []
+            ev = "\n".join(f"   - {e}" for e in events) if events else "   (none)"
+            validation = data.get("validation") or {}
+            vinvalid = validation.get("invalid") or []
+            valerts = validation.get("alerts") or []
+            if vinvalid or valerts:
+                vlines = [f"   - {i.get('label', '?')}: {i.get('reason', 'invalid')}" for i in vinvalid]
+                vlines += [f"   - error: {a}" for a in valerts]
+                vstr = "\n".join(vlines)
+            else:
+                vstr = "   (form looks valid / none)"
+            body = (
+                f"status    : {status}\n"
+                f"URL       : {url}  ({changed})\n"
+                f"title     : {data.get('title', '')}\n"
+                f"screenshot: {shot}\n"
+                f"validation:\n{vstr}\n"
+                f"events    :\n{ev}\n"
+                f"elements  ({len(els)} total):\n{_compact_elements(els)}"
+            )
+            url_flag = "URL UNCHANGED" if (prev is not None and prev == url) else "url ok"
+            shot_flag = "SCREENSHOT BLANK" if is_blank else "screenshot ok"
+            vflag = f" | {len(vinvalid)} VALIDATION ISSUE(S)" if (vinvalid or valerts) else ""
+            term = f"[browser-diag] {action_desc}: {url_flag} | {shot_flag} | {len(els)} elements{vflag}"
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        header = f"\n{'=' * 26} BROWSER DIAG {ts} {'=' * 26}\n"
+        entry = header + f"action    : {action_desc}\ntab       : {tab_id}\n" + body + "\n"
+
+        os.makedirs(os.path.dirname(BROWSER_DIAG_LOG), exist_ok=True)
+        if not _diag_run_started:
+            entry = f"\n\n{'#' * 20} NEW AEON RUN @ {ts} {'#' * 20}\n" + entry
+            _diag_run_started = True
+            print(f"[browser-diag] logging raw browser facts to: {BROWSER_DIAG_LOG}")
+        with open(BROWSER_DIAG_LOG, "a", encoding="utf-8") as f:
+            f.write(entry)
+        print(term)
+    except Exception:
+        pass  # never let diagnostics break a browser action
 
 
 def _print_image_to_terminal(image_bytes, target_width=80):
@@ -268,10 +410,12 @@ def process_browser_response(data, action_desc, session_id, tab_id,
                              include_vision=True, visual="overlay", worker=None,
                              compare=False):
     if data.get("status") == "error":
+        _log_browser_diag(data, action_desc, session_id, tab_id)
         return f"Browser Error during {action_desc}: {data.get('msg')}"
 
     # Plain-text results (get_text / read_text) have no screenshot payload.
     if "clean_b64" not in data and "text" in data:
+        _log_browser_diag(data, action_desc, session_id, tab_id)
         return f"--- {action_desc} ---\nExtracted text:\n{data['text'][:8000]}"
 
     output_dir = os.path.expanduser(f"~/.aeon/temp/browser_output_{session_id}_{tab_id}")
@@ -294,6 +438,9 @@ def process_browser_response(data, action_desc, session_id, tab_id,
     clean_bytes = base64.b64decode(data["clean_b64"])
     with open(clean_path, "wb") as f:
         f.write(clean_bytes)
+    # Ground-truth diagnostics from the raw response (real URL, URL-change, element
+    # list, screenshot health) — independent of the model's later summary.
+    _log_browser_diag(data, action_desc, session_id, tab_id, clean_bytes=clean_bytes)
     have_overlay = bool(data.get("overlay_b64"))
     if have_overlay:
         with open(overlay_path, "wb") as f:
@@ -363,13 +510,16 @@ def process_browser_response(data, action_desc, session_id, tab_id,
     events_str = ("\n=== EVENTS ===\n" + "\n".join(f"- {e}" for e in events) + "\n") if events else ""
 
     shots = f"clean={clean_path}" + (f" | numbered={overlay_path}" if have_overlay else "")
+    validation_str = _format_validation(data.get("validation"))
+    validation_block = f"\n{validation_str}\n" if validation_str else ""
     return (
         f"--- BROWSER: {action_desc} (tab '{tab_id}') ---\n"
         f"URL: {page_url}\n"
         f"Title: {page_title}\n"
         f"Open tabs: [{open_tabs_str}]\n"
         f"{scroll_str}\n"
-        f"{events_str}\n"
+        f"{events_str}"
+        f"{validation_block}\n"
         f"=== INTERACTIVE ELEMENTS (act on these by [id]) ===\n"
         f"{elements_str}\n\n"
         f"=== PAGE VIEW ===\n{vision_note}\n"
