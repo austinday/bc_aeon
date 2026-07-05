@@ -52,6 +52,14 @@ OBSERVATION_TOOLS = {
 # task. A turn whose every action is passive means the principal did no real work.
 PASSIVE_TOOLS = OBSERVATION_TOOLS | {"think", "say_to_user"}
 
+# Tools that observe or reflect but do NOT change task/world state. The loop guard
+# fingerprints only the CONSEQUENTIAL (non-passive) actions of a turn, so a model
+# cannot launder a repeated dead action by padding the turn with a think() or a
+# read() — which is exactly what the STUCK directive tells it to do, and exactly
+# how a real run slipped the guard (thought it was clicking a button forever).
+# browser_read is included: re-reading the page is inspection, not progress.
+NON_CONSEQUENTIAL_TOOLS = PASSIVE_TOOLS | {"browser_read"}
+
 
 class Worker:
     def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False, debug_log_path: Optional[str] = None):
@@ -91,7 +99,8 @@ class Worker:
         self._consecutive_passive_turns = 0  # Run of turns doing only observation/think/say (idle-babysitting detector)
         self.open_files_access_order = []  # Tracks order of file access for LRU suggestions
         self.recent_intents = deque(maxlen=3)  # Tracks recent intents for loop detection
-        self._loop_blocked_fingerprint = None  # Normalized command under a hard loop block (refused until it changes)
+        self._loop_blocked_fingerprint = None  # Consequential command under a hard loop block (refused until it changes)
+        self._loop_block_hits = 0  # How many turns in a row the block has refused the same action (escalation)
         self._stuck_banner = ""  # Top-of-prompt STUCK banner, set by loop/oscillation detection
         self.prev_prompt_tokens = 0  # Tracks context size of previous iteration for growth metrics
         self.action_log_summary = ""  # Non-destructive summary of older action log entries
@@ -614,6 +623,25 @@ class Worker:
         commands compare equal (whitespace only — commands are case-sensitive)."""
         return re.sub(r"\s+", " ", (text or "")).strip()
 
+    def _consequential_fp(self, actions) -> str:
+        """Fingerprint only the state-changing actions of a turn, dropping passive
+        tools (think / read / observe). This is what the loop guard keys on, so
+        `think + click(X)` and a bare `click(X)` share one fingerprint — padding a
+        repeated dead action with a think() no longer disarms the block or resets
+        the repeat streak. Returns "" for a turn that did nothing consequential
+        (pure think/read), which the guard treats as transparent (neither a repeat
+        nor a reset)."""
+        parts = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            t = (a.get("tool_name") or a.get("tool") or "").strip()
+            if not t or t in NON_CONSEQUENTIAL_TOOLS:
+                continue
+            p = a.get("parameters") or a.get("args") or {}
+            parts.append(f"{t}({p})" if p else f"{t}()")
+        return self._normalize_cmd("|".join(parts))
+
     @staticmethod
     def _normalize_output(text: str) -> str:
         """Normalize command output for loop comparison by stripping volatile
@@ -734,6 +762,7 @@ class Worker:
         self._recent_commands.clear()
         self._recent_outputs.clear()
         self._loop_blocked_fingerprint = None
+        self._loop_block_hits = 0
         self._stuck_banner = ""
         self.recent_intents.clear()
         self.expanded_categories.clear()
@@ -1505,7 +1534,6 @@ class Worker:
 
                 combined_summary_parts = []
                 actions_taken_str = []
-                full_actions_taken_str = []
                 turn_tool_names = []  # Resolved tool names actually run this turn (for loop/idle classification)
                 user_input_handled = False
                 completion_blocked = False
@@ -1532,34 +1560,57 @@ class Worker:
 
                 # --- HARD LOOP BLOCK (enforcement) ---
                 # The previous turn tripped the 3x repeat guard and armed a block on
-                # this exact command. A prose warning is not enough for a weak model,
-                # so we make the no-op impossible: if the proposed command is the
-                # byte-equivalent of the looping one, refuse to run it and force a
-                # different move. Any genuinely different command disarms the block.
+                # this exact consequential action. A prose warning is not enough for a
+                # weak model, so we make the no-op impossible: if the proposed turn's
+                # CONSEQUENTIAL fingerprint matches the looping one, refuse to run it
+                # and force a different move. Crucially we key on the consequential
+                # fingerprint (passive think/read stripped), so padding the turn with
+                # a think() can't launder the same dead action past the block.
                 if self._loop_blocked_fingerprint:
-                    proposed_fp = self._normalize_cmd("|".join(
-                        (f"{(a.get('tool_name') or '').strip()}({a.get('parameters', {})})"
-                         if a.get('parameters') else f"{(a.get('tool_name') or '').strip()}()")
-                        for a in actions))
+                    proposed_fp = self._consequential_fp(actions)
                     if proposed_fp and proposed_fp == self._loop_blocked_fingerprint:
-                        block_msg = (
-                            "** COMMAND BLOCKED (loop guard): this is the SAME command that just produced no "
-                            "change 3+ times, so it was NOT executed — running it again cannot help. **\n"
-                            "You MUST do something DIFFERENT this turn:\n"
-                            "- Use `think` to write the exact error, three candidate root causes, and pick one.\n"
-                            "- Then change the command, its inputs, or the approach — or switch to a different sub-task.\n"
-                            "Re-issuing the identical command will keep being blocked."
-                        )
+                        self._loop_block_hits += 1
+                        if self._loop_block_hits >= 3:
+                            # Repeatedly hammering the same dead action: escalate from
+                            # "try something different" to "this path is confirmed dead;
+                            # switch categorically or surface the blocker."
+                            block_msg = (
+                                f"** COMMAND BLOCKED (loop guard, {self._loop_block_hits}x) — CONFIRMED DEAD END. **\n"
+                                "This exact action has now been refused repeatedly; it does NOT work and will "
+                                "never work. STOP trying variations of it (re-clicking the same element, "
+                                "re-running the same command).\n"
+                                "This turn you MUST do ONE of:\n"
+                                "- Act on a DIFFERENT element / URL / target, or\n"
+                                "- Execute your stated FALLBACK plan (a different method entirely), or\n"
+                                "- If no path forward exists, call task_complete and report the blocker plainly.\n"
+                                "Do NOT re-issue the blocked action; it will keep being refused."
+                            )
+                        else:
+                            block_msg = (
+                                "** COMMAND BLOCKED (loop guard): this is the SAME action that just produced no "
+                                "change 3+ times, so it was NOT executed — running it again cannot help. **\n"
+                                "You MUST do something DIFFERENT this turn:\n"
+                                "- Use `think` (in a separate turn) to write the exact failure, three candidate "
+                                "root causes, and pick one.\n"
+                                "- Then act on a DIFFERENT element/target, change the approach, or switch sub-task.\n"
+                                "Padding this action with a think() will NOT get it past the block — the action "
+                                "itself must change."
+                            )
                         self.print_func(f"{C_RED}{block_msg}{C_RESET}")
                         self.last_observation = block_msg
                         self.action_log.append(
                             f"[Iter {iteration}]\n- Intent: {intent}\n- Actions: {', '.join(queued)}\n"
-                            f"- Result: BLOCKED by loop guard (identical command repeated 3+x; not executed).")
+                            f"- Result: BLOCKED by loop guard ({self._loop_block_hits}x; same consequential "
+                            f"action, not executed).")
                         self._persist_session_state()
                         continue
-                    # A different command was proposed -> loop broken; disarm.
-                    self._loop_blocked_fingerprint = None
-                    self._stuck_banner = ""
+                    if proposed_fp:
+                        # A genuinely DIFFERENT consequential action -> loop broken; disarm.
+                        self._loop_blocked_fingerprint = None
+                        self._loop_block_hits = 0
+                        self._stuck_banner = ""
+                    # else: a pure think/read turn -> leave the block armed (thinking is
+                    # allowed and encouraged) but do not disarm on padding alone.
 
                 for idx, action_data in enumerate(actions):
                     tool_name = action_data.get("tool_name")
@@ -1591,10 +1642,8 @@ class Worker:
                     if tool_name in SUB_AGENT_TOOLS:
                         self._last_sub_agent_action_iter = iteration
 
-                    full_action_desc = f"{tool_name}({params})" if params else f"{tool_name}()"
                     display_action_desc = f"{tool_name}({str(params)[:40]}...)" if params else f"{tool_name}()"
                     actions_taken_str.append(display_action_desc)
-                    full_actions_taken_str.append(full_action_desc)
                     turn_tool_names.append(tool_name)
 
                     # Per-action marker so each tool's streamed output sits under its own header.
@@ -1749,109 +1798,117 @@ class Worker:
                 # students (or background jobs) from being falsely flagged STUCK.
                 if not observation_only:
                     # --- LOOP / REPEAT DETECTION ---
-                    # Fingerprint the command (whitespace-normalized) and a
-                    # noise-normalized view of its output. Keying on raw byte-identity
-                    # was too brittle: a timestamp, elapsed time, pid, counter or ANSI
-                    # code made "the same result" compare unequal, so real loops never
-                    # tripped. We compare on the normalized command, with the output
-                    # only used to phrase the warning — re-running the identical
-                    # command is itself the smell, regardless of output churn.
-                    norm_cmd = self._normalize_cmd("|".join(full_actions_taken_str))
-                    norm_out = self._normalize_output(raw_output)
-                    self._recent_commands.append(norm_cmd)
-                    self._recent_outputs.append(norm_out)
-                    if len(self._recent_commands) > self.MAX_REPEAT_WINDOW:
-                        self._recent_commands.pop(0)
-                        self._recent_outputs.pop(0)
+                    # Fingerprint only the CONSEQUENTIAL (state-changing) actions of the
+                    # turn plus a noise-normalized view of output. Two reasons this is
+                    # narrow: (1) keying on raw byte-identity was too brittle — a
+                    # timestamp/pid/counter/ANSI code made "the same result" compare
+                    # unequal, so real loops never tripped; (2) keying on the WHOLE turn
+                    # let a model launder a repeated dead action by padding it with a
+                    # think()/read() (which the STUCK directive literally tells it to do),
+                    # resetting the streak and disarming the block. A pure think/read turn
+                    # has an empty consequential fingerprint and is transparent here: it
+                    # neither counts as a repeat nor resets an in-progress streak.
+                    norm_cmd = self._consequential_fp(actions)
+                    if norm_cmd:
+                        norm_out = self._normalize_output(raw_output)
+                        self._recent_commands.append(norm_cmd)
+                        self._recent_outputs.append(norm_out)
+                        if len(self._recent_commands) > self.MAX_REPEAT_WINDOW:
+                            self._recent_commands.pop(0)
+                            self._recent_outputs.pop(0)
 
-                    # Consecutive run of the identical command (output may vary), and
-                    # of the identical command+output pair, counted back from this turn.
-                    cmd_streak = 0
-                    for c in reversed(self._recent_commands):
-                        if norm_cmd and c == norm_cmd:
-                            cmd_streak += 1
-                        else:
-                            break
-                    pair_streak = 0
-                    for c, o in zip(reversed(self._recent_commands), reversed(self._recent_outputs)):
-                        if norm_cmd and c == norm_cmd and o == norm_out:
-                            pair_streak += 1
-                        else:
-                            break
+                        # Consecutive run of the identical action (output may vary), and
+                        # of the identical action+output pair, counted back from this turn.
+                        cmd_streak = 0
+                        for c in reversed(self._recent_commands):
+                            if c == norm_cmd:
+                                cmd_streak += 1
+                            else:
+                                break
+                        pair_streak = 0
+                        for c, o in zip(reversed(self._recent_commands), reversed(self._recent_outputs)):
+                            if c == norm_cmd and o == norm_out:
+                                pair_streak += 1
+                            else:
+                                break
 
-                    if norm_cmd and cmd_streak >= self.REPEAT_THRESHOLD:
-                        loop_detected = True
-                        repeat_count = cmd_streak
-                        out_phrase = ("identical output each time" if pair_streak >= cmd_streak
-                                      else "no meaningful change in output")
-                        # Graduated: the first repeat (2x) gets a measured nudge — a
-                        # command can legitimately repeat once (e.g. a re-run after an
-                        # unrelated edit). Escalate to the hard STUCK protocol AND arm
-                        # an execution block only at 3x+, where it really is spinning.
-                        if repeat_count <= 2:
-                            loop_warning = (
-                                f"\n\n** REPEAT NOTICE: you ran the same command(s) twice with {out_phrase} — "
-                                f"no real change. Before repeating again, confirm a repeat will actually do "
-                                f"something different; if not, change the input, the approach, or the sub-task. **"
-                            )
-                            warn_color = C_YELLOW
-                        else:
-                            # Publish the loop so that, IF this worker is a sub-agent, its
-                            # principal sees a LOOPING flag in the digest (a fast loop keeps
-                            # the heartbeat fresh, so it would otherwise look healthy).
-                            self.stuck_reason = (f"self-reported loop: ran the same command(s) {repeat_count}x "
-                                                 f"with {out_phrase}.")
-                            # Arm a HARD block: next turn the byte-equivalent command is
-                            # refused outright (a weak model ignores prose nudges), and
-                            # raise a top-of-prompt banner it cannot miss.
-                            self._loop_blocked_fingerprint = norm_cmd
-                            self._stuck_banner = (
-                                "===[ ! STUCK — READ THIS FIRST ]===\n"
-                                f"You have run the SAME command {repeat_count}x in a row with {out_phrase}. "
-                                "Repeating it is now BLOCKED and will not execute. Do NOT try it again.\n"
-                                "This turn: use `think` to diagnose the failure, then change the command, its "
-                                "inputs, or the approach — or switch to a different sub-task.\n"
-                                "===[ END STUCK ]==="
-                            )
-                            loop_warning = (
-                                f"\n\n** LOOP DETECTED: You have run the SAME command(s) {repeat_count} times in a row "
-                                f"with {out_phrase}. The situation is NOT changing. **\n"
-                                f"You MUST do something DIFFERENT now. You are STUCK.\n"
-                                f"- Repeating this command is now BLOCKED — it will be refused, not executed.\n"
-                                f"- Use the `think` tool on your next turn to state the exact error, list three "
-                                f"possible root causes, and select the most likely one.\n"
-                                f"- Then change the command, its inputs, or the approach — or switch sub-tasks."
-                            )
-                            warn_color = C_RED
-                        self.last_observation += loop_warning
-                        self.print_func(f"{warn_color}{loop_warning}{C_RESET}")
-
-                    # --- OSCILLATION (2-CYCLE) DETECTION ---
-                    # The check above only catches CONSECUTIVE identical turns. An agent
-                    # ping-ponging between two states (A,B,A,B) — e.g. toggling a setting
-                    # back and forth — never has two identical turns in a row, so it
-                    # slips through. Detect a repeated 2-cycle over the last 4 turns.
-                    if not loop_detected and len(self._recent_commands) >= 4:
-                        pairs = list(zip(self._recent_commands[-4:], self._recent_outputs[-4:]))
-                        a, b, c, d = pairs
-                        if a == c and b == d and a != b:
+                        if cmd_streak >= self.REPEAT_THRESHOLD:
                             loop_detected = True
-                            self.stuck_reason = ("self-reported oscillation: alternating between two "
-                                                 "states (A,B,A,B) with no net progress.")
-                            self._stuck_banner = (
-                                "===[ ! STUCK — READ THIS FIRST ]===\n"
-                                "You are alternating between TWO actions (A,B,A,B) and making no net progress. "
-                                "Break the cycle: use `think`, then choose a THIRD, different approach.\n"
-                                "===[ END STUCK ]==="
-                            )
-                            osc_warning = (
-                                "\n\n** OSCILLATION DETECTED: You are alternating between TWO actions/states "
-                                "(A, B, A, B) and making no net progress — each undoes or ignores the other. **\n"
-                                "Stop the back-and-forth. Use the `think` tool to identify why these two steps "
-                                "conflict, then choose a THIRD, different approach that breaks the cycle."
-                            )
-                            self.last_observation += osc_warning
-                            self.print_func(f"{C_RED}{osc_warning}{C_RESET}")
+                            repeat_count = cmd_streak
+                            out_phrase = ("identical output each time" if pair_streak >= cmd_streak
+                                          else "no meaningful change in output")
+                            # Graduated: the first repeat (2x) gets a measured nudge — an
+                            # action can legitimately repeat once (e.g. a re-run after an
+                            # unrelated edit). Escalate to the hard STUCK protocol AND arm
+                            # an execution block only at 3x+, where it really is spinning.
+                            if repeat_count <= 2:
+                                loop_warning = (
+                                    f"\n\n** REPEAT NOTICE: you ran the same action(s) twice with {out_phrase} — "
+                                    f"no real change. Before repeating again, confirm a repeat will actually do "
+                                    f"something different; if not, change the input, the approach, or the sub-task. **"
+                                )
+                                warn_color = C_YELLOW
+                            else:
+                                # Publish the loop so that, IF this worker is a sub-agent, its
+                                # principal sees a LOOPING flag in the digest (a fast loop keeps
+                                # the heartbeat fresh, so it would otherwise look healthy).
+                                self.stuck_reason = (f"self-reported loop: ran the same action(s) {repeat_count}x "
+                                                     f"with {out_phrase}.")
+                                # Arm a HARD block on the consequential fingerprint: next turn
+                                # this action is refused outright (a weak model ignores prose
+                                # nudges) even if padded with a think(); raise a top-of-prompt
+                                # banner it cannot miss. Reset the escalation counter.
+                                self._loop_blocked_fingerprint = norm_cmd
+                                self._loop_block_hits = 0
+                                self._stuck_banner = (
+                                    "===[ ! STUCK — READ THIS FIRST ]===\n"
+                                    f"You have run the SAME action {repeat_count}x in a row with {out_phrase}. "
+                                    "Repeating it is now BLOCKED and will not execute — padding it with a think() "
+                                    "will NOT get it past the block. Do NOT try it again.\n"
+                                    "This turn: use `think` to diagnose the failure, then act on a DIFFERENT "
+                                    "target, change the approach, or switch to a different sub-task.\n"
+                                    "===[ END STUCK ]==="
+                                )
+                                loop_warning = (
+                                    f"\n\n** LOOP DETECTED: You have run the SAME action(s) {repeat_count} times in a row "
+                                    f"with {out_phrase}. The situation is NOT changing. **\n"
+                                    f"You MUST do something DIFFERENT now. You are STUCK.\n"
+                                    f"- Repeating this action is now BLOCKED — it will be refused, not executed, and "
+                                    f"padding it with a think() will not help.\n"
+                                    f"- Use the `think` tool to state the exact error, list three possible root "
+                                    f"causes, and select the most likely one.\n"
+                                    f"- Then act on a DIFFERENT target, change the approach, or switch sub-tasks."
+                                )
+                                warn_color = C_RED
+                            self.last_observation += loop_warning
+                            self.print_func(f"{warn_color}{loop_warning}{C_RESET}")
+
+                        # --- OSCILLATION (2-CYCLE) DETECTION ---
+                        # The check above only catches CONSECUTIVE identical turns. An agent
+                        # ping-ponging between two states (A,B,A,B) — e.g. toggling a setting
+                        # back and forth — never has two identical turns in a row, so it
+                        # slips through. Detect a repeated 2-cycle over the last 4 turns.
+                        if not loop_detected and len(self._recent_commands) >= 4:
+                            pairs = list(zip(self._recent_commands[-4:], self._recent_outputs[-4:]))
+                            a, b, c, d = pairs
+                            if a == c and b == d and a != b:
+                                loop_detected = True
+                                self.stuck_reason = ("self-reported oscillation: alternating between two "
+                                                     "states (A,B,A,B) with no net progress.")
+                                self._stuck_banner = (
+                                    "===[ ! STUCK — READ THIS FIRST ]===\n"
+                                    "You are alternating between TWO actions (A,B,A,B) and making no net progress. "
+                                    "Break the cycle: use `think`, then choose a THIRD, different approach.\n"
+                                    "===[ END STUCK ]==="
+                                )
+                                osc_warning = (
+                                    "\n\n** OSCILLATION DETECTED: You are alternating between TWO actions/states "
+                                    "(A, B, A, B) and making no net progress — each undoes or ignores the other. **\n"
+                                    "Stop the back-and-forth. Use the `think` tool to identify why these two steps "
+                                    "conflict, then choose a THIRD, different approach that breaks the cycle."
+                                )
+                                self.last_observation += osc_warning
+                                self.print_func(f"{C_RED}{osc_warning}{C_RESET}")
 
                     # --- INTENT-LEVEL STALL DETECTION ---
                     # Catches spinning on the same GOAL across turns even when the exact
@@ -1876,10 +1933,12 @@ class Worker:
                             self.last_observation += stall_note
                             self.print_func(f"{C_YELLOW}{stall_note}{C_RESET}")
 
-                    if not loop_detected:
-                        # Progress was made (command/output changed) -> clear any prior
-                        # loop flag and stuck banner so a recovered agent stops showing
-                        # as LOOPING / STUCK.
+                    if norm_cmd and not loop_detected:
+                        # A CONSEQUENTIAL action ran and it was not a loop -> real
+                        # progress; clear any prior loop flag and stuck banner so a
+                        # recovered agent stops showing as LOOPING / STUCK. A pure
+                        # think/read turn (empty norm_cmd) does NOT clear it — thinking
+                        # about being stuck is not the same as getting unstuck.
                         self.stuck_reason = None
                         self._stuck_banner = ""
 
