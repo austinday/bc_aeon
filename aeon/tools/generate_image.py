@@ -150,56 +150,121 @@ class ComfyUITool(BaseTool):
         except Exception:
             pass
 
-    def _ensure_comfyui_running(self, required_vram: float = 20.0):
-        """Ensures ComfyUI is healthy and running on a GPU with sufficient VRAM."""
-        # 1. Determine which GPU ComfyUI is currently using
-        _, current_gpu = self._manage_registry('get_info') if hasattr(self, '_manage_registry') else (None, None)
-        # Note: _manage_registry('get_info') is a conceptual addition, let's use the existing logic
-        # Since _manage_registry returns (count, gpu_id) on 'register' and 'unregister', 
-        # we can just call it with a dummy action or modify it. 
-        # For now, let's just call it with 'register' to get the current state.
-        
-        # To avoid double-registering in this call, we'll just peek at the registry.
+    def _registry_gpu(self):
+        """Peek the GPU the shared ComfyUI was last started on (or None)."""
         import fcntl
-        registry_path = "/tmp/aeon_comfyui_registry.json"
-        lock_path = "/tmp/aeon_comfyui_registry.lock"
-        current_gpu = None
         try:
-            with open(lock_path, 'w') as lock_fd:
+            with open("/tmp/aeon_comfyui_registry.lock", 'w') as lock_fd:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                if os.path.exists(registry_path):
-                    with open(registry_path, 'r') as f:
-                        current_gpu = json.load(f).get("gpu_id")
-        except: pass
+                if os.path.exists("/tmp/aeon_comfyui_registry.json"):
+                    with open("/tmp/aeon_comfyui_registry.json") as f:
+                        return json.load(f).get("gpu_id")
+        except Exception:
+            pass
+        return None
 
-        # 2. Reserve VRAM. If server is already on a GPU, we MUST wait for that specific GPU.
-        print(f"{self.C_CYAN}Reserving {required_vram}GB VRAM (Target GPU: {current_gpu if current_gpu is not None else 'Any'})...{self.C_RESET}")
-        allocated_gpu = wait_for_vram(required_vram, gpu_id=current_gpu)
-        print(f"{self.C_CYAN}VRAM reserved on GPU {allocated_gpu}.{self.C_RESET}")
+    def _ensure_comfyui_running(self, required_vram: float = 20.0):
+        """Ensure the SHARED ComfyUI is up, safely under concurrent agents.
 
-        # 3. Check if server is healthy AND on the correct GPU
-        if self._check_comfyui_health() and allocated_gpu == current_gpu:
+        Concurrency rules that keep multiple agents from crashing each other:
+          - If it's already healthy, USE IT AS-IS. Never restart a running server
+            (that would kill other agents' in-flight jobs) and never reserve VRAM
+            again (its memory is already accounted for by the live container).
+          - If it needs starting, do so under a cross-process START lock so only
+            ONE agent runs start_comfyui.sh; the rest block, then find it healthy.
+        """
+        # Fast path: warm and healthy -> reuse, no reservation, no restart.
+        if self._check_comfyui_health():
             return True
 
-        # 4. If not healthy or on wrong GPU, restart it on the allocated GPU
-        print(f"{self.C_CYAN}Starting/Restarting ComfyUI on GPU {allocated_gpu}...{self.C_RESET}")
-        self._manage_registry('register', gpu_id=allocated_gpu)
-        
-        script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "start_comfyui.sh"))
-        env = os.environ.copy()
-        env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
-        env["COMFYUI_GPU"] = str(allocated_gpu)
-        res = subprocess.run(["bash", script_path], capture_output=True, text=True, env=env)
-        if res.returncode != 0:
-            raise RuntimeError(f"Error starting ComfyUI: {res.stderr}")
-        
-        print(f"{self.C_CYAN}Waiting for ComfyUI to become healthy...{self.C_RESET}")
-        for _ in range(60):
+        import fcntl
+        with open("/tmp/aeon_comfyui_start.lock", 'w') as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)  # serialize starts across all agents
+            # Someone may have started it while we waited for the lock.
             if self._check_comfyui_health():
                 return True
+
+            # Reserve VRAM only now, for the actual model load. Prefer the GPU the
+            # server last used; else any GPU with room. wait_for_vram blocks (with
+            # its own timeout) if the GPU is full -> callers wait in line, not crash.
+            current_gpu = self._registry_gpu()
+            print(f"{self.C_CYAN}Reserving {required_vram}GB VRAM for ComfyUI "
+                  f"(target GPU: {current_gpu if current_gpu is not None else 'any'})...{self.C_RESET}")
+            allocated_gpu = wait_for_vram(required_vram, gpu_id=current_gpu)
+            self._manage_registry('register', gpu_id=allocated_gpu)
+
+            print(f"{self.C_CYAN}Starting ComfyUI on GPU {allocated_gpu}...{self.C_RESET}")
+            script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "start_comfyui.sh"))
+            env = os.environ.copy()
+            env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
+            env["COMFYUI_GPU"] = str(allocated_gpu)
+            res = subprocess.run(["bash", script_path], capture_output=True, text=True, env=env)
+            if res.returncode != 0:
+                raise RuntimeError(f"Error starting ComfyUI: {res.stderr}")
+
+            print(f"{self.C_CYAN}Waiting for ComfyUI to become healthy...{self.C_RESET}")
+            for _ in range(90):  # up to ~180s for a cold container + first boot
+                if self._check_comfyui_health():
+                    return True
+                time.sleep(2)
+            raise RuntimeError("Error: ComfyUI failed to become healthy after starting.")
+
+    def _prompt_in_queue(self, prompt_id: str) -> bool:
+        """Is our prompt still running or pending in ComfyUI's queue? Used to tell
+        'legitimately waiting behind another agent's job' from 'lost'. On a
+        transient error we assume still-queued (patience over a false failure)."""
+        try:
+            q = requests.get(f"{self.comfy_url}/queue", timeout=10).json()
+        except requests.RequestException:
+            return True
+        for key in ("queue_running", "queue_pending"):
+            for item in q.get(key, []) or []:
+                if isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == prompt_id:
+                    return True
+        return False
+
+    def _await_comfy(self, prompt_id: str, node: str = "9", hard_timeout: int = 1800):
+        """Wait for a submitted prompt's SaveImage output, tolerating time spent
+        QUEUED behind other agents' jobs so concurrent callers don't false-timeout
+        waiting their turn. Returns the node's output dict; raises on real failure
+        or the (generous) hard cap. `hard_timeout` counts wall time, but a job that
+        is still visibly in the queue never trips the 'lost' check."""
+        start = time.time()
+        missing = 0
+        while time.time() - start < hard_timeout:
+            try:
+                hist = requests.get(f"{self.comfy_url}/history/{prompt_id}", timeout=10).json()
+            except requests.RequestException:
+                time.sleep(2)
+                continue
+            if prompt_id in hist:
+                outputs = hist[prompt_id].get("outputs", {})
+                if node in outputs:
+                    return outputs[node]
+                status = hist[prompt_id].get("status", {})
+                raise RuntimeError(f"ComfyUI finished but produced no image (status={status}).")
+            # Not done. Still queued/running = we are legitimately waiting our turn.
+            if self._prompt_in_queue(prompt_id):
+                missing = 0
+            else:
+                missing += 1
+                if missing >= 5:  # ~10s absent from BOTH history and queue -> dropped
+                    raise RuntimeError("ComfyUI job vanished from the queue without producing output.")
             time.sleep(2)
-        
-        raise RuntimeError("Error: ComfyUI failed to become healthy after starting.")
+        raise RuntimeError(f"ComfyUI timed out after {hard_timeout // 60} min (job still not complete).")
+
+    def _download_comfy_output(self, info: dict, dest: str, timeout: int = 30):
+        """Download a produced file (image or video) from ComfyUI's /view to
+        `dest`; raise on failure. Larger timeout for big video files."""
+        r = requests.get(f"{self.comfy_url}/view", params={
+            "filename": info["filename"],
+            "subfolder": info.get("subfolder", ""),
+            "type": info.get("type", "output"),
+        }, timeout=timeout)
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to download output from ComfyUI (HTTP {r.status_code}).")
+        with open(dest, "wb") as f:
+            f.write(r.content)
 
 class GenerateImageTool(ComfyUITool):
     """Generate images with an abliterated/uncensored FLUX model via local ComfyUI.
@@ -332,39 +397,12 @@ class GenerateImageTool(ComfyUITool):
                 return f"Error submitting workflow to ComfyUI: {req.text}"
             
             prompt_id = req.json()["prompt_id"]
-            
+
             print(f"{self.C_CYAN}Waiting for image generation to complete...{self.C_RESET}")
-            max_retries = 120 # 6 minutes max wait
-            for _ in range(max_retries):
-                history_req = requests.get(f"{self.comfy_url}/history/{prompt_id}", timeout=5)
-                history = history_req.json()
-                
-                if prompt_id in history:
-                    outputs = history[prompt_id].get("outputs", {})
-                    if "9" not in outputs:
-                        return "Error: ComfyUI execution completed but SaveImage node did not produce output. Check server logs."
-                    
-                    image_info = outputs["9"]["images"][0]
-                    filename = image_info["filename"]
-                    subfolder = image_info["subfolder"]
-                    folder_type = image_info["type"]
-                    
-                    img_req = requests.get(
-                        f"{self.comfy_url}/view?filename={filename}&subfolder={subfolder}&type={folder_type}",
-                        timeout=10
-                    )
-                    
-                    if img_req.status_code == 200:
-                        with open(abs_output_path, "wb") as f:
-                            f.write(img_req.content)
-                        return f"Successfully generated image and saved to: {abs_output_path}"
-                    else:
-                        return f"Error: Failed to download the generated image from ComfyUI (HTTP {img_req.status_code})"
-                
-                time.sleep(3)
-                
-            return "Error: Image generation timed out after 6 minutes."
-            
+            node_out = self._await_comfy(prompt_id, node="9")  # queue-aware; raises on failure
+            self._download_comfy_output(node_out["images"][0], abs_output_path)
+            return f"Successfully generated image and saved to: {abs_output_path}"
+
         except Exception as e:
             return self.format_error_message(e, "generating image via ComfyUI", "checking if ComfyUI is running correctly")
         
@@ -461,39 +499,12 @@ class EditImageTool(ComfyUITool):
                 return f"Error submitting workflow to ComfyUI: {req.text}"
             
             prompt_id = req.json()["prompt_id"]
-            
+
             print(f"{self.C_CYAN}Waiting for image editing to complete...{self.C_RESET}")
-            max_retries = 120
-            for _ in range(max_retries):
-                history_req = requests.get(f"{self.comfy_url}/history/{prompt_id}", timeout=5)
-                history = history_req.json()
-                
-                if prompt_id in history:
-                    outputs = history[prompt_id].get("outputs", {})
-                    if "9" not in outputs:
-                        return "Error: ComfyUI execution completed but SaveImage node did not produce output. Check server logs."
-                    
-                    image_info = outputs["9"]["images"][0]
-                    filename = image_info["filename"]
-                    subfolder = image_info["subfolder"]
-                    folder_type = image_info["type"]
-                    
-                    img_req = requests.get(
-                        f"{self.comfy_url}/view?filename={filename}&subfolder={subfolder}&type={folder_type}",
-                        timeout=10
-                    )
-                    
-                    if img_req.status_code == 200:
-                        with open(abs_output_path, "wb") as f:
-                            f.write(img_req.content)
-                        return f"Successfully edited image and saved to: {abs_output_path}"
-                    else:
-                        return f"Error: Failed to download the edited image from ComfyUI (HTTP {img_req.status_code})"
-                
-                time.sleep(3)
-                
-            return "Error: Image editing timed out after 6 minutes."
-            
+            node_out = self._await_comfy(prompt_id, node="9")  # queue-aware; raises on failure
+            self._download_comfy_output(node_out["images"][0], abs_output_path)
+            return f"Successfully edited image and saved to: {abs_output_path}"
+
         except Exception as e:
             return self.format_error_message(e, "editing image via ComfyUI", "checking if ComfyUI is running correctly")
         

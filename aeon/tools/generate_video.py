@@ -196,26 +196,14 @@ class GenerateVideoTool(ComfyUITool):
         if r.status_code != 200:
             raise RuntimeError(f"ComfyUI rejected workflow (HTTP {r.status_code}): {r.text[:600]}")
         pid = r.json()["prompt_id"]
-        for _ in range(400):  # up to ~20 min
-            hist = requests.get(f"{self.comfy_url}/history/{pid}", timeout=10).json()
-            if pid in hist:
-                rec = hist[pid]
-                if rec.get("status", {}).get("status_str") == "error":
-                    raise RuntimeError(f"ComfyUI execution error: {json.dumps(rec.get('status'))[:600]}")
-                out = rec.get("outputs", {}).get("13", {})
-                items = out.get("gifs") or out.get("videos") or out.get("images")
-                if not items:
-                    raise RuntimeError("ComfyUI finished but produced no video output.")
-                info = items[0]
-                v = requests.get(f"{self.comfy_url}/view", params={
-                    "filename": info["filename"], "subfolder": info.get("subfolder", ""),
-                    "type": info.get("type", "output")}, timeout=120)
-                v.raise_for_status()
-                with open(abs_output_path, "wb") as f:
-                    f.write(v.content)
-                return abs_output_path
-            time.sleep(3)
-        raise RuntimeError("Video generation timed out.")
+        # Queue-aware wait (shared helper): tolerates time spent queued behind
+        # other agents' jobs so concurrent callers don't false-timeout.
+        out = self._await_comfy(pid, node="13", hard_timeout=1800)
+        items = out.get("gifs") or out.get("videos") or out.get("images")
+        if not items:
+            raise RuntimeError("ComfyUI finished but produced no video output.")
+        self._download_comfy_output(items[0], abs_output_path, timeout=120)
+        return abs_output_path
 
     # ---------- public entrypoint ----------
     def execute(self, mode: str, prompt: Union[str, List[str]] = "", output_path: str = "",
