@@ -141,16 +141,23 @@ class ComfyUITool(BaseTool):
         raise RuntimeError("Error: ComfyUI failed to become healthy after starting.")
 
 class GenerateImageTool(ComfyUITool):
-    """A tool to generate images using FLUX GGUF via a local ComfyUI instance."""
+    """Generate images with an abliterated/uncensored FLUX model via local ComfyUI.
+
+    Default model is FLUX.1-dev-abliterated-V2 (fully abliterated, open/ungated),
+    using the FLUX.1 dual-encoder graph (t5xxl + clip_l). FLUX.2-dev is a drop-in
+    upgrade once its abliterated Mistral text encoder is available: drop a
+    `mistral*flux2*.safetensors` into text_encoders and the resolver switches to
+    the higher-quality FLUX.2 graph automatically.
+    """
     def __init__(self, llm_client=None):
         super().__init__(
             name="generate_image",
             description=TOOL_DESC_GENERATE_IMAGE,
-            underlying_model='FLUX.2-klein-9B uncensored GGUF'
+            underlying_model='FLUX.1-dev-abliterated-V2 (uncensored GGUF)'
         )
         self.llm_client = llm_client
 
-    def _resolve(self, subdir: str, patterns, default: str) -> str:
+    def _resolve(self, subdir: str, patterns, default: str = None) -> str:
         """Basename of the first model in comfyui/<subdir> matching any pattern; else default."""
         import glob
         base = os.path.join(os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon")),
@@ -161,15 +168,55 @@ class GenerateImageTool(ComfyUITool):
                 return os.path.basename(hits[0])
         return default
 
-    def _flux2_models(self):
-        """Resolve the uncensored FLUX.2 model set (auto-adapts to whichever quant is present)."""
-        unet = self._resolve("unet", ("*flux*2*klein*.gguf", "*flux-2*.gguf", "*flux*klein*.gguf"),
-                             "flux-2-klein-9b-Q8_0.gguf")
-        clip = self._resolve("text_encoders", ("*flux2*uncensored*.gguf", "*flux*2*klein*uncensored*.gguf"),
-                             "flux2-klein-9b-uncensored-q8_0.gguf")
-        vae = self._resolve("vae", ("*flux2*vae*.safetensors", "flux2-vae*.safetensors"),
-                            "flux2-vae.safetensors")
-        return unet, clip, vae
+    def _flux2_dev_te(self):
+        """The FLUX.2-dev Mistral text encoder (safetensors), if present — its
+        arrival is what upgrades generation from FLUX.1 to FLUX.2-dev. Prefers an
+        abliterated build over a base one. Returns None when not installed yet."""
+        return self._resolve("text_encoders",
+                             ("*mistral*abliterated*flux2*.safetensors", "*flux2*abliterated*.safetensors",
+                              "*mistral*flux2*.safetensors", "*flux2*dev*te*.safetensors"))
+
+    def _flux1_models(self):
+        """Resolve the abliterated FLUX.1-dev set (auto-adapts to whichever quant
+        is present). Encoders/VAE are the standard FLUX.1 pieces already on disk."""
+        unet = self._resolve("unet",
+                             ("*flux*1*dev*abliterated*.gguf", "*flux*dev*abliterated*.gguf", "*abliterated*V2*.gguf"),
+                             "T8-flux.1-dev-abliterated-V2-GGUF-Q8_0.gguf")
+        clip_l = self._resolve("text_encoders", ("clip_l.safetensors", "*clip_l*.safetensors"), "clip_l.safetensors")
+        t5 = self._resolve("text_encoders", ("t5xxl_fp8*.safetensors", "t5xxl*.safetensors"), "t5xxl_fp8_e4m3fn.safetensors")
+        vae = self._resolve("vae", ("ae.safetensors", "*flux*ae*.safetensors"), "ae.safetensors")
+        return unet, clip_l, t5, vae
+
+    def _flux2_dev_models(self, te):
+        """Resolve the FLUX.2-dev set (used only once the Mistral TE `te` is present)."""
+        unet = self._resolve("unet", ("*flux2*dev*.gguf", "*flux-2-dev*.gguf"), "flux2-dev-Q8_0.gguf")
+        vae = self._resolve("vae", ("*flux2*vae*.safetensors", "flux2-vae*.safetensors"), "flux2-vae.safetensors")
+        return unet, te, vae
+
+    @staticmethod
+    def _flux_workflow(*, unet_node, clip_node, vae_name, latent_node, scheduler_node,
+                       prompt, guidance, seed):
+        """Assemble a FLUX text-to-image graph. The sampler chain (encode →
+        guidance → custom-advanced sampler → decode → save) is identical across
+        FLUX.1 and FLUX.2; only the loaders, latent, and scheduler differ, so those
+        are passed in. Keeps the two model paths from duplicating ~15 nodes each."""
+        return {
+            "1": unet_node,
+            "2": clip_node,
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": vae_name}},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
+            "5": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": guidance}},
+            "6": latent_node,
+            "7": scheduler_node,
+            "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+            "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+            "14": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["5", 0]}},
+            "11": {"class_type": "SamplerCustomAdvanced",
+                   "inputs": {"noise": ["10", 0], "guider": ["14", 0], "sampler": ["8", 0],
+                              "sigmas": ["7", 0], "latent_image": ["6", 0]}},
+            "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+            "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "Aeon", "images": ["12", 0]}},
+        }
 
     def execute(self, prompt: str, output_path: str = None, width: int = 1024, height: int = 1024, enhance: bool = None) -> str:
         if not prompt:
@@ -190,27 +237,33 @@ class GenerateImageTool(ComfyUITool):
             self._manage_registry('register')
             self._ensure_comfyui_running(required_vram=20.0)
 
-            unet, clip, vae = self._flux2_models()
             seed = random.randint(1, 0xffffffffffffffff)
-            # Uncensored FLUX.2-klein graph: GGUF model + flux2 (Mistral) uncensored text
-            # encoder + flux2 VAE, sampled via the modern guider path (validated).
-            workflow = {
-                "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": unet}},
-                "2": {"class_type": "CLIPLoaderGGUF", "inputs": {"clip_name": clip, "type": "flux2"}},
-                "3": {"class_type": "VAELoader", "inputs": {"vae_name": vae}},
-                "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
-                "5": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": 4.0}},
-                "6": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-                "7": {"class_type": "Flux2Scheduler", "inputs": {"steps": 20, "width": width, "height": height}},
-                "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-                "14": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["5", 0]}},
-                "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
-                "11": {"class_type": "SamplerCustomAdvanced",
-                       "inputs": {"noise": ["10", 0], "guider": ["14", 0], "sampler": ["8", 0],
-                                  "sigmas": ["7", 0], "latent_image": ["6", 0]}},
-                "12": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
-                "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "Aeon", "images": ["12", 0]}},
-            }
+            flux2_te = self._flux2_dev_te()
+            if flux2_te:
+                # FLUX.2-dev (higher quality) — active once the abliterated Mistral
+                # text encoder is installed: GGUF UNet + safetensors Mistral TE via
+                # native CLIPLoader + flux2 VAE/latent/scheduler.
+                unet, te, vae = self._flux2_dev_models(flux2_te)
+                print(f"{self.C_CYAN}Model: FLUX.2-dev ({unet}) + {te}{self.C_RESET}")
+                workflow = self._flux_workflow(
+                    unet_node={"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": unet}},
+                    clip_node={"class_type": "CLIPLoader", "inputs": {"clip_name": te, "type": "flux2"}},
+                    vae_name=vae,
+                    latent_node={"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+                    scheduler_node={"class_type": "Flux2Scheduler", "inputs": {"steps": 20, "width": width, "height": height}},
+                    prompt=prompt, guidance=4.0, seed=seed)
+            else:
+                # FLUX.1-dev-abliterated (default) — fully abliterated, ungated:
+                # GGUF UNet + dual encoder (t5xxl + clip_l) + flux `ae` VAE.
+                unet, clip_l, t5, vae = self._flux1_models()
+                print(f"{self.C_CYAN}Model: FLUX.1-dev-abliterated ({unet}){self.C_RESET}")
+                workflow = self._flux_workflow(
+                    unet_node={"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": unet}},
+                    clip_node={"class_type": "DualCLIPLoader", "inputs": {"clip_name1": t5, "clip_name2": clip_l, "type": "flux"}},
+                    vae_name=vae,
+                    latent_node={"class_type": "EmptySD3LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+                    scheduler_node={"class_type": "BasicScheduler", "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": 20, "denoise": 1.0}},
+                    prompt=prompt, guidance=3.5, seed=seed)
 
             print(f"{self.C_CYAN}Submitting image generation workflow to ComfyUI...{self.C_RESET}")
             req = requests.post(f"{self.comfy_url}/prompt", json={"prompt": workflow}, timeout=5)
@@ -255,14 +308,16 @@ class GenerateImageTool(ComfyUITool):
             return self.format_error_message(e, "generating image via ComfyUI", "checking if ComfyUI is running correctly")
         
         finally:
-            # Unregister and check if we are the last active user
-            remaining_users, _ = self._manage_registry('unregister')
+            # Release our VRAM reservation and drop our registry slot, but LEAVE
+            # ComfyUI running. Tearing the container down here (as this once did)
+            # cold-started the ~20GB model on EVERY image — so sequential
+            # generations, and the agent's own health checks between them, kept
+            # hitting an unreachable server and timing out. The container is a
+            # persistent service now; it is reaped at session exit by
+            # _safe_cleanup() in main.py, which is multi-agent-safe.
+            self._manage_registry('unregister')
             release_vram()
-            if remaining_users == 0:
-                print(f"{self.C_CYAN}Last agent finished. Cleaning up container...{self.C_RESET}")
-                subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                print(f"{self.C_CYAN}Image complete. Leaving ComfyUI running for {remaining_users} other active agent(s)...{self.C_RESET}")
+            print(f"{self.C_CYAN}Image complete. ComfyUI left warm for the next request.{self.C_RESET}")
 
 
 class EditImageTool(ComfyUITool):
@@ -387,11 +442,10 @@ class EditImageTool(ComfyUITool):
             return self.format_error_message(e, "editing image via ComfyUI", "checking if ComfyUI is running correctly")
         
         finally:
-            # Unregister and check if we are the last active user
-            remaining_users, _ = self._manage_registry('unregister')
+            # Leave ComfyUI warm (see GenerateImageTool.finally): the per-call
+            # teardown cold-started the model on every edit and caused the same
+            # "server unreachable" timeout loop. Session-exit cleanup handles the
+            # container. Only release VRAM + drop our registry slot here.
+            self._manage_registry('unregister')
             release_vram()
-            if remaining_users == 0:
-                print(f"{self.C_CYAN}Last agent finished. Cleaning up container...{self.C_RESET}")
-                subprocess.run(["docker", "rm", "-f", "aeon_comfyui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                print(f"{self.C_CYAN}Image edit complete. Leaving ComfyUI running for {remaining_users} other active agent(s)...{self.C_RESET}")
+            print(f"{self.C_CYAN}Image edit complete. ComfyUI left warm for the next request.{self.C_RESET}")
