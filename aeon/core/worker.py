@@ -60,6 +60,17 @@ PASSIVE_TOOLS = OBSERVATION_TOOLS | {"think", "say_to_user"}
 # browser_read is included: re-reading the page is inspection, not progress.
 NON_CONSEQUENTIAL_TOOLS = PASSIVE_TOOLS | {"browser_read"}
 
+# Parameters that only change how a result is PRESENTED or ASSERTED, never what
+# the action does to the page/world. The loop guard must ignore them when it
+# fingerprints an action: a weak model re-clicking the same element re-decorates
+# its own call every turn (adds/drops tab_id=default, toggles compare/visual,
+# restates expected_text). If those incidental differences changed the
+# fingerprint, the repeat streak would keep resetting and never reach the hard
+# block — the exact "clicked Next forever, only ever got the soft notice" failure.
+INCIDENTAL_PARAM_KEYS = frozenset({
+    "include_vision", "visual", "compare", "expected_text",
+})
+
 
 class Worker:
     def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False, debug_log_path: Optional[str] = None):
@@ -623,14 +634,38 @@ class Worker:
         commands compare equal (whitespace only — commands are case-sensitive)."""
         return re.sub(r"\s+", " ", (text or "")).strip()
 
+    @staticmethod
+    def _canonical_params(params) -> str:
+        """Canonicalize a tool's parameters for loop-fingerprinting: drop
+        None-valued and presentation-only keys, treat a defaulted tab_id as absent,
+        and sort what's left. This makes 'the same action' compare equal even when
+        a weak model re-decorates its own call each turn (adds/drops tab_id=default,
+        toggles compare/visual, restates expected_text) — the churn that used to
+        keep the repeat streak from ever reaching the hard block, so a dead action
+        (e.g. clicking the same Next button) only ever drew the soft notice and was
+        allowed to spin forever."""
+        if not isinstance(params, dict):
+            return str(params)
+        norm = {}
+        for k, v in params.items():
+            if v is None or k in INCIDENTAL_PARAM_KEYS:
+                continue
+            # Absent tab_id == "default": canonicalize both to "not present" so a
+            # call gains/loses tab_id=default without changing its fingerprint.
+            if k == "tab_id" and v in ("", "default"):
+                continue
+            norm[k] = v
+        return "{" + ", ".join(f"{k}={norm[k]!r}" for k in sorted(norm)) + "}"
+
     def _consequential_fp(self, actions) -> str:
         """Fingerprint only the state-changing actions of a turn, dropping passive
         tools (think / read / observe). This is what the loop guard keys on, so
         `think + click(X)` and a bare `click(X)` share one fingerprint — padding a
         repeated dead action with a think() no longer disarms the block or resets
-        the repeat streak. Returns "" for a turn that did nothing consequential
-        (pure think/read), which the guard treats as transparent (neither a repeat
-        nor a reset)."""
+        the repeat streak. Parameters are canonicalized (see _canonical_params) so
+        incidental call decoration doesn't mint a fresh fingerprint each turn.
+        Returns "" for a turn that did nothing consequential (pure think/read),
+        which the guard treats as transparent (neither a repeat nor a reset)."""
         parts = []
         for a in actions:
             if not isinstance(a, dict):
@@ -639,7 +674,7 @@ class Worker:
             if not t or t in NON_CONSEQUENTIAL_TOOLS:
                 continue
             p = a.get("parameters") or a.get("args") or {}
-            parts.append(f"{t}({p})" if p else f"{t}()")
+            parts.append(f"{t}({self._canonical_params(p)})")
         return self._normalize_cmd("|".join(parts))
 
     @staticmethod
@@ -681,14 +716,61 @@ class Worker:
             return 0.0
         return len(sa & sb) / len(sa | sb)
 
+    @staticmethod
+    def _first_error_snippet(text: str, limit: int = 160) -> str:
+        """First output line that names an error/failure, trimmed — enough to tell
+        WHICH failure without dumping the whole result into the log."""
+        for line in (text or "").splitlines():
+            ll = line.lower()
+            if "error" in ll or "failed" in ll:
+                s = line.strip()
+                return ": " + (s[:limit] + "…" if len(s) > limit else s)
+        return "."
+
+    @staticmethod
+    def _derive_ground_truth_outcome(raw_output: str, consequential: bool,
+                                     loop_detected: bool = False, repeat_count: int = 0) -> str:
+        """Derive a factual, model-INDEPENDENT outcome tag for a turn from the ACTUAL
+        tool output. This is the fix for the log recording the model's own
+        `previous_result_summary` — the rosy self-narration that let a stuck agent
+        write 'clicked Next' for a click that did nothing, so its own history never
+        showed the no-op. Returns '' when the output shows nothing notable (caller
+        then keeps the model's note as the record). Markers are emitted verbatim by
+        the tools; scanned strongest-first (a block/error dominates a no-op, which
+        dominates a still-invalid form). No-op and validation only count for a turn
+        that actually tried to change something (a deliberate re-read is not a
+        no-op)."""
+        text = raw_output or ""
+        low = text.lower()
+        error_markers = ("COMMAND FAILED", "Tool Execution Error", "Tool Parameter Error",
+                         "Browser Error during", "Browser action failed", "Error during ",
+                         "Error executing")
+        tag = ""
+        if "command blocked" in low:
+            tag = "BLOCKED by loop guard — the action was refused, not executed (it was a repeat)."
+        elif any(m in text for m in error_markers):
+            tag = "ERROR — the action failed" + Worker._first_error_snippet(text)
+        elif consequential and "NO CHANGE:" in text:
+            tag = ("NO EFFECT — the action did NOT change the page (URL + interactive elements "
+                   "identical to before). Retrying it cannot help; the cause is a precondition "
+                   "elsewhere (unfilled/invalid field, disabled or wrong target, needs scroll).")
+        elif consequential and "FORM VALIDATION" in text:
+            tag = "FORM STILL INVALID — a required field is unmet, so the submit/next control stays blocked."
+        if loop_detected and repeat_count >= 2:
+            streak = f" [LOOP: this same action has now repeated {repeat_count}x with no change]"
+            tag = (tag + streak) if tag else ("NO PROGRESS —" + streak.lstrip())
+        return tag
+
     def _collapse_repeated_entries(self, lines: list) -> list:
         """Collapse runs of attempt-log entries with the same actions AND result
         into a single entry annotated with the repeat count, so the model can
         literally SEE it has been repeating instead of inferring it from a long
-        log. Compares on Actions + Result (ignores iter number and intent wording)."""
+        log. Compares on Actions + (ground-truth) Result, ignoring iter number,
+        intent wording, and the subordinate 'Agent's note' — which the model
+        rewords every turn and which used to defeat this collapse entirely."""
         def key(entry: str):
             m_a = re.search(r"- Actions: (.*?)(?:\n- Result:|\Z)", entry, re.S)
-            m_r = re.search(r"- Result: (.*)\Z", entry, re.S)
+            m_r = re.search(r"- Result: (.*?)(?:\n- Agent's note:|\Z)", entry, re.S)
             a = re.sub(r"\s+", " ", (m_a.group(1) if m_a else "")).strip()
             r = re.sub(r"\s+", " ", (m_r.group(1) if m_r else "")).strip()
             return (a, r)
@@ -717,8 +799,12 @@ class Worker:
         if self.pending_iteration_state:
             p = self.pending_iteration_state
             actions_str = ", ".join(p['actions'])
-            lines.append(f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {actions_str}\n- Result: (Pending...)")
-            
+            # The ground-truth outcome of the just-finished action is already known
+            # (derived at stash time), so show it now instead of a bare "Pending" —
+            # this is the model's most immediate, un-spun feedback on its last move.
+            res = (p.get('outcome') or "").strip() or "(Pending...)"
+            lines.append(f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {actions_str}\n- Result: {res}")
+
         return "\n\n".join(lines)
 
     def _get_compressed_attempt_log(self, pressure: str = "Low") -> str:
@@ -744,12 +830,13 @@ class Worker:
             lines.append(f"[HISTORICAL SUMMARY]\n{self.action_log_summary}")
 
         lines.extend(self._collapse_repeated_entries(recent_entries))
-        
+
         if self.pending_iteration_state:
             p = self.pending_iteration_state
             actions_str = ", ".join(p['actions'])
-            lines.append(f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {actions_str}\n- Result: (Pending...)")
-            
+            res = (p.get('outcome') or "").strip() or "(Pending...)"
+            lines.append(f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {actions_str}\n- Result: {res}")
+
         return "\n\n".join(lines)
 
     def _reset_state(self, initial_observation="Project started."):
@@ -1522,7 +1609,20 @@ class Worker:
                 if self.pending_iteration_state:
                     p = self.pending_iteration_state
                     acts_str = ", ".join(p['actions'])
-                    finished_entry = f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {acts_str}\n- Result: {previous_result_summary}"
+                    # Ground truth (derived from the actual tool output last turn) is
+                    # the authoritative Result; the model's own summary is kept only as
+                    # a clearly-subordinate note. When ground truth flagged nothing
+                    # notable (a normal, effective action), fall back to the model's
+                    # summary as before — no need to second-guess a turn that worked.
+                    outcome = (p.get('outcome') or "").strip()
+                    note = self._truncate_output((previous_result_summary or "").strip(), max_chars=400)
+                    if outcome:
+                        finished_entry = (f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n"
+                                          f"- Actions: {acts_str}\n- Result: {outcome}\n"
+                                          f"- Agent's note: {note or '(none)'}")
+                    else:
+                        finished_entry = (f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n"
+                                          f"- Actions: {acts_str}\n- Result: {note}")
                     self.action_log.append(finished_entry)
                     self.pending_iteration_state = None
 
@@ -1791,6 +1891,7 @@ class Worker:
                     self._consecutive_passive_turns = 0
 
                 loop_detected = False
+                repeat_count = 0  # consecutive-repeat streak, for the ground-truth outcome tag
                 # Polling background state is legitimate even when its output is
                 # byte-identical turn after turn, so skip the entire loop /
                 # oscillation / stall machinery on observation-only turns. This is
@@ -1959,11 +2060,18 @@ class Worker:
                     self.last_observation += idle_note
                     self.print_func(f"{C_YELLOW}{idle_note}{C_RESET}")
 
-                # Cache the pending iteration state to be finalized next iteration
+                # Cache the pending iteration state to be finalized next iteration.
+                # Derive the ground-truth outcome NOW, from the real tool output —
+                # not next turn from the model's `previous_result_summary`, which is
+                # the unreliable self-narration this record must not depend on.
+                outcome = self._derive_ground_truth_outcome(
+                    raw_output, consequential=bool(norm_cmd),
+                    loop_detected=loop_detected, repeat_count=repeat_count)
                 self.pending_iteration_state = {
                     'iter': iteration,
                     'intent': intent,
-                    'actions': actions_taken_str
+                    'actions': actions_taken_str,
+                    'outcome': outcome,
                 }
 
                 # Persist after each completed iteration so memories/plan/log survive

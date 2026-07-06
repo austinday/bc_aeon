@@ -249,6 +249,135 @@ class TestToolNameResolution(unittest.TestCase):
         self.assertEqual(w._tool_signature_hint("missing"), "")
 
 
+class TestLoopFingerprint(unittest.TestCase):
+    """The loop guard keys on _consequential_fp. A weak model re-decorates its own
+    tool call each turn (adds/drops tab_id=default, toggles compare, restates
+    expected_text); those are incidental and must NOT mint a fresh fingerprint, or
+    the repeat streak never reaches the hard block and a dead action spins forever
+    (the real 'clicked Next forever, only ever soft-warned' failure)."""
+
+    def _worker(self):
+        from aeon.core.worker import Worker
+        return Worker.__new__(Worker)
+
+    def _click(self, **params):
+        return [{"tool_name": "browser_interact",
+                 "parameters": {"action": "click", "element_id": 6, **params}}]
+
+    def test_incidental_params_share_one_fingerprint(self):
+        w = self._worker()
+        base = w._consequential_fp(self._click(expected_text="Next"))
+        # Same click, re-decorated the ways the stuck transcript actually varied it.
+        for variant in (
+            self._click(expected_text="Next", tab_id="default"),   # tab_id=default added
+            self._click(expected_text="Next", compare=True),        # compare toggled
+            self._click(),                                          # expected_text dropped
+            self._click(tab_id="default", include_vision=True, visual="overlay"),
+        ):
+            self.assertEqual(w._consequential_fp(variant), base)
+
+    def test_meaningful_param_change_is_distinct(self):
+        w = self._worker()
+        # A different element / different action must remain a different fingerprint.
+        self.assertNotEqual(w._consequential_fp(self._click()),
+                            w._consequential_fp(
+                                [{"tool_name": "browser_interact",
+                                  "parameters": {"action": "click", "element_id": 7}}]))
+        self.assertNotEqual(w._consequential_fp(self._click()),
+                            w._consequential_fp(
+                                [{"tool_name": "browser_interact",
+                                  "parameters": {"action": "type", "element_id": 6,
+                                                 "text": "x"}}]))
+
+    def test_non_default_tab_id_is_kept(self):
+        w = self._worker()
+        self.assertNotEqual(w._consequential_fp(self._click(tab_id="default")),
+                            w._consequential_fp(self._click(tab_id="gmail")))
+
+    def test_streak_reaches_hard_block_over_transcript(self):
+        # The decorated clicks from the stuck run must now count as one streak and
+        # cross the 3x hard-block threshold instead of resetting to 2 each time.
+        w = self._worker()
+        clicks = [self._click(expected_text="Next"),
+                  self._click(expected_text="Next", tab_id="default"),
+                  self._click(expected_text="Next", compare=True)]
+        fps = [w._consequential_fp(c) for c in clicks]
+        streak = 0
+        for fp in fps:
+            streak = streak + 1 if fp == fps[-1] else 1
+        self.assertGreaterEqual(streak, 3)
+
+    def test_pure_read_turn_is_transparent(self):
+        w = self._worker()
+        self.assertEqual(
+            w._consequential_fp([{"tool_name": "browser_read",
+                                  "parameters": {"tab_id": "default"}}]), "")
+
+
+class TestGroundTruthOutcome(unittest.TestCase):
+    """The attempt log must record what the tool output ACTUALLY showed, not the
+    model's own summary of it — a stuck agent narrates 'clicked Next' for a click
+    that did nothing, so a self-narrated log hides the very no-op it needs to see."""
+
+    def _worker(self):
+        from aeon.core.worker import Worker
+        return Worker.__new__(Worker)
+
+    def test_no_op_detected_only_when_consequential(self):
+        from aeon.core.worker import Worker
+        banner = "URL: x\n⚠ NO CHANGE: the URL and EVERY interactive element are identical..."
+        self.assertIn("NO EFFECT", Worker._derive_ground_truth_outcome(banner, consequential=True))
+        # A deliberate re-read is not a no-op even if the page didn't change.
+        self.assertEqual(
+            Worker._derive_ground_truth_outcome(
+                "(No change since your last observation.)", consequential=False), "")
+
+    def test_error_and_block_dominate(self):
+        from aeon.core.worker import Worker
+        self.assertTrue(Worker._derive_ground_truth_outcome(
+            "COMMAND FAILED: boom", consequential=True).startswith("ERROR"))
+        self.assertTrue(Worker._derive_ground_truth_outcome(
+            "** COMMAND BLOCKED (loop guard) ...", consequential=True).startswith("BLOCKED"))
+
+    def test_effective_action_yields_no_tag(self):
+        from aeon.core.worker import Worker
+        # A normal, effective action flags nothing -> caller keeps the model's note.
+        self.assertEqual(Worker._derive_ground_truth_outcome(
+            "URL: y\nTitle: Next page\n=== INTERACTIVE ELEMENTS ===", consequential=True), "")
+
+    def test_loop_streak_appended(self):
+        from aeon.core.worker import Worker
+        out = Worker._derive_ground_truth_outcome(
+            "⚠ NO CHANGE: ...", consequential=True, loop_detected=True, repeat_count=4)
+        self.assertIn("repeated 4x", out)
+
+    def test_collapse_survives_reworded_agent_notes(self):
+        # The core fix: identical ground-truth Result collapses even when the model
+        # reworded its subordinate note each turn (what used to defeat collapse).
+        w = self._worker()
+        noop = ("NO EFFECT — the action did NOT change the page (URL + interactive "
+                "elements identical to before).")
+        notes = ["clicked Next; still on Basic information.",
+                 "page did not advance after clicking Next.",
+                 "attempted Next again, remained on birthday screen."]
+        entries = [
+            f"[Iter {26+i}]\n- Intent: advance signup\n"
+            f"- Actions: browser_interact(click [6])\n- Result: {noop}\n- Agent's note: {notes[i]}"
+            for i in range(3)
+        ]
+        collapsed = w._collapse_repeated_entries(entries)
+        self.assertEqual(len(collapsed), 1)
+        self.assertIn("repeated 3x", collapsed[0])
+
+    def test_distinct_results_do_not_collapse(self):
+        w = self._worker()
+        e1 = ("[Iter 1]\n- Intent: go\n- Actions: browser_interact(click [6])\n"
+              "- Result: NO EFFECT — no change.\n- Agent's note: a")
+        e2 = ("[Iter 2]\n- Intent: go\n- Actions: browser_interact(click [6])\n"
+              "- Result: FORM STILL INVALID — Month unmet.\n- Agent's note: b")
+        self.assertEqual(len(w._collapse_repeated_entries([e1, e2])), 2)
+
+
 class TestToolLoader(unittest.TestCase):
     def test_all_tool_modules_import_cleanly(self):
         # With empty deps, dependency-bearing tools skip silently; any entry in

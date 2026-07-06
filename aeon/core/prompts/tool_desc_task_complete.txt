@@ -4,6 +4,8 @@ CRITICAL: If the objective was to produce information (analysis, research, brain
 
 For code/implementation objectives, validate by running scripts and checking outputs before completing.
 
+For real-world state changes (account created, form submitted, message sent, file uploaded, purchase made), the objective is complete ONLY when your LATEST observation actually shows that end-state. Still sitting on a signup / verification / captcha / login / error screen means it is NOT done — do not call task_complete, and do NOT report credentials, IDs, or results you have not seen confirmed. If you are blocked and cannot finish, say so honestly via say_to_user and complete with a reason that states the block — never fabricate a success.
+
 Schema:
   reason (str, optional, default="Task completed."): A brief summary of what was accomplished and how it was verified.
 Example: {"tool_name": "task_complete", "parameters": {"reason": "Delivered the 5-point analysis to the user via say_to_user; objective met."}}
