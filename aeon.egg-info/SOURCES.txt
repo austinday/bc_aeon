@@ -145,6 +145,7 @@ aeon/tools/browser.py
 aeon/tools/categories.py
 aeon/tools/category_tools.py
 aeon/tools/communication.py
+aeon/tools/composite_image.py
 aeon/tools/file_io.py
 aeon/tools/generate_image.py
 aeon/tools/generate_video.py
