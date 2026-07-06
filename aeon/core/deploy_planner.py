@@ -193,6 +193,9 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo], mode: Optional[str] = None) -
         "AEON_MTP_METHOD": (entry.mtp.method if entry.mtp else "draft_model"),
         "AEON_MTP_NMAX": str(entry.mtp.n_max if entry.mtp else 0),
         "AEON_KV_QUANT": entry.kv_quant or "",
+        # vLLM --max-num-batched-tokens: raise prefill batch so a big agent prompt
+        # prefills in ~one pass (low TTFT) instead of many chunked-prefill steps.
+        "AEON_MAX_NUM_BATCHED": str(entry.max_num_batched_tokens or ""),
     }
     return plan_obj
 

@@ -53,6 +53,11 @@ class CatalogEntry:
     served_name: Optional[str] = None
     mtp: Optional[Mtp] = None
     kv_quant: Optional[str] = None        # llamacpp -ctk/-ctv ('q4_0'); vLLM --kv-cache-dtype ('fp8'); None=f16
+    # vLLM prefill batch size (--max-num-batched-tokens). Default (small, ~2048 under
+    # chunked prefill) chops a big agent prompt into many scheduler steps -> long TTFT.
+    # Set high on a model with VRAM headroom so a 20-30k prompt (+ a screenshot's vision
+    # tokens) prefills in ~one pass. None = leave vLLM's default.
+    max_num_batched_tokens: Optional[int] = None
     force_split: bool = False             # never dual-copy (e.g. always-too-big MoE)
     multimodal: bool = False              # serves vision on its chat endpoint (analyze_image can reuse it)
     # setup download
@@ -158,6 +163,10 @@ CATALOG: List[CatalogEntry] = [
         served_name="Qwen3.6-27B-FP8",
         mtp=Mtp(method="mtp", n_max=3),   # native in-checkpoint MTP: no separate draft model
         kv_quant="fp8",
+        # TTFT fix: 32 GiB FP8 weights leave ~50 GiB free on a 96 GiB card, so prefill a
+        # 20-30k agent prompt (+ screenshot vision tokens) in ~one pass instead of ~15
+        # tiny chunked-prefill steps. Was the main cause of long time-to-first-token.
+        max_num_batched_tokens=32768,
         multimodal=True,             # advertised multimodal; live-test vision before relying on it
         # No download_cmd here: setup PHASE 5.6d pre-caches it; vLLM also fetches at runtime.
     ),

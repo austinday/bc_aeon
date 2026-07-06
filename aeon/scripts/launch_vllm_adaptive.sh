@@ -83,6 +83,12 @@ launch_node() {
     local args=(--model "$HF_MODEL" --served-model-name "$SERVED" --host 0.0.0.0 --port "$port"
                 --tensor-parallel-size "$tp" --gpu-memory-utilization "$UTIL"
                 --enable-prefix-caching --enable-chunked-prefill --max-model-len "${MAX_MODEL_LEN:-$ctx}")
+    # Prefill batch size: with chunked prefill on, vLLM's small default (~2048) splits a
+    # 20-30k-token agent prompt into many scheduler steps -> long time-to-first-token.
+    # The catalog sets this high on roomy models so the prompt prefills in ~one pass.
+    # Env MAX_NUM_BATCHED_TOKENS overrides; unset on both -> vLLM default (unchanged).
+    local batched="${MAX_NUM_BATCHED_TOKENS:-${AEON_MAX_NUM_BATCHED:-}}"
+    [ -n "$batched" ] && args+=(--max-num-batched-tokens "$batched")
     [ -n "$cpu_offload" ] && [ "$cpu_offload" != "0.0" ] && [ "$cpu_offload" != "0" ] && args+=(--cpu-offload-gb "$cpu_offload")
     args+=("${SPEC_ARGS[@]}")
     args+=("${KV_ARGS[@]}")
