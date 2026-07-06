@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 import base64
 import requests
 import subprocess
@@ -35,6 +34,24 @@ MAX_ELEMENTS_CHARS = 14000
 BROWSER_DIAG_LOG = os.path.expanduser("~/.aeon/logs/browser_diag.log")
 _diag_last_url = {}       # (session, tab) -> last URL, to flag actions that didn't navigate
 _diag_run_started = False  # so we stamp a "NEW RUN" banner once per process
+_last_page_sig = {}       # (session, tab) -> signature of the last observed page (model-facing no-op detector)
+
+
+def _page_signature(data):
+    """Compact, comparable signature of what the agent can actually act on: the URL
+    plus the ordered (id, role, name/value, states) of every interactive element.
+    Two consecutive turns with the SAME signature are the same actionable page — the
+    action between them accomplished nothing the agent can act on. This is the fact
+    that stops a weak model from re-clicking a dead button, so — unlike the diag log
+    — it must be surfaced INTO the result the model reads."""
+    els = data.get("elements") or []
+    el_sig = tuple(
+        (e.get("id"), e.get("role"),
+         (e.get("name") or e.get("value") or "").strip(),
+         tuple(e.get("states") or []))
+        for e in els
+    )
+    return (data.get("url", ""), el_sig)
 
 
 def _format_validation(validation):
@@ -137,10 +154,12 @@ def _log_browser_diag(data, action_desc, session_id, tab_id, clean_bytes=None):
                 vstr = "\n".join(vlines)
             else:
                 vstr = "   (form looks valid / none)"
+            identity = data.get("identity")
             body = (
                 f"status    : {status}\n"
                 f"URL       : {url}  ({changed})\n"
                 f"title     : {data.get('title', '')}\n"
+                f"identity  : {identity or '(not signed in / not detected)'}\n"
                 f"screenshot: {shot}\n"
                 f"validation:\n{vstr}\n"
                 f"events    :\n{ev}\n"
@@ -149,7 +168,8 @@ def _log_browser_diag(data, action_desc, session_id, tab_id, clean_bytes=None):
             url_flag = "URL UNCHANGED" if (prev is not None and prev == url) else "url ok"
             shot_flag = "SCREENSHOT BLANK" if is_blank else "screenshot ok"
             vflag = f" | {len(vinvalid)} VALIDATION ISSUE(S)" if (vinvalid or valerts) else ""
-            term = f"[browser-diag] {action_desc}: {url_flag} | {shot_flag} | {len(els)} elements{vflag}"
+            idflag = f" | as {identity}" if identity else ""
+            term = f"[browser-diag] {action_desc}: {url_flag} | {shot_flag} | {len(els)} elements{vflag}{idflag}"
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         header = f"\n{'=' * 26} BROWSER DIAG {ts} {'=' * 26}\n"
@@ -165,38 +185,6 @@ def _log_browser_diag(data, action_desc, session_id, tab_id, clean_bytes=None):
         print(term)
     except Exception:
         pass  # never let diagnostics break a browser action
-
-
-def _print_image_to_terminal(image_bytes, target_width=80):
-    """Renders an image directly in the terminal using ANSI truecolor and half-block characters."""
-    # Only worth doing when a human is watching an interactive terminal. In an
-    # autonomous/sub-agent run (piped stdout) it just burns CPU on a PIL resize +
-    # per-pixel loop and floods the logs with escape codes, so skip it entirely.
-    if not sys.stdout.isatty():
-        return
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        w, h = img.size
-        aspect_ratio = h / w
-        target_height = int(target_width * aspect_ratio / 2)
-
-        img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
-        img = img.convert("RGB")
-
-        print("\n\033[96m--- Browser Vision Preview ---\033[0m")
-        for y in range(0, target_height, 2):
-            line = ""
-            for x in range(target_width):
-                r1, g1, b1 = img.getpixel((x, y))
-                if y + 1 < target_height:
-                    r2, g2, b2 = img.getpixel((x, y + 1))
-                else:
-                    r2, g2, b2 = (0, 0, 0)
-                line += f"\033[38;2;{r1};{g1};{b1}m\033[48;2;{r2};{g2};{b2}m▀\033[0m"
-            print(line)
-        print("\033[96m------------------------------\033[0m\n")
-    except Exception as e:
-        print(f"Failed to render image to terminal: {e}")
 
 
 def _manage_browser_registry(action='register'):
@@ -446,8 +434,35 @@ def process_browser_response(data, action_desc, session_id, tab_id,
         with open(overlay_path, "wb") as f:
             f.write(base64.b64decode(data["overlay_b64"]))
 
-    # Human-facing terminal preview of the real (clean) render.
-    _print_image_to_terminal(clean_bytes, target_width=80)
+    # --- Model-facing NO-OP detection ---
+    # Compare this page to the last one observed on the same tab. The deciding model
+    # only ever holds the CURRENT page in context (last turn's is gone), so it cannot
+    # tell on its own that an action changed nothing — and an unchanged page that
+    # still shows the button it just clicked makes re-clicking that button the most
+    # natural next move. Telling it plainly "this did nothing, the fix is elsewhere"
+    # removes the pull to repeat at the source, before the loop guard ever has to.
+    key = (session_id, tab_id)
+    sig = _page_signature(data)
+    prev_sig = _last_page_sig.get(key)
+    no_change = prev_sig is not None and prev_sig == sig
+    _last_page_sig[key] = sig
+    # A read is meant only to re-observe; a click/type/navigate is meant to change
+    # something, so an unchanged page there is a wasted action worth flagging hard.
+    is_passive_read = action_desc.strip().lower().startswith("read page")
+    if no_change and not is_passive_read:
+        no_change_block = (
+            "\n⚠ NO CHANGE: the URL and EVERY interactive element are identical to before this "
+            "action — it had NO EFFECT on the page. Do NOT repeat it (or minor variants of it); an "
+            "inert action cannot change the result by being retried. The real cause is elsewhere — "
+            "typically ONE of: a required field is empty/invalid (check FORM VALIDATION below), the "
+            "target is disabled or not the real control, the control you need is a DIFFERENT element, "
+            "or you must scroll/switch focus/tab first. Pick a DIFFERENT element or a different "
+            "approach this turn.\n"
+        )
+    elif no_change:
+        no_change_block = "\n(No change since your last observation — the page has not updated.)\n"
+    else:
+        no_change_block = ""
 
     elements_str = _format_elements(data.get("elements", []))
     scroll_str = _format_scroll(data.get("page_state"))
@@ -512,8 +527,20 @@ def process_browser_response(data, action_desc, session_id, tab_id,
     shots = f"clean={clean_path}" + (f" | numbered={overlay_path}" if have_overlay else "")
     validation_str = _format_validation(data.get("validation"))
     validation_block = f"\n{validation_str}\n" if validation_str else ""
+    # Ground-truth identity: the account the browser is ACTUALLY signed in as. The
+    # profile is persistent+shared, so this may be a pre-existing login, NOT the
+    # account you think you're working on — report/act on THIS, not your assumption.
+    identity = data.get("identity")
+    identity_line = (
+        f"SIGNED IN AS: {identity}  (ground truth — this is the account active in the "
+        f"browser right now; confirm it is the one you intend before acting on or "
+        f"reporting about it)\n"
+        if identity else ""
+    )
     return (
         f"--- BROWSER: {action_desc} (tab '{tab_id}') ---\n"
+        f"{no_change_block}"
+        f"{identity_line}"
         f"URL: {page_url}\n"
         f"Title: {page_title}\n"
         f"Open tabs: [{open_tabs_str}]\n"

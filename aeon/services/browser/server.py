@@ -1072,6 +1072,50 @@ async def _extract(page: Page, profile: str, session_id: str, tab_id: str) -> Di
     return {"elements": elements, "page": main_state}
 
 
+# Detects the account the browser is CURRENTLY signed in as, from the page itself.
+# The agent operates a persistent, shared profile, so a "create a new account" task
+# can start already logged in as someone else — and a weak model will happily report
+# that stranger's inbox as "the account I just made". Surfacing the real identity as
+# ground truth in every observation makes that impossible to miss. Returns a real
+# email string found in an account affordance, or null — never a guess.
+_IDENTITY_JS = r"""
+() => {
+  const emailRe = /[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}/i;
+  // 1) Explicit account affordances (Google's One-Bar chip, sign-out link, etc.).
+  const strong = [
+    'a[aria-label^="Google Account"]', '[aria-label*="Google Account"]',
+    'a[href*="SignOutOptions"]', 'a[href*="Logout"]', 'a[href*="logout"]',
+  ];
+  for (const s of strong) {
+    for (const el of document.querySelectorAll(s)) {
+      const m = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).match(emailRe);
+      if (m) return m[0];
+    }
+  }
+  // 2) Generic: an aria-label that is clearly about the signed-in account/profile.
+  for (const el of document.querySelectorAll('[aria-label]')) {
+    const al = el.getAttribute('aria-label') || '';
+    if (/account|signed in|logged in|profile/i.test(al)) {
+      const m = al.match(emailRe);
+      if (m) return m[0];
+    }
+  }
+  return null;
+}
+"""
+
+
+async def _detect_identity(page: Page) -> Optional[str]:
+    """Best-effort signed-in account for this page. Never raises, never guesses."""
+    try:
+        ident = await page.evaluate(_IDENTITY_JS)
+        return ident if isinstance(ident, str) and "@" in ident else None
+    except PWError:
+        return None
+    except Exception:
+        return None
+
+
 async def _build_response(page: Page, profile: str, session_id: str, tab_id: str,
                           overlay: bool = True) -> Dict[str, Any]:
     # Reliably surface any tab the site just opened, and prune any that closed,
@@ -1111,6 +1155,7 @@ async def _build_response(page: Page, profile: str, session_id: str, tab_id: str
                 pass
 
     title = await page.title()
+    identity = await _detect_identity(page)
     # Drain any dialog/download notes captured since the last observation.
     events = page_events.pop(id(page), [])
     return {
@@ -1119,6 +1164,7 @@ async def _build_response(page: Page, profile: str, session_id: str, tab_id: str
         "tab_id": tab_id,
         "url": page.url,
         "title": title,
+        "identity": identity,
         "clean_b64": base64.b64encode(clean_bytes).decode(),
         # Present only when the numbered overlay was actually drawn this call.
         "overlay_b64": base64.b64encode(overlay_bytes).decode() if overlay_bytes is not None else None,
@@ -1284,20 +1330,51 @@ async def navigate(req: NavigateRequest):
     return await _build_response(page, profile, req.session_id, req.tab_id, overlay=req.overlay)
 
 
-def _verify_expected(profile: str, session_id: str, tab_id: str, element_id: int, expected: str) -> Optional[str]:
-    """Return an error string if expected_text doesn't match the indexed element."""
+def _resolve_target(profile: str, session_id: str, tab_id: str,
+                    element_id: int, expected: str):
+    """Make expected_text the SOURCE OF TRUTH for which element to act on, not just a
+    tripwire. Element ids are re-numbered by screen position on every observation, so
+    an agent routinely pairs the right expected_text with a stale/wrong id. Behavior:
+      - no expected_text, or no snapshot -> act on the id as given (nothing to check);
+      - given id already matches expected_text -> keep it;
+      - exactly ONE other element matches -> RETARGET to it (return a correction note);
+      - MULTIPLE match -> ambiguous, return an error listing the candidate ids;
+      - NONE match -> return an error (the wanted control isn't indexed on this page).
+    Returns (resolved_id, note, error): at most one of note/error is set."""
     if not expected:
-        return None
+        return element_id, None, None
     snap = last_elements.get(_key(profile, session_id, tab_id), {})
+    if not snap:
+        return element_id, None, None  # no snapshot to check against; allow as-is
+    exp = expected.lower()
+
+    def _matches(info):
+        return exp in f"{info.get('name', '')} {info.get('value', '')}".lower()
+
     info = snap.get(element_id)
-    if not info:
-        return None  # no snapshot to check against; allow
-    hay = f"{info.get('name', '')} {info.get('value', '')}".lower()
-    if expected.lower() not in hay:
-        return (f"expected_text '{expected}' not found in element [{element_id}] "
-                f"(role={info.get('role')}, name='{info.get('name')}'). "
-                f"Re-read the page and target the correct element.")
-    return None
+    if info and _matches(info):
+        return element_id, None, None  # the given id is already correct
+
+    hits = [eid for eid, i in snap.items() if _matches(i)]
+    if len(hits) == 1:
+        rid = hits[0]
+        ri = snap.get(rid, {})
+        note = (f"[auto-corrected target] element [{element_id}] did not match expected_text "
+                f"'{expected}'; retargeted to [{rid}] (role={ri.get('role')}, "
+                f"name='{ri.get('name')}'). Element ids are re-numbered every observation — "
+                f"prefer expected_text and re-read before acting.")
+        return rid, note, None
+    if len(hits) > 1:
+        opts = ", ".join(f"[{h}] '{snap[h].get('name', '')}'" for h in hits[:8])
+        err = (f"expected_text '{expected}' matches MULTIPLE elements: {opts}. "
+               f"Re-issue targeting the specific [id] you want.")
+        return element_id, None, err
+    cur = snap.get(element_id, {})
+    err = (f"expected_text '{expected}' not found in element [{element_id}] "
+           f"(role={cur.get('role')}, name='{cur.get('name')}') NOR in any other indexed "
+           f"element on this page. The control you want may not be captured — re-read the "
+           f"page, scroll it into view, or target a different element.")
+    return element_id, None, err
 
 
 @app.post("/interact")
@@ -1306,6 +1383,13 @@ async def interact(req: InteractRequest):
     ctx = await _ensure_browser(profile)
     page = await _get_page(profile, req.session_id, req.tab_id)
     a = (req.action or "").strip().lower()
+    # 'select'/'choose' are common phrasings for choosing a dropdown option; accept
+    # them as select_option, and let the agent pass the option in `text` (what a
+    # 'type'-minded model reaches for) as well as the documented `value`.
+    if a in ("select", "choose", "pick"):
+        a = "select_option"
+    if a == "select_option" and req.value is None and req.text is not None:
+        req.value = req.text
 
     # ---- page-level actions that need no element ----
     try:
@@ -1392,12 +1476,19 @@ async def interact(req: InteractRequest):
         if req.element_id is None:
             raise HTTPException(status_code=400, detail=f"action '{a}' requires element_id.")
 
-        verr = _verify_expected(profile, req.session_id, req.tab_id, req.element_id, req.expected_text or "")
-        # Verify the target matches expected_text before any action that clicks or
-        # mutates state, so a click/keystroke/toggle never lands on the wrong element.
-        if verr and a in ("click", "double_click", "right_click", "type",
-                          "check", "uncheck", "select_option", "clear", "upload_file"):
-            raise HTTPException(status_code=409, detail=verr)
+        # Resolve the target from expected_text: ids are re-numbered by screen
+        # position each observation, so an agent's id is often stale even when its
+        # expected_text is right. For the actions where expected_text is honored,
+        # RETARGET to the matching element (or fail with a helpful message), instead
+        # of only rejecting a mismatch and leaving the agent to guess again.
+        retarget_note = None
+        if a in ("click", "double_click", "right_click", "type",
+                 "check", "uncheck", "select_option", "clear", "upload_file"):
+            resolved_id, retarget_note, rerr = _resolve_target(
+                profile, req.session_id, req.tab_id, req.element_id, req.expected_text or "")
+            if rerr:
+                raise HTTPException(status_code=409, detail=rerr)
+            req.element_id = resolved_id
 
         loc = await _locator(page, req.element_id, profile, req.session_id, req.tab_id)
         try:
@@ -1471,7 +1562,12 @@ async def interact(req: InteractRequest):
             raise HTTPException(status_code=400, detail=f"Unsupported action: {a}")
 
         await _settle_action(page)
-        return await _build_response(page, profile, req.session_id, req.tab_id, overlay=req.overlay)
+        resp = await _build_response(page, profile, req.session_id, req.tab_id, overlay=req.overlay)
+        # Surface an auto-retarget so the agent SEES its id was corrected (and learns
+        # to lean on expected_text) instead of silently acting on a different element.
+        if retarget_note:
+            resp.setdefault("events", []).insert(0, retarget_note)
+        return resp
 
     except HTTPException:
         raise
