@@ -33,10 +33,16 @@ UTIL="${GPU_MEM_UTIL:-$DEF_UTIL}"
 
 SPEC_ARGS=()
 if [ -n "${AEON_MTP_DRAFT_MODEL}" ]; then
-    # method is plan-driven: gemma-4 assistant => "mtp" (native MTP speculator), other
-    # drafts => "draft_model". Passing "draft_model" for a gemma-4 assistant silently
-    # disables MTP (vLLM #42005), so the catalog sets this explicitly.
+    # SEPARATE draft/speculator model (e.g. the gemma-4 'assistant'). method is
+    # plan-driven: gemma-4 assistant => "mtp" (native MTP speculator), other drafts =>
+    # "draft_model". Passing "draft_model" for a gemma-4 assistant silently disables
+    # MTP (vLLM #42005), so the catalog sets this explicitly.
     SPEC_ARGS=(--speculative-config "{\"method\": \"${AEON_MTP_METHOD:-draft_model}\", \"model\": \"${AEON_MTP_DRAFT_MODEL}\", \"num_speculative_tokens\": ${AEON_MTP_NMAX:-5}}")
+elif { [ "${AEON_MTP_METHOD:-}" = "mtp" ] || [ "${AEON_MTP_METHOD:-}" = "eagle" ]; } && [ "${AEON_MTP_NMAX:-0}" != "0" ]; then
+    # NATIVE in-checkpoint MTP (e.g. Qwen3.6): the MTP/EAGLE head ships inside the
+    # target weights, so there is NO separate draft model -> omit "model" (passing one
+    # would point vLLM at a nonexistent draft). vLLM auto-loads the head from the model.
+    SPEC_ARGS=(--speculative-config "{\"method\": \"${AEON_MTP_METHOD}\", \"num_speculative_tokens\": ${AEON_MTP_NMAX}}")
 fi
 
 # Blackwell perf knobs (local, no re-quant):

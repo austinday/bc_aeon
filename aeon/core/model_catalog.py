@@ -101,6 +101,67 @@ CATALOG: List[CatalogEntry] = [
         # No download_cmd: vLLM fetches at runtime; setup PHASE 5.6c warms the HF cache.
     ),
     CatalogEntry(
+        # Full-precision sibling of the NVFP4 build: the SAME abliterated Gemma-4-31B,
+        # served at native BF16 (16-bit weights/activations) instead of self-quantized
+        # NVFP4. Higher fidelity (no 4-bit qu/act loss -> better fine-grained grounding &
+        # OCR, which is exactly what the browser agent leans on) at ~3x the VRAM. Still
+        # fits ONE 96 GB Blackwell card solo on GPU0 (weights ~62 + fp8 KV), same as the
+        # NVFP4 entry, and keeps native MTP via the same official assistant draft. Source
+        # is huihui-ai's abliterated Gemma-4 (v2: first 5 layers left intact -> fewer
+        # spurious refusals) — the same abliterated lineage the NVFP4 build was quantized
+        # from. vLLM auto-detects bfloat16 from the checkpoint; the generic launcher needs
+        # no quant/dtype flags. max_ctx capped at 128k because BF16 weights leave far less
+        # VRAM for KV than the 21 GiB NVFP4 build (which runs 256k).
+        name="Gemma-4-31B-BF16-MTP",
+        family="Gemma-4",
+        provider="vllm",
+        image="aeon_vllm:latest",
+        weights_gib=66.0,            # ~62 BF16 target + ~0.9 assistant draft, rounded up for planning headroom
+        kv_gib_per_64k=3.0,          # fp8 KV (Blackwell) — same architecture as the NVFP4 build
+        max_ctx=131072,              # 128k: BF16 weights leave less room for KV than NVFP4
+        ports={"lb": 8024, "node0": 8025, "node1": 8026},
+        hf_model="huihui-ai/Huihui-gemma-4-31B-it-abliterated-v2",
+        served_name="Gemma-4-31B-BF16",
+        mtp=Mtp(draft_model="google/gemma-4-31B-it-assistant", method="mtp", n_max=5),
+        kv_quant="fp8",              # vLLM --kv-cache-dtype fp8 on Blackwell FP8 units
+        multimodal=True,             # Gemma4ForConditionalGeneration vision tower (same as NVFP4)
+        # No download_cmd: vLLM fetches at runtime (like the NVFP4 entry). ~62 GiB first pull.
+    ),
+    CatalogEntry(
+        # Qwen3.6-27B (dense, multimodal, Apache-2.0) — a strong AGENTIC/coding model
+        # (beats Qwen3.5-397B MoE on coding benchmarks) with NATIVE Multi-Token
+        # Prediction built into the weights. This is the AEON-Ultimate uncensored
+        # (abliterated: 0/100 refusals) build re-quantized to vanilla-Qwen FP8 (8-bit,
+        # block-128) with the MTP block included verbatim. Single-stream decode is the
+        # optimization target here: native MTP (K=3, ~+90% decode TPS) + FP8 weights +
+        # fp8 KV + CUDA graphs + FlashInfer. Fits one 96 GB card solo on GPU0 (~31 GiB
+        # weights) with huge KV headroom (hybrid Gated-DeltaNet: 3/4 layers use linear
+        # attention -> small KV), so it runs the full 256k context.
+        #
+        # NATIVE MTP: unlike the Gemma-4 entries (separate 'assistant' draft), the MTP
+        # head is IN this checkpoint, so draft_model is None and the launcher emits a
+        # model-less --speculative-config {"method":"mtp","num_speculative_tokens":3}.
+        #
+        # VISION: the card advertises multimodal (image-text-to-text). multimodal=True
+        # so the browser loop / analyze_image reuse it — but vision on a quantized+MTP
+        # build is fragile (see the NVFP4 lesson), so LIVE-TEST vision with this exact
+        # checkpoint before trusting the browser agent to it; if broken, set False here.
+        name="Qwen3.6-27B-FP8-MTP",
+        family="Qwen3.6",
+        provider="vllm",
+        image="aeon_vllm:latest",
+        weights_gib=32.0,            # ~31 GiB FP8 (7 shards) incl. the in-checkpoint MTP block
+        kv_gib_per_64k=2.5,          # fp8 KV; hybrid linear attention keeps KV small
+        max_ctx=262144,
+        ports={"lb": 8027, "node0": 8028, "node1": 8029},
+        hf_model="kasimat/Qwen3.6-27B-AEON-Ultimate-Uncensored-FP8-MTP",
+        served_name="Qwen3.6-27B-FP8",
+        mtp=Mtp(method="mtp", n_max=3),   # native in-checkpoint MTP: no separate draft model
+        kv_quant="fp8",
+        multimodal=True,             # advertised multimodal; live-test vision before relying on it
+        # No download_cmd here: setup PHASE 5.6d pre-caches it; vLLM also fetches at runtime.
+    ),
+    CatalogEntry(
         name="CyberNeurova-DeepSeek-V4-Flash",
         family="DeepSeek-V4",
         provider="llamacpp",

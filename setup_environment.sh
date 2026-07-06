@@ -132,6 +132,21 @@ if python3 -c "import sys; sys.exit(0 if float('${MIN_VRAM}')>0 else 1)" 2>/dev/
         "$HF_HUB_CACHE_DIR:/root/.cache/huggingface" "$GEMMA4_NVFP4_CMD"
 fi
 
+# Pre-cache the abliterated Qwen3.6-27B FP8 (8-bit) build for vLLM. NATIVE MTP: the
+# MTP head is baked into this checkpoint, so there is NO separate draft repo to fetch
+# (unlike Gemma-4's assistant). ~31 GiB; VRAM-gated at the same 1.5x-of-one-GPU rule as
+# the catalog entry (weights_gib=32.0). Skipped on small GPUs; the launcher still
+# fetches at runtime if this phase is skipped.
+if python3 -c "import sys; sys.exit(0 if float('${MIN_VRAM}')>0 else 1)" 2>/dev/null \
+   && python3 -c "import sys; sys.exit(0 if 32.0 <= 1.5*float('${MIN_VRAM}') else 1)" 2>/dev/null; then
+    log_step "PHASE 5.6d: Pre-cache Qwen3.6-27B FP8 (abliterated, native MTP) for vLLM"
+    HF_HUB_CACHE_DIR="$HOME/.cache/huggingface"
+    mkdir -p "$HF_HUB_CACHE_DIR"
+    QWEN36_FP8_CMD="hf download kasimat/Qwen3.6-27B-AEON-Ultimate-Uncensored-FP8-MTP"
+    run_downloader "$HF_HUB_CACHE_DIR/.aeon_qwen36_fp8_state" "$SETUP_VERSION:qwen36-27b-fp8-vllm" \
+        "$HF_HUB_CACHE_DIR:/root/.cache/huggingface" "$QWEN36_FP8_CMD"
+fi
+
 # (Removed) PHASE 5.7 used to download the Qwen3.6-35B-A3B GGUF for a dedicated GPU1
 # vision server. Vision now runs on the multimodal Gemma-4 already loaded on GPU0
 # (analyze_image reuses it), so that ~21 GB download is no longer needed.

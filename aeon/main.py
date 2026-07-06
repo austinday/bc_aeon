@@ -523,10 +523,14 @@ def build_model_menu(local_models):
 
     return entries
 
-def select_model(menu_entries, label):
-    """Display unified model menu and return selected model config."""
+def select_model(menu_entries, label, default_model=None):
+    """Display the unified model menu and return the selected model config. If
+    default_model names a selectable entry, it is marked and chosen on a bare Enter
+    (so the historical fast-boot into the main model is one keystroke, while every
+    other deployable model — e.g. the BF16 build, dual-GPU, DeepSeek — is a number)."""
     print(f'\n[MENU] {label}')
     selectable = []
+    default_idx = None
     for entry in menu_entries:
         if entry.get('is_header'):
             if entry['label'] == '':
@@ -535,10 +539,18 @@ def select_model(menu_entries, label):
                 print(f" {entry['label']}")
         else:
             selectable.append(entry)
-            print(f" {len(selectable):>2}. {entry['label']}")
+            is_default = default_model and entry.get('model') == default_model and default_idx is None
+            if is_default:
+                default_idx = len(selectable)
+            tag = '  <- default (press Enter)' if is_default else ''
+            print(f" {len(selectable):>2}. {entry['label']}{tag}")
+    prompt = (f'Select Model (1-{len(selectable)}) [Enter = {default_idx}]: '
+              if default_idx else f'Select Model (1-{len(selectable)}): ')
     while True:
         try:
-            choice = input(f'Select Model (1-{len(selectable)}): ')
+            choice = input(prompt)
+            if not choice.strip() and default_idx:
+                return selectable[default_idx - 1]
             if choice.isdigit() and 1 <= int(choice) <= len(selectable):
                 return selectable[int(choice)-1]
         except (KeyboardInterrupt, EOFError): sys.exit(0)
@@ -1065,7 +1077,7 @@ def cli():
 
     if args.menu and not model_name:
         # Explicitly requested the interactive picker (choose solo vs dual, etc.).
-        model_config = select_model(menu, 'Select Model')
+        model_config = select_model(menu, 'Select Model', default_model=DEFAULT_MODEL)
     elif model_name:
         model_config = find_model_config(model_name, menu)
         if not model_config:
@@ -1077,14 +1089,23 @@ def cli():
                 print(f"  Did you mean: {', '.join(close)}?")
             print(f"  Available: {available}")
             sys.exit(1)
+    elif sys.stdin.isatty() and not args.resume:
+        # Fresh INTERACTIVE start with no --model: show the picker so the user chooses
+        # among the deployable models (e.g. Gemma-4 NVFP4 vs BF16, solo vs dual-GPU).
+        # A bare Enter selects the main model, so the old one-keystroke boot is intact.
+        # (--resume always passes --model, and non-TTY falls through to the default
+        # below, so the restart relaunch and scripted/piped runs never block on a prompt.)
+        model_config = select_model(menu, 'Select Model', default_model=DEFAULT_MODEL)
     else:
         model_config = find_model_config(DEFAULT_MODEL, menu)
         if model_config:
-            print(f"[CONFIG] No --model given; defaulting to main model: {DEFAULT_MODEL} "
-                  f"(single-GPU/solo). Use --dual for dual-GPU, or --menu to choose.")
+            print(f"[CONFIG] Non-interactive start; defaulting to main model: {DEFAULT_MODEL} "
+                  f"(single-GPU/solo). Pass --model to choose, or --menu for the picker.")
         else:
-            print(f"[CONFIG] Main model '{DEFAULT_MODEL}' not deployable on this machine; choose one:")
-            model_config = select_model(menu, 'Select Model')
+            available = [e['model'] for e in menu if not e.get('is_header')]
+            print(f"[ERROR] Main model '{DEFAULT_MODEL}' not deployable here and no TTY to prompt. "
+                  f"Pass --model. Available: {available}")
+            sys.exit(1)
 
     print(f"[CONFIG] Model: {model_config['model']} ({model_config['provider']})")
 
