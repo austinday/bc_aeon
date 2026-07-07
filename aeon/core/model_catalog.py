@@ -147,10 +147,12 @@ CATALOG: List[CatalogEntry] = [
         # head is IN this checkpoint, so draft_model is None and the launcher emits a
         # model-less --speculative-config {"method":"mtp","num_speculative_tokens":3}.
         #
-        # VISION: the card advertises multimodal (image-text-to-text). multimodal=True
-        # so the browser loop / analyze_image reuse it — but vision on a quantized+MTP
-        # build is fragile (see the NVFP4 lesson), so LIVE-TEST vision with this exact
-        # checkpoint before trusting the browser agent to it; if broken, set False here.
+        # VISION: multimodal (image-text-to-text), Qwen3_5ForConditionalGeneration with
+        # the vision tower kept BF16. multimodal=True so the browser loop / analyze_image
+        # reuse it. LIVE-VERIFIED 2026-07-06: passes the startup vision self-test 6/6 at
+        # browser resolution (Qwen3.6 OCR is resolution-sensitive — reads fine at the
+        # 1920px the browser sends; an earlier low-res probe false-failed it). This is the
+        # 8-bit sibling of the Huihui NVFP4 entry below.
         name="Qwen3.6-27B-FP8-MTP",
         family="Qwen3.6",
         provider="vllm",
@@ -169,6 +171,39 @@ CATALOG: List[CatalogEntry] = [
         max_num_batched_tokens=32768,
         multimodal=True,             # advertised multimodal; live-test vision before relying on it
         # No download_cmd here: setup PHASE 5.6d pre-caches it; vLLM also fetches at runtime.
+    ),
+    CatalogEntry(
+        # Qwen3.6-27B, HUIHUI-lineage abliteration, NVFP4 (4-bit) + native MTP, multimodal.
+        # This is the vision-WORKING counterpart to the FP8 entry above: that one (kasimat,
+        # AEON-7 abliteration) has an intact vision tower but MISREADS text — the AEON-7
+        # abliteration runs uniformly across all attn/MLP layers, damaging the language
+        # layers that interpret vision tokens (live-tested 2026-07-06: read 'RP9PCV' as
+        # 'R171'). huihui-ai abliterate more surgically (early layers spared), so vision
+        # reading is far more likely to survive. Architecture is Qwen3_5ForConditionalGeneration
+        # with the vision tower EXCLUDED from NVFP4 (visual.* in the ignore list) — the
+        # ConditionalGeneration requirement from the NVFP4 lesson is met. Native in-checkpoint
+        # MTP (method qwen3_5_mtp, K=3; the launcher now accepts that method name).
+        #
+        # multimodal=True is optimistic-but-verified: the startup vision self-test
+        # (aeon.core.vision_selftest) reads a probe code back before this is trusted for
+        # browsing. If huihui's abliteration also broke reading, the gate fails LOUD and we
+        # flip this to False / re-abliterate vision-preserving.
+        name="Qwen3.6-27B-Huihui-NVFP4-MTP",
+        family="Qwen3.6",
+        provider="vllm",
+        image="aeon_vllm:latest",
+        weights_gib=20.0,            # ~19.1 GiB NVFP4 (single shard) incl. the MTP head
+        kv_gib_per_64k=2.5,          # fp8 KV; hybrid linear attention keeps KV small
+        max_ctx=262144,
+        # 8033-8035: 8030-8032 would collide with the hardcoded browser service on :8030.
+        ports={"lb": 8033, "node0": 8034, "node1": 8035},
+        hf_model="sakamakismile/Huihui-Qwen3.6-27B-abliterated-NVFP4-MTP",
+        served_name="Qwen3.6-27B-Huihui-NVFP4",
+        mtp=Mtp(method="qwen3_5_mtp", n_max=3),   # native in-checkpoint MTP: no separate draft
+        kv_quant="fp8",
+        max_num_batched_tokens=32768,  # same TTFT fix as the FP8 entry (roomy 20 GiB weights)
+        multimodal=True,             # vision-preserving lineage; the boot self-test verifies it
+        # No download_cmd: vLLM fetches at runtime; weights are pre-pulled into the HF cache.
     ),
     CatalogEntry(
         name="CyberNeurova-DeepSeek-V4-Flash",

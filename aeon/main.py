@@ -74,28 +74,44 @@ def _config_from_plan(entry, p, model_name):
     }
 
 
-def build_local_model_configs():
-    """Plan each catalog model for this machine's GPUs -> menu/runtime configs.
+# --- Model selection policy (temporary single-model lockdown) --------------
+# Aeon currently boots straight into ONE model: the abliterated 8-bit Qwen3.6-27B
+# (FP8 weights + native in-checkpoint MTP), placed SOLO on GPU0. Every other
+# catalog entry — the Gemma-4 NVFP4/BF16 builds, the Huihui NVFP4 Qwen, DeepSeek —
+# stays in the catalog and on disk but is disabled from selection here, so the menu
+# offers only this model and it loads by default. To re-widen the picker, add names
+# back to ENABLED_MODEL_NAMES (or set it to None for "all") and flip OFFER_DUAL_GPU.
+ENABLED_MODEL_NAMES = {"Qwen3.6-27B-FP8-MTP"}
+OFFER_DUAL_GPU = False
 
-    For models that fit a single GPU we offer two deployment choices:
+
+def build_local_model_configs():
+    """Plan each ENABLED catalog model for this machine's GPUs -> menu/runtime configs.
+
+    For models that fit a single GPU we can offer two deployment choices:
       - SOLO: the model on GPU0 only, leaving GPU1 free for image/video/vision tools
         (the default this harness expects). Listed first / recommended.
       - DUAL: two copies (one per GPU) + router for max throughput, using BOTH GPUs
-        (so GPU1 is unavailable for tools).
+        (so GPU1 is unavailable for tools). Gated off via OFFER_DUAL_GPU right now.
     Bigger models (force_split / don't fit one GPU) get a single auto plan.
+
+    Disabled entries (see ENABLED_MODEL_NAMES) are skipped entirely — they remain in
+    the catalog / on disk but never reach the menu or runtime.
     """
     gpus = detect_gpus()
     n = len(gpus)
     configs = []
     for entry in _catalog.CATALOG:
+        if ENABLED_MODEL_NAMES is not None and entry.name not in ENABLED_MODEL_NAMES:
+            continue  # disabled from selection (still catalogued / on disk)
         if not _local_model_available(entry, gpus):
             continue
         solo = _plan_deploy(entry, gpus, mode='solo')
         if solo.tier == 'solo':
             # Primary: GPU0-only (keeps GPU1 for tools).
             configs.append(_config_from_plan(entry, solo, entry.name))
-            # Alternative: dual-copy across both GPUs, when present.
-            if n >= 2 and not entry.force_split:
+            # Alternative: dual-copy across both GPUs, when enabled and present.
+            if OFFER_DUAL_GPU and n >= 2 and not entry.force_split:
                 dual = _plan_deploy(entry, gpus, mode='dual')
                 if dual.tier == 'dual':
                     configs.append(_config_from_plan(entry, dual, f"{entry.name} [dual-GPU]"))
@@ -107,9 +123,11 @@ def build_local_model_configs():
 
 LLAMACPP_MODELS = build_local_model_configs()
 
-# The abliterated Gemma-4-31B NVFP4 + native MTP build is Aeon's main model: it is
-# the default when no --model is passed (see cli()). Matches the catalog entry name.
-DEFAULT_MODEL = "Gemma-4-31B-NVFP4-MTP"
+# The abliterated 8-bit Qwen3.6-27B (FP8 + native in-checkpoint MTP, solo on GPU0)
+# is Aeon's main model: it is the default when no --model is passed (see cli()) and,
+# per ENABLED_MODEL_NAMES above, currently the only selectable model. Matches the
+# catalog entry name.
+DEFAULT_MODEL = "Qwen3.6-27B-FP8-MTP"
 
 def is_container_running(name):
     try: return bool(subprocess.check_output(["docker", "ps", "-q", "-f", f"name={name}"], stderr=subprocess.DEVNULL, text=True).strip())
@@ -1024,8 +1042,9 @@ def cli():
                     'Runs a single LLM in a plan/act loop with collapsible tools, '
                     'skills, sub-agents, and persistent memory.',
         epilog='Examples:\n'
-               '  python3 -m aeon.main --model Gemma-4-31B-NVFP4-MTP --start "Summarize the repo"\n'
-               '  python3 -m aeon.main --start "Build X" --max-iterations 40\n',
+               '  python3 -m aeon.main --start "Summarize the repo"\n'
+               '  python3 -m aeon.main --start "Build X" --max-iterations 40\n'
+               '  python3 -m aeon.main -n --start "Do X and exit"   # headless, no prompt\n',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('--debug', action='store_true', help='Enable detailed LLM call logging to ~/')
@@ -1038,6 +1057,10 @@ def cli():
                         help='Deploy the main model in DUAL-GPU mode (a copy on each GPU + routing) '
                              'instead of the default single-GPU (solo) placement.')
     parser.add_argument('--start', type=str, help='Initial objective to start immediately')
+    parser.add_argument('--non-interactive', '-n', action='store_true',
+                        help='Headless mode: run the --start objective (and any --resume) to '
+                             'completion, then exit without dropping into the interactive "> " '
+                             'prompt. Never shows the model picker. Requires --start (or --resume).')
     parser.add_argument('--max-iterations', type=int, default=None,
                         help='Cap iterations per objective; the agent is forced to deliver a final '
                              'report at the limit. Default: unbounded.')
@@ -1047,6 +1070,9 @@ def cli():
 
     if args.max_iterations is not None and args.max_iterations < 1:
         parser.error('--max-iterations must be a positive integer')
+
+    if args.non_interactive and not (args.start or args.resume):
+        parser.error('--non-interactive requires --start "<objective>" (nothing to run headless otherwise)')
 
     # --- Enumerate local models (start brain if needed) ---
     local_models = []
@@ -1065,18 +1091,20 @@ def cli():
     menu = build_model_menu(local_models)
 
     # --- Select model (used for both planning and utility tasks) ---
-    # Gemma-4-31B-NVFP4-MTP (abliterated) is THE main model: when --model is not
-    # given we boot straight into it instead of prompting. We only drop to the
-    # interactive menu if this machine can't deploy it (e.g. won't fit the GPUs),
-    # so the default never silently becomes some other model.
-    # --dual is a convenience shortcut for the main model's dual-GPU variant, whose
-    # menu name is "<name> [dual-GPU]" (a copy on each GPU + adaptive_lb routing).
+    # Qwen3.6-27B-FP8-MTP (abliterated, 8-bit, native MTP, solo on GPU0) is THE main
+    # model AND — per ENABLED_MODEL_NAMES — currently the only selectable one, so Aeon
+    # boots straight into it without prompting. The interactive picker no longer pops up
+    # on a bare TTY start; pass --menu to force it (useful again once more models are
+    # re-enabled) or --model NAME to name one explicitly.
     model_name = args.model
     if not model_name and args.dual:
+        # Dual-GPU is currently disabled (OFFER_DUAL_GPU=False); this name won't resolve,
+        # which yields the clear "not found / available" error below rather than silently
+        # falling back to solo.
         model_name = f"{DEFAULT_MODEL} [dual-GPU]"
 
     if args.menu and not model_name:
-        # Explicitly requested the interactive picker (choose solo vs dual, etc.).
+        # Explicitly requested the interactive picker (choose among enabled models).
         model_config = select_model(menu, 'Select Model', default_model=DEFAULT_MODEL)
     elif model_name:
         model_config = find_model_config(model_name, menu)
@@ -1089,21 +1117,17 @@ def cli():
                 print(f"  Did you mean: {', '.join(close)}?")
             print(f"  Available: {available}")
             sys.exit(1)
-    elif sys.stdin.isatty() and not args.resume:
-        # Fresh INTERACTIVE start with no --model: show the picker so the user chooses
-        # among the deployable models (e.g. Gemma-4 NVFP4 vs BF16, solo vs dual-GPU).
-        # A bare Enter selects the main model, so the old one-keystroke boot is intact.
-        # (--resume always passes --model, and non-TTY falls through to the default
-        # below, so the restart relaunch and scripted/piped runs never block on a prompt.)
-        model_config = select_model(menu, 'Select Model', default_model=DEFAULT_MODEL)
     else:
+        # Default path (no --model, no --menu): boot straight into the single enabled
+        # model, whether or not there's a TTY. This is what makes `--start "<task>"`
+        # (and `-n --start ...`) just go, with no picker to click through.
         model_config = find_model_config(DEFAULT_MODEL, menu)
         if model_config:
-            print(f"[CONFIG] Non-interactive start; defaulting to main model: {DEFAULT_MODEL} "
-                  f"(single-GPU/solo). Pass --model to choose, or --menu for the picker.")
+            print(f"[CONFIG] Booting default model: {DEFAULT_MODEL} (single-GPU/solo on GPU0). "
+                  f"Pass --menu for the picker or --model NAME to choose.")
         else:
             available = [e['model'] for e in menu if not e.get('is_header')]
-            print(f"[ERROR] Main model '{DEFAULT_MODEL}' not deployable here and no TTY to prompt. "
+            print(f"[ERROR] Default model '{DEFAULT_MODEL}' not deployable here. "
                   f"Pass --model. Available: {available}")
             sys.exit(1)
 
@@ -1133,8 +1157,54 @@ def cli():
         os.environ.pop("AEON_VISION_BASE_URL", None)
         os.environ.pop("AEON_VISION_MODEL", None)
         if model_config.get('multimodal') and model_config.get('base_url'):
-            os.environ["AEON_VISION_BASE_URL"] = model_config['base_url']
-            os.environ["AEON_VISION_MODEL"] = model_config.get('api_model') or model_config['model']
+            vis_base = model_config['base_url']
+            vis_model = model_config.get('api_model') or model_config['model']
+            # HARD GATE: a model we *declare* multimodal is trusted to drive the
+            # browser from screenshots. Before exporting it as the vision backend,
+            # prove it can actually SEE — send a nonce image and require it read
+            # back. This catches an unreachable endpoint, a text-only build that
+            # rejects images, AND (the silent-killer) a quant/MTP build that
+            # accepts images but confabulates. If it fails, STOP with fix-it info
+            # rather than let a blind model browse. Opt out with
+            # AEON_SKIP_VISION_SELFTEST=1 (unverified — prints a warning).
+            if os.environ.get("AEON_SKIP_VISION_SELFTEST") == "1":
+                print("\033[93m[VISION SELF-TEST] Skipped via AEON_SKIP_VISION_SELFTEST=1 "
+                      "— vision is UNVERIFIED this session.\033[0m")
+            else:
+                from aeon.core.vision_selftest import run_vision_self_test, VisionSelfTestError
+                print(f"[VISION SELF-TEST] Verifying {vis_model} can read an image...")
+                try:
+                    code = run_vision_self_test(vis_base, vis_model)
+                    if code:
+                        print(f"\033[92m[VISION SELF-TEST] PASS — model read the probe code "
+                              f"'{code}'. Vision trusted for browsing.\033[0m")
+                except VisionSelfTestError as ve:
+                    # A vision-capability failure is NOT a broken-code regression:
+                    # the code booted, imported and restored state fine. Clear the
+                    # bootguard pending marker first so this abort is not
+                    # misattributed to a code change and rolled back on next start.
+                    try:
+                        from aeon.core import bootguard
+                        bootguard.mark_boot_ok()
+                    except Exception:
+                        pass
+                    bar = "=" * 72
+                    imgs = "\n".join(f"        {p}" for p in getattr(ve, "images", []))
+                    print(f"\n\033[91m{bar}\n"
+                          f"FATAL: VISION SELF-TEST FAILED for '{vis_model}'\n"
+                          f"{bar}\n"
+                          f"Why:  {ve}\n"
+                          f"Fix:  {ve.hint}\n"
+                          f"Endpoint: {vis_base.rstrip('/')}/chat/completions\n"
+                          + (f"Probe images (inspect these — they are crisp):\n{imgs}\n" if imgs else "")
+                          + f"This model is declared multimodal=True but cannot be trusted to see.\n"
+                          f"Aeon is stopping so this is fixed rather than silently browsing blind.\n"
+                          f"(To start anyway, text-only and UNVERIFIED, set "
+                          f"AEON_SKIP_VISION_SELFTEST=1.)\n"
+                          f"{bar}\033[0m")
+                    raise
+            os.environ["AEON_VISION_BASE_URL"] = vis_base
+            os.environ["AEON_VISION_MODEL"] = vis_model
             print(f"[CONFIG] Vision -> reusing the loaded multimodal model "
                   f"({os.environ['AEON_VISION_MODEL']}); no separate vision server.")
         llm_client = LLMClient(model_config)
@@ -1246,17 +1316,23 @@ def cli():
                 worker.run(obj, max_iterations=args.max_iterations)
                 obj = _execute_restart(session, worker)
 
-        while True:
-            try:
-                obj = input("> ")
-                if obj.strip(): 
-                    if obj.strip() in ['exit', 'quit']: break
-                    while obj:
-                        worker.run(obj, max_iterations=args.max_iterations)
-                        obj = _execute_restart(session, worker)
-            except (KeyboardInterrupt, EOFError):
-                print("\n")
-                break
+        # Headless mode: the --start objective (and any --resume) is done; exit instead
+        # of dropping into the interactive prompt. Lets you "start it up with a task and
+        # it just goes" with no attached terminal.
+        if args.non_interactive:
+            print("[CONFIG] Non-interactive mode: objective complete, exiting.")
+        else:
+            while True:
+                try:
+                    obj = input("> ")
+                    if obj.strip():
+                        if obj.strip() in ['exit', 'quit']: break
+                        while obj:
+                            worker.run(obj, max_iterations=args.max_iterations)
+                            obj = _execute_restart(session, worker)
+                except (KeyboardInterrupt, EOFError):
+                    print("\n")
+                    break
     except Exception as e:
         print(f"[ERROR] Fatal error: {e}")
         raise

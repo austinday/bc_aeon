@@ -27,6 +27,7 @@ aeon/core/runtime_signals.py
 aeon/core/sub_agent_state.py
 aeon/core/system_info.py
 aeon/core/utils.py
+aeon/core/vision_selftest.py
 aeon/core/worker.py
 aeon/core/worker_utils.py
 aeon/core/prompts/__init__.py
