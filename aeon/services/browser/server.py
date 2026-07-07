@@ -858,6 +858,48 @@ async def _human_click(page: Page, locator, button: str = "left", clicks: int = 
         await locator.click(button=button, click_count=clicks, timeout=5000)
 
 
+async def _element_disabled(locator) -> bool:
+    """True if the element is disabled (native `disabled` or aria-disabled='true')."""
+    try:
+        if not await locator.is_enabled(timeout=800):
+            return True
+    except PWError:
+        pass
+    try:
+        if ((await locator.get_attribute("aria-disabled")) or "").lower() == "true":
+            return True
+    except PWError:
+        pass
+    return False
+
+
+async def _wait_enabled_or_note(locator, element_id) -> Optional[str]:
+    """Return None if the target is (or shortly becomes) enabled, else a note saying
+    it is disabled and why that matters.
+
+    A human/coordinate click (see _human_click -> page.mouse.click) fires at a point
+    and BYPASSES Playwright's built-in enabled check — so clicking a disabled control
+    (e.g. a Submit/Next greyed out while an async field-validation runs) is a SILENT
+    no-op. The agent then sees an unchanged page and wrongly concludes the value was
+    rejected/taken, and loops. So: wait a bounded time for an async check to enable
+    it; if it stays disabled, hand back a clear reason instead of a dead click."""
+    for _ in range(13):  # ~2.5s max
+        if not await _element_disabled(locator):
+            return None
+        await asyncio.sleep(0.2)
+    label = ""
+    try:
+        label = ((await locator.get_attribute("aria-label")) or (await locator.inner_text()) or "")[:40]
+    except PWError:
+        pass
+    tag = f" '{label.strip()}'" if label.strip() else ""
+    return (f"⚠ TARGET DISABLED: element [{element_id}]{tag} is disabled, so the click did NOT "
+            f"register (no effect). The form's precondition is unmet — a required field is empty "
+            f"or invalid, or an availability/validation check is still pending or failed. Fix the "
+            f"blocking field (see FORM VALIDATION) before clicking; re-clicking this control will "
+            f"keep doing nothing.")
+
+
 async def _human_field_clear(page: Page, locator):
     """Clear a focused field the way a person does: select-all, then delete —
     real keystrokes, not an instant programmatic fill. A fill() fallback only
@@ -1497,12 +1539,24 @@ async def interact(req: InteractRequest):
             raise HTTPException(status_code=404,
                                 detail=f"Element [{req.element_id}] is no longer on the page. Re-read it.")
 
+        # Pre-click enabled guard: a coordinate click bypasses Playwright's enabled
+        # check, so clicking a disabled control silently does nothing. Wait briefly
+        # for an async validation to enable it; if it stays disabled, skip the dead
+        # click and report WHY (surfaced as an event below) instead of misleading the
+        # agent with an unchanged page.
+        click_blocked_note = None
+        if a in ("click", "double_click", "right_click"):
+            click_blocked_note = await _wait_enabled_or_note(loc, req.element_id)
+
         if a == "click":
-            await _human_click(page, loc)
+            if not click_blocked_note:
+                await _human_click(page, loc)
         elif a == "double_click":
-            await _human_click(page, loc, clicks=2)
+            if not click_blocked_note:
+                await _human_click(page, loc, clicks=2)
         elif a == "right_click":
-            await _human_click(page, loc, button="right")
+            if not click_blocked_note:
+                await _human_click(page, loc, button="right")
         elif a == "hover":
             await loc.scroll_into_view_if_needed(timeout=5000)
             c = await _click_point(page, loc)
@@ -1567,6 +1621,10 @@ async def interact(req: InteractRequest):
         # to lean on expected_text) instead of silently acting on a different element.
         if retarget_note:
             resp.setdefault("events", []).insert(0, retarget_note)
+        # Surface a skipped disabled-target click so the agent gets the REASON the page
+        # did not change, rather than inferring "rejected/taken" and looping.
+        if click_blocked_note:
+            resp.setdefault("events", []).insert(0, click_blocked_note)
         return resp
 
     except HTTPException:

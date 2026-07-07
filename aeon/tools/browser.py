@@ -289,6 +289,28 @@ def _session_id():
     return str(os.getpid())
 
 
+def _resolve_tab(worker, tab_id):
+    """Resolve the tab to act on, defaulting to the LAST tab this agent used rather
+    than the literal 'default'. The #1 browser footgun was: the model navigates to
+    tab 'email_task' but a later interact omits tab_id -> it defaulted to 'default'
+    (a tab that never existed) -> 'HTTP 404: Tab default not found' -> the agent
+    blamed itself and looped. Now an omitted/'default' tab_id follows the last tab
+    the agent actually navigated/acted in."""
+    last = getattr(worker, "_last_browser_tab", None) if worker else None
+    if not tab_id or tab_id == "default":
+        return last or "default"
+    return tab_id
+
+
+def _remember_tab(worker, tab_id):
+    """Record the tab this agent is currently working in, for _resolve_tab."""
+    if worker is not None and tab_id:
+        try:
+            worker._last_browser_tab = tab_id
+        except Exception:
+            pass
+
+
 def _profile_for(worker):
     """The browser profile (isolation unit) for this agent. The principal uses
     'default' (shared, persistent — logins survive); each sub-agent sets its own
@@ -583,10 +605,12 @@ class BrowserNavigateTool(BaseTool):
         super().__init__(name="browser_navigate", description=TOOL_DESC_BROWSER_NAVIGATE)
         self.worker = worker
 
-    def execute(self, url: str, tab_id: str = "default", include_vision: bool = True,
+    def execute(self, url: str, tab_id: str = None, include_vision: bool = True,
                 visual: str = "overlay", **kwargs) -> str:
         if not url:
             return "Error: 'url' is required."
+        tab_id = _resolve_tab(self.worker, tab_id)
+        _remember_tab(self.worker, tab_id)
         return _post("navigate", {"session_id": _session_id(), "tab_id": tab_id, "url": url},
                      f"Navigated to {url}", tab_id, include_vision=include_vision,
                      visual=visual, worker=self.worker)
@@ -598,7 +622,7 @@ class BrowserInteractTool(BaseTool):
         self.worker = worker
 
     def execute(self, action: str, element_id: int = None, text: str = None,
-                expected_text: str = None, tab_id: str = "default", key: str = None,
+                expected_text: str = None, tab_id: str = None, key: str = None,
                 value: str = None, file_path: str = None, amount: int = None,
                 direction: str = None, to_element_id: int = None,
                 clear_first: bool = True, then_enter: bool = False,
@@ -606,6 +630,8 @@ class BrowserInteractTool(BaseTool):
                 visual: str = "overlay", compare: bool = False, **kwargs) -> str:
         if not action:
             return "Error: 'action' is required."
+        tab_id = _resolve_tab(self.worker, tab_id)
+        _remember_tab(self.worker, tab_id)
         # Friendly aliases so common phrasings just work.
         alias = {"scroll_down": ("scroll", "down"), "scroll_up": ("scroll", "up"),
                  "scroll_to_bottom": ("scroll", "bottom"), "scroll_to_top": ("scroll", "top"),
@@ -641,7 +667,8 @@ class BrowserReadTool(BaseTool):
                 "scroll state, and attaches the current page screenshot to your next turn so you SEE the "
                 "page again. Use it after a page updates on its own, when element ids feel stale, or to "
                 "re-orient (take a fresh look) before choosing the next action.\n"
-                "Schema:\n  tab_id (str, optional, default='default'): the tab to read.\n"
+                "Schema:\n  tab_id (str, optional): the tab to read; OMIT to read the tab you last "
+                "navigated/acted in (the usual case). Only set it to read a DIFFERENT open tab.\n"
                 "  include_vision (bool, optional, default true): set false to skip attaching the "
                 "screenshot for a faster, element-list-only read when you don't need to see the page.\n"
                 "  visual (str, optional, default 'overlay'): 'overlay' = render + numbered [id] marks; "
@@ -651,8 +678,10 @@ class BrowserReadTool(BaseTool):
         )
         self.worker = worker
 
-    def execute(self, tab_id: str = "default", include_vision: bool = True,
+    def execute(self, tab_id: str = None, include_vision: bool = True,
                 visual: str = "overlay", **kwargs) -> str:
+        tab_id = _resolve_tab(self.worker, tab_id)
+        _remember_tab(self.worker, tab_id)
         return _post("observe", {"session_id": _session_id(), "tab_id": tab_id}, "Read page", tab_id,
                      include_vision=include_vision, visual=visual, worker=self.worker)
 
@@ -690,6 +719,9 @@ class BrowserSwitchTabTool(BaseTool):
 
     def execute(self, tab_id: str = "default", include_vision: bool = True,
                 visual: str = "overlay", **kwargs) -> str:
+        # A switch names an explicit target; remember it so later omitted-tab
+        # interacts follow the tab the agent switched to.
+        _remember_tab(self.worker, tab_id)
         return _post("switch_tab", {"session_id": _session_id(), "tab_id": tab_id},
                      f"Switched to tab '{tab_id}'", tab_id,
                      include_vision=include_vision, visual=visual, worker=self.worker)
