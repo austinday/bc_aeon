@@ -39,7 +39,7 @@ else
 fi
 
 echo "[Browser] Starting container (headed Chromium under Xvfb, persistent profile)..."
-docker run -d --name $CONTAINER_NAME \
+docker run -d --label owner=aday --name $CONTAINER_NAME \
     $GPU_RUN_ARGS \
     -p $PORT:8030 \
     -e PORT=8030 \

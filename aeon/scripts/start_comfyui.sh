@@ -18,7 +18,7 @@ docker rm -f aeon_comfyui >/dev/null 2>&1 || true
 GPU_ID=${COMFYUI_GPU:-1}
 echo "Using GPU: ${GPU_ID}"
 
-docker run -d \
+docker run -d --label owner=aday \
     --name aeon_comfyui \
     --gpus "device=${GPU_ID}" \
     --shm-size=8gb \

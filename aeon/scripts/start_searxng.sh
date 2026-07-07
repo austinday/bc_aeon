@@ -48,7 +48,7 @@ if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${PORT}/healthz
 fi
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
+docker run -d --label owner=aday --name "$CONTAINER_NAME" --restart unless-stopped \
     -p "127.0.0.1:${PORT}:8080" \
     -v "$CONFIG_DIR:/etc/searxng" \
     -e "SEARXNG_BASE_URL=http://localhost:${PORT}/" \

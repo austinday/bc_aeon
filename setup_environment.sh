@@ -60,7 +60,7 @@ run_downloader() {
     local tty_flag=""
     if [ -t 0 ]; then tty_flag="-t"; fi
 
-    docker run --network=host --rm $tty_flag \
+    docker run --label owner=aday --network=host --rm $tty_flag \
         -e HF_TOKEN="$HF_TOKEN" \
         -e PYTHONUNBUFFERED=1 \
         -v "$vol_map" \
@@ -75,7 +75,7 @@ run_downloader() {
 
     # Fix permissions to match host user
     local vol_mount="${vol_map##*:}"
-    docker run --rm -v "$vol_map" aeon_downloader:latest chown -R $(id -u):$(id -g) "$vol_mount" || true
+    docker run --label owner=aday --rm -v "$vol_map" aeon_downloader:latest chown -R $(id -u):$(id -g) "$vol_mount" || true
 
     echo "$state_val" > "$state_file"
 }

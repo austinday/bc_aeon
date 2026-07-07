@@ -89,7 +89,7 @@ launch_node() {
         args+=(--batch-size "${BATCH:-4096}")
     fi
     echo "[adaptive-llamacpp] launch $name (GPU $devices, port $port, ctx $ctx${tensor_split:+, split $tensor_split})"
-    docker run -d --name "$name" --gpus "\"device=${devices}\"" -p "${port}:8080" \
+    docker run -d --label owner=aday --name "$name" --gpus "\"device=${devices}\"" -p "${port}:8080" \
         -v "${MODELS_DIR}:/models:ro" --shm-size=16g --ulimit memlock=-1 \
         "$IMAGE" "${args[@]}" > /tmp/aeon_${name}.cid 2>/tmp/aeon_${name}.err || {
             echo "[adaptive-llamacpp] docker run failed for $name:"; cat /tmp/aeon_${name}.err; return 1; }
@@ -141,7 +141,7 @@ if [ "$TIER" = "dual" ]; then
     docker rm -f "$LB_NAME" >/dev/null 2>&1 || true
     JOINED=$(IFS=,; echo "${NODE_URLS[*]}")
     echo "[adaptive-llamacpp] Starting router $LB_NAME on :$LB_PORT -> $JOINED"
-    docker run -d --name "$LB_NAME" --network host \
+    docker run -d --label owner=aday --name "$LB_NAME" --network host \
         -e AEON_LB_NODES="$JOINED" -e AEON_LB_PORT="$LB_PORT" \
         -v "${SCRIPT_DIR}/adaptive_lb.py:/app/adaptive_lb.py" -w /app \
         python:3.11-slim sh -c "pip install -q fastapi uvicorn httpx && python adaptive_lb.py" > /dev/null

@@ -49,7 +49,7 @@ echo "[2/2] Launching Brain Node (GPU 1 -> :8000)..."
 #   - OLLAMA_NUM_CTX=65536: enough for long summaries/compressions; light KV on a 3B.
 UTILITY_MODEL="${AEON_UTILITY_MODEL:-huihui_ai/qwen2.5-abliterate:3b}"
 
-docker run -d \
+docker run -d --label owner=aday \
     --name aeon_brain_node \
     --gpus '"device=1"' \
     -v "$HOST_OLLAMA_DIR:/root/.ollama" \

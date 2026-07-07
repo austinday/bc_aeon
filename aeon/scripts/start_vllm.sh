@@ -20,7 +20,7 @@ MODEL_PATH="/models/$MODEL_NAME"
 
 echo "Starting vLLM for $MODEL_NAME on GPU $GPU_ID (Port $PORT)..."
 
-docker run -d \
+docker run -d --label owner=aday \
   --name aeon_vllm \
   --gpus '"device=0"' \
   -v "$MODELS_DIR:/models" \

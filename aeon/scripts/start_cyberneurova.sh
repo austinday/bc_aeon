@@ -85,7 +85,7 @@ wait_for_health() {
 
 # 284B / ~153 GiB cannot fit one card -> always split GPU0 + GPU1, GPU0-weighted.
 echo "[CyberNeurova-V4] Starting dual-GPU server (GPU0-weighted split ${TENSOR_SPLIT}, ubatch ${UBATCH_SIZE}, ctx ${CTX_SIZE})..."
-docker run -d \
+docker run -d --label owner=aday \
     --name $CONTAINER_NAME \
     --gpus '"device=0,1"' \
     -p ${PORT}:8001 \
