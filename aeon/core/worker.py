@@ -60,6 +60,14 @@ PASSIVE_TOOLS = OBSERVATION_TOOLS | {"think", "say_to_user"}
 # browser_read is included: re-reading the page is inspection, not progress.
 NON_CONSEQUENTIAL_TOOLS = PASSIVE_TOOLS | {"browser_read"}
 
+# Substrings a tool emits when a state-changing action failed or changed nothing.
+# Shared by _derive_ground_truth_outcome (builds the log tag) and
+# _turn_made_no_progress (the boolean the semantic-stall detector keys on) so the
+# two never drift.
+NO_PROGRESS_ERROR_MARKERS = ("COMMAND FAILED", "Tool Execution Error", "Tool Parameter Error",
+                             "Browser Error during", "Browser action failed", "Error during ",
+                             "Error executing")
+
 # Parameters that only change how a result is PRESENTED or ASSERTED, never what
 # the action does to the page/world. The loop guard must ignore them when it
 # fingerprints an action: a weak model re-clicking the same element re-decorates
@@ -85,6 +93,9 @@ class Worker:
         self.logger = get_logger()
         self.print_func = print_func
         self.debug_mode = debug_mode
+        if self.tools:
+            # Tools handed to the constructor (register_tools also refreshes).
+            self._refresh_action_schema()
 
         # Initialize debug logging ONCE per worker instance
         self._debug_initialized = False
@@ -112,6 +123,8 @@ class Worker:
         self.recent_intents = deque(maxlen=3)  # Tracks recent intents for loop detection
         self._loop_blocked_fingerprint = None  # Consequential command under a hard loop block (refused until it changes)
         self._loop_block_hits = 0  # How many turns in a row the block has refused the same action (escalation)
+        self._no_progress_streak = 0  # Consecutive state-changing turns that made no progress under the same approach
+        self._last_struct_fp = ""  # Structural fingerprint (tool+verb, text dropped) of the last consequential turn
         self._stuck_banner = ""  # Top-of-prompt STUCK banner, set by loop/oscillation detection
         self.prev_prompt_tokens = 0  # Tracks context size of previous iteration for growth metrics
         self.action_log_summary = ""  # Non-destructive summary of older action log entries
@@ -208,6 +221,21 @@ class Worker:
         for tool in tools_list:
             tool.worker = self
             self.tools[tool.name] = tool
+        self._refresh_action_schema()
+
+    def _refresh_action_schema(self):
+        """(Re)build the turn schema from the registered tools and hand it to the
+        LLM client, which asks the server to grammar-constrain generation to it
+        (vLLM structured outputs). This is what makes malformed JSON and
+        hallucinated tool names impossible at the source instead of errors to
+        recover from. Best-effort: on any failure the client keeps its previous
+        schema (or None -> legacy parse path), never breaking the loop."""
+        try:
+            from aeon.core.action_schema import build_turn_schema
+            if self.tools:
+                self.llm_client.set_action_schema(build_turn_schema(list(self.tools.keys())))
+        except Exception as e:
+            self.logger.warning(f"Could not install structured-output schema: {e}")
 
     def set_visual_context(self, image_paths, replace: bool = True):
         """Register screenshot file path(s) for the multimodal model to look at on
@@ -677,6 +705,65 @@ class Worker:
             parts.append(f"{t}({self._canonical_params(p)})")
         return self._normalize_cmd("|".join(parts))
 
+    def _structural_fp(self, actions) -> str:
+        """Coarser than _consequential_fp: keeps the tool and its action VERB but
+        drops all free-text/target params. Two turns that make the same move while
+        varying one incidental value — e.g. a fresh username on each signup attempt —
+        share a structural fingerprint even though their _consequential_fp (which
+        includes the text) differs every turn and so never arms the exact-repeat
+        block. This is what lets the semantic-stall detector see through that."""
+        parts = []
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            t = (a.get("tool_name") or a.get("tool") or "").strip()
+            if not t or t in NON_CONSEQUENTIAL_TOOLS:
+                continue
+            p = a.get("parameters") or a.get("args") or {}
+            verb = ""
+            if isinstance(p, dict):
+                raw = str(p.get("action") or p.get("command") or "").strip()
+                verb = raw.split()[0][:24] if raw.split() else ""
+            parts.append(f"{t}:{verb}" if verb else t)
+        return "|".join(parts)
+
+    @staticmethod
+    def _turn_made_no_progress(raw_output: str, consequential: bool) -> bool:
+        """Boolean form of the no-progress markers _derive_ground_truth_outcome scans:
+        True when a state-CHANGING turn failed, was blocked, or changed nothing (URL +
+        elements identical, or a form is still invalid). Passive turns are never
+        'no progress' (inspection isn't an attempt). Used by the semantic-stall
+        detector to count attempts that keep failing even as their params vary."""
+        if not consequential:
+            return False
+        text = raw_output or ""
+        low = text.lower()
+        if "command blocked" in low:
+            return True
+        if any(m in text for m in NO_PROGRESS_ERROR_MARKERS):
+            return True
+        if "NO CHANGE:" in text or "FORM VALIDATION" in text:
+            return True
+        return False
+
+    @staticmethod
+    def _note_contradicts_outcome(note: str, outcome: str) -> bool:
+        """True when the model's self-narration claims success/progress but the
+        DERIVED ground truth says the turn failed or changed nothing. This is the
+        exact confabulation that let a stuck agent write 'successfully advanced' for
+        a no-op click; flagging it in the log stops that fiction from compounding."""
+        if not note or not outcome:
+            return False
+        if not outcome.upper().startswith(
+                ("NO EFFECT", "FORM STILL INVALID", "ERROR", "BLOCKED", "NO PROGRESS")):
+            return False
+        low = note.lower()
+        success_words = ("success", "advanced", "proceeded", "completed", "filled in",
+                         "now on", "loaded successfully", "moved to", "submitted", "accepted",
+                         "worked", "went through", "was created", "logged in", "signed in",
+                         "next step", "proceeding to")
+        return any(w in low for w in success_words)
+
     @staticmethod
     def _normalize_output(text: str) -> str:
         """Normalize command output for loop comparison by stripping volatile
@@ -742,13 +829,10 @@ class Worker:
         no-op)."""
         text = raw_output or ""
         low = text.lower()
-        error_markers = ("COMMAND FAILED", "Tool Execution Error", "Tool Parameter Error",
-                         "Browser Error during", "Browser action failed", "Error during ",
-                         "Error executing")
         tag = ""
         if "command blocked" in low:
             tag = "BLOCKED by loop guard — the action was refused, not executed (it was a repeat)."
-        elif any(m in text for m in error_markers):
+        elif any(m in text for m in NO_PROGRESS_ERROR_MARKERS):
             tag = "ERROR — the action failed" + Worker._first_error_snippet(text)
         elif consequential and "NO CHANGE:" in text:
             tag = ("NO EFFECT — the action did NOT change the page (URL + interactive elements "
@@ -850,6 +934,8 @@ class Worker:
         self._recent_outputs.clear()
         self._loop_blocked_fingerprint = None
         self._loop_block_hits = 0
+        self._no_progress_streak = 0
+        self._last_struct_fp = ""
         self._stuck_banner = ""
         self.recent_intents.clear()
         self.expanded_categories.clear()
@@ -1554,6 +1640,12 @@ class Worker:
                 previous_result_summary = response_data.get("previous_result_summary", "N/A (first turn)")
                 intent = response_data.get("intent", "(No intent provided)")
                 updated_plan = response_data.get("updated_plan")
+                # updated_plan is now an optional plain string. If a model still block-
+                # encodes it and the block goes missing, an unsubstituted "__BLOCK_N__"
+                # placeholder can arrive here — ignore it (keep the prior plan) rather
+                # than storing the literal placeholder as the plan.
+                if isinstance(updated_plan, str) and "__BLOCK" in updated_plan and len(updated_plan.strip()) < 20:
+                    updated_plan = None
                 actions = self._normalize_actions(response_data.get("actions", []))
 
                 if self.debug_mode and hasattr(self, 'debug_path'):
@@ -1620,6 +1712,14 @@ class Worker:
                         finished_entry = (f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n"
                                           f"- Actions: {acts_str}\n- Result: {outcome}\n"
                                           f"- Agent's note: {note or '(none)'}")
+                        # Confabulation guard: if the model's note claims success but the
+                        # measured Result says the turn failed/changed nothing, mark the
+                        # mismatch inline so the fiction can't quietly drive the next turn.
+                        if self._note_contradicts_outcome(note, outcome):
+                            finished_entry += (
+                                "\n- ⚠ NOTE-VS-REALITY MISMATCH: the note above claims progress, but the "
+                                "measured Result says the action did NOT succeed. Trust the Result — do "
+                                "not act as though it worked.")
                     else:
                         finished_entry = (f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n"
                                           f"- Actions: {acts_str}\n- Result: {note}")
@@ -1892,6 +1992,7 @@ class Worker:
 
                 loop_detected = False
                 repeat_count = 0  # consecutive-repeat streak, for the ground-truth outcome tag
+                no_progress = False  # this (state-changing) turn failed / changed nothing — for the semantic-stall detector
                 # Polling background state is legitimate even when its output is
                 # byte-identical turn after turn, so skip the entire loop /
                 # oscillation / stall machinery on observation-only turns. This is
@@ -1910,6 +2011,7 @@ class Worker:
                     # has an empty consequential fingerprint and is transparent here: it
                     # neither counts as a repeat nor resets an in-progress streak.
                     norm_cmd = self._consequential_fp(actions)
+                    no_progress = self._turn_made_no_progress(raw_output, bool(norm_cmd))
                     if norm_cmd:
                         norm_out = self._normalize_output(raw_output)
                         self._recent_commands.append(norm_cmd)
@@ -2034,14 +2136,58 @@ class Worker:
                             self.last_observation += stall_note
                             self.print_func(f"{C_YELLOW}{stall_note}{C_RESET}")
 
-                    if norm_cmd and not loop_detected:
-                        # A CONSEQUENTIAL action ran and it was not a loop -> real
-                        # progress; clear any prior loop flag and stuck banner so a
-                        # recovered agent stops showing as LOOPING / STUCK. A pure
-                        # think/read turn (empty norm_cmd) does NOT clear it — thinking
-                        # about being stuck is not the same as getting unstuck.
+                    # --- SEMANTIC STALL (varying-detail loop) ---
+                    # The exact-fingerprint block above is disarmed when the model
+                    # changes one incidental value each turn (a fresh username per
+                    # signup try) while the move and its no-progress result stay the
+                    # same — the real failure that spun ~18 turns. Count consecutive
+                    # state-changing turns that made NO progress under the SAME action
+                    # STRUCTURE (tool+verb, text dropped) and escalate to the hard
+                    # top-of-prompt banner, since the inline stall note above was shown
+                    # in the wild to be ignored for many turns.
+                    if norm_cmd and no_progress and not loop_detected:
+                        struct_fp = self._structural_fp(actions)
+                        if struct_fp and struct_fp == self._last_struct_fp:
+                            self._no_progress_streak += 1
+                        else:
+                            self._no_progress_streak = 1
+                        self._last_struct_fp = struct_fp
+                        if self._no_progress_streak >= 3:
+                            stop = self._no_progress_streak >= 5
+                            self.stuck_reason = (
+                                f"semantic stall: {self._no_progress_streak} consecutive attempts at the "
+                                f"same move, all no-progress (varying a detail is not a new approach).")
+                            if stop:
+                                self._stuck_banner = (
+                                    "===[ ! STUCK — READ THIS FIRST ]===\n"
+                                    f"{self._no_progress_streak} attempts at this SAME move have all failed the same "
+                                    "way. Tweaking one value (another username, another suffix) is NOT a new approach "
+                                    "and will keep failing. STOP this sub-task NOW: switch to a genuinely different "
+                                    "method/provider/target, or if none exists, report the blocker to the user "
+                                    "(say_to_user / task_complete). Do NOT attempt this move again.\n"
+                                    "===[ END STUCK ]===")
+                            else:
+                                self._stuck_banner = (
+                                    "===[ ! STUCK — READ THIS FIRST ]===\n"
+                                    f"You have made the SAME move {self._no_progress_streak}x with the same no-progress "
+                                    "result, changing only an incidental detail each time — that is NOT progress. This "
+                                    "turn: use `think` to name the real blocker, then change the METHOD (different "
+                                    "target / provider / approach), not just another value.\n"
+                                    "===[ END STUCK ]===")
+                            self.last_observation += "\n\n" + self._stuck_banner
+                            self.print_func(f"{C_RED}\n\n{self._stuck_banner}{C_RESET}")
+
+                    if norm_cmd and not loop_detected and not no_progress:
+                        # A CONSEQUENTIAL action ran, it was not a loop, and it actually
+                        # changed something -> real progress; clear any prior loop flag,
+                        # stuck banner and semantic-stall streak so a recovered agent
+                        # stops showing as LOOPING / STUCK. A pure think/read turn (empty
+                        # norm_cmd) does NOT clear it — thinking about being stuck is not
+                        # getting unstuck; nor does a no-progress turn (handled above).
                         self.stuck_reason = None
                         self._stuck_banner = ""
+                        self._no_progress_streak = 0
+                        self._last_struct_fp = ""
 
                 # --- IDLE-BABYSITTING DETECTION ---
                 # The distinct failure the loop detector should NOT own: the
@@ -2094,10 +2240,10 @@ class Worker:
                 if "Primary Agent failed" in err_str or "JSON" in err_str:
                     self.last_observation = (
                         "SYSTEM: Your previous response could not be parsed into a valid action plan after "
-                        "several attempts. SIMPLIFY your next response: emit a SMALL, strictly-valid JSON "
-                        "object and put ALL multi-line code/text in --- BEGIN BLOCK_N --- blocks AFTER the "
-                        "JSON (never inline code, quotes, or escapes in JSON values). Start with a single "
-                        "simple action.\n"
+                        "several attempts. SIMPLIFY your next response: emit ONE small, strictly-valid JSON "
+                        "object and nothing else. Multi-line code/text goes INSIDE JSON string values with "
+                        "standard escaping (newlines as \\n, quotes as \\\"). Start with a single simple "
+                        "action.\n"
                         f"(Underlying error: {err_str[:300]})"
                     )
                 else:

@@ -57,6 +57,20 @@ class LLMClient:
         # utility tier and no fallback model.
         self.utility_client, self.utility_model = self.client, self.api_model
 
+        # --- STRUCTURED OUTPUTS (grammar-constrained decoding) ---
+        # The worker hands us the turn schema (aeon.core.action_schema) once its
+        # tools are registered. When set, the primary-agent call asks the server
+        # to CONSTRAIN generation to that schema (vLLM/xgrammar masks invalid
+        # tokens at the sampler), so malformed JSON and hallucinated tool names
+        # cannot be generated at all. _structured_mode tracks which request
+        # style this server accepts and degrades gracefully:
+        #   'response_format' (OpenAI-standard json_schema; vLLM >= 0.9, newer
+        #                      llama.cpp/Ollama) -> 'guided_json' (vLLM-native
+        #   extra_body, older servers) -> 'legacy' (unconstrained + the parse/
+        #   repair cascade below, exactly the old behavior).
+        self.action_schema: Optional[Dict] = None
+        self._structured_mode: Optional[str] = None  # None = unprobed
+
     def _create_client(self, config: dict):
         """Create an OpenAI-compatible client for a LOCAL inference server.
 
@@ -76,6 +90,59 @@ class LLMClient:
 
     def set_debug_path(self, path: pathlib.Path):
         self.debug_path = path
+
+    def set_action_schema(self, schema: Optional[Dict]):
+        """Install (or clear) the turn schema used for grammar-constrained
+        decoding of primary-agent responses. Called by Worker.register_tools so
+        the 'tool_name' enum always matches the actually-registered tools."""
+        self.action_schema = schema
+        # Re-probe on a schema change only if we had given up: a previously
+        # working mode keeps working with a new schema.
+        if self._structured_mode == "legacy":
+            self._structured_mode = None
+
+    def _structured_request_kwargs(self) -> Optional[Dict]:
+        """Extra kwargs for chat.completions.create that constrain generation
+        to self.action_schema, per the currently-trusted request style.
+        Returns None when structured decoding is unavailable (no schema, or the
+        server rejected both styles) — callers then use the legacy parse path."""
+        if not self.action_schema or self._structured_mode == "legacy":
+            return None
+        if self._structured_mode == "guided_json":
+            return {"extra_body": {"guided_json": self.action_schema,
+                                   "repetition_penalty": 1.05}}
+        # Default / 'response_format': the OpenAI-standard structured-outputs
+        # request. vLLM 0.9+ (xgrammar), newer llama.cpp and Ollama accept this.
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "aeon_turn", "strict": True,
+                                "schema": self.action_schema},
+            },
+            "extra_body": {"repetition_penalty": 1.05},
+        }
+
+    def _downgrade_structured_mode(self, err: Exception) -> bool:
+        """After a BadRequest that names the structured-output machinery,
+        step down one tier and report True (caller should retry the call).
+        Returns False when the error is unrelated to structured outputs."""
+        msg = str(err).lower()
+        if not any(k in msg for k in ("response_format", "json_schema", "guided",
+                                      "structured", "grammar", "schema")):
+            return False
+        if self._structured_mode in (None, "response_format"):
+            self._structured_mode = "guided_json"
+            self.logger.warning(
+                "Server rejected response_format json_schema; retrying with "
+                "vLLM-native guided_json.")
+            return True
+        if self._structured_mode == "guided_json":
+            self._structured_mode = "legacy"
+            self.logger.warning(
+                "Server rejected guided_json too; falling back to legacy "
+                "unconstrained decoding + parse/repair for this session.")
+            return True
+        return False
 
     def set_iteration(self, iteration: int):
         self.current_iteration = iteration
@@ -679,30 +746,60 @@ class LLMClient:
             try:
                 start_time = time.time()
 
+                # Grammar-constrained decoding: when the worker installed a turn
+                # schema, the server's sampler is constrained to it (vLLM/xgrammar
+                # masks invalid tokens), so the response is GUARANTEED to be a
+                # single schema-valid JSON object — the parse/repair cascade below
+                # becomes a dead path. Degrades per _downgrade_structured_mode if
+                # this server can't do it.
+                structured_kwargs = self._structured_request_kwargs()
+                sampling_kwargs = dict(structured_kwargs or
+                                       {"extra_body": {"repetition_penalty": 1.05}})
+                # NOTE: no frequency_penalty here, deliberately. It accumulates on
+                # repeated tokens — and JSON's structural tokens ('"', ',', '}')
+                # are the most-repeated tokens in a long response. Production logs
+                # showed "Expecting ',' delimiter" failures clustered deep in the
+                # output (char 400-3200), exactly where the accumulated penalty
+                # starts suppressing delimiters. The mild flat repetition_penalty
+                # (1.05, vLLM extra_body) keeps the anti-runaway nudge without the
+                # compounding structural damage; max_tokens is the hard backstop.
+
                 # Stream the response to accurately measure TTFT vs pure generation time
                 resp_stream = self.client.chat.completions.create(
                     model=self.api_model,
                     messages=[{"role": "user", "content": self._content_with_images(current_prompt, image_urls)}],
                     temperature=0.2,
                     stream=True,
+                    # Hard ceiling on one turn's output. Without this a low-temp model
+                    # that hits a confusing input (e.g. an unparseable CAPTCHA frame)
+                    # can enter a repetition loop and emit tens of thousands of tokens
+                    # — a real incident here was 85k tokens / 11 min in a single turn.
+                    # A normal turn (thought + actions, or a file write inside a JSON
+                    # string) is well under this; the cap only bites a runaway.
+                    max_tokens=16384,
                     # Ask the server for a final usage chunk so we can report the
                     # model's REAL generated-token count, not a tiktoken estimate
                     # (cl100k mis-counts Gemma tokens, making t/s look far too low).
                     stream_options={"include_usage": True},
+                    **sampling_kwargs,
                 )
 
                 first_token_time = None
                 raw_chunks =[]
                 server_completion_tokens = None
+                finish_reason = None
 
                 for chunk in resp_stream:
                     # The final usage-only chunk has empty choices; don't let it set TTFT.
                     if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
                         if first_token_time is None:
                             first_token_time = time.time()
-                        delta = chunk.choices[0].delta
+                        choice = chunk.choices[0]
+                        delta = choice.delta
                         if hasattr(delta, 'content') and delta.content:
                             raw_chunks.append(delta.content)
+                        if getattr(choice, 'finish_reason', None):
+                            finish_reason = choice.finish_reason
                     usage = getattr(chunk, 'usage', None)
                     if usage is not None and getattr(usage, 'completion_tokens', None):
                         server_completion_tokens = usage.completion_tokens
@@ -721,6 +818,42 @@ class LLMClient:
                     print(f"{C_YELLOW}[LLM RAW - PRIMARY AGENT]\n{raw}{C_RESET}")
 
                 self._log_to_debug("PRIMARY_AGENT", self.model, current_prompt, raw)
+
+                # A response cut off at max_tokens can't be a complete JSON object
+                # (grammar-constrained or not). Retry with a terseness note rather
+                # than feeding a guaranteed-broken string to the parser.
+                if finish_reason == "length":
+                    last_error = ("Response truncated at the max_tokens ceiling "
+                                  "(finish_reason=length) — incomplete JSON.")
+                    self.logger.warning(
+                        f"Primary Agent attempt {attempt + 1}/{max_retries}: {last_error}")
+                    if attempt < max_retries - 1:
+                        current_prompt = prompt + (
+                            "\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS CUT OFF (too long) **\n"
+                            "Your response exceeded the output limit and was truncated. Be BRIEF: "
+                            "shorten 'thought' to a few sentences, and if you were writing a large "
+                            "file, write a smaller piece of it this turn (or split the work across "
+                            "multiple str_replace/write_file turns).")
+                        continue
+                    break
+
+                # --- STRUCTURED FAST PATH ---
+                # Grammar-constrained output IS the JSON object — parse directly.
+                # Any failure here is unexpected (a server-side gap, not a model
+                # mistake), so log it loudly and fall through to the tolerant
+                # legacy pipeline below rather than crashing the turn.
+                if structured_kwargs is not None:
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict) and parsed.get('actions') is not None:
+                            return json.dumps(parsed)
+                        self.logger.warning(
+                            "Structured output parsed but missing 'actions'; "
+                            "falling through to legacy parsing this turn.")
+                    except (json.JSONDecodeError, ValueError) as se:
+                        self.logger.warning(
+                            f"Structured output was not clean JSON ({se}); "
+                            f"falling through to legacy parsing this turn.")
 
                 # Step 1: Find where the JSON object ends
                 json_end = self._find_json_end(raw)
@@ -742,7 +875,24 @@ class LLMClient:
                     # Step 4: Substitute content blocks into parsed JSON
                     missing_blocks =[]
                     parsed = self._substitute_blocks(parsed, blocks, missing_blocks)
-                    
+
+                    # updated_plan is optional and must NOT depend on the block system.
+                    # If a model block-encoded it and the block is missing, DROP the plan
+                    # (the worker keeps the prior one) instead of firing the recovery
+                    # reprompt — that reprompt was observed to derail the model into
+                    # meta-reasoning about blocks instead of doing the task.
+                    up = parsed.get('updated_plan')
+                    if isinstance(up, str):
+                        m = re.match(r'^\s*(?:__BLOCK[_\s]*(\d+)__|<{2,4}BLOCK[_\s]*(\d+)>{2,4})\s*$', up)
+                        if m:
+                            num = m.group(1) or m.group(2)
+                            parsed['updated_plan'] = ""
+                            # Only stop recovering this block if nothing else references it.
+                            key = f'BLOCK_{num}'
+                            if key in missing_blocks and f'__BLOCK_{num}__' not in json.dumps(
+                                    parsed.get('actions', [])):
+                                missing_blocks.remove(key)
+
                     # --- TARGETED BLOCK RECOVERY ---
                     if missing_blocks:
                         if self.debug_path:
@@ -814,18 +964,25 @@ class LLMClient:
                         print(f"{C_YELLOW}------------------------------{C_RESET}\n")
 
                     if attempt < max_retries - 1:
-                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output a valid JSON object containing 'thought' and 'actions'. \nCRITICAL: JSON values must be static strings. Do not put Python operations (like '+' or '*') or complex escape characters inside the JSON. For multi-line or complex strings, use content blocks (--- BEGIN BLOCK_N --- ... --- END BLOCK_N ---)."
+                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output exactly ONE valid JSON object containing 'thought' and 'actions', and nothing else.\nCRITICAL: JSON values must be static strings with standard JSON escaping — newlines as \\n, quotes as \\\", backslashes as \\\\. No Python operations (like '+' or '*'), no markdown fences, no text before or after the JSON."
 
             except (openai.APIConnectionError, openai.InternalServerError, requests.exceptions.ConnectionError) as e:
                 if self._handle_connection_error(e):
                     continue # Recovery successful, retry the request
                 raise
             except openai.BadRequestError as e:
-                # The server rejected the request. If it was because THIS model
-                # can't accept images (a text-only build served where a multimodal
-                # one was expected), degrade gracefully: stop sending screenshots
-                # for the rest of the session and retry text-only THIS turn, rather
-                # than crashing every browser turn with a 400.
+                # The server rejected the request. First: if the rejection names
+                # the structured-output machinery (response_format/guided/schema),
+                # step down one tier (response_format -> guided_json -> legacy)
+                # and retry THIS attempt — an older server simply doesn't speak
+                # the newer request style; the turn itself is fine.
+                if self._downgrade_structured_mode(e):
+                    continue
+                # If it was because THIS model can't accept images (a text-only
+                # build served where a multimodal one was expected), degrade
+                # gracefully: stop sending screenshots for the rest of the session
+                # and retry text-only THIS turn, rather than crashing every
+                # browser turn with a 400.
                 msg = str(e).lower()
                 if image_urls and ("multimodal" in msg or "image" in msg):
                     self.logger.warning("Model rejected image input; falling back to text-only for this session.")

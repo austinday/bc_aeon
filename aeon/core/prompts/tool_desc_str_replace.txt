@@ -11,11 +11,10 @@ RELIABILITY NOTES:
 
 Schema:
   file_path (str, required): Path to the file to edit.
-  patch (str, required): A string containing one or more SEARCH/REPLACE blocks.
-Example: {"tool_name": "str_replace", "parameters": {"file_path": "src/big_module.py", "patch": "__BLOCK_1__"}}
+  patch (str, required): A string containing one or more SEARCH/REPLACE blocks, JSON-escaped (newlines as \n).
+Example: {"tool_name": "str_replace", "parameters": {"file_path": "src/big_module.py", "patch": "<<<< SEARCH\n    def calculate_metrics(self):\n        return sum(self.data)\n====\n    def calculate_metrics(self):\n        return sum(self.data) / len(self.data) if self.data else 0\n>>>> REPLACE"}}
 
-Format the patch EXACTLY like this in your content block (you may include multiple blocks):
---- BEGIN BLOCK_1 ---
+The patch string format (shown unescaped for clarity; you may include several SEARCH/REPLACE sections in one patch):
 <<<< SEARCH
     def calculate_metrics(self):
         return sum(self.data)
@@ -23,7 +22,6 @@ Format the patch EXACTLY like this in your content block (you may include multip
     def calculate_metrics(self):
         return sum(self.data) / len(self.data) if self.data else 0
 >>>> REPLACE
---- END BLOCK_1 ---
 
 RULES:
 1. The SEARCH block should match the existing code; copy it from a freshly opened file.

@@ -8,5 +8,5 @@ Above is your objective. If unclear, ambiguous, or conversational, use "get_user
 - Proactively use `memorize` to capture credentials, discovered paths, and key decisions, and `spawn_sub_agent` for genuinely independent parallel work. These tools are easy to forget; reach for them deliberately rather than improvising.
 
 *** FINAL FORMATTING REMINDER ***
-You MUST output a valid JSON object.
-CRITICAL: You MUST use the `__BLOCK_N__` placeholder system for ANY multi-line code, quotes, or complex strings. DO NOT try to write raw code/JSON inside the action JSON values! Put the "__BLOCK_N__" string in the JSON, and put the actual code below the JSON.
+You MUST output exactly ONE valid JSON object and nothing else.
+CRITICAL: Multi-line code/text goes INSIDE the JSON string values with standard JSON escaping (newline as \n, quote as \", backslash as \\). No markdown fences, no text before or after the JSON.

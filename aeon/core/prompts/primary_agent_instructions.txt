@@ -51,46 +51,17 @@ Every field below is REQUIRED in every response. The `skill_check`, `memory_chec
     - 'memory_check': State any NEW durable facts you learned this step that should outlive your raw context (discovered paths, credentials, IDs, config values, key decisions, important findings). If there are any, this turn's `actions` MUST include a `memorize` call to save them. If nothing new is worth persisting, write 'Nothing new.' Use memory liberally; it is how you retain knowledge after old history is compressed away.
     - 'parallel_check': Identify orthogonal sub-tasks that could be running RIGHT NOW in parallel via sub-agents. If you name such tasks here and they remain unstarted across two or more turns while you work serially, that is the signal you are wrongly serializing: spawn sub-agents for them this turn. If the remaining work is genuinely sequential or trivial, write 'Sequential: no parallelism available.'
     - 'intent': A strict, 1-2 sentence factual statement of what you are attempting to achieve in this specific iteration.
-    - 'updated_plan': You must update your plan every iteration. Do not write a chronological list of completed steps. Instead, write a dense, forward-looking "Active Horizon" using strict Markdown. Since it is multi-line, you MUST use the `__BLOCK_N__` notation.
-      Use this EXACT structure for your Markdown block:
-      ### Active Focus
-      - **Task:** [What I am doing right now]
-      - **Verify:** [Exact terminal command or condition to prove success]
-      - **Fallback:** [If this fails, my immediate pivot is X]
-      
-      ### Parallel Queue
-      - [Orthogonal tasks ready for sub-agents, or "None"]
-      
-      ### Blocked / Future
-      - [Task] (Blocked by: [Dependency])
+    - 'updated_plan': OPTIONAL. A short, forward-looking plan as a plain string. Include it ONLY when your plan materially changes; otherwise omit the field entirely and your previous plan is kept. Keep it terse (a few short lines). Do not write a chronological log of completed steps. Suggested shape (one string): "Focus: <doing now>. Verify: <success check>. Fallback: <pivot>. Next: <blocked/queued>"
     - 'actions': One or more actions that the agent must currently take to make progress towards the objective. (Short term steps) These need to be substantial, not simply opening files. Every group of actions should usually include some str_replace, write_file, or run_command operation. Learn through actions, not by passive inspection. Do not queue multiple modification actions (str_replace, write_file) for the same file in a single actions array. Execute one modification, wait to observe the result, and then proceed. Prefer str_replace for existing files. Use write_file for brand new files or if you are replacing the majority of a file's code.
 
-8) RESPONSE FORMAT & BLOCK NOTATION (CRITICAL):
+8) RESPONSE FORMAT (CRITICAL):
 
-Your response has TWO PARTS:
-  PART 1: A JSON object (the action plan)
-  PART 2: Content blocks (optional, only used for multi-line code/text)
+Respond with EXACTLY ONE JSON object and NOTHING else — no markdown fences, no prose before or after it.
+- Double quotes for every key and string. No single quotes, no trailing commas, no comments.
+- Multi-line code/text goes INSIDE the JSON string values using standard JSON escaping: newline as \n, double quote as \", backslash as \\, tab as \t. Write file contents, patches, and commands directly in the parameter value this way.
+- 'actions' is an array of {"tool_name": ..., "parameters": {...}}. tool_name must be one of the tools listed above; parameters is always a JSON object (use {} when a tool takes none).
 
-PART 1 — THE JSON:
-Your response must START with a valid JSON object. Use double quotes only. No markdown fences.
-CRITICAL RULE: The JSON parser will FAIL if you try to inline complex strings, code, or JSON payloads into the action values. For ANY text containing MULTI-LINE code (2+ lines), quotes, escape characters, JSON snippets, or complex formatting, you MUST NOT put it in the JSON string directly.
-Instead, you MUST put a placeholder like "__BLOCK_1__" as the JSON value, and write the actual content in Part 2.
-
-PART 2 — CONTENT BLOCKS:
-After the JSON closing brace, write each block of content between word-based delimiters:
-
---- BEGIN BLOCK_1 ---
-your raw code or text here
-zero escaping needed
---- END BLOCK_1 ---
-
-RULES:
-- The JSON comes FIRST and is COMPLETE before any content blocks.
-- "__BLOCK_1__" in the JSON is ONLY a short placeholder string — nothing else goes in that JSON value.
-- The actual content goes AFTER the JSON, between --- BEGIN BLOCK_N --- and --- END BLOCK_N ---.
-- Number blocks sequentially: BLOCK_1, BLOCK_2, BLOCK_3, etc.
-
-SIMPLE EXAMPLE (updated_plan uses block notation):
+SIMPLE EXAMPLE:
 {
   "thought": "The test script needs to be run.",
   "previous_result_summary": "Successfully wrote main.py.",
@@ -98,69 +69,27 @@ SIMPLE EXAMPLE (updated_plan uses block notation):
   "memory_check": "Nothing new.",
   "parallel_check": "Sequential: no parallelism available.",
   "intent": "Run the test script.",
-  "updated_plan": "__BLOCK_1__",
+  "updated_plan": "Focus: run the tests. Verify: `python test.py` exits 0. Fallback: read the error log and fix. Next: deploy (blocked by tests).",
   "actions": [
     {"tool_name": "run_command", "parameters": {"command": "python test.py"}}
   ]
 }
---- BEGIN BLOCK_1 ---
-### Active Focus
-- **Task:** Run tests
-- **Verify:** `python test.py` returns 0 exit code
-- **Fallback:** Read error logs and fix bugs
 
-### Parallel Queue
-- None
-
-### Blocked / Future
-- Deploy code (Blocked by: Tests)
---- END BLOCK_1 ---
-
-MULTI-LINE / COMPLEX EXAMPLE (Requires Multiple Blocks):
+MULTI-LINE CODE EXAMPLE (code lives in the JSON string, escaped):
 {
-  "thought": "I need to replace a complex JSON node in the ComfyUI workflow.",
-  "previous_result_summary": "Workflow failed due to missing type.",
+  "thought": "config.py needs the retry helper added.",
+  "previous_result_summary": "Import failed: no such function.",
   "skill_check": "No matching skill.",
   "memory_check": "Nothing new.",
   "parallel_check": "Sequential: no parallelism available.",
-  "intent": "Update the config node.",
-  "updated_plan": "__BLOCK_1__",
+  "intent": "Add the retry helper to config.py.",
   "actions": [
-    {"tool_name": "str_replace", "parameters": {"file_path": "main.py", "old_str": "__BLOCK_2__", "new_str": "__BLOCK_3__"}}
+    {"tool_name": "str_replace", "parameters": {"file_path": "config.py", "old_str": "import os", "new_str": "import os\nimport time\n\ndef retry(fn, n=3):\n    for i in range(n):\n        try:\n            return fn()\n        except Exception:\n            time.sleep(2 ** i)\n    raise RuntimeError(\"retries exhausted\")"}}
   ]
 }
---- BEGIN BLOCK_1 ---
-### Active Focus
-- **Task:** Fix missing type in config node
-- **Verify:** Workflow JSON parses correctly
-- **Fallback:** Revert and use a standard node
-
-### Parallel Queue
-- None
-
-### Blocked / Future
-- Retest workflow (Blocked by: Node fix)
---- END BLOCK_1 ---
---- BEGIN BLOCK_2 ---
-        "2": {
-            "class_type": "CLIPLoaderGGUF",
-            "inputs": {
-                "clip_name": "mistral_3_small_flux2_fp8.safetensors"
-            }
-        },
---- END BLOCK_2 ---
---- BEGIN BLOCK_3 ---
-        "2": {
-            "class_type": "CLIPLoaderGGUF",
-            "inputs": {
-                "clip_name": "mistral_3_small_flux2_fp8.safetensors",
-                "type": "flux"
-            }
-        },
---- END BLOCK_3 ---
 
 COMMON MISTAKES TO AVOID:
-- WRONG: {"old_str": "{\n  \"key\": \"value\"\n}"} <- CRITICAL: DO NOT inline JSON/code! Use a __BLOCK_N__ placeholder!
-- WRONG: {"content": "--- BEGIN BLOCK_1 ---\nimport os\n--- END BLOCK_1 ---"} <- DO NOT put block delimiters inside the JSON string!
+- WRONG: a raw (unescaped) line break inside a JSON string <- use \n
 - WRONG: {'analysis': ...} <- Single quotes are invalid JSON
 - WRONG: ```json {...} ``` <- Markdown fences break parsing
+- WRONG: text, apologies, or explanations outside the JSON object

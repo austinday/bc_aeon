@@ -772,6 +772,163 @@ class TestBrowserUtil(unittest.TestCase):
         self.assertIsNone(self.bu.primary_locale(""))
 
 
+class TestActionSchema(unittest.TestCase):
+    """The turn schema handed to the server for grammar-constrained decoding."""
+
+    def setUp(self):
+        from aeon.core.action_schema import build_turn_schema
+        self.schema = build_turn_schema(["run_command", "write_file", "think"])
+
+    def test_required_fields_present(self):
+        from aeon.core.action_schema import TURN_FIELDS_REQUIRED
+        self.assertEqual(self.schema["required"], TURN_FIELDS_REQUIRED)
+        for f in TURN_FIELDS_REQUIRED:
+            self.assertIn(f, self.schema["properties"])
+
+    def test_thought_generated_first(self):
+        # xgrammar emits properties in schema order: reasoning must precede actions.
+        self.assertEqual(next(iter(self.schema["properties"])), "thought")
+
+    def test_updated_plan_optional(self):
+        self.assertIn("updated_plan", self.schema["properties"])
+        self.assertNotIn("updated_plan", self.schema["required"])
+
+    def test_tool_name_enum_matches_tools(self):
+        item = self.schema["properties"]["actions"]["items"]
+        self.assertEqual(item["properties"]["tool_name"]["enum"],
+                         ["run_command", "think", "write_file"])
+
+    def test_envelope_closed_parameters_open(self):
+        # Envelope/action: strictly closed. Tool parameters: free-form object.
+        item = self.schema["properties"]["actions"]["items"]
+        self.assertFalse(self.schema["additionalProperties"])
+        self.assertFalse(item["additionalProperties"])
+        self.assertTrue(item["properties"]["parameters"]["additionalProperties"])
+
+    def test_no_tools_gives_unconstrained_name(self):
+        from aeon.core.action_schema import build_turn_schema
+        s = build_turn_schema([])
+        self.assertNotIn("enum", s["properties"]["actions"]["items"]["properties"]["tool_name"])
+
+    def test_schema_is_json_serializable(self):
+        import json as _json
+        _json.dumps(self.schema)
+
+
+class TestStructuredRequestModes(unittest.TestCase):
+    """Structured-output request construction + graceful downgrade tiers."""
+
+    def setUp(self):
+        self.c = _bare_llm_client()
+        from aeon.core.action_schema import build_turn_schema
+        self.c.action_schema = build_turn_schema(["run_command"])
+        self.c._structured_mode = None
+
+    def test_default_mode_uses_response_format(self):
+        kw = self.c._structured_request_kwargs()
+        self.assertIn("response_format", kw)
+        self.assertEqual(kw["response_format"]["type"], "json_schema")
+        self.assertIs(kw["response_format"]["json_schema"]["schema"], self.c.action_schema)
+
+    def test_guided_json_mode(self):
+        self.c._structured_mode = "guided_json"
+        kw = self.c._structured_request_kwargs()
+        self.assertNotIn("response_format", kw)
+        self.assertIs(kw["extra_body"]["guided_json"], self.c.action_schema)
+
+    def test_legacy_mode_returns_none(self):
+        self.c._structured_mode = "legacy"
+        self.assertIsNone(self.c._structured_request_kwargs())
+
+    def test_no_schema_returns_none(self):
+        self.c.action_schema = None
+        self.assertIsNone(self.c._structured_request_kwargs())
+
+    def test_downgrade_ladder(self):
+        err = Exception("response_format 'json_schema' is not supported")
+        self.assertTrue(self.c._downgrade_structured_mode(err))
+        self.assertEqual(self.c._structured_mode, "guided_json")
+        err2 = Exception("guided_json is not a valid parameter")
+        self.assertTrue(self.c._downgrade_structured_mode(err2))
+        self.assertEqual(self.c._structured_mode, "legacy")
+        # Fully downgraded: nothing further to try.
+        self.assertFalse(self.c._downgrade_structured_mode(err2))
+
+    def test_unrelated_error_does_not_downgrade(self):
+        err = Exception("context length exceeded")
+        self.assertFalse(self.c._downgrade_structured_mode(err))
+        self.assertIsNone(self.c._structured_mode)
+
+    def test_set_schema_reprobes_after_legacy(self):
+        self.c._structured_mode = "legacy"
+        self.c.set_action_schema(self.c.action_schema)
+        self.assertIsNone(self.c._structured_mode)
+
+
+class TestStructuredEndToEnd(unittest.TestCase):
+    """get_primary_agent_response with a stubbed server: the structured fast
+    path parses directly (no repair machinery), and a max_tokens truncation
+    triggers a retry with a terseness note instead of a parse attempt."""
+
+    @staticmethod
+    def _chunks(text, finish_reason="stop"):
+        from types import SimpleNamespace as NS
+        return [
+            NS(choices=[NS(delta=NS(content=text), finish_reason=None)], usage=None),
+            NS(choices=[NS(delta=NS(content=None), finish_reason=finish_reason)], usage=None),
+            NS(choices=[], usage=NS(completion_tokens=42)),
+        ]
+
+    def _client_returning(self, batches):
+        """A bare LLMClient whose chat.completions.create pops from batches
+        (each batch = (text, finish_reason)) and records the request kwargs."""
+        from types import SimpleNamespace as NS
+        c = _bare_llm_client()
+        from aeon.core.action_schema import build_turn_schema
+        c.action_schema = build_turn_schema(["run_command"])
+        c._structured_mode = None
+        c.debug_path = None
+        c.model = c.api_model = "stub"
+        c._vision_supported = True
+        c.requests = []
+
+        def create(**kwargs):
+            c.requests.append(kwargs)
+            text, fr = batches.pop(0)
+            return iter(self._chunks(text, fr))
+
+        c.client = NS(chat=NS(completions=NS(create=create)))
+        return c
+
+    def test_structured_fast_path(self):
+        import json as _json
+        good = ('{"thought": "t", "previous_result_summary": "N/A", "skill_check": "No matching skill.", '
+                '"memory_check": "Nothing new.", "parallel_check": "Sequential: no parallelism available.", '
+                '"intent": "run it", "actions": [{"tool_name": "run_command", '
+                '"parameters": {"command": "echo hi"}}]}')
+        c = self._client_returning([(good, "stop")])
+        out = c.get_primary_agent_response("PROMPT")
+        data = _json.loads(out)
+        self.assertEqual(data["actions"][0]["tool_name"], "run_command")
+        # The request actually asked for grammar-constrained decoding...
+        self.assertIn("response_format", c.requests[0])
+        # ...and did NOT send the JSON-corrupting accumulating penalty.
+        self.assertNotIn("frequency_penalty", c.requests[0])
+
+    def test_truncation_retries_with_terseness_note(self):
+        import json as _json
+        good = ('{"thought": "t", "previous_result_summary": "N/A", "skill_check": "No matching skill.", '
+                '"memory_check": "Nothing new.", "parallel_check": "Sequential: no parallelism available.", '
+                '"intent": "run it", "actions": [{"tool_name": "run_command", '
+                '"parameters": {"command": "echo hi"}}]}')
+        c = self._client_returning([('{"thought": "endless...', "length"), (good, "stop")])
+        out = c.get_primary_agent_response("PROMPT")
+        self.assertEqual(_json.loads(out)["intent"], "run it")
+        self.assertEqual(len(c.requests), 2)
+        retry_prompt = c.requests[1]["messages"][0]["content"]
+        self.assertIn("CUT OFF", retry_prompt)
+
+
 def load_tests(loader, standard_tests, pattern):
     return standard_tests
 

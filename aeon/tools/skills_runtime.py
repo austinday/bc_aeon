@@ -133,10 +133,11 @@ class CreateSkillTool(BaseTool):
                 "Schema:\n"
                 "  category (str, required): Skill category folder, e.g. 'research', 'coding' (created if new).\n"
                 "  skill_name (str, required): Skill name (no spaces/slashes), e.g. 'web_research'.\n"
-                "  content (str, required): The full protocol text (use a __BLOCK_N__ block).\n"
+                "  content (str, required): The full protocol text, JSON-escaped (newlines as \\n).\n"
                 "  overwrite (bool, optional, default=false): Allow replacing an existing skill of the same name.\n"
                 "Example: {\"tool_name\": \"create_skill\", \"parameters\": {\"category\": \"coding\", "
-                "\"skill_name\": \"api_migration\", \"content\": \"__BLOCK_1__\"}}"
+                "\"skill_name\": \"api_migration\", \"content\": \"# Applies to API migrations\\n1. Map the "
+                "old endpoints...\\n2. ...\"}}"
             )
         )
         self.worker = worker

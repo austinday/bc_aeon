@@ -9,6 +9,6 @@ THIS IS THE PREFERRED, MOST RELIABLE WAY TO CREATE OR EDIT FILES.
 Schema:
   file_path (str, required): Path to the file. Created if it does not exist; fully overwritten if it does.
   content (str, required): The COMPLETE file content. Prefix with "base64:" for binary content.
-Example: {"tool_name": "write_file", "parameters": {"file_path": "src/main.py", "content": "__BLOCK_1__"}}
+Example: {"tool_name": "write_file", "parameters": {"file_path": "src/main.py", "content": "import os\n\ndef main():\n    print(\"hello\")\n"}}
 
-For multi-line content, put a "__BLOCK_N__" placeholder in the JSON and write the actual content in a content block after the JSON (see RESPONSE FORMAT in your instructions). No escaping is needed inside content blocks.
+Multi-line content goes directly in the "content" string with standard JSON escaping: newline as \n, double quote as \", backslash as \\.
