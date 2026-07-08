@@ -75,20 +75,38 @@ def _format_validation(validation):
 
 def _screenshot_health(clean_bytes):
     """Return (summary, is_blank). Tells whether the model was actually SEEING the
-    page or being handed a blank/degraded frame — the difference between "the site
-    blocked us" and "our vision pipeline was broken and the model confabulated"."""
+    page or handed a genuinely blank/degraded frame — the difference between "this
+    page is just sparse" and "our vision pipeline broke and the model would
+    confabulate".
+
+    Blankness is the fraction of pixels that DEPART from the background luminance
+    (real content/text), not global std. This matters: a legible page like
+    example.com is mostly uniform background with one small block of text, so its
+    global std is low — the old test downsampled to 32x32 (smearing the text away)
+    and mislabeled such perfectly-readable pages as blank, which would then tell
+    the model to distrust a screenshot it could actually read. Text survives as a
+    small-but-clear content fraction (~1% on example.com) while a truly blank
+    frame has ~0. Require BOTH almost-no-content AND a tiny luminance range so
+    only a genuinely uniform frame trips it.
+    """
     if not clean_bytes:
         return "MISSING (no screenshot bytes in response)", True
     size = len(clean_bytes)
     try:
         img = Image.open(io.BytesIO(clean_bytes)).convert("L")
         w, h = img.size
-        px = list(img.resize((32, 32)).getdata())
-        mean = sum(px) / len(px)
-        std = (sum((p - mean) ** 2 for p in px) / len(px)) ** 0.5
-        is_blank = std < 4.0
-        flag = "  <-- LIKELY BLANK/UNIFORM (model was flying blind)" if is_blank else ""
-        return f"bytes={size} dims={w}x{h} mean_lum={mean:.0f} pixel_std={std:.1f}{flag}", is_blank
+        # 256x256: bounds cost, drops JPEG noise, but keeps real text as content.
+        px = sorted(img.resize((256, 256)).getdata())
+        n = len(px)
+        bg = px[n // 2]                                   # median = background
+        content = sum(1 for p in px if abs(p - bg) > 24) / n
+        lum_range = px[-1] - px[0]
+        # example.com scores content~0.010 / range~136; a uniform failed paint
+        # scores ~0.000 / ~0. The gap is ~20x, so this has wide margin either way.
+        is_blank = content < 0.0005 and lum_range < 24
+        flag = "  <-- LIKELY BLANK/UNIFORM (model may be flying blind)" if is_blank else ""
+        return (f"bytes={size} dims={w}x{h} bg_lum={bg} content={content * 100:.2f}% "
+                f"range={lum_range}{flag}", is_blank)
     except Exception as e:
         tiny = size < 3000
         note = "  <-- suspiciously small (possibly blank)" if tiny else ""
@@ -460,6 +478,15 @@ def process_browser_response(data, action_desc, session_id, tab_id,
     # Ground-truth diagnostics from the raw response (real URL, URL-change, element
     # list, screenshot health) — independent of the model's later summary.
     _log_browser_diag(data, action_desc, session_id, tab_id, clean_bytes=clean_bytes)
+    # Surface screenshot health to the MODEL, not just the diag log. A blank/uniform
+    # frame means the render failed and the model is flying blind; without telling it,
+    # the model confidently "reads" content off an empty image (observed on
+    # example.com: a blank frame, yet the agent reported the h1 from priors and
+    # declared success). Ground it in the truth instead.
+    try:
+        _, screenshot_is_blank = _screenshot_health(clean_bytes)
+    except Exception:
+        screenshot_is_blank = False
     have_overlay = bool(data.get("overlay_b64"))
     if have_overlay:
         with open(overlay_path, "wb") as f:
@@ -548,6 +575,16 @@ def process_browser_response(data, action_desc, session_id, tab_id,
         vision_note = ("(no multimodal context available to attach the screenshot; acting on the "
                        "element list. Screenshots saved to disk below.)")
 
+    # A blank frame overrides the "look at it directly" invitation: reading anything
+    # off it would be confabulation.
+    if attached and screenshot_is_blank:
+        vision_note = ("⚠ The attached screenshot is BLANK/UNIFORM — the page did not render into "
+                       "this frame (a capture/render failure, NOT proof the page is empty). Do NOT "
+                       "read, quote, or describe any on-page text from it; anything you 'see' would "
+                       "be confabulated. Act only on the URL/title/element list below, or call "
+                       "browser_read to re-observe. If it stays blank, report that you cannot see "
+                       "the page rather than guessing its contents.")
+
     # Dialogs auto-handled and files downloaded since the last step are reported
     # here so the agent always knows they happened. Downloaded files are also
     # copied into the workspace ./downloads so the agent can use them directly.
@@ -568,8 +605,16 @@ def process_browser_response(data, action_desc, session_id, tab_id,
         f"reporting about it)\n"
         if identity else ""
     )
+    blank_block = (
+        "\n⚠ BLANK SCREENSHOT — the captured frame is uniform/near-empty; the page did NOT "
+        "render into it (capture/render failure, not proof the page is empty). You are flying "
+        "BLIND this turn: do NOT claim to read or see any page text/content — that would be "
+        "confabulation. Use only the URL/title/elements below, or browser_read to re-observe.\n"
+        if screenshot_is_blank else ""
+    )
     return (
         f"--- BROWSER: {action_desc} (tab '{tab_id}') ---\n"
+        f"{blank_block}"
         f"{no_change_block}"
         f"{identity_line}"
         f"URL: {page_url}\n"
