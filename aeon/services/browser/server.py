@@ -540,6 +540,13 @@ async def _ensure_browser(profile: str = DEFAULT_PROFILE):
         # navigator.webdriver=true (bot.sannysoft "WebDriver (New): present (failed)").
         # It's a launch flag — invisible to page JS, no detectable shim — that makes
         # navigator.webdriver read false exactly like a normal browser.
+        # NOTE: the window comes up at Chrome's small default (~945x973) because
+        # --start-maximized is a no-op under Xvfb (no window manager). Pages still
+        # render and read correctly at that size; a naive `--window-size=1920,1080`
+        # here does NOT fix it and in fact yields a 0-width window under this
+        # headed-Xvfb setup ("Cannot take screenshot with 0 width"), so enlarging
+        # the viewport needs a real fix (correct Xvfb geometry / a minimal WM /
+        # Playwright viewport sizing), not a flag swap. Left as-is deliberately.
         args = ["--no-sandbox", "--disable-dev-shm-usage", "--start-maximized",
                 "--disable-blink-features=AutomationControlled"]
         # GPU-accelerated WebGL (only when the container has a GPU, signalled by
@@ -1158,6 +1165,30 @@ async def _detect_identity(page: Page) -> Optional[str]:
         return None
 
 
+async def _ensure_paintable(page: Page, tries: int = 40, delay: float = 0.5):
+    """Wait until the page reports a non-zero viewport before we screenshot it.
+
+    Right after a cold container start, Xvfb/Chrome can leave the headed window at
+    0x0 for several seconds; page.screenshot() then hard-fails with "Cannot take
+    screenshot with 0 width" and the whole browser action errors out. This returns
+    immediately once the window has real dimensions (the warm/common case) and,
+    only if it never does within the budget, forces an explicit viewport as a
+    last resort so we can still capture a frame instead of failing the action.
+    """
+    for _ in range(tries):
+        try:
+            sz = await page.evaluate("({w: window.innerWidth, h: window.innerHeight})")
+        except Exception:
+            sz = None
+        if sz and sz.get("w") and sz.get("h"):
+            return
+        await asyncio.sleep(delay)
+    try:  # best-effort fallback; may be rejected under a no_viewport context
+        await page.set_viewport_size({"width": SCREEN_W, "height": SCREEN_H})
+    except Exception:
+        pass
+
+
 async def _build_response(page: Page, profile: str, session_id: str, tab_id: str,
                           overlay: bool = True) -> Dict[str, Any]:
     # Reliably surface any tab the site just opened, and prune any that closed,
@@ -1170,6 +1201,7 @@ async def _build_response(page: Page, profile: str, session_id: str, tab_id: str
     # drawn from the merged absolute coordinates (covers iframe/shadow elements).
     # quality=90: the agent's multimodal model reads this exact JPEG (passed
     # through without re-encoding), so keep small page text/labels legible.
+    await _ensure_paintable(page)  # robust to a cold-start 0-width window
     clean_bytes = await page.screenshot(type="jpeg", quality=90)
     overlay_bytes = None
     # The numbered overlay screenshot is only needed when the caller will actually
