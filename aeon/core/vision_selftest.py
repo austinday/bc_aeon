@@ -10,11 +10,15 @@ own:
   2. the model is actually text-only             -> HTTP 400 rejecting the image
   3. the model "sees" but MISREADS text          -> HTTP 200 with wrong content
 
-Case 3 is the dangerous one and the one we actually hit on the abliterated
-Qwen3.6 FP8 build: the vision tower is intact (BF16, un-quantized) but the
-uniformly-abliterated language layers that interpret vision tokens read a crisp
-'RP9PCV' back as 'R171' — coarse shape seen, fine detail garbled. That is NOT a
-quant-damaged tower and NOT a probe artifact; it is degraded visual *reading*.
+Case 3 is the dangerous one — a model that "sees" but garbles fine text, which
+no other startup check catches. We first suspected it on the abliterated Qwen3.6
+FP8 build (a crisp 'RP9PCV' read back as 'R171'), but that turned out to be a
+LOW-RESOLUTION probe artifact: rendering the probe at the 1920 px the browser
+actually sends (see _render_probe) fixed it, and the FP8 build now passes
+(re-verified 2026-07-08). The gate stays because case 3 is real for *some*
+weights (a uniform abliteration can damage the language layers that interpret
+vision tokens) — this probe proves reading works before the model drives the
+browser, rather than trusting the label.
 
 This probe renders a random nonce into a legible, screenshot-like image and
 requires the model to read it back. It samples several times and requires a

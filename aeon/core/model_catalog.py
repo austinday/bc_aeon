@@ -174,20 +174,20 @@ CATALOG: List[CatalogEntry] = [
     ),
     CatalogEntry(
         # Qwen3.6-27B, HUIHUI-lineage abliteration, NVFP4 (4-bit) + native MTP, multimodal.
-        # This is the vision-WORKING counterpart to the FP8 entry above: that one (kasimat,
-        # AEON-7 abliteration) has an intact vision tower but MISREADS text — the AEON-7
-        # abliteration runs uniformly across all attn/MLP layers, damaging the language
-        # layers that interpret vision tokens (live-tested 2026-07-06: read 'RP9PCV' as
-        # 'R171'). huihui-ai abliterate more surgically (early layers spared), so vision
-        # reading is far more likely to survive. Architecture is Qwen3_5ForConditionalGeneration
-        # with the vision tower EXCLUDED from NVFP4 (visual.* in the ignore list) — the
-        # ConditionalGeneration requirement from the NVFP4 lesson is met. Native in-checkpoint
-        # MTP (method qwen3_5_mtp, K=3; the launcher now accepts that method name).
+        # A smaller (~20 GiB vs 32 GiB), different-lineage ALTERNATIVE to the FP8 default
+        # above — NOT a vision fix for it. Earlier notes here claimed the kasimat FP8 build
+        # "misreads text" (read 'RP9PCV' as 'R171'); that was a LOW-RESOLUTION probe
+        # artifact, since corrected. Both builds now PASS the startup vision self-test at
+        # the 1920 px the browser actually sends (FP8 re-verified 2026-07-08: read 'A7Y9AR'
+        # correctly). Keep this entry as a lighter option / hedge on a different abliteration
+        # (huihui-ai spare early layers), not because the default is vision-broken.
+        # Architecture is Qwen3_5ForConditionalGeneration with the vision tower EXCLUDED from
+        # NVFP4 (visual.* in the ignore list) — the ConditionalGeneration requirement from the
+        # NVFP4 lesson is met. Native in-checkpoint MTP (method qwen3_5_mtp, K=3).
         #
-        # multimodal=True is optimistic-but-verified: the startup vision self-test
+        # multimodal=True is still gate-verified: the startup vision self-test
         # (aeon.core.vision_selftest) reads a probe code back before this is trusted for
-        # browsing. If huihui's abliteration also broke reading, the gate fails LOUD and we
-        # flip this to False / re-abliterate vision-preserving.
+        # browsing, so a regression fails LOUD rather than browsing blind.
         name="Qwen3.6-27B-Huihui-NVFP4-MTP",
         family="Qwen3.6",
         provider="vllm",
