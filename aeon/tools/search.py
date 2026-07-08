@@ -35,7 +35,9 @@ class SearchWebTool(BaseTool):
             pass
         script = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "start_searxng.sh"))
         try:
-            subprocess.run(["bash", script], check=True, capture_output=True, text=True)
+            subprocess.run(["bash", script], check=True, capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Timed out (180s) starting local SearXNG (docker may be stuck).")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to start local SearXNG: {(e.stderr or e.stdout or '').strip()}")
 

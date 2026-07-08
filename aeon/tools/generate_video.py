@@ -82,9 +82,16 @@ class GenerateVideoTool(ComfyUITool):
         return f"{CONTAINER_OUTPUT}/{name}"
 
     # ---------- ffmpeg helpers (mount an absolute work dir; reference basenames) ----------
-    def _ffmpeg(self, work_dir: str, args: List[str]):
-        subprocess.run(["docker", "run", "--rm", "-v", f"{work_dir}:/work", "-w", "/work",
-                        "mwader/static-ffmpeg", *args], check=True, capture_output=True)
+    def _ffmpeg(self, work_dir: str, args: List[str], timeout: int = 600):
+        # Bound every ffmpeg call: a malformed/streaming input can make ffmpeg
+        # block indefinitely, which would hang the whole agent loop. --rm cleans
+        # the container up on both success and TimeoutExpired-triggered kill.
+        try:
+            subprocess.run(["docker", "run", "--rm", "-v", f"{work_dir}:/work", "-w", "/work",
+                            "mwader/static-ffmpeg", *args], check=True, capture_output=True,
+                           timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"ffmpeg timed out after {timeout}s (input may be malformed).")
 
     def _extract_last_frame(self, work_dir: str, video_name: str, image_name: str):
         self._ffmpeg(work_dir, ["-sseof", "-1", "-i", video_name, "-update", "1", "-q:v", "2", image_name])

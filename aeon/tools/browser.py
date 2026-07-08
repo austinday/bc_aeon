@@ -281,7 +281,16 @@ def ensure_browser_running():
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         if _browser_healthy():
             return True
-        subprocess.run(["bash", script_path], check=True)
+        # Bound the start: `docker run -d` returns fast, but a stuck docker
+        # daemon must not hang the agent loop. Capture output so a failed start
+        # yields a diagnostic instead of a bare CalledProcessError.
+        try:
+            subprocess.run(["bash", script_path], check=True,
+                           capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Timed out (180s) starting the browser service (docker may be stuck).")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to start the browser service: {(e.stderr or e.stdout or '').strip()[:400]}")
     return True
 
 
