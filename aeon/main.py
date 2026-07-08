@@ -148,7 +148,15 @@ def wait_for_service(name, port, endpoint="/api/tags", timeout=60):
     return False
 
 def start_local_brain_services():
-    """Start the Ollama brain container if not already running."""
+    """Start the Ollama brain container if not already running.
+
+    Returns True only if the brain is up and answering; returns False (never
+    raises) if it could not be started — e.g. host port 8000 is already in use —
+    so callers can degrade to catalog-only models instead of crashing the whole
+    harness. The brain is optional: it only backs the interactive picker's list of
+    locally-pulled Ollama models (the runtime no longer uses a separate Ollama
+    utility model — see enable_utility_tier_if_available).
+    """
     if is_container_running("aeon_brain_node"):
         print("[SYSTEM] Brain node already running.")
         return True
@@ -156,7 +164,12 @@ def start_local_brain_services():
     script = Path(__file__).parent / "scripts" / "start_brain.sh"
     env = os.environ.copy()
     env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
-    subprocess.run(["bash", str(script)], check=True, env=env)
+    try:
+        subprocess.run(["bash", str(script)], check=True, env=env)
+    except (subprocess.CalledProcessError, OSError) as e:
+        print(f"[WARN] Local Ollama brain failed to start ({e}); "
+              "the host may already use port 8000. Continuing without it.")
+        return False
     return wait_for_service("Aeon Brain (Ollama)", 8000, endpoint="/api/tags", timeout=120)
 
 def warm_up_models(local_model_names):
@@ -1074,21 +1087,40 @@ def cli():
     if args.non_interactive and not (args.start or args.resume):
         parser.error('--non-interactive requires --start "<objective>" (nothing to run headless otherwise)')
 
-    # --- Enumerate local models (start brain if needed) ---
-    local_models = []
-    if is_container_running("aeon_brain_node"):
-        local_models = get_ollama_models()
-    else:
-        print("[SYSTEM] Starting brain to enumerate local models...")
-        start_local_brain_services()
-        local_models = get_ollama_models()
+    # --- Enumerate local (Ollama) models — only when the picker actually needs them ---
+    # The Ollama "brain" container exists solely to list locally-pulled Ollama
+    # models in the interactive picker; nothing at runtime uses it anymore (support
+    # tasks run on the strong model — see enable_utility_tier_if_available, and the
+    # GPU1 qwen2.5:3b brain was removed). Starting it pulls a ~2 GB image on first
+    # run and binds host port 8000, so a headless or default/--model boot — which
+    # never shows the picker and today runs a vLLM catalog model — must NOT start
+    # it. Doing so both wasted that pull/boot and, if the host already used :8000,
+    # crashed the entire harness, breaking the host-coexistence goal. Start it only
+    # when an Ollama model might actually be chosen, and treat failure as non-fatal.
+    def _enumerate_ollama_models():
+        if is_container_running("aeon_brain_node"):
+            return get_ollama_models()
+        print("[SYSTEM] Starting local Ollama brain to enumerate local models...")
+        if start_local_brain_services():
+            return get_ollama_models()
+        return []
 
-    if not local_models:
-        print("[WARN] No local models found via API.")
+    if args.menu and not args.model:
+        local_models = _enumerate_ollama_models()    # picker may offer Ollama models
+    elif is_container_running("aeon_brain_node"):
+        local_models = get_ollama_models()            # already running — include for free
+    else:
         local_models = []
 
-    # --- Build the local model menu ---
+    # --- Build the model menu (always includes the vLLM / llama.cpp catalog) ---
     menu = build_model_menu(local_models)
+
+    # An explicit --model that isn't a catalog entry may name a local Ollama model
+    # we skipped enumerating; start the brain once and rebuild before erroring out.
+    if args.model and not local_models and not find_model_config(args.model, menu):
+        extra = _enumerate_ollama_models()
+        if extra:
+            menu = build_model_menu(extra)
 
     # --- Select model (used for both planning and utility tasks) ---
     # Qwen3.6-27B-FP8-MTP (abliterated, 8-bit, native MTP, solo on GPU0) is THE main
