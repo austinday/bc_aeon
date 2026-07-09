@@ -19,11 +19,13 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 # Download gates (multiple of one GPU's VRAM the weights must fit within).
-# Normal models use 1.5x; force_split models (designed to span both GPUs, e.g.
-# DeepSeek-V4 at ~1.6x on a 96 GB card) are allowed up to the 1.6x split ceiling
-# so they download on the big machine they target but are skipped on small ones.
+# Normal models use 1.5x; force_split models (designed to span both GPUs) are
+# allowed up to the split ceiling so they download on the big machine they
+# target but are skipped on small ones. 1.9x fits the largest split model,
+# Qwen3.5-397B Q3_K (~178 GiB = 1.86x a 96 GB card); on a 48 GB machine
+# 1.9 x 48 = 91 GiB still correctly skips every split model.
 DOWNLOAD_VRAM_MULTIPLE = 1.5
-DOWNLOAD_VRAM_MULTIPLE_SPLIT = 1.6
+DOWNLOAD_VRAM_MULTIPLE_SPLIT = 1.9
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,15 @@ class CatalogEntry:
     served_name: Optional[str] = None
     mtp: Optional[Mtp] = None
     kv_quant: Optional[str] = None        # llamacpp -ctk/-ctv ('q4_0'); vLLM --kv-cache-dtype ('fp8'); None=f16
+    # llamacpp multimodal projector + explicit chat template, paths relative to
+    # model_dir (they must live inside it: the launcher mounts only model_dir).
+    mmproj_file: Optional[str] = None
+    chat_template_file: Optional[str] = None
+    # Override the planner's global SAFETY (fraction of each GPU's VRAM treated
+    # as usable, default 0.90). Only for entries whose fit has been measured by
+    # hand — e.g. Qwen3.5-397B, whose weights alone exceed 0.90 x 2 GPUs but
+    # which verifiably fits at 0.95 thanks to its tiny hybrid-attention KV.
+    vram_safety: Optional[float] = None
     # vLLM prefill batch size (--max-num-batched-tokens). Default (small, ~2048 under
     # chunked prefill) chops a big agent prompt into many scheduler steps -> long TTFT.
     # Set high on a model with VRAM headroom so a 20-30k prompt (+ a screenshot's vision
@@ -224,6 +235,68 @@ CATALOG: List[CatalogEntry] = [
             "F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf --local-dir /models"
         ),
         download_state="cyberneurova-v4-q4k",
+    ),
+    CatalogEntry(
+        # Qwen3.5-397B-A17B (MoE: 512 experts / 10 active, ~17B active params),
+        # huihui-ai ABLITERATED, Q3_K GGUF — the flagship "big brain" option. Spans
+        # BOTH GPUs (weights ~176.5 GiB in 21 shards on 2 x 95.6 GiB).
+        #
+        # TEXT-ONLY (multimodal=False, mmproj NOT loaded): the repo ships an mmproj
+        # and the base model is image-text-to-text, BUT the 176.5 GiB of weights
+        # leave GPU0 only ~4 GiB free — and GPU0 also hosts the CLIP encoder + main
+        # compute + KV. A browser-res image encode (mtmd_encode -> cuMemCreate) then
+        # OOMs GPU0 mid-request. Confirmed live 2026-07-08: KV/prompt-processing ran
+        # fine, the crash was purely the vision-encode VRAM spike. This box can't fit
+        # 178 GiB weights + the vision encoder together, at ANY context (the KV delta
+        # between 128k and 256k is ~0.5 GiB on GPU0; the encode spike is ~2 GiB, so
+        # dropping context doesn't rescue it). So this entry serves TEXT-ONLY at the
+        # full 256k; use Qwen3.6-27B for browser/vision work.
+        #
+        # FIT MATH (256k via q4_0 KV): hybrid attention — only 15/60 layers are
+        # full attention (2 KV heads x 256 head_dim; the rest Gated-DeltaNet with
+        # constant ~0.2 GiB state) — makes KV tiny: ~1.9 GiB/64k f16, ~1.0 q8_0,
+        # ~0.5 q4_0. Weights are the constraint, not context: 177.4 GiB of 189.9
+        # CUDA-visible leaves ~12 GiB. At q8_0, 256k KV (~4 GiB) left <1.5 GiB/GPU
+        # for compute buffers + vision-encode spikes and died in real use, so this
+        # used to cap at 128k. Dropping KV to q4_0 halves it: 256k q4_0 KV (~2 GiB)
+        # is the SAME footprint as the old 128k q8_0 config — ~3 GiB/GPU headroom
+        # that survives real use — so we serve the full 256k, GPU-resident (no CPU
+        # offload; fast at every depth) for a mild long-context recall softening.
+        # Needs vram_safety 0.95 because weights alone exceed the planner's default
+        # 0.90 budget.
+        # SPEED: fully GPU-resident (no CPU-offloaded experts), flash-attn,
+        # q4_0 KV, only ~17B active params per token despite the 397B total.
+        # Native GGUF arch 'qwen35moe' — supported by the llama.cpp build in
+        # aeon_ds4:latest (a generic llama-server image despite the name).
+        # No MTP: the repo has no draft GGUF.
+        # chat_template-vl-think.jinja is the repo's fixed template (tool-calling
+        # 500s with the embedded one — see the HF README); it serves text turns fine.
+        name="Qwen3.5-397B-A17B-Q3K",
+        family="Qwen3.5",
+        provider="llamacpp",
+        image="aeon_ds4:latest",
+        weights_gib=177.2,           # 176.5 shards + ~0.2 recurrent state (mmproj NOT loaded)
+        kv_gib_per_64k=0.5,          # q4_0; 15 full-attn layers x 2 KV heads x 256 dim
+        max_ctx=262144,              # 256k: q4_0 KV keeps it GPU-resident (see fit math)
+        ports={"lb": 8036, "node0": 8037, "node1": 8038},
+        model_dir="gguf_models/Huihui-Qwen3.5-397B",
+        target_glob="Q3_K-GGUF-00001-of-*.gguf",   # llama.cpp auto-loads the other 20 shards
+        kv_quant="q4_0",
+        # mmproj deliberately NOT set: vision encoder OOMs GPU0 at this weight size
+        # (see header). Restoring it requires freeing GPU0 VRAM, not just re-adding it.
+        chat_template_file="chat_template-vl-think.jinja",
+        vram_safety=0.95,
+        force_split=True,            # 178 GiB never fits one card; always span GPUs
+        multimodal=False,            # text-only: vision-encode spike doesn't fit GPU0
+        download_dir="gguf_models/Huihui-Qwen3.5-397B",
+        # NB: --include must be REPEATED per pattern; bare filenames after it are
+        # parsed as positional FILENAMES, which silently makes hf IGNORE --include.
+        download_cmd=(
+            "hf download huihui-ai/Huihui-Qwen3.5-397B-A17B-abliterated-GGUF "
+            "--include 'Q3_K-GGUF/*' --include mmproj-model-f16.gguf "
+            "--include chat_template-vl-think.jinja --local-dir /models"
+        ),
+        download_state="huihui-qwen35-397b-q3k",
     ),
 ]
 

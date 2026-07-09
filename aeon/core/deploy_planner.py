@@ -20,6 +20,7 @@ from aeon.core.gpu import GpuInfo, min_total_vram_gib
 from aeon.core.model_catalog import CatalogEntry, MIN_CTX
 
 SAFETY = 0.90          # fraction of a GPU's VRAM usable (compute buffers, frag headroom)
+                       # (entries with a measured fit may override via CatalogEntry.vram_safety)
 MAIN_GPU_BUFFER = 1.0  # GiB reserved on GPU0 for the compute buffer in split mode
 CTX_GRANULARITY = 8192 # round context down to a multiple of this
 
@@ -94,7 +95,7 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo], mode: Optional[str] = None) -
     """
     n = len(gpus)
     v = min_total_vram_gib(gpus)               # min per-GPU total VRAM
-    v_usable = v * SAFETY
+    v_usable = v * (entry.vram_safety or SAFETY)
     total_usable = n * v_usable
     slug = _slug(entry.name)
     kv_per_tok = entry.kv_gib_per_64k / 65536.0
@@ -193,6 +194,9 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo], mode: Optional[str] = None) -
         "AEON_MTP_METHOD": (entry.mtp.method if entry.mtp else "draft_model"),
         "AEON_MTP_NMAX": str(entry.mtp.n_max if entry.mtp else 0),
         "AEON_KV_QUANT": entry.kv_quant or "",
+        # llamacpp vision (--mmproj) + explicit chat template, relative to model_dir.
+        "AEON_MMPROJ_FILE": entry.mmproj_file or "",
+        "AEON_CHAT_TEMPLATE_FILE": entry.chat_template_file or "",
         # vLLM --max-num-batched-tokens: raise prefill batch so a big agent prompt
         # prefills in ~one pass (low TTFT) instead of many chunked-prefill steps.
         "AEON_MAX_NUM_BATCHED": str(entry.max_num_batched_tokens or ""),

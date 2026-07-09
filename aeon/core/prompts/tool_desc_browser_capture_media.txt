@@ -1,0 +1,19 @@
+Save an image or a video that is ON THE CURRENT PAGE to a file — use this whenever you SEE an image, photo, graphic, video, or video ad in the page screenshot and want to keep it. It downloads the ORIGINAL file when possible (best quality), and falls back to capturing the pixels/recording the screen when the original cannot be downloaded (e.g. canvas, blob:, or a DRM-free streaming player).
+
+Two-step, because images/videos are NOT in the numbered [id] element list you act on:
+  1. LIST — call with NO media_id to get a catalog of every image/video on the page, each with a `media_id`, its type, size, on-screen position, alt text, and source.
+  2. SAVE — call again with the `media_id` you want AND an `output_dir`. The file is downloaded/captured and written into that directory; the full saved path is returned.
+
+Schema:
+  media_id (int, optional): which item from the catalog to save. OMIT on the first call to list what's available.
+  output_dir (str, REQUIRED when saving): the DIRECTORY to write the file into. The filename is chosen automatically and the full path returned. Relative resolves against the current workspace; absolute is honored. Use '.' for the workspace. Not needed for the listing call.
+  tab_id (str, optional): the tab to capture from; OMIT to use the tab you last navigated/acted in.
+  duration_s (int, optional, default 8): only for the video screen-recording fallback — how many seconds to record if the video cannot be downloaded directly. Make sure the video is PLAYING before you call.
+
+Notes:
+  - For video, the original file is tried first, then yt-dlp on the page (covers YouTube/HLS/most players), then an N-second screen recording as a last resort. The result tells you which method was used.
+  - Images always succeed: a real URL is downloaded; otherwise the exact element is screenshotted.
+
+Example (list):  {"tool_name": "browser_capture_media", "parameters": {}}
+Example (save):  {"tool_name": "browser_capture_media", "parameters": {"media_id": 0, "output_dir": "captures"}}
+Example (video): {"tool_name": "browser_capture_media", "parameters": {"media_id": 3, "output_dir": ".", "duration_s": 12}}

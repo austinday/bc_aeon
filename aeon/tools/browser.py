@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import base64
 import requests
 import subprocess
@@ -15,7 +16,9 @@ from ..core.prompts import (
     TOOL_DESC_BROWSER_INTERACT,
     TOOL_DESC_BROWSER_CLOSE_TAB,
     TOOL_DESC_BROWSER_SWITCH_TAB,
+    TOOL_DESC_BROWSER_CAPTURE_MEDIA,
 )
+from ..core.paths import resolve_output_dir
 
 BROWSER_API_URL = "http://localhost:8030"
 
@@ -443,6 +446,32 @@ def _relocate_downloads(events):
     return extra
 
 
+def _host_download_dir():
+    """Host path of the container's DOWNLOAD_DIR (/profiles/downloads). The browser
+    profile volume ${AEON_HOME:-~/.aeon}/browser_profiles is mounted at /profiles
+    (see start_browser.sh), so a file the service wrote there is visible here."""
+    aeon_home = os.environ.get("AEON_HOME") or os.path.expanduser("~/.aeon")
+    return os.path.join(aeon_home, "browser_profiles", "downloads")
+
+
+def _format_media_list(data):
+    """Render the enumerated page media so the model can pick one by id."""
+    media = data.get("media") or []
+    if not media:
+        return ("No images or videos were detected on this page. If you expected some, scroll the "
+                "media into view or wait for it to load, then call browser_capture_media again.")
+    lines = [f"Media found on {data.get('url', '')}. To SAVE one, call browser_capture_media again "
+             f"with its media_id AND an output_dir:"]
+    for m in media:
+        alt = f' — "{m["alt"]}"' if m.get("alt") else ""
+        src = m.get("src") or ""
+        src_hint = (" src=" + (src if len(src) <= 80 else src[:77] + "…")) if src else ""
+        loc = "in view" if m.get("inView") else "off-screen"
+        lines.append(f"  [media_id {m.get('id')}] {m.get('tag')} {m.get('w')}x{m.get('h')} "
+                     f"({m.get('dw')}x{m.get('dh')}px on screen, {loc}){alt}{src_hint}")
+    return "\n".join(lines)
+
+
 def process_browser_response(data, action_desc, session_id, tab_id,
                              include_vision=True, visual="overlay", worker=None,
                              compare=False):
@@ -779,3 +808,64 @@ class BrowserSwitchTabTool(BaseTool):
         return _post("switch_tab", {"session_id": _session_id(), "tab_id": tab_id},
                      f"Switched to tab '{tab_id}'", tab_id,
                      include_vision=include_vision, visual=visual, worker=self.worker)
+
+
+class BrowserCaptureMediaTool(BaseTool):
+    def __init__(self, worker=None):
+        super().__init__(name="browser_capture_media", description=TOOL_DESC_BROWSER_CAPTURE_MEDIA)
+        self.worker = worker
+
+    def execute(self, output_dir: str = None, media_id: int = None,
+                tab_id: str = None, duration_s: int = 8, **kwargs) -> str:
+        tab_id = _resolve_tab(self.worker, tab_id)
+        _remember_tab(self.worker, tab_id)
+        try:
+            ensure_browser_running()
+            payload = {"session_id": _session_id(), "tab_id": tab_id,
+                       "profile": _profile_for(self.worker), "media_id": media_id,
+                       "duration_s": duration_s}
+            # Generous timeout: a video screen-recording fallback runs for duration_s.
+            resp = requests.post(f"{BROWSER_API_URL}/capture_media", json=payload, timeout=300)
+            if resp.status_code != 200:
+                try:
+                    detail = resp.json().get("detail", resp.text)
+                except Exception:
+                    detail = resp.text
+                return f"Browser capture failed: HTTP {resp.status_code}: {detail}"
+            data = resp.json()
+        except Exception as e:
+            return f"Error capturing media: {type(e).__name__}: {e}"
+
+        # No id chosen -> hand back the catalog so the model can pick one.
+        if data.get("mode") == "list":
+            return _format_media_list(data)
+
+        # Capture mode: the service saved the file into the shared download dir;
+        # move it into the caller's requested output_dir.
+        if not output_dir or not str(output_dir).strip():
+            return ("Error: 'output_dir' is required to save the media — the directory to write the "
+                    "file into (e.g. '.' for the current workspace).")
+        filename = data.get("filename")
+        src = os.path.join(_host_download_dir(), filename)
+        for _ in range(15):  # bind-mount flush can lag the service's write
+            if os.path.exists(src):
+                break
+            time.sleep(0.2)
+        if not os.path.exists(src):
+            return (f"Capture reported success ({data.get('method')}) but the file did not appear "
+                    f"at {src}. The browser service may be running without the shared profile mount.")
+        dest = str(resolve_output_dir(output_dir, filename))
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        try:
+            shutil.copy2(src, dest)
+        except Exception as e:
+            return f"Captured to {src} but could not copy it into {output_dir}: {e}"
+        # The service writes as root (docker), so we may not be able to delete the
+        # source — best-effort cleanup; the copy above is what matters.
+        try:
+            os.remove(src)
+        except Exception:
+            pass
+        size = os.path.getsize(dest)
+        return (f"Captured {data.get('tag')} (media_id {data.get('media_id')}) via "
+                f"{data.get('method')}. Saved to: {dest} ({size:,} bytes).")

@@ -2,7 +2,7 @@ CRITICAL: MUST USE THIS TOOL for ANY image generation request. Whenever the user
 Generates a high-quality image using a local, UNCENSORED FLUX.2-klein model via ComfyUI and saves it to a file. The model has no content restrictions; fulfil the user's described image directly. Pairs with generate_video: create character sheets, scene stills, and storyboard frames here, then animate them (see the video_director skill).
 Schema:
   prompt (str, required): The detailed visual description of the image to generate. Make this highly descriptive.
-  output_path (str, optional): Where to save the image. A relative path is resolved against the current workspace (the directory you are working in); an absolute path is honored as-is. If omitted, the image is saved with an auto-generated name at the base of the current workspace. Pass a path whenever you have a specific location/filename in mind (e.g. 'city.png' or 'renders/city.png'). Do NOT invent nested output dirs like 'aeon_output/...'.
+  output_dir (str, REQUIRED): The DIRECTORY to save the image in; the file is auto-named for you and its full path is returned. A relative dir resolves against the current workspace (the directory you are working in); an absolute dir is honored as-is. Use '.' for the current workspace. Do NOT include a filename — pass a directory.
   width (int, optional, default=1024): The width of the generated image.
   height (int, optional, default=1024): The height of the generated image.
-Example: {"tool_name": "generate_image", "parameters": {"prompt": "A futuristic city skyline at sunset, cyberpunk style", "output_path": "city.png"}}
+Example: {"tool_name": "generate_image", "parameters": {"prompt": "A futuristic city skyline at sunset, cyberpunk style", "output_dir": "renders"}}

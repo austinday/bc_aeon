@@ -69,6 +69,7 @@ TOOL_DESC_BROWSER_NAVIGATE = _load('tool_desc_browser_navigate.txt')
 TOOL_DESC_BROWSER_INTERACT = _load('tool_desc_browser_interact.txt')
 TOOL_DESC_BROWSER_CLOSE_TAB = _load('tool_desc_browser_close_tab.txt')
 TOOL_DESC_BROWSER_SWITCH_TAB = _load('tool_desc_browser_switch_tab.txt')
+TOOL_DESC_BROWSER_CAPTURE_MEDIA = _load('tool_desc_browser_capture_media.txt')
 # === SELF-MODIFICATION TOOLS ===
 TOOL_DESC_RESTART_AEON = _load('tool_desc_restart_aeon.txt')
 TOOL_DESC_EXPAND_CATEGORY = _load('tool_desc_expand_category.txt')

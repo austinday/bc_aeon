@@ -90,3 +90,17 @@ def resolve_output_path(output_path: Optional[str], default_basename: str) -> Pa
         return p.resolve()
     # No path given: use the caller-provided default name at the workspace base.
     return (workspace / default_basename).resolve()
+
+
+def resolve_output_dir(output_dir: str, basename: str) -> Path:
+    """Resolve a REQUIRED output DIRECTORY plus an auto basename into an absolute
+    file path. Relative dirs resolve against the workspace root (never the aeon
+    install dir); absolute dirs are honored as given. This is the contract for
+    every asset-producing tool: the caller names WHERE, we name the file.
+
+    Returns an absolute Path; the caller creates parent dirs.
+    """
+    d = Path(str(output_dir).strip()).expanduser()
+    if not d.is_absolute():
+        d = get_workspace_root() / d
+    return (d / basename).resolve()

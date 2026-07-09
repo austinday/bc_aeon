@@ -7,7 +7,7 @@ Schema:
   prompt (str, required): The detailed instruction describing the desired output (reference the extra images by position if used).
   input_path_2 (str, optional): A second reference image (image2) to draw content from, e.g. a logo/product to add.
   input_path_3 (str, optional): A third reference image (image3).
-  output_path (str, optional): Where to save. Relative resolves against the workspace; absolute is honored. If omitted, saved as '<input>_edited.png'. Do NOT invent nested output dirs like 'aeon_output/...'.
+  output_dir (str, REQUIRED): The DIRECTORY to save into; the file is auto-named '<input>_edited.png' and its full path is returned. Relative resolves against the workspace; absolute is honored. Use '.' for the current workspace. Do NOT include a filename — pass a directory.
   denoise (float, optional, default=0.75): How much to alter the base. 0.0 no change, 1.0 fully new. 0.6-0.8 is usually best for editing.
-Example (single): {"tool_name": "edit_image", "parameters": {"input_path": "photo.png", "prompt": "make it winter, snowy", "output_path": "photo_winter.png"}}
-Example (compose logo): {"tool_name": "edit_image", "parameters": {"input_path": "ad_scene.png", "prompt": "place the logo from the second image cleanly on the wall in the background", "input_path_2": "brand_logo.png", "output_path": "ad_with_logo.png"}}
+Example (single): {"tool_name": "edit_image", "parameters": {"input_path": "photo.png", "prompt": "make it winter, snowy", "output_dir": "."}}
+Example (compose logo): {"tool_name": "edit_image", "parameters": {"input_path": "ad_scene.png", "prompt": "place the logo from the second image cleanly on the wall in the background", "input_path_2": "brand_logo.png", "output_dir": "ads"}}

@@ -31,7 +31,8 @@ setup(
         "psutil",
         "nvidia-ml-py3",
         "requests",
-        "huggingface_hub"
+        "huggingface_hub",
+        "prompt_toolkit>=3.0",
     ],
     entry_points={
         "console_scripts": [

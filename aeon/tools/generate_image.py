@@ -9,7 +9,7 @@ from .base import BaseTool
 from ..core.prompts import TOOL_DESC_GENERATE_IMAGE, TOOL_DESC_EDIT_IMAGE
 from ..core.gpu_queue import wait_for_vram, release_vram
 from ..core.prompt_enhancer import enhance_prompt
-from ..core.paths import resolve_output_path
+from ..core.paths import resolve_output_dir
 
 # ComfyUI is a SHARED, VRAM-heavy service (image gen, image edit, and video all
 # hit one container). It must free its ~20GB for other tools when the agent moves
@@ -352,18 +352,20 @@ class GenerateImageTool(ComfyUITool):
             "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "Aeon", "images": ["12", 0]}},
         }
 
-    def execute(self, prompt: str, output_path: str = None, width: int = 1024, height: int = 1024, enhance: bool = None) -> str:
+    def execute(self, prompt: str, output_dir: str = None, width: int = 1024, height: int = 1024, enhance: bool = None) -> str:
         if not prompt:
             return "Error: 'prompt' parameter is required."
+        if not output_dir or not str(output_dir).strip():
+            return "Error: 'output_dir' is required — the directory to save the generated image in."
 
         # Tolerate string/odd dimensions from the model (e.g. "1024" or 1000).
         width = self._norm_dim(width)
         height = self._norm_dim(height)
 
         prompt = enhance_prompt(self.llm_client, prompt, "image", force=enhance)
-        # Resolve relative to the workspace (where aeon was launched), or
-        # auto-name at the workspace base when no path is given.
-        abs_output_path = str(resolve_output_path(output_path, time.strftime("aeon_image_%Y%m%d_%H%M%S.png")))
+        # Auto-name the file inside the caller-provided output_dir (relative dirs
+        # resolve against the workspace aeon was launched from).
+        abs_output_path = str(resolve_output_dir(output_dir, time.strftime("aeon_image_%Y%m%d_%H%M%S.png")))
         os.makedirs(os.path.dirname(abs_output_path) or ".", exist_ok=True)
 
         try:
@@ -432,19 +434,22 @@ class EditImageTool(ComfyUITool):
         )
         self.llm_client = llm_client
 
-    def execute(self, input_path: str, prompt: str, input_path_2: str = None, input_path_3: str = None,
-                output_path: str = None, denoise: float = 0.75, enhance: bool = None) -> str:
+    def execute(self, input_path: str, prompt: str, output_dir: str = None,
+                input_path_2: str = None, input_path_3: str = None,
+                denoise: float = 0.75, enhance: bool = None) -> str:
         if not input_path:
             return "Error: 'input_path' parameter is required."
         if not prompt:
             return "Error: 'prompt' parameter is required."
+        if not output_dir or not str(output_dir).strip():
+            return "Error: 'output_dir' is required — the directory to save the edited image in."
 
         denoise = self._norm_unit(denoise, default=0.75)
         prompt = enhance_prompt(self.llm_client, prompt, "image_edit", force=enhance)
         abs_input_path = os.path.abspath(input_path)
-        # Default: '<input-name>_edited.png' at the workspace base.
+        # Auto-name '<input-name>_edited.png' inside the caller-provided output_dir.
         default_name = os.path.splitext(os.path.basename(abs_input_path))[0] + "_edited.png"
-        abs_output_path = str(resolve_output_path(output_path, default_name))
+        abs_output_path = str(resolve_output_dir(output_dir, default_name))
 
         if not os.path.exists(abs_input_path):
             return f"Error: Input image not found at {abs_input_path}"

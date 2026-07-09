@@ -11,7 +11,7 @@ import requests
 from aeon.tools.generate_image import ComfyUITool
 from aeon.core.prompt_enhancer import enhance_prompt
 from aeon.core.prompts import TOOL_DESC_GENERATE_VIDEO
-from aeon.core.paths import resolve_output_path
+from aeon.core.paths import resolve_output_dir
 
 
 def _aeon_home() -> str:
@@ -213,7 +213,7 @@ class GenerateVideoTool(ComfyUITool):
         return abs_output_path
 
     # ---------- public entrypoint ----------
-    def execute(self, mode: str, prompt: Union[str, List[str]] = "", output_path: str = "",
+    def execute(self, mode: str, output_dir: str = "", prompt: Union[str, List[str]] = "",
                 width: int = 768, height: int = 512, frames: int = DEFAULT_FRAMES,
                 init_image: Optional[str] = None, keyframes: Optional[List[Dict]] = None,
                 init_video: Optional[str] = None, denoise: float = 0.6,
@@ -227,6 +227,8 @@ class GenerateVideoTool(ComfyUITool):
             sugg = difflib.get_close_matches(str(mode), sorted(valid_modes), n=1, cutoff=0.3)
             hint = f" Did you mean '{sugg[0]}'?" if sugg else ""
             return (f"Error: invalid mode '{mode}'. Valid modes: {', '.join(sorted(valid_modes))}.{hint}")
+        if not output_dir or not str(output_dir).strip():
+            return "Error: 'output_dir' is required — the directory to save the generated video in."
 
         # Tolerate string/odd numeric params from the model.
         def _int(v, default):
@@ -242,9 +244,9 @@ class GenerateVideoTool(ComfyUITool):
         if input_path_1 and not init_image and not init_video:
             (init_video, init_image) = (input_path_1, None) if mode in ("extend_video", "edit_video") else (None, input_path_1)
 
-        # Resolve relative to the workspace (where aeon was launched), or
-        # auto-name at the workspace base when no path is given.
-        abs_output = str(resolve_output_path(output_path, time.strftime("aeon_video_%Y%m%d_%H%M%S.mp4")))
+        # Auto-name the file inside the caller-provided output_dir (relative dirs
+        # resolve against the workspace aeon was launched from).
+        abs_output = str(resolve_output_dir(output_dir, time.strftime("aeon_video_%Y%m%d_%H%M%S.mp4")))
         os.makedirs(os.path.dirname(abs_output) or ".", exist_ok=True)
         work_dir = os.path.join(_aeon_home(), "temp", "video_work", str(os.getpid()))
         os.makedirs(work_dir, exist_ok=True)

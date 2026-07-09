@@ -42,6 +42,26 @@ if [ -z "$TARGET" ]; then
 fi
 echo "[adaptive-llamacpp] tier=$TIER image=$IMAGE target=$TARGET kv_quant=${KV_QUANT:-default}"
 
+# Vision (multimodal projector) + explicit chat template, when the catalog entry
+# provides them. Both must live INSIDE model_dir (only that dir is mounted).
+MMPROJ=""
+if [ -n "${AEON_MMPROJ_FILE:-}" ]; then
+    if [ -f "$MODELS_DIR/$AEON_MMPROJ_FILE" ]; then
+        MMPROJ="$AEON_MMPROJ_FILE"
+        echo "[adaptive-llamacpp] vision: mmproj=$MMPROJ"
+    else
+        echo "[adaptive-llamacpp] WARN: mmproj $AEON_MMPROJ_FILE missing; serving TEXT-ONLY" >&2
+    fi
+fi
+CHAT_TEMPLATE=""
+if [ -n "${AEON_CHAT_TEMPLATE_FILE:-}" ]; then
+    if [ -f "$MODELS_DIR/$AEON_CHAT_TEMPLATE_FILE" ]; then
+        CHAT_TEMPLATE="$AEON_CHAT_TEMPLATE_FILE"
+    else
+        echo "[adaptive-llamacpp] WARN: chat template $AEON_CHAT_TEMPLATE_FILE missing; using the GGUF's embedded one" >&2
+    fi
+fi
+
 # --- MTP draft (self-heal: normalize the raw assistant GGUF if needed) ---
 DRAFT=""
 if [ "$MTP" = "True" ] && [ -n "${AEON_MTP_DRAFT_FILE}" ]; then
@@ -81,6 +101,12 @@ launch_node() {
     fi
     args+=(-ngl "${NGL:-$ngl}" --flash-attn on -c "$ctx" --host 0.0.0.0 --port 8080 --threads "$PHYSICAL_CORES")
     [ -n "$KV_QUANT" ] && args+=(-ctk "$KV_QUANT" -ctv "$KV_QUANT")
+    [ -n "$MMPROJ" ] && args+=(--mmproj "/models/${MMPROJ}")
+    if [ -n "$CHAT_TEMPLATE" ]; then
+        args+=(--chat-template-file "/models/${CHAT_TEMPLATE}")
+        # --chat-template-file needs the jinja engine; the single role adds --jinja below.
+        [ "$role" = "single" ] || args+=(--jinja)
+    fi
     if [ "$role" = "single" ]; then
         # Split/offload: span GPUs, GPU0-weighted layer split, smaller ubatch for headroom.
         args+=(--split-mode layer --main-gpu 0 --tensor-split "${TENSOR_SPLIT:-$tensor_split}" \

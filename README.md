@@ -10,9 +10,9 @@ the detected GPUs, and cloud models (Gemini/Vertex/Grok) work out of the box.
 
 ```bash
 pip install .                      # installs the `aeon` console script
-python3 -m aeon.main               # boots the main model (Gemma-4, single-GPU/solo), then type objectives
-python3 -m aeon.main --menu        # interactive picker: choose solo vs dual-GPU, etc.
-python3 -m aeon.main --dual        # main model across BOTH GPUs (copy per GPU + routing)
+python3 -m aeon.main               # interactive start: model picker (Enter = Qwen3.6-27B-FP8, solo GPU0)
+python3 -m aeon.main --model Qwen3.5-397B-A17B-Q3K   # skip the picker, name a model directly
+python3 -m aeon.main -n --start "Do X"               # headless: no picker, boots the default model
 ```
 
 Common flags:

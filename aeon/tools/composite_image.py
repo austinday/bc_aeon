@@ -1,7 +1,7 @@
 import os
 from PIL import Image
 from .base import BaseTool
-from ..core.paths import resolve_output_path
+from ..core.paths import resolve_output_dir
 
 
 class CompositeImageTool(BaseTool):
@@ -22,7 +22,8 @@ class CompositeImageTool(BaseTool):
                 "Schema:\n"
                 "  base_path (str, required): the background image to paste onto.\n"
                 "  overlay_path (str, required): the logo/graphic to place (transparent PNG best).\n"
-                "  output_path (str, optional): where to save (default '<base>_composited.png').\n"
+                "  output_dir (str, REQUIRED): the DIRECTORY to save into; the file is auto-named "
+                "'<base>_composited.png' and its full path is returned. Use '.' for the current workspace.\n"
                 "  position (str, optional, default 'bottom-right'): one of top-left, top-right, "
                 "bottom-left, bottom-right, center, top, bottom, left, right; OR exact pixels 'x,y'.\n"
                 "  scale (float, optional, default 0.2): overlay width as a FRACTION of the base "
@@ -31,8 +32,8 @@ class CompositeImageTool(BaseTool):
                 "  margin (int, optional): pixels from the edge for corner/edge positions "
                 "(default = 3% of base width).\n"
                 "Example: {\"tool_name\": \"composite_image\", \"parameters\": {\"base_path\": "
-                "\"ad_bg.png\", \"overlay_path\": \"logo.png\", \"position\": \"top-right\", "
-                "\"scale\": 0.18}}"
+                "\"ad_bg.png\", \"overlay_path\": \"logo.png\", \"output_dir\": \".\", "
+                "\"position\": \"top-right\", \"scale\": 0.18}}"
             ),
             directives=[],
         )
@@ -60,12 +61,14 @@ class CompositeImageTool(BaseTool):
         y = margin if vert == "top" else (bh - oh - margin) if vert == "bottom" else (bh - oh) // 2
         return x, y
 
-    def execute(self, base_path: str, overlay_path: str, output_path: str = None,
+    def execute(self, base_path: str, overlay_path: str, output_dir: str = None,
                 position: str = "bottom-right", scale=0.2, opacity=1.0, margin=None) -> str:
         if not base_path:
             return "Error: 'base_path' is required."
         if not overlay_path:
             return "Error: 'overlay_path' (the logo/graphic to place) is required."
+        if not output_dir or not str(output_dir).strip():
+            return "Error: 'output_dir' is required — the directory to save the composited image in."
         base_abs, ov_abs = os.path.abspath(base_path), os.path.abspath(overlay_path)
         if not os.path.exists(base_abs):
             return f"Error: base image not found at {base_abs}"
@@ -94,8 +97,8 @@ class CompositeImageTool(BaseTool):
             x, y = self._position(position, base.size, overlay.size, m)
             base.alpha_composite(overlay, (x, y))
 
-            out = str(resolve_output_path(
-                output_path, os.path.splitext(os.path.basename(base_abs))[0] + "_composited.png"))
+            out = str(resolve_output_dir(
+                output_dir, os.path.splitext(os.path.basename(base_abs))[0] + "_composited.png"))
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
             if os.path.splitext(out)[1].lower() in (".jpg", ".jpeg"):
                 base.convert("RGB").save(out, quality=95)

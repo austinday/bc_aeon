@@ -1,6 +1,15 @@
 # LIVE TEST RESTART 2026-05-15
 import os, argparse, json, time, sys, subprocess, requests, fcntl, signal, atexit
 
+# Loading readline patches the built-in input() with a full line editor
+# (wrap-aware backspace, arrow keys, history, paste) for every prompt in the
+# process — the model picker, the REPL, and the shared console reader. Without it,
+# input() can't backspace across a line that wrapped to a second screen row.
+try:
+    import readline  # noqa: F401
+except Exception:
+    pass
+
 # Force local source priority to prevent site-packages resolution issues
 current_dir = os.getcwd()
 if current_dir not in sys.path:
@@ -46,7 +55,9 @@ def _local_model_available(entry, gpus):
     if entry.provider == 'llamacpp':
         d = Path(aeon_home) / 'models' / (entry.model_dir or '')
         try:
-            return d.is_dir() and any(d.glob(entry.target_glob or '*.gguf'))
+            # '**/' also matches zero directories, so this finds the target GGUF
+            # both directly in model_dir and in a shard subdir (e.g. Q3_K-GGUF/).
+            return d.is_dir() and any(d.glob('**/' + (entry.target_glob or '*.gguf')))
         except Exception:
             return False
     # vLLM fetches weights from the HF hub at runtime; offer it if it fits.
@@ -74,14 +85,13 @@ def _config_from_plan(entry, p, model_name):
     }
 
 
-# --- Model selection policy (temporary single-model lockdown) --------------
-# Aeon currently boots straight into ONE model: the abliterated 8-bit Qwen3.6-27B
-# (FP8 weights + native in-checkpoint MTP), placed SOLO on GPU0. Every other
-# catalog entry — the Gemma-4 NVFP4/BF16 builds, the Huihui NVFP4 Qwen, DeepSeek —
-# stays in the catalog and on disk but is disabled from selection here, so the menu
-# offers only this model and it loads by default. To re-widen the picker, add names
-# back to ENABLED_MODEL_NAMES (or set it to None for "all") and flip OFFER_DUAL_GPU.
-ENABLED_MODEL_NAMES = {"Qwen3.6-27B-FP8-MTP"}
+# --- Model selection policy -------------------------------------------------
+# The picker is OPEN again (2026-07-08, for the Qwen3.5-397B addition): every
+# deployable catalog model is selectable, and a bare interactive start shows the
+# menu — a bare Enter still boots DEFAULT_MODEL, so fast-boot stays one keystroke.
+# To restrict selection again, set this to a set of names (the 2026-07-06
+# single-model lockdown was ENABLED_MODEL_NAMES = {"Qwen3.6-27B-FP8-MTP"}).
+ENABLED_MODEL_NAMES = None
 OFFER_DUAL_GPU = False
 
 
@@ -124,9 +134,8 @@ def build_local_model_configs():
 LLAMACPP_MODELS = build_local_model_configs()
 
 # The abliterated 8-bit Qwen3.6-27B (FP8 + native in-checkpoint MTP, solo on GPU0)
-# is Aeon's main model: it is the default when no --model is passed (see cli()) and,
-# per ENABLED_MODEL_NAMES above, currently the only selectable model. Matches the
-# catalog entry name.
+# is Aeon's main model: the picker's Enter-default on an interactive start, and the
+# straight-boot model for headless (-n) / no-TTY runs. Matches the catalog entry name.
 DEFAULT_MODEL = "Qwen3.6-27B-FP8-MTP"
 
 def is_container_running(name):
@@ -1123,11 +1132,10 @@ def cli():
             menu = build_model_menu(extra)
 
     # --- Select model (used for both planning and utility tasks) ---
-    # Qwen3.6-27B-FP8-MTP (abliterated, 8-bit, native MTP, solo on GPU0) is THE main
-    # model AND — per ENABLED_MODEL_NAMES — currently the only selectable one, so Aeon
-    # boots straight into it without prompting. The interactive picker no longer pops up
-    # on a bare TTY start; pass --menu to force it (useful again once more models are
-    # re-enabled) or --model NAME to name one explicitly.
+    # On a bare interactive (TTY) start the picker is shown, with Qwen3.6-27B-FP8-MTP
+    # as the Enter-default. Headless (-n) and no-TTY starts never prompt: they boot
+    # the default directly, so scripted `--start "<task>"` pipelines just go.
+    # --model NAME skips the menu either way.
     model_name = args.model
     if not model_name and args.dual:
         # Dual-GPU is currently disabled (OFFER_DUAL_GPU=False); this name won't resolve,
@@ -1149,10 +1157,13 @@ def cli():
                 print(f"  Did you mean: {', '.join(close)}?")
             print(f"  Available: {available}")
             sys.exit(1)
+    elif sys.stdin.isatty() and not args.non_interactive:
+        # Bare interactive start: show the picker (re-enabled 2026-07-08). A bare
+        # Enter boots DEFAULT_MODEL, so the historical fast boot is one keystroke.
+        model_config = select_model(menu, 'Select Model', default_model=DEFAULT_MODEL)
     else:
-        # Default path (no --model, no --menu): boot straight into the single enabled
-        # model, whether or not there's a TTY. This is what makes `--start "<task>"`
-        # (and `-n --start ...`) just go, with no picker to click through.
+        # Headless (-n) or no TTY: boot straight into the default model with no
+        # picker to click through, so scripted `--start "<task>"` runs just go.
         model_config = find_model_config(DEFAULT_MODEL, menu)
         if model_config:
             print(f"[CONFIG] Booting default model: {DEFAULT_MODEL} (single-GPU/solo on GPU0). "
@@ -1354,9 +1365,10 @@ def cli():
         if args.non_interactive:
             print("[CONFIG] Non-interactive mode: objective complete, exiting.")
         else:
+            from aeon.core.console import console
             while True:
                 try:
-                    obj = input("> ")
+                    obj = console().readline("> ")
                     if obj.strip():
                         if obj.strip() in ['exit', 'quit']: break
                         while obj:

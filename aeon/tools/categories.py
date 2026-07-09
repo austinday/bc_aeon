@@ -28,7 +28,7 @@ TOP_LEVEL_TOOLS = {
     # to see HOW to use them, so it improvised (curl to "navigate", a hallucinated
     # browser_driver module to type). Always-visible is worth the tokens here.
     'browser_navigate', 'browser_interact', 'browser_read',
-    'browser_switch_tab', 'browser_close_tab',
+    'browser_switch_tab', 'browser_close_tab', 'browser_capture_media',
 }
 
 # Hierarchical tool categories.

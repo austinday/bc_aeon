@@ -3,7 +3,7 @@ FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 # Install REAL Google Chrome (for channel='chrome' max-stealth browsing) plus
 # Xvfb so Chrome can run HEADED (far less detectable than headless).
 RUN apt-get update && apt-get install -y \
-    xvfb curl wget gnupg python3-pip \
+    xvfb curl wget gnupg python3-pip ffmpeg \
  && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
       | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
  && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \

@@ -313,6 +313,27 @@ class TestLoopFingerprint(unittest.TestCase):
             w._consequential_fp([{"tool_name": "browser_read",
                                   "parameters": {"tab_id": "default"}}]), "")
 
+    def _search(self, q):
+        return [{"tool_name": "search_web", "parameters": {"query": q}}]
+
+    def test_distinct_searches_have_distinct_structural_fp(self):
+        # Regression: the structural fingerprint (semantic-stall detector) used to
+        # collapse every verb-less call to the bare tool name, so three DIFFERENT
+        # web searches looked like one repeated move and tripped 'semantic stall'.
+        w = self._worker()
+        fps = {w._structural_fp(self._search(q))
+               for q in ("pizza NYC", "tokyo weather", "python asyncio")}
+        self.assertEqual(len(fps), 3)
+
+    def test_signup_varied_detail_still_collapses_structurally(self):
+        # The intended catch must survive: a verb-FUL action (type) varying only an
+        # incidental value (a fresh username) still shares one structural fingerprint.
+        w = self._worker()
+        def typ(u):
+            return [{"tool_name": "browser_interact",
+                     "parameters": {"action": "type", "element_id": 3, "text": u}}]
+        self.assertEqual(w._structural_fp(typ("alice1")), w._structural_fp(typ("bob2")))
+
 
 class TestGroundTruthOutcome(unittest.TestCase):
     """The attempt log must record what the tool output ACTUALLY showed, not the

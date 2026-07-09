@@ -1325,6 +1325,14 @@ class InteractRequest(BaseModel):
     overlay: Optional[bool] = True          # draw+shoot the Set-of-Mark overlay (skip when no vision needed)
 
 
+class CaptureRequest(BaseModel):
+    session_id: str = "default"
+    tab_id: str = "default"
+    profile: str = DEFAULT_PROFILE
+    media_id: Optional[int] = None          # which enumerated item to save; None -> just list them
+    duration_s: Optional[int] = 8           # for the video screen-recording fallback
+
+
 # ============================================================================
 # Endpoints
 # ============================================================================
@@ -1826,6 +1834,186 @@ async def observe(req: TabRequest):
         except Exception:
             pass
     return await _build_response(page, profile, req.session_id, req.tab_id, overlay=req.overlay)
+
+
+# --- Media capture (save an image/video the agent sees on the page) ----------
+# The agent perceives media in the SCREENSHOT, but <img>/<video> are not in the
+# interactive element index (only clickable/semantic roles are). So capture has
+# its own enumeration: stamp every media node with data-aeon-media=<id>, hand the
+# agent the list, and let it pick one by id. Then download the ORIGINAL bytes when
+# a real URL exists (best), else fall back to re-rendering pixels — for images an
+# element screenshot, for video yt-dlp then a screen recording.
+_ENUM_MEDIA_JS = r"""
+() => {
+  const out = [];
+  let id = 0;
+  const vw = innerWidth, vh = innerHeight;
+  const add = (el, tag, src, natW, natH) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return;          // skip trackers/spacers/icons
+    el.setAttribute('data-aeon-media', String(id));
+    out.push({
+      id, tag, src: src || '',
+      w: Math.round(natW || r.width), h: Math.round(natH || r.height),
+      dw: Math.round(r.width), dh: Math.round(r.height),
+      x: Math.round(r.left), y: Math.round(r.top),
+      area: Math.round(r.width * r.height),
+      alt: (el.getAttribute('alt') || el.getAttribute('aria-label') ||
+            el.getAttribute('title') || '').replace(/\s+/g,' ').trim().slice(0,120),
+      inView: r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw,
+    });
+    id++;
+  };
+  document.querySelectorAll('img').forEach(el => add(el, 'img', el.currentSrc || el.src, el.naturalWidth, el.naturalHeight));
+  document.querySelectorAll('video').forEach(el => add(el, 'video', el.currentSrc || el.src || '', el.videoWidth, el.videoHeight));
+  document.querySelectorAll('canvas').forEach(el => add(el, 'canvas', '', el.width, el.height));
+  // CSS background images (hero banners, some ads), bounded so a huge DOM stays cheap.
+  const all = document.querySelectorAll('body *');
+  for (let i = 0; i < all.length && out.length < 60; i++) {
+    const el = all[i];
+    const bg = getComputedStyle(el).backgroundImage;
+    if (bg && bg.indexOf('url(') === 0) {
+      const m = bg.match(/url\(["']?(.*?)["']?\)/);
+      if (m && m[1] && m[1].indexOf('data:image/svg') !== 0) add(el, 'bg', m[1]);
+    }
+  }
+  return out;
+}
+"""
+
+_VIDEO_EXTS = (".mp4", ".webm", ".mov", ".m4v", ".mkv")
+
+
+def _unique_name(prefix: str, ext: str) -> str:
+    return f"{prefix}_{os.getpid()}_{int(time.time() * 1000)}{ext}"
+
+
+def _ext_from(src: str, content_type: str, default: str) -> str:
+    path = src.split("?")[0].split("#")[0]
+    e = os.path.splitext(path)[1].lower()
+    if e and len(e) <= 5:
+        return e
+    ct = (content_type or "").split(";")[0].strip().lower()
+    ct_map = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+              "image/webp": ".webp", "image/svg+xml": ".svg", "video/mp4": ".mp4",
+              "video/webm": ".webm"}
+    return ct_map.get(ct, default)
+
+
+async def _fetch_bytes(page: Page, src: str):
+    """Download a media URL THROUGH the page's own context (its cookies/proxy), so
+    auth-gated assets work. Returns (bytes, content_type) or (None, None)."""
+    try:
+        resp = await page.context.request.get(src, timeout=45000)
+        if not resp.ok:
+            return None, None
+        body = await resp.body()
+        ct = ""
+        try:
+            ct = (await resp.header_value("content-type")) or ""
+        except Exception:
+            pass
+        return (body or None), ct
+    except Exception:
+        return None, None
+
+
+async def _capture_image(page: Page, entry: dict, out_dir: str) -> Dict[str, Any]:
+    src = entry.get("src") or ""
+    prefix = "capture_img"
+    # 1. Original bytes when a real URL exists — the actual file, full quality.
+    if src.startswith("http"):
+        body, ct = await _fetch_bytes(page, src)
+        if body:
+            dest = os.path.join(out_dir, _unique_name(prefix, _ext_from(src, ct, ".jpg")))
+            with open(dest, "wb") as f:
+                f.write(body)
+            return {"filename": os.path.basename(dest), "method": "downloaded original image bytes"}
+    # 2. Fallback: re-render the exact node's pixels (canvas / blob: / data: / CSS bg,
+    #    or a fetch that failed). Always works because it screenshots what's on screen.
+    dest = os.path.join(out_dir, _unique_name(prefix, ".png"))
+    loc = page.locator(f'[data-aeon-media="{entry["id"]}"]').first
+    await loc.scroll_into_view_if_needed(timeout=5000)
+    await loc.screenshot(path=dest)
+    return {"filename": os.path.basename(dest), "method": "element screenshot (re-rendered pixels, not the original file)"}
+
+
+async def _run(cmd: list, timeout: int) -> tuple:
+    """Run a subprocess without blocking the event loop; return (rc, stderr_tail)."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode, (err or b"").decode("utf-8", "ignore")[-400:]
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return 124, f"timed out after {timeout}s"
+
+
+async def _capture_video(page: Page, entry: dict, out_dir: str, duration_s: int) -> Dict[str, Any]:
+    src = entry.get("src") or ""
+    prefix = "capture_vid"
+    # 1. Direct video file URL -> download the original bytes.
+    if src.startswith("http") and any(src.split("?")[0].lower().endswith(e) for e in _VIDEO_EXTS):
+        body, ct = await _fetch_bytes(page, src)
+        if body:
+            dest = os.path.join(out_dir, _unique_name(prefix, _ext_from(src, ct, ".mp4")))
+            with open(dest, "wb") as f:
+                f.write(body)
+            return {"filename": os.path.basename(dest), "method": "downloaded original video file"}
+    # 2. yt-dlp on the PAGE url — handles HLS/DASH/blob players, YouTube, most embeds.
+    stem = _unique_name(prefix, "")
+    rc, err = await _run(
+        ["yt-dlp", "--no-playlist", "--no-warnings", "-f", "mp4/best",
+         "-o", os.path.join(out_dir, stem + ".%(ext)s"), page.url],
+        timeout=max(60, duration_s * 6))
+    hits = [f for f in os.listdir(out_dir) if f.startswith(stem)]
+    if rc == 0 and hits:
+        return {"filename": hits[0], "method": "downloaded via yt-dlp (page media stream)"}
+    # 3. Last resort: screen-record the live Xvfb display while the video plays.
+    dest = os.path.join(out_dir, _unique_name(prefix, ".mp4"))
+    display = os.environ.get("DISPLAY", ":99")
+    rc, err = await _run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "x11grab", "-draw_mouse", "0",
+         "-video_size", f"{SCREEN_W}x{SCREEN_H}", "-framerate", "24", "-i", display,
+         "-t", str(max(1, min(int(duration_s), 60))), "-pix_fmt", "yuv420p", dest],
+        timeout=max(30, int(duration_s) + 20))
+    if rc == 0 and os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return {"filename": os.path.basename(dest),
+                "method": f"screen recording of the page for {duration_s}s (not the original file)"}
+    raise HTTPException(status_code=502,
+                        detail=f"Could not download the video and the screen-recording fallback failed ({err}).")
+
+
+@app.post("/capture_media")
+async def capture_media(req: CaptureRequest):
+    profile = _safe_profile(req.profile)
+    await _ensure_browser(profile)
+    page = await _get_page(profile, req.session_id, req.tab_id)
+    try:
+        media = await page.evaluate(_ENUM_MEDIA_JS)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not enumerate page media: {e}")
+    media.sort(key=lambda m: m.get("area", 0), reverse=True)  # biggest first (most likely intended)
+
+    # No id chosen -> return the catalog for the agent to pick from.
+    if req.media_id is None:
+        return {"status": "ok", "mode": "list", "url": page.url, "media": media[:40]}
+
+    entry = next((m for m in media if m.get("id") == req.media_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404,
+                            detail=f"No media with id {req.media_id} on this page. Call capture_media without media_id to re-list.")
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    if entry["tag"] == "video":
+        result = await _capture_video(page, entry, DOWNLOAD_DIR, int(req.duration_s or 8))
+    else:
+        result = await _capture_image(page, entry, DOWNLOAD_DIR)
+    return {"status": "ok", "mode": "capture", "media_id": req.media_id,
+            "tag": entry["tag"], **result}
 
 
 @app.post("/switch_tab")

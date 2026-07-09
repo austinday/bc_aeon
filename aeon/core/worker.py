@@ -110,6 +110,9 @@ class Worker:
         self.action_log = []  # Persistent factual record of attempts (intents + results)
         self.open_files_mtime = {}  # Tracks last modified time of open files to avoid redundant reads
         self.pending_iteration_state = None # Holds intent/actions while awaiting result
+        # Type-ahead interruption is handled by the shared console reader
+        # (aeon.core.console); the worker just enables it around a run and pulls
+        # the stashed message. See _start_input_listener / _take_pending_message.
         self._recent_commands = []  # Rolling window for loop detection
         self._recent_outputs = []   # Corresponding outputs for loop detection
         self.expanded_categories = set()  # Tracks which tool categories are currently expanded
@@ -121,6 +124,7 @@ class Worker:
         self._consecutive_passive_turns = 0  # Run of turns doing only observation/think/say (idle-babysitting detector)
         self.open_files_access_order = []  # Tracks order of file access for LRU suggestions
         self.recent_intents = deque(maxlen=3)  # Tracks recent intents for loop detection
+        self._recent_turn_fps = deque(maxlen=3)  # Per-turn consequential fingerprint (parallels recent_intents) — lets the intent-stall tell varied work from spinning
         self._loop_blocked_fingerprint = None  # Consequential command under a hard loop block (refused until it changes)
         self._loop_block_hits = 0  # How many turns in a row the block has refused the same action (escalation)
         self._no_progress_streak = 0  # Consecutive state-changing turns that made no progress under the same approach
@@ -706,12 +710,21 @@ class Worker:
         return self._normalize_cmd("|".join(parts))
 
     def _structural_fp(self, actions) -> str:
-        """Coarser than _consequential_fp: keeps the tool and its action VERB but
-        drops all free-text/target params. Two turns that make the same move while
-        varying one incidental value — e.g. a fresh username on each signup attempt —
-        share a structural fingerprint even though their _consequential_fp (which
-        includes the text) differs every turn and so never arms the exact-repeat
-        block. This is what lets the semantic-stall detector see through that."""
+        """Coarser than _consequential_fp: for a tool that carries an action VERB
+        (browser_interact's click/type, run_command's command word) it keeps the
+        tool+verb but drops the free-text target — so two turns that make the same
+        move while varying one incidental value (a fresh username on each signup
+        attempt) share a fingerprint even though their _consequential_fp differs.
+        This is what lets the semantic-stall detector see through that.
+
+        But for a VERB-LESS tool the text argument IS the whole substance of the
+        action — a search_web query, an image prompt, a write_file path. Collapsing
+        those to the bare tool name made the stall detector treat genuinely
+        DIFFERENT calls (two different web searches) as the SAME repeated move,
+        firing 'semantic stall' on legitimate, varied work. So when there is no
+        verb, fold the canonical params in, keeping distinct substantive calls
+        distinct here too (identical repeats are still caught by the exact-repeat
+        block, which keys on _consequential_fp)."""
         parts = []
         for a in actions:
             if not isinstance(a, dict):
@@ -724,7 +737,10 @@ class Worker:
             if isinstance(p, dict):
                 raw = str(p.get("action") or p.get("command") or "").strip()
                 verb = raw.split()[0][:24] if raw.split() else ""
-            parts.append(f"{t}:{verb}" if verb else t)
+            if verb:
+                parts.append(f"{t}:{verb}")
+            else:
+                parts.append(f"{t}({self._canonical_params(p)})")
         return "|".join(parts)
 
     @staticmethod
@@ -938,6 +954,7 @@ class Worker:
         self._last_struct_fp = ""
         self._stuck_banner = ""
         self.recent_intents.clear()
+        self._recent_turn_fps.clear()
         self.expanded_categories.clear()
         self.notified_sub_agents.clear()
         self.notified_jobs.clear()
@@ -1106,6 +1123,36 @@ class Worker:
             return "(nothing done yet)"
         recent = self._collapse_repeated_entries(self.action_log[-n:])
         return self._truncate_output("\n\n".join(recent), max_chars=max_chars)
+
+    # ------------------------------------------------------------------
+    # Type-ahead interruption: while a run is in flight the shared console
+    # reader (aeon.core.console) accepts a typed line and interrupts this loop,
+    # so a new instruction stops the current step and gets folded in — same
+    # path as Ctrl+C. All actual reading (with full readline editing) happens in
+    # that one reader; here we just enable/disable type-ahead around a run and
+    # pull the message it stashed.
+    # ------------------------------------------------------------------
+    def _start_input_listener(self):
+        from aeon.core.console import console
+        console().enable_typeahead()
+
+    def _stop_input_listener(self):
+        from aeon.core.console import console
+        console().disable_typeahead()
+
+    def _take_pending_message(self):
+        """Fetch and clear any unsolicited type-ahead line the reader stashed."""
+        from aeon.core.console import console
+        return console().take_pending()
+
+    def _blocking_read_line(self, prompt: Optional[str] = None) -> str:
+        """Read one line of SOLICITED input (get_user_input / guidance prompt)
+        through the shared readline-backed console reader."""
+        from aeon.core.console import console
+        try:
+            return console().readline(prompt or "")
+        except (EOFError, KeyboardInterrupt):
+            return ''
 
     def _integrate_user_input(self, objective: str, user_text: str, iteration: int):
         """Fold a mid-run user interruption into the ongoing work intelligently
@@ -1366,6 +1413,18 @@ class Worker:
                 pass
 
     def run(self, objective: str, max_iterations: Optional[int] = None, step_callback: Optional[Callable[[int, int, str], None]] = None, terminal_tools: List[str] = None):
+        """Public entrypoint: run one objective to completion. Wraps the loop so a
+        background stdin listener is live for its whole duration (letting the user
+        type a message mid-run to interrupt it) and is always torn down afterward,
+        handing stdin back to the REPL."""
+        self._start_input_listener()
+        try:
+            return self._run_objective(objective, max_iterations=max_iterations,
+                                       step_callback=step_callback, terminal_tools=terminal_tools)
+        finally:
+            self._stop_input_listener()
+
+    def _run_objective(self, objective: str, max_iterations: Optional[int] = None, step_callback: Optional[Callable[[int, int, str], None]] = None, terminal_tools: List[str] = None):
         if terminal_tools is None:
             terminal_tools = ['task_complete', 'restart_aeon']
 
@@ -1381,6 +1440,17 @@ class Worker:
 
         while True:
             try:
+                # Type-ahead backstop: if the user submitted a message while the
+                # previous step ran, fold it in before doing anything else. The
+                # interrupt path (except KeyboardInterrupt) handles the common
+                # case immediately; this catches a message whose interrupt landed
+                # between iterations.
+                pending = self._take_pending_message()
+                if pending is not None:
+                    objective, reset_iter = self._integrate_user_input(objective, pending, iteration)
+                    if reset_iter:
+                        iteration = 0
+
                 iter_start_time = time.time()
                 iteration += 1
                 self.llm_client.set_iteration(iteration)
@@ -1906,8 +1976,8 @@ class Worker:
 
                     elif tool_name == "get_user_input":
                         try:
-                            self.print_func(f"{C_YELLOW}Agent Request: {params.get('prompt', 'Please provide input:')}\n> {C_RESET}")
-                            user_in = input()
+                            user_in = self._blocking_read_line(
+                                f"{C_YELLOW}Agent Request: {params.get('prompt', 'Please provide input:')}\n> {C_RESET}")
                         except EOFError:
                             return
 
@@ -2120,7 +2190,17 @@ class Worker:
                     # matching almost never fired.
                     norm_intent = re.sub(r"\s+", " ", (intent or "").strip().lower())[:160]
                     self.recent_intents.append(norm_intent)
-                    if (not loop_detected and norm_intent
+                    self._recent_turn_fps.append(norm_cmd)
+                    # Doing genuinely VARIED work is not a stall even if the stated
+                    # goal (and its wording) holds steady: a research phase that
+                    # fires three DIFFERENT searches shares an intent but is making
+                    # progress, so the wording-similarity heuristic alone would
+                    # false-fire. Suppress the warning when every turn in the window
+                    # ran a DISTINCT consequential action.
+                    window_fps = [f for f in self._recent_turn_fps if f]
+                    varied_work = (len(window_fps) == self.recent_intents.maxlen
+                                   and len(set(window_fps)) == len(window_fps))
+                    if (not loop_detected and norm_intent and not varied_work
                             and len(self.recent_intents) == self.recent_intents.maxlen):
                         ints = [s for s in self.recent_intents if s]
                         if len(ints) == self.recent_intents.maxlen and all(
@@ -2254,10 +2334,24 @@ class Worker:
                 time.sleep(2)
 
             except KeyboardInterrupt:
-                self.print_func(f"\n{C_RED}PAUSED (User Interrupt).{C_RESET}")
+                # Two ways in: (1) the user TYPED a message mid-run — the listener
+                # stashed it and interrupted us; we already have the text, so fold
+                # it straight in. (2) a bare Ctrl+C with nothing typed — pause and
+                # prompt for guidance, exactly as before.
+                typed = self._take_pending_message()
                 try:
-                    self.print_func(f"{C_YELLOW}Enter guidance, press Enter to resume, or type 'exit' to quit.{C_RESET}")
-                    user_guidance = input(f"{C_BLUE}User Guidance > {C_RESET}")
+                    if typed is not None:
+                        self.print_func(f"\n{C_RED}Interrupted — reading your message.{C_RESET}")
+                        self.print_func(f"{C_CYAN}Integrating: {typed}{C_RESET}")
+                        objective, reset_iter = self._integrate_user_input(objective, typed, iteration)
+                        if reset_iter:
+                            iteration = 0
+                        continue
+
+                    self.print_func(f"\n{C_RED}PAUSED (User Interrupt).{C_RESET}")
+                    user_guidance = self._blocking_read_line(
+                        f"{C_YELLOW}Enter guidance, press Enter to resume, or type 'exit' to quit.{C_RESET}\n"
+                        f"{C_BLUE}User Guidance > {C_RESET}")
 
                     if not user_guidance.strip():
                         self.print_func("Resuming...")
