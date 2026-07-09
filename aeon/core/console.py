@@ -26,6 +26,7 @@ multi-line paste). Non-TTY stdin (piped, headless ``-n``, a sub-agent) degrades
 to a plain ``input()`` with no background thread.
 """
 import sys
+import time
 import queue
 import threading
 import _thread
@@ -105,23 +106,47 @@ class ConsoleInput:
                         self._awaiting = False
                     if was_await:
                         self._q.put(_EOF)
+                    else:
+                        # Unsolicited read hit EOF. On a live TTY the next read
+                        # blocks for input; but if stdin is genuinely closed this
+                        # would busy-loop, so back off before trying again.
+                        time.sleep(0.2)
                     continue
                 except KeyboardInterrupt:
-                    # SIGINT is delivered to the main thread; drop the in-progress
-                    # read here and let the main thread's handler drive.
+                    # prompt_toolkit runs the terminal in raw mode with signals off,
+                    # so Ctrl+C surfaces HERE (in the reader) instead of as SIGINT to
+                    # the main thread. Re-dispatch it to preserve Ctrl+C semantics:
+                    #   * during a solicited read -> unblock the caller as EOF (the
+                    #     REPL treats that as quit, like the old Ctrl+C at '> ');
+                    #   * during a run (type-ahead) -> pause the agent exactly as a
+                    #     bare Ctrl+C used to (the main loop then prompts for guidance).
                     with self._cond:
+                        was_await = self._awaiting
+                        typeahead = self._typeahead
                         self._awaiting = False
+                    if was_await:
+                        self._q.put(_EOF)
+                    elif typeahead:
+                        _thread.interrupt_main()
                     continue
                 except Exception:
                     continue
+                # Classify under the lock so awaiting/typeahead are read atomically.
+                # Interrupt the main thread ONLY if type-ahead is STILL on: a run
+                # can end (disable_typeahead) while the user is mid-line, and a
+                # stray interrupt then would surface as a bare KeyboardInterrupt at
+                # the REPL and quietly exit the program.
                 with self._cond:
-                    was_await = self._awaiting
-                    if was_await:
+                    if self._awaiting:
                         self._awaiting = False
                         self._prompt = ""
-                if was_await:
+                        deliver, interrupt = True, False
+                    else:
+                        deliver = False
+                        interrupt = self._typeahead and bool(line.strip())
+                if deliver:
                     self._q.put(line)
-                elif line.strip():
+                elif interrupt:
                     with self._pending_lock:
                         self._pending = line
                     _thread.interrupt_main()
