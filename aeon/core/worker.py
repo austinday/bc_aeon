@@ -144,6 +144,7 @@ class Worker:
         self.important_reminders = IMPORTANT_REMINDERS
         self.max_history_tokens = 30000
         self.current_objective = None
+        self.last_say_to_user = None  # Most recent say_to_user text; a sub-agent's final report
         self.model_name = None  # Set by main.py for restart persistence
         self.active_skill = None  # {'path': ..., 'content': ...} when a skill protocol is active
         # Screenshot(s) to attach to the NEXT prompt so the multimodal model SEES
@@ -965,6 +966,7 @@ class Worker:
         self._last_sub_agent_action_iter = 0
         self._consecutive_passive_turns = 0
         self.visual_context = []
+        self.last_say_to_user = None
 
     def serialize_state(self) -> dict:
         """Serialize worker state for persistence across restarts."""
@@ -1494,7 +1496,10 @@ class Worker:
                     # or if no summary exists yet.
                     if not self.action_log_summary or len(self.action_log) % 5 == 0:
                         self.print_func(f"{C_CYAN}Updating action log summary to preserve context focus...{C_RESET}")
-                        recent_count = 10
+                        # Keep >= the largest display window (12 at Low pressure in
+                        # _get_compressed_attempt_log) so no entry appears both
+                        # summarized and verbatim.
+                        recent_count = 12
                         older_history = self.action_log[:-recent_count] if len(self.action_log) > recent_count else self.action_log
                         log_text = "\n\n".join(older_history)
                         self.action_log_summary = self.llm_client.compress_action_log(log_text)
@@ -1603,7 +1608,11 @@ class Worker:
                     prompt += f"\n\nSYSTEM REMINDER: You have {rem_iters} effective iterations remaining to complete this task. Plan accordingly."
                     if rem_iters <= 0:
                         self.print_func(f"{C_RED}Iteration budget exhausted. Forcing final report.{C_RESET}")
-                        self.last_observation = "SYSTEM ALERT: Iteration budget exhausted. You MUST use 'task_complete' to report your final status."
+                        # Append to the PROMPT (already built): writing this to
+                        # last_observation here would be overwritten at end of turn
+                        # and never reach the model.
+                        prompt += ("\nSYSTEM ALERT: Iteration budget exhausted. You MUST use "
+                                   "'task_complete' THIS turn to report your final status.")
 
                 # Final token count and growth tracking
                 prompt_tokens = estimate_tokens(prompt)
@@ -1969,6 +1978,13 @@ class Worker:
                         finished_entry = f"[Iter {p['iter']}]\n- Intent: {p['intent']}\n- Actions: {acts_str}\n- Result: Task marked complete. {result_str}"
                         self.action_log.append(finished_entry)
                         self.pending_iteration_state = None
+
+                        # Fold this FINAL turn's outputs into last_observation so
+                        # anything reading it after run() returns (e.g. the
+                        # sub-agent wrapper's fallback report) sees this turn,
+                        # not the previous one.
+                        self.last_observation = self._truncate_output(
+                            "\n\n".join(combined_summary_parts + [result_str]), max_chars=8000)
 
                         self._persist_session_state()
                         if step_callback: step_callback(iteration, display_max, "Complete")

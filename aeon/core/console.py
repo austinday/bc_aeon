@@ -41,6 +41,7 @@ class ConsoleInput:
         self._awaiting = False        # a caller is blocking in readline() for a line
         self._typeahead = False       # unsolicited lines interrupt the main thread
         self._prompt = ""             # prompt to show for the pending solicited read
+        self._reading = False         # reader thread is currently blocked in _read()
         self._pending = None          # last unsolicited (type-ahead) line
         self._pending_lock = threading.Lock()
         self._started = False
@@ -98,6 +99,7 @@ class ConsoleInput:
                     while not (self._awaiting or self._typeahead):
                         self._cond.wait()
                     prompt = self._prompt if self._awaiting else ""
+                    self._reading = True
                 try:
                     line = self._read(prompt)
                 except EOFError:
@@ -131,6 +133,9 @@ class ConsoleInput:
                     continue
                 except Exception:
                     continue
+                finally:
+                    with self._cond:
+                        self._reading = False
                 # Classify under the lock so awaiting/typeahead are read atomically.
                 # Interrupt the main thread ONLY if type-ahead is STILL on: a run
                 # can end (disable_typeahead) while the user is mid-line, and a
@@ -167,7 +172,15 @@ class ConsoleInput:
         with self._cond:
             self._prompt = prompt
             self._awaiting = True
+            # If the reader is ALREADY blocked in a bare type-ahead read (the
+            # normal state mid-run), it can't show this prompt — the read began
+            # before the prompt existed. Print it here so the user actually sees
+            # what is being asked (get_user_input, the Ctrl+C guidance prompt);
+            # the typed line is still classified correctly at submit time.
+            show_now = self._reading and bool(prompt)
             self._cond.notify_all()
+        if show_now:
+            print(prompt, end="", flush=True)
         item = self._q.get()
         if item is _EOF:
             raise EOFError

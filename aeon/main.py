@@ -741,11 +741,11 @@ class SessionManager:
                     self.startup_lock.close()
                 except: pass
             
-            if self._original_sigterm:
+            if self._original_sigterm is not None:  # SIG_DFL == 0 is falsy but valid
                 signal.signal(signal.SIGTERM, self._original_sigterm)
                 
         finally:
-            if old_sigint:
+            if old_sigint is not None:
                 signal.signal(signal.SIGINT, old_sigint)
             print("[SESSION] Cleanup complete.")
 

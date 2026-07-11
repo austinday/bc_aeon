@@ -263,10 +263,15 @@ def main():
         worker.run(objective, max_iterations=args.max_iterations, step_callback=update_telemetry)
 
         done_event.set()  # stand the watchdog down BEFORE the final writes
+        # The report the principal reads: prefer the sub-agent's final say_to_user
+        # message (the instructed deliverable). last_observation is the fallback,
+        # but on the terminal turn it still holds the PREVIOUS turn's output — the
+        # say_to_user text itself is never echoed into it.
+        final_report = getattr(worker, "last_say_to_user", None) or worker.last_observation
         write_terminal("COMPLETED", {
             "agent_id": args.agent_id,
             "status": "COMPLETED",
-            "result": worker.last_observation,
+            "result": final_report,
             "plan": worker.current_plan,
             "memories": worker.memories,
         })

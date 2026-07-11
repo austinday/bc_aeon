@@ -40,17 +40,24 @@ class ThinkTool(BaseTool):
 
 class SayToUserTool(BaseTool):
     """A tool to communicate with the user."""
-    def __init__(self):
+    def __init__(self, worker=None):
         super().__init__(
             name="say_to_user",
             description=TOOL_DESC_SAY_TO_USER
         )
+        self.worker = worker
 
     def execute(self, message: str):
         if not message:
             return "Error: message parameter is required."
         # Print a newline to ensure the message starts below the tool call line
         print(f"\n{C_GREEN}{message}{C_RESET}")
+        # Stash the delivered text on the worker: for a sub-agent, the final
+        # say_to_user IS the report the principal reads (the wrapper prefers this
+        # over last_observation, which by the terminal turn only holds the
+        # PREVIOUS turn's output — the deliverable used to be lost entirely).
+        if self.worker is not None:
+            self.worker.last_say_to_user = message
         # Return only a concise confirmation, NOT the full message: the message
         # text is already in this action's parameters, so echoing it back would
         # duplicate a potentially long report into the agent's context every turn.

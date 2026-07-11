@@ -80,7 +80,11 @@ class LLMClient:
         """
         provider = config['provider']
         if provider == 'local':
-            return openai.OpenAI(base_url='http://localhost:8013/v1', api_key='ollama')
+            # The Ollama brain container maps host port 8000 -> 11434 (see
+            # scripts/start_brain.sh) and serves the OpenAI-compatible API under
+            # /v1. Port 8013 is the llama.cpp/vLLM load balancer — pointing an
+            # Ollama model there sends its chats to the wrong server entirely.
+            return openai.OpenAI(base_url='http://localhost:8000/v1', api_key='ollama')
         elif provider in ['llamacpp', 'vllm']:
             return openai.OpenAI(base_url=config['base_url'], api_key='no-key-needed')
         raise ValueError(
@@ -594,9 +598,22 @@ class LLMClient:
     def _handle_connection_error(self, error):
         """Handle API connection errors with exponential backoff and GPU recovery check."""
         self.logger.warning(f"Connection error detected: {error}. Entering recovery mode...")
-        
+
         start_time = time.time()
-        
+
+        # FIRST: a quick reachability probe. A single dropped connection or a
+        # momentarily-busy server must NOT trigger the heavy self-heal below,
+        # which force-removes the model containers (and used to do so after a
+        # blind 5-minute sleep) even when the server was actually fine.
+        for probe_delay in (2, 5, 10):
+            time.sleep(probe_delay)
+            try:
+                self.client.models.list()
+                self.logger.info("Server is reachable again (transient error). Resuming agent...")
+                return True
+            except Exception:
+                pass
+
         # Check if we are using a local model that we can self-heal
         llamacpp_config = None
         try:
@@ -604,7 +621,7 @@ class LLMClient:
             llamacpp_config = get_llamacpp_config(self.model)
         except ImportError:
             pass
-        
+
         if llamacpp_config:
             self.logger.info(f"Local model {self.model} detected. Pausing for 5 minutes before attempting self-healing...")
             time.sleep(300)

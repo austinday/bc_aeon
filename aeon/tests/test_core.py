@@ -950,6 +950,65 @@ class TestStructuredEndToEnd(unittest.TestCase):
         self.assertIn("CUT OFF", retry_prompt)
 
 
+class TestSubAgentReportIntegrity(unittest.TestCase):
+    """The principal reads a sub-agent's deliverable from output.json. Two bugs
+    guarded here: (1) say_to_user must stash its message on the worker (the
+    wrapper's report source — last_observation never contains it), and
+    (2) kill_sub_agent must NOT clobber a finished agent's output.json."""
+
+    def test_say_to_user_stashes_message_on_worker(self):
+        import types
+        from aeon.tools.communication import SayToUserTool
+        w = types.SimpleNamespace(last_say_to_user=None)
+        out = SayToUserTool(worker=w).execute("final findings: all good")
+        self.assertIn("delivered", out.lower())
+        self.assertEqual(w.last_say_to_user, "final findings: all good")
+
+    def test_kill_does_not_clobber_completed_report(self):
+        import json as _json
+        import os
+        import tempfile
+        import types
+        from pathlib import Path
+        from aeon.tools.sub_agent import KillSubAgent
+        from aeon.core import runtime_signals as rt
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "aeon_output" / "inst" / "sub_agents"
+            agent_dir = base / "abcd1234-0000-0000-0000-000000000000"
+            agent_dir.mkdir(parents=True)
+            rt.atomic_write_json(agent_dir / "output.json", {
+                "agent_id": agent_dir.name, "status": "COMPLETED",
+                "result": "THE REPORT",
+            })
+            rt.atomic_write_text(agent_dir / "status.txt", "COMPLETED")
+
+            tool = KillSubAgent(worker=types.SimpleNamespace(
+                instance_id="inst", notified_sub_agents=set()))
+            old_cwd = os.getcwd()
+            os.chdir(td)  # output_dir resolves relative to cwd
+            try:
+                out = tool.execute("abcd1234")
+            finally:
+                os.chdir(old_cwd)
+            self.assertIn("already finished", out.lower())
+            data = _json.loads((agent_dir / "output.json").read_text())
+            self.assertEqual(data["result"], "THE REPORT")
+            self.assertEqual(data["status"], "COMPLETED")
+
+
+class TestLocalProviderEndpoint(unittest.TestCase):
+    """Provider 'local' (Ollama) must talk to the brain's port 8000 (mapped from
+    11434 in start_brain.sh), NOT 8013 — that's the llama.cpp/vLLM load balancer,
+    which would silently route Ollama chats to a different model."""
+
+    def test_local_provider_uses_ollama_port(self):
+        from aeon.core.llm import LLMClient
+        c = LLMClient.__new__(LLMClient)
+        client = c._create_client({'provider': 'local'})
+        self.assertIn(":8000", str(client.base_url))
+
+
 def load_tests(loader, standard_tests, pattern):
     return standard_tests
 

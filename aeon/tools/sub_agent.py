@@ -251,8 +251,11 @@ class SpawnSubAgent(BaseTool):
                 start_new_session=True,
             )
         except Exception as e:
-            log_fd.close()
             return f"COMMAND FAILED: could not launch sub-agent process: {e}"
+        finally:
+            # The child inherited the fd; keeping it open in the parent leaks one
+            # fd per spawn for the life of the session.
+            log_fd.close()
 
         rt.atomic_write_text(agent_dir / "pid.txt", str(process.pid))
         rt.atomic_write_text(agent_dir / "status.txt", "RUNNING")
@@ -548,6 +551,15 @@ class KillSubAgent(BaseTool):
         agent_dir, err = _resolve_agent_dir(self.output_dir, agent_id)
         if err:
             return err
+
+        # Already terminal? Do NOT overwrite output.json — that would destroy a
+        # completed agent's findings. Mark it collected and point at the report.
+        is_term, status, _ = resolve(agent_dir)
+        if is_term:
+            base_status = norm_status(status)
+            self.worker.notified_sub_agents.add(f"{agent_dir.name}_{base_status}")
+            return (f"Sub-agent {agent_dir.name[:8]} already finished ({base_status}); nothing to kill. "
+                    f"Its report is preserved — read it with get_sub_agent_report(agent_id='{agent_dir.name[:8]}').")
 
         rt.atomic_write_json(agent_dir / "output.json", {
             "agent_id": agent_dir.name,
