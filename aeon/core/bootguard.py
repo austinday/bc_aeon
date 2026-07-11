@@ -30,6 +30,17 @@ from . import checkpoint
 
 
 def _marker_path() -> Path:
+    # STABLE across working directories: a crashed relaunch in workspace A must be
+    # recoverable by a fresh start in workspace B (the marker names aeon_code_dir,
+    # so recovery acts on the right source tree regardless of where aeon runs).
+    # The old cwd-relative location silently skipped recovery unless the next
+    # start happened to be in the same directory.
+    aeon_home = os.environ.get("AEON_HOME") or os.path.expanduser("~/.aeon")
+    return Path(aeon_home) / "boot_pending.json"
+
+
+def _legacy_marker_path() -> Path:
+    """Pre-2026-07 location (cwd-relative); still consumed for compatibility."""
     return Path(os.getcwd()) / "aeon_output" / ".aeon_boot_pending.json"
 
 
@@ -53,12 +64,12 @@ def mark_pending(aeon_code_dir: str, ckpt_ref: str, reason: str = "") -> None:
 
 def mark_boot_ok() -> None:
     """Clear the pending marker — the relaunched process booted healthily."""
-    try:
-        p = _marker_path()
-        if p.exists():
-            p.unlink()
-    except Exception:
-        pass
+    for p in (_marker_path(), _legacy_marker_path()):
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
 
 
 def check_and_recover(print_func=print) -> dict:
@@ -69,6 +80,8 @@ def check_and_recover(print_func=print) -> dict:
     Returns a small status dict for logging/telemetry.
     """
     p = _marker_path()
+    if not p.exists():
+        p = _legacy_marker_path()  # marker written by pre-change code
     if not p.exists():
         return {"recovered": False}
     try:

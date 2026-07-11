@@ -783,6 +783,11 @@ class BrowserCloseTabTool(BaseTool):
             if resp.status_code != 200:
                 return f"HTTP Error {resp.status_code} from browser API: {resp.text}"
             data = resp.json()
+            # If we just closed the remembered "last used" tab, forget it —
+            # otherwise the next omitted tab_id resolves to the closed tab and
+            # 404s (the exact footgun _resolve_tab exists to prevent).
+            if self.worker is not None and getattr(self.worker, "_last_browser_tab", None) == tab_id:
+                self.worker._last_browser_tab = None
             remaining = data.get("remaining_tabs", 0)
             if remaining == 0:
                 rem_browser = _manage_browser_registry('unregister')

@@ -15,6 +15,11 @@ SOFT_IGNORE = {
     '__pycache__', 'node_modules', 'venv', '.venv', '.ipynb_checkpoints',
     '.vscode', '.idea', 'dist', 'site-packages', '.tox', '.mypy_cache',
     '.pytest_cache', '.ruff_cache', 'egg-info',
+    # Agent bookkeeping (sub-agent dirs, job logs, session state): accessed via
+    # dedicated tools/digests, never navigated by tree. Without this it is only
+    # excluded when the workspace's .gitignore happens to list it, so in a fresh
+    # workspace it got walked into the prompt every iteration.
+    'aeon_output',
 }
 
 BINARY_EXT = {

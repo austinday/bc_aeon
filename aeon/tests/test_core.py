@@ -1042,6 +1042,37 @@ class TestSensitiveMemoryGuard(unittest.TestCase):
         self.assertFalse(sens("build_command", "make -j8"))
 
 
+class TestBootguardMarkerStability(unittest.TestCase):
+    """The boot-pending marker must live at a cwd-INDEPENDENT path: a crashed
+    relaunch in workspace A has to be recoverable by a fresh start in workspace B
+    (the marker itself names aeon_code_dir)."""
+
+    def test_marker_roundtrip_under_aeon_home(self):
+        import json as _json
+        import os
+        import tempfile
+        from aeon.core import bootguard
+
+        old_home = os.environ.get("AEON_HOME")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["AEON_HOME"] = td
+            try:
+                p = bootguard._marker_path()
+                self.assertTrue(str(p).startswith(td), "marker must live under AEON_HOME, not cwd")
+                bootguard.mark_pending("/some/code/dir", "aeon-ckpt/x", reason="test")
+                self.assertTrue(p.exists())
+                data = _json.loads(p.read_text())
+                self.assertEqual(data["aeon_code_dir"], "/some/code/dir")
+                self.assertEqual(data["checkpoint"], "aeon-ckpt/x")
+                bootguard.mark_boot_ok()
+                self.assertFalse(p.exists())
+            finally:
+                if old_home is None:
+                    os.environ.pop("AEON_HOME", None)
+                else:
+                    os.environ["AEON_HOME"] = old_home
+
+
 class TestLocalProviderEndpoint(unittest.TestCase):
     """Provider 'local' (Ollama) must talk to the brain's port 8000 (mapped from
     11434 in start_brain.sh), NOT 8013 — that's the llama.cpp/vLLM load balancer,
