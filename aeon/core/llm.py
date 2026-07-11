@@ -804,6 +804,7 @@ class LLMClient:
                 first_token_time = None
                 raw_chunks =[]
                 server_completion_tokens = None
+                server_prompt_tokens = None
                 finish_reason = None
 
                 for chunk in resp_stream:
@@ -820,6 +821,19 @@ class LLMClient:
                     usage = getattr(chunk, 'usage', None)
                     if usage is not None and getattr(usage, 'completion_tokens', None):
                         server_completion_tokens = usage.completion_tokens
+                    if usage is not None and getattr(usage, 'prompt_tokens', None):
+                        server_prompt_tokens = usage.prompt_tokens
+
+                # Calibrate estimate_tokens against the server's REAL prompt token
+                # count (free — it's already in the usage chunk), so the worker's
+                # context-pressure math tracks the served model's tokenizer, not
+                # cl100k. Text-only turns only: image tokens would inflate the ratio.
+                if server_prompt_tokens and not image_urls:
+                    try:
+                        from .utils.tokens import calibrate
+                        calibrate(current_prompt, server_prompt_tokens)
+                    except Exception:
+                        pass
 
                 end_time = time.time()
                 raw = "".join(raw_chunks)

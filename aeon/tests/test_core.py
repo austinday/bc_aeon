@@ -997,6 +997,51 @@ class TestSubAgentReportIntegrity(unittest.TestCase):
             self.assertEqual(data["status"], "COMPLETED")
 
 
+class TestTokenCalibration(unittest.TestCase):
+    """estimate_tokens self-calibrates from the server's real prompt_tokens.
+    The EMA must move toward the observed ratio, ignore absurd/short samples,
+    and never poison future estimates."""
+
+    def setUp(self):
+        from aeon.core.utils import tokens
+        tokens._reset_calibration()
+
+    def tearDown(self):
+        from aeon.core.utils import tokens
+        tokens._reset_calibration()
+
+    def test_calibration_scales_estimates(self):
+        from aeon.core.utils import tokens
+        text = "some representative agent context " * 200  # comfortably > 500 raw tokens
+        base = tokens.estimate_tokens(text)
+        tokens.calibrate(text, int(tokens._raw_estimate(text) * 2))  # server says 2x
+        scaled = tokens.estimate_tokens(text)
+        self.assertGreater(scaled, base)  # EMA moved toward 2x
+        self.assertLess(scaled, base * 2)  # but not all the way in one step
+
+    def test_absurd_and_tiny_samples_ignored(self):
+        from aeon.core.utils import tokens
+        text = "word " * 2000
+        base = tokens.estimate_tokens(text)
+        tokens.calibrate(text, int(tokens._raw_estimate(text) * 50))  # image-inflated ratio
+        tokens.calibrate("short", 10_000)                             # sample too small
+        self.assertEqual(tokens.estimate_tokens(text), base)
+
+
+class TestSensitiveMemoryGuard(unittest.TestCase):
+    """Sensitive memories must be exempt from LLM memory compression (a
+    paraphrased password is silent data loss)."""
+
+    def test_key_and_category_markers(self):
+        from aeon.core.worker import Worker
+        sens = Worker._is_sensitive_memory
+        self.assertTrue(sens("github_password", "hunter2"))
+        self.assertTrue(sens("api_key_openrouter", {"value": "sk-x", "category": "general"}))
+        self.assertTrue(sens("proton_details", {"value": "u/p", "category": "credentials"}))
+        self.assertFalse(sens("project_paths", {"value": "/data", "category": "general"}))
+        self.assertFalse(sens("build_command", "make -j8"))
+
+
 class TestLocalProviderEndpoint(unittest.TestCase):
     """Provider 'local' (Ollama) must talk to the brain's port 8000 (mapped from
     11434 in start_brain.sh), NOT 8013 — that's the llama.cpp/vLLM load balancer,

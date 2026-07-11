@@ -28,6 +28,10 @@ SUB_AGENT_FORBIDDEN_TOOLS = {
     "run_command_async",
     "job_output",
     "kill_job",
+    # No interactive user: stdin is detached (DEVNULL) and the terminal belongs
+    # to the principal. A sub-agent must report blockers in its final report,
+    # not sit waiting for input that can never arrive.
+    "get_user_input",
 }
 
 
@@ -236,6 +240,10 @@ def main():
         worker = Worker(llm_client=llm_client, debug_mode=args.debug)
         worker.model_name = config.get("model", "unknown")
         worker.model_config = config
+        # Sub-agents share the principal's cwd (workspace symlink): with
+        # persistence on they'd clobber the principal's session_state.json every
+        # iteration and inherit its memories/plan at boot.
+        worker.persist_session = False
         # Browse as an ISOLATED identity: each sub-agent gets its own browser
         # context (own cookies/session/fingerprint) instead of sharing the
         # principal's profile, so parallel agents don't collide.

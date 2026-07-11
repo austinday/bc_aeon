@@ -132,7 +132,13 @@ class Worker:
         self._stuck_banner = ""  # Top-of-prompt STUCK banner, set by loop/oscillation detection
         self.prev_prompt_tokens = 0  # Tracks context size of previous iteration for growth metrics
         self.action_log_summary = ""  # Non-destructive summary of older action log entries
+        self._summarized_upto = 0  # Index into action_log below which entries are already folded into the summary
         self.instance_id = str(uuid.uuid4())[:8]  # Unique ID for this Aeon run instance
+        # Cross-run session persistence (aeon_output/session_state.json). The
+        # sub-agent wrapper turns this OFF: sub-agents share the principal's cwd
+        # (workspace symlink), so with it on they clobber the principal's session
+        # file every iteration AND inherit its memories at boot.
+        self.persist_session = True
         self.MAX_REPEAT_WINDOW = 5  # How many recent commands to track
         self.REPEAT_THRESHOLD = 2   # How many identical commands before warning
         self.effective_iterations = 0
@@ -633,12 +639,28 @@ class Worker:
         out.extend(lines)
         return "\n".join(out)
 
-    def _format_memories(self) -> str:
-        if not self.memories:
+    # Memories whose key/category names one of these are exact-value data
+    # (credentials, tokens, IDs...). They are NEVER passed through the LLM memory
+    # compressor — a paraphrased password or dropped API key is silent data loss —
+    # but are merged back verbatim after compression.
+    _SENSITIVE_MEMORY_MARKERS = ("credential", "password", "secret", "token",
+                                 "key", "login", "auth", "account", "cookie")
+
+    @classmethod
+    def _is_sensitive_memory(cls, key: str, value) -> bool:
+        hay = str(key).lower()
+        if isinstance(value, dict):
+            hay += " " + str(value.get("category", "")).lower()
+        return any(m in hay for m in cls._SENSITIVE_MEMORY_MARKERS)
+
+    def _format_memories(self, mems: Optional[dict] = None) -> str:
+        if mems is None:
+            mems = self.memories
+        if not mems:
             return "No memories recorded yet."
-        
+
         formatted = []
-        for k, v in self.memories.items():
+        for k, v in mems.items():
             if isinstance(v, dict):
                 val = v.get('value', '')
                 cat = v.get('category', 'general')
@@ -946,6 +968,8 @@ class Worker:
         self.memories = {}
         self.last_observation = initial_observation
         self.action_log.clear()
+        self.action_log_summary = ""  # a stale summary must not describe the previous objective
+        self._summarized_upto = 0
         self.pending_iteration_state = None
         self._recent_commands.clear()
         self._recent_outputs.clear()
@@ -975,6 +999,7 @@ class Worker:
             'current_plan': self.current_plan,
             'action_log': list(self.action_log),
             'action_log_summary': self.action_log_summary,
+            'summarized_upto': self._summarized_upto,
             'objective': self.current_objective or '',
             'expanded_categories': list(self.expanded_categories),
             'notified_sub_agents': list(self.notified_sub_agents),
@@ -990,6 +1015,7 @@ class Worker:
         self.memories = state.get('memories', {})
         self.action_log = state.get('action_log', [])
         self.action_log_summary = state.get('action_log_summary', "")
+        self._summarized_upto = min(int(state.get('summarized_upto', 0) or 0), len(self.action_log))
         self.expanded_categories = set(state.get('expanded_categories', []))
         self.notified_sub_agents = set(state.get('notified_sub_agents', []))
         self.notified_jobs = set(state.get('notified_jobs', []))
@@ -1046,6 +1072,8 @@ class Worker:
     def _persist_session_state(self):
         """Atomically write the current state to the stable session file. Best-effort:
         any failure is logged and swallowed so persistence never breaks the loop."""
+        if not self.persist_session:
+            return
         try:
             path = self._session_state_path()
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1068,6 +1096,8 @@ class Worker:
         Skipped entirely if state is already populated (e.g. a restart_aeon resume
         already ran restore_state), so we never clobber live state.
         """
+        if not self.persist_session:
+            return  # sub-agents neither inherit nor write the shared session file
         if getattr(self, '_persisted_loaded', False):
             return
         self._persisted_loaded = True
@@ -1095,6 +1125,7 @@ class Worker:
             if data.get('action_log'):
                 self.action_log = list(data['action_log'])
                 self.action_log_summary = data.get('action_log_summary', "")
+                self._summarized_upto = min(int(data.get('summarized_upto', 0) or 0), len(self.action_log))
                 restored.append(f"{len(self.action_log)} attempt-log entr(ies)")
             if data.get('current_plan'):
                 self.current_plan = data['current_plan']
@@ -1436,6 +1467,19 @@ class Worker:
         iteration = 0
         self.last_observation = f"User input received: {objective}"
         self._maybe_load_persisted_state(objective)
+
+        # Pre-flight skill routing: one utility-model call that names the best-
+        # matching skill protocol (or nothing) so the agent activates it on turn 1
+        # instead of relying on the per-turn skill_check reflection to notice.
+        # Fully best-effort — route_skills returns '' on any failure or no match.
+        try:
+            routing = self.llm_client.route_skills(objective)
+        except Exception:
+            routing = ""
+        if routing:
+            self.last_observation = f"{self.last_observation}\n\n{routing}"
+            self.print_func(f"{C_CYAN}{routing}{C_RESET}")
+
         self.print_func(f"{C_GREEN}Objective: {objective}{C_RESET}\n")
 
         graceful_exit_triggered = False
@@ -1495,14 +1539,24 @@ class Worker:
                     # Only re-compress if we have enough new entries to justify it (e.g., 5 new entries)
                     # or if no summary exists yet.
                     if not self.action_log_summary or len(self.action_log) % 5 == 0:
-                        self.print_func(f"{C_CYAN}Updating action log summary to preserve context focus...{C_RESET}")
+                        # INCREMENTAL: fold only the entries not yet summarized into
+                        # the existing summary, instead of re-summarizing the entire
+                        # (ever-growing) history from scratch every 5 turns.
                         # Keep >= the largest display window (12 at Low pressure in
                         # _get_compressed_attempt_log) so no entry appears both
                         # summarized and verbatim.
                         recent_count = 12
-                        older_history = self.action_log[:-recent_count] if len(self.action_log) > recent_count else self.action_log
-                        log_text = "\n\n".join(older_history)
-                        self.action_log_summary = self.llm_client.compress_action_log(log_text)
+                        cutoff = max(0, len(self.action_log) - recent_count)
+                        new_entries = self.action_log[self._summarized_upto:cutoff]
+                        if new_entries:
+                            self.print_func(f"{C_CYAN}Updating action log summary to preserve context focus...{C_RESET}")
+                            if self.action_log_summary:
+                                log_text = (f"[EXISTING SUMMARY OF OLDER HISTORY]\n{self.action_log_summary}\n\n"
+                                            f"[NEW ENTRIES TO FOLD INTO THE SUMMARY]\n" + "\n\n".join(new_entries))
+                            else:
+                                log_text = "\n\n".join(new_entries)
+                            self.action_log_summary = self.llm_client.compress_action_log(log_text)
+                            self._summarized_upto = cutoff
 
                 # --- SUB-AGENT AWARENESS DIGEST ---
                 # Passive, always-on. Built every turn and injected into the prompt
@@ -1564,14 +1618,22 @@ class Worker:
                 system_specs = get_runtime_info()
                 attempt_log_str = self._get_compressed_attempt_log(pressure=pressure)
 
-                # Automatic Memory Compression: Trigger if pressure is high and memories are significant
+                # Automatic Memory Compression: Trigger if pressure is high and memories are significant.
+                # Sensitive entries (credentials/tokens/IDs) are exempted from the LLM
+                # rewrite — a paraphrased password is silent data loss — and merged
+                # back verbatim afterwards.
                 if pressure in ["High", "CRITICAL"] and estimate_tokens(memories_str) > 2000:
                     self.print_func(f"{C_CYAN}Context pressure is {pressure}. Compressing memories to save space...{C_RESET}")
-                    compressed_mems = self.llm_client.compress_memories(memories_str)
-                    if compressed_mems:
-                        self.memories = compressed_mems
-                        memories_str = self._format_memories() # Update string for the current prompt
-                        self.print_func(f"{C_GREEN}Memories compressed successfully.{C_RESET}")
+                    protected = {k: v for k, v in self.memories.items()
+                                 if self._is_sensitive_memory(k, v)}
+                    compressible = {k: v for k, v in self.memories.items() if k not in protected}
+                    if compressible:
+                        compressed_mems = self.llm_client.compress_memories(self._format_memories(compressible))
+                        if compressed_mems:
+                            self.memories = {**compressed_mems, **protected}  # protected survive verbatim
+                            memories_str = self._format_memories() # Update string for the current prompt
+                            kept = f" ({len(protected)} sensitive entr(ies) kept verbatim)" if protected else ""
+                            self.print_func(f"{C_GREEN}Memories compressed successfully{kept}.{C_RESET}")
 
                 # Build the prompt, including diagnostics if pressure is elevated
                 # This empowers the agent to proactively close files or summarize.
@@ -1996,6 +2058,18 @@ class Worker:
                                 f"{C_YELLOW}Agent Request: {params.get('prompt', 'Please provide input:')}\n> {C_RESET}")
                         except EOFError:
                             return
+
+                        if not user_in.strip():
+                            # EOF / non-interactive stdin / bare Enter: there is
+                            # no guidance to integrate. Feeding "" to the LLM
+                            # integrator wasted a call and could rewrite the
+                            # objective off nothing.
+                            self.last_observation = (
+                                "No user input was received (empty line or non-interactive session). "
+                                "Do not ask again — proceed autonomously using your best judgment, and "
+                                "surface any blocker in your final report (say_to_user / task_complete).")
+                            user_input_handled = True
+                            break
 
                         self.print_func(f"{C_CYAN}Integrating user input...{C_RESET}")
                         # Preserve any output produced earlier this same turn so it

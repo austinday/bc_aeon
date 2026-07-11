@@ -245,6 +245,10 @@ class SpawnSubAgent(BaseTool):
         try:
             process = subprocess.Popen(
                 cmd,
+                # Detach stdin: inheriting the principal's TTY makes the
+                # sub-agent's console reader contend with the principal's for
+                # the same terminal (background-session reads -> SIGTTIN).
+                stdin=subprocess.DEVNULL,
                 stdout=log_fd,
                 stderr=subprocess.STDOUT,
                 preexec_fn=set_pdeathsig,
