@@ -86,7 +86,13 @@ class ConsoleInput:
             from prompt_toolkit.patch_stdout import patch_stdout
             self._session = PromptSession()
             self._use_pt = True
-            patch = patch_stdout()
+            # raw=True is REQUIRED: the default StdoutProxy writes app output via
+            # Vt100_Output.write(), which sanitizes ESC (\x1b -> '?') to stop
+            # untrusted text from injecting control codes. Aeon's own output is
+            # heavily ANSI-colored and trusted, so without raw=True every color
+            # code renders as a literal "?[0m". raw=True uses write_raw(), which
+            # preserves the escape bytes so the terminal colors the text.
+            patch = patch_stdout(raw=True)
             patch.__enter__()   # route all stdout writes above the live prompt
         except Exception:
             self._use_pt = False
