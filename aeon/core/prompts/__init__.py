@@ -31,6 +31,7 @@ PRIMARY_AGENT_INSTRUCTIONS = _load('primary_agent_instructions.txt')
 # =============================================================================
 COMPRESS_ACTION_LOG_PROMPT = _load('compress_action_log_prompt.txt')
 ANALYZE_INTERRUPTION_PROMPT = _load('analyze_interruption_prompt.txt')
+INTEGRATE_RESUME_PROMPT = _load('integrate_resume_prompt.txt')
 SUMMARIZE_TEXT_PROMPT = _load('summarize_text_prompt.txt')
 COMPRESS_MEMORIES_PROMPT = _load('compress_memories_prompt.txt')
 

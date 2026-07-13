@@ -1120,29 +1120,34 @@ class TestResumePreviousSession(unittest.TestCase):
         self.assertIn('resume_previous_session', names)
         self.assertIn('resume_previous_session', TOP_LEVEL_TOOLS)
 
-    def test_resume_restores_state_and_objective(self):
+    def _write_dump(self, td):
         import json as _json
+        from pathlib import Path
+        dump = Path(td) / "aeon_output" / "interrupted_session.json"
+        dump.parent.mkdir(parents=True)
+        dump.write_text(_json.dumps({
+            "objective": "Build the parser",
+            "current_plan": "Focus: finish the tokenizer.",
+            "action_log": ["[Iter 1]\n- Intent: start\n- Actions: x\n- Result: ok"],
+            "action_log_summary": "",
+            "memories": {"path": {"value": "/x", "category": "general"}},
+            "open_files_list": [],
+            "open_files_access_order": [],
+            "summarized_upto": 0,
+            "stopped_at": "2026-07-12 10:00:00",
+            "stop_reason": "ctrl-c",
+        }))
+
+    def test_resume_restores_state_and_objective(self):
+        # No new-session instruction / no llm_client -> falls back to the restored
+        # objective verbatim (the integration path is exercised separately below).
         import os
         import tempfile
-        from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
             old = os.getcwd()
             os.chdir(td)
             try:
-                dump = Path(td) / "aeon_output" / "interrupted_session.json"
-                dump.parent.mkdir(parents=True)
-                dump.write_text(_json.dumps({
-                    "objective": "Build the parser",
-                    "current_plan": "Focus: finish the tokenizer.",
-                    "action_log": ["[Iter 1]\n- Intent: start\n- Actions: x\n- Result: ok"],
-                    "action_log_summary": "",
-                    "memories": {"path": {"value": "/x", "category": "general"}},
-                    "open_files_list": [],
-                    "open_files_access_order": [],
-                    "summarized_upto": 0,
-                    "stopped_at": "2026-07-12 10:00:00",
-                    "stop_reason": "ctrl-c",
-                }))
+                self._write_dump(td)
                 w = self._worker()
                 out = w.resume_from_dump()
                 self.assertIn("Build the parser", out)
@@ -1150,6 +1155,43 @@ class TestResumePreviousSession(unittest.TestCase):
                 self.assertEqual(w.current_plan, "Focus: finish the tokenizer.")
                 self.assertEqual(len(w.action_log), 1)
                 self.assertIn("path", w.memories)
+            finally:
+                os.chdir(old)
+
+    def test_resume_integrates_new_instruction(self):
+        # The new-session prompt ("continue but also do X") is merged with the
+        # restored objective via an llm call, and the merged objective is adopted.
+        import os
+        import tempfile
+
+        class _StubLLM:
+            def __init__(self, result):
+                self.result = result
+                self.calls = []
+
+            def integrate_resume(self, prev_objective, prev_plan, progress, new_instruction):
+                self.calls.append((prev_objective, prev_plan, progress, new_instruction))
+                return self.result
+
+        with tempfile.TemporaryDirectory() as td:
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                self._write_dump(td)
+                w = self._worker()
+                w.current_objective = "continue but now also add CSV export"
+                w.llm_client = _StubLLM({
+                    "objective": "Build the parser AND add CSV export",
+                    "directive": "Keep the parser work; additionally add CSV export.",
+                })
+                out = w.resume_from_dump()
+                self.assertEqual(w._resume_objective, "Build the parser AND add CSV export")
+                self.assertEqual(len(w.llm_client.calls), 1)
+                prev_objective, prev_plan, progress, new_instruction = w.llm_client.calls[0]
+                self.assertEqual(prev_objective, "Build the parser")
+                self.assertEqual(new_instruction, "continue but now also add CSV export")
+                self.assertIn("CSV export", out)              # merged objective surfaced
+                self.assertIn("additionally add CSV export", out)  # directive surfaced
             finally:
                 os.chdir(old)
 

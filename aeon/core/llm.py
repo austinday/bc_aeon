@@ -18,6 +18,7 @@ from .utils import estimate_tokens
 from .prompts import (
     COMPRESS_ACTION_LOG_PROMPT,
     ANALYZE_INTERRUPTION_PROMPT,
+    INTEGRATE_RESUME_PROMPT,
     SUMMARIZE_TEXT_PROMPT,
     COMPRESS_MEMORIES_PROMPT,
 )
@@ -1107,6 +1108,33 @@ class LLMClient:
                     "directive": (f"The user interjected: \"{inp}\". Consider it, respond if it is a "
                                   f"question, and decide whether to adjust your approach."),
                     "reasoning": f"Integration failed ({e}); preserved context and surfaced input."}
+
+    def integrate_resume(self, prev_objective, prev_plan, progress, new_instruction) -> Dict:
+        """Merge the user's resume instruction (the new-session prompt) with the
+        PREVIOUS session's objective. The user may just want to continue, or may
+        redirect/modify the trajectory on restart; this reconciles the two into the
+        objective the agent should now pursue. Returns {objective, directive,
+        reasoning}. Best-effort: on any failure, falls back to the previous
+        objective unchanged so resume never breaks."""
+        prompt = INTEGRATE_RESUME_PROMPT.format(
+            prev_objective=prev_objective, prev_plan=prev_plan,
+            progress=progress, new_instruction=new_instruction)
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.api_model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            content = resp.choices[0].message.content
+            self._log_to_debug("INTEGRATE_RESUME", self.api_model, prompt, content)
+            data = json.loads(self._clean_json_response(content))
+            if not (data.get("objective") or "").strip():
+                data["objective"] = prev_objective
+            return data
+        except Exception as e:
+            self.logger.warning(f"Resume integration failed: {e}")
+            return {"objective": prev_objective, "directive": "",
+                    "reasoning": f"Integration failed ({e}); kept the previous objective."}
 
     def reason(self, prompt: str) -> str:
         """General reasoning/thinking call (uses primary/strong model)."""

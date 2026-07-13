@@ -1148,21 +1148,46 @@ class Worker:
         # Placeholders; _sync_open_files repopulates real content from disk next turn.
         self.open_files = {p: "Restoring from state..." for p in (data.get('open_files_list') or [])}
 
-        # Signal the run loop to switch the live objective to the restored one.
-        self._resume_objective = prev_obj
+        # Integrate the user's RESUME instruction (the new-session prompt) with the
+        # restored objective. The user rarely wants a byte-identical replay: their
+        # 'continue…' message may redirect or extend the work, so an LLM merges the
+        # two into the objective to actually pursue. Pure 'continue from where you
+        # left off' comes back ~unchanged. Best-effort: any failure keeps prev_obj.
+        new_instruction = (getattr(self, "current_objective", "") or "").strip()
+        merged_obj, directive = prev_obj, ""
+        if new_instruction and getattr(self, "llm_client", None) is not None:
+            analysis = self.llm_client.integrate_resume(
+                prev_obj, self.current_plan, self._recent_progress_digest(), new_instruction)
+            merged_obj = (analysis.get("objective") or "").strip() or prev_obj
+            directive = (analysis.get("directive") or "").strip()
+
+        # Signal the run loop to switch the live objective to the merged one.
+        self._resume_objective = merged_obj
 
         stopped_at = data.get('stopped_at') or data.get('saved_at') or 'a previous session'
         recent = self._collapse_repeated_entries(self.action_log[-4:]) if self.action_log else []
         recent_str = "\n\n".join(recent) if recent else "(no prior actions recorded)"
+        changed = merged_obj.strip() != prev_obj.strip()
+        obj_line = (f"- Objective (previous + your resume request): {merged_obj}"
+                    if changed else f"- Objective (unchanged — pure continuation): {merged_obj}")
+        req_line = f"- Your resume request: {new_instruction}\n" if new_instruction else ""
+        dir_line = f"- What changed vs. the previous objective: {directive}\n" if directive else ""
+        tail = ("You are now continuing toward the objective above. Note how your resume request "
+                "reshaped it, UPDATE your plan (updated_plan) to reflect the change, then take the next "
+                "concrete step — do not restart work already done."
+                if changed else
+                "You are now continuing THAT objective from where it left off. Review the restored plan "
+                "and attempt log, then take the NEXT concrete step — do not restart work already done.")
         return (
             f"RESUMED the previous session (stopped {stopped_at}).\n"
-            f"- Objective restored: {prev_obj}\n"
+            f"{req_line}"
+            f"{obj_line}\n"
+            f"{dir_line}"
             f"- Plan restored: {self.current_plan}\n"
             f"- Restored {len(self.memories)} memory item(s), {len(self.action_log)} attempt-log "
             f"entr(ies), {len(self.open_files)} open file(s).\n"
             f"- Most recent prior actions:\n{recent_str}\n\n"
-            f"You are now continuing THAT objective from where it left off. Review the restored plan and "
-            f"attempt log, then take the NEXT concrete step — do not restart work that is already done."
+            f"{tail}"
         )
 
     def _persist_session_state(self):

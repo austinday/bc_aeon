@@ -19,8 +19,11 @@ class ResumePreviousSessionTool(BaseTool):
                 "ONLY when the user asks you to continue or resume prior work — e.g. 'continue from where "
                 "you left off', 'resume the previous task', 'pick up where you stopped', 'keep going on "
                 "what you were doing'. It reads the state dump saved when the last run was stopped (such "
-                "as by Ctrl+C) and restores it, then you continue that objective instead of treating the "
-                "user's message as a brand-new task. If nothing was saved, it says so.\n"
+                "as by Ctrl+C) and restores it. The user's current message is integrated with the "
+                "restored objective — a plain 'continue' resumes the same goal, while a request that "
+                "redirects or extends it (e.g. 'continue but now also do X') reshapes the objective "
+                "accordingly — so you continue that work instead of treating the message as a brand-new "
+                "task. If nothing was saved, it says so.\n"
                 "Schema: no parameters.\n"
                 "Example: {\"tool_name\": \"resume_previous_session\", \"parameters\": {}}"
             ),
