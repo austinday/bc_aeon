@@ -29,7 +29,9 @@ case "$TIER" in
     split)   DEF_UTIL=0.90 ;;
     *)       DEF_UTIL=0.92 ;;
 esac
-UTIL="${GPU_MEM_UTIL:-$DEF_UTIL}"
+# Precedence: explicit GPU_MEM_UTIL override > planner's fitted util (solo/dual,
+# sized to weights+KV(ctx)+headroom instead of the whole card) > tier default.
+UTIL="${GPU_MEM_UTIL:-${AEON_GPU_MEM_UTIL:-$DEF_UTIL}}"
 
 SPEC_ARGS=()
 if [ -n "${AEON_MTP_DRAFT_MODEL}" ]; then

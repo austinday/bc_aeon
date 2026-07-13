@@ -1042,6 +1042,56 @@ class TestSensitiveMemoryGuard(unittest.TestCase):
         self.assertFalse(sens("build_command", "make -j8"))
 
 
+class TestFittedGpuMemUtil(unittest.TestCase):
+    """A single-copy (solo/dual) plan must size gpu_memory_utilization to
+    weights + KV(ctx) + headroom, NOT fill the whole card — otherwise vLLM
+    pre-allocates a huge KV pool a single agent never uses. split/offload, which
+    legitimately fill the GPUs, keep the launcher's tier default."""
+
+    def _gpus(self, n=2, gib=95.6):
+        from aeon.core.gpu import GpuInfo
+        return [GpuInfo(index=i, name="test", total_gib=gib, free_gib=gib) for i in range(n)]
+
+    def test_solo_util_fits_footprint_not_whole_card(self):
+        from aeon.core import model_catalog as c, deploy_planner as dp
+        gpus = self._gpus()
+        e = c.by_name("Qwen3.6-27B-Huihui-NVFP4-MTP")
+        p = dp.plan(e, gpus, mode="solo")
+        self.assertEqual(p.tier, "solo")
+        util = float(p.env["AEON_GPU_MEM_UTIL"])
+        reserved = util * gpus[0].total_gib
+        kv = p.context_limit * e.kv_gib_per_64k / 65536.0
+        expected = e.weights_gib + kv + dp.KV_POOL_HEADROOM_GIB
+        self.assertAlmostEqual(reserved, expected, delta=0.5)
+        # Well below the old flat 0.85 fill, and the KV pool still holds full ctx.
+        self.assertLess(util, 0.6)
+        self.assertGreaterEqual(reserved - e.weights_gib, kv)
+
+    def test_dual_util_is_fitted_per_gpu(self):
+        from aeon.core import model_catalog as c, deploy_planner as dp
+        gpus = self._gpus()
+        e = c.by_name("Qwen3.6-27B-Huihui-NVFP4-MTP")
+        p = dp.plan(e, gpus, mode="dual")
+        self.assertEqual(p.tier, "dual")
+        self.assertTrue(p.env["AEON_GPU_MEM_UTIL"])
+        self.assertLess(float(p.env["AEON_GPU_MEM_UTIL"]), 0.6)
+
+    def test_split_keeps_tier_default(self):
+        from aeon.core import model_catalog as c, deploy_planner as dp
+        e = c.by_name("Qwen3.5-397B-A17B-Q3K")  # force_split flagship
+        p = dp.plan(e, self._gpus())
+        self.assertIn(p.tier, ("split", "offload"))
+        self.assertEqual(p.env["AEON_GPU_MEM_UTIL"], "")
+
+    def test_util_never_exceeds_safety_cap(self):
+        from aeon.core import model_catalog as c, deploy_planner as dp
+        # Tiny cards force the footprint above the cap -> util clamps to SAFETY.
+        e = c.by_name("Qwen3.6-27B-Huihui-NVFP4-MTP")
+        p = dp.plan(e, self._gpus(gib=40.0), mode="solo")
+        if p.tier == "solo":
+            self.assertLessEqual(float(p.env["AEON_GPU_MEM_UTIL"]), dp.SAFETY)
+
+
 class TestResumePreviousSession(unittest.TestCase):
     """A stopped session writes a resumable dump; the resume_previous_session tool
     reads it and sets the loop up to continue the prior objective."""

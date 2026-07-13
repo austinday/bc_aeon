@@ -24,6 +24,29 @@ SAFETY = 0.90          # fraction of a GPU's VRAM usable (compute buffers, frag 
 MAIN_GPU_BUFFER = 1.0  # GiB reserved on GPU0 for the compute buffer in split mode
 CTX_GRANULARITY = 8192 # round context down to a multiple of this
 
+# vLLM pre-allocates gpu_memory_utilization * the card's TOTAL VRAM, then turns all
+# of the non-weight remainder into KV-cache pool. Filling 85-90% of a 96 GB card
+# for a 20 GB model that needs ~10 GB of KV at 256k wastes ~50 GB per GPU on KV
+# blocks a single agent never touches. For a single copy per GPU (solo / dual) we
+# instead size utilization to the real footprint: weights + KV(context) + this
+# headroom for activations, CUDA graphs, the MTP head, and fragmentation. vLLM
+# still gets a KV pool that comfortably holds one max_model_len sequence — it just
+# stops claiming the entire card. (split/offload keep the tier default: those
+# genuinely fill the GPUs.)
+KV_POOL_HEADROOM_GIB = 12.0
+
+
+def _fit_gpu_mem_util(entry: CatalogEntry, ctx: int, kv_per_tok: float, v_total: float) -> float:
+    """gpu_memory_utilization sized to weights + KV(ctx) + headroom, as a fraction
+    of one GPU's TOTAL VRAM. Capped at the model's safety ceiling and never below a
+    floor that keeps the KV pool able to hold a full max_model_len sequence. The
+    launcher still lets an explicit GPU_MEM_UTIL env override win."""
+    if v_total <= 0:
+        return SAFETY
+    cap = entry.vram_safety or SAFETY
+    target_gib = entry.weights_gib + ctx * kv_per_tok + KV_POOL_HEADROOM_GIB
+    return round(min(cap, target_gib / v_total), 3)
+
 
 def _round_ctx(ctx: float, max_ctx: int) -> int:
     c = int(ctx // CTX_GRANULARITY) * CTX_GRANULARITY
@@ -122,10 +145,14 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo], mode: Optional[str] = None) -
     lb_port = entry.ports["lb"]
     base_url = f"http://localhost:{lb_port}/v1"
     mtp = entry.supports_mtp
+    # Fitted gpu_memory_utilization for single-copy tiers; "" (tier default) for
+    # split/offload, which legitimately fill the card. Set in the solo/dual branches.
+    gpu_mem_util = ""
 
     if tier == "solo":
         # One instance on GPU0; agent connects to it directly (no router). GPU1 stays free.
         ctx = _round_ctx((v_usable - entry.weights_gib) / kv_per_tok, entry.max_ctx)
+        gpu_mem_util = _fit_gpu_mem_util(entry, ctx, kv_per_tok, v)
         node = {"role": "node", "devices": "0", "port": lb_port, "ctx": ctx,
                 "tensor_split": "", "ngl": 99, "cpu_offload_gib": 0.0,
                 "container": f"aeon_{slug}"}
@@ -139,6 +166,7 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo], mode: Optional[str] = None) -
     elif tier == "dual":
         # Largest context that fits one GPU alongside one copy of the weights.
         ctx = _round_ctx((v_usable - entry.weights_gib) / kv_per_tok, entry.max_ctx)
+        gpu_mem_util = _fit_gpu_mem_util(entry, ctx, kv_per_tok, v)
         node0 = {"role": "node", "devices": "0", "port": entry.ports["node0"], "ctx": ctx,
                  "tensor_split": "", "ngl": 99, "cpu_offload_gib": 0.0,
                  "container": f"aeon_{slug}_node0"}
@@ -200,6 +228,10 @@ def plan(entry: CatalogEntry, gpus: List[GpuInfo], mode: Optional[str] = None) -
         # vLLM --max-num-batched-tokens: raise prefill batch so a big agent prompt
         # prefills in ~one pass (low TTFT) instead of many chunked-prefill steps.
         "AEON_MAX_NUM_BATCHED": str(entry.max_num_batched_tokens or ""),
+        # Fitted gpu_memory_utilization (solo/dual); empty for split/offload so the
+        # launcher keeps the tier default. Stops vLLM claiming the whole card for a
+        # KV pool a single agent never uses.
+        "AEON_GPU_MEM_UTIL": str(gpu_mem_util) if gpu_mem_util else "",
     }
     return plan_obj
 
