@@ -86,13 +86,21 @@ def _config_from_plan(entry, p, model_name):
 
 
 # --- Model selection policy -------------------------------------------------
-# The picker is OPEN again (2026-07-08, for the Qwen3.5-397B addition): every
-# deployable catalog model is selectable, and a bare interactive start shows the
-# menu — a bare Enter still boots DEFAULT_MODEL, so fast-boot stays one keystroke.
-# To restrict selection again, set this to a set of names (the 2026-07-06
-# single-model lockdown was ENABLED_MODEL_NAMES = {"Qwen3.6-27B-FP8-MTP"}).
-ENABLED_MODEL_NAMES = None
-OFFER_DUAL_GPU = False
+# ENABLED_MODEL_NAMES is an allowlist: only these catalog entries reach the menu
+# (None = every deployable model). Set to focus the picker on the Qwen3.6-27B
+# Huihui NVFP4 build plus the two big split-only flagships, dropping the earlier
+# Gemma-4 (NVFP4 + BF16) and Qwen3.6 FP8 entries that used to be menu items 1-3.
+ENABLED_MODEL_NAMES = {
+    "Qwen3.6-27B-Huihui-NVFP4-MTP",   # primary (solo default + dual-GPU option)
+    "CyberNeurova-DeepSeek-V4-Flash",  # 284B MoE flagship (force_split)
+    "Qwen3.5-397B-A17B-Q3K",           # 397B MoE flagship (force_split)
+}
+# Offer the dual-copy (one model per GPU) + load-balancer deployment for models
+# that fit a single GPU. Of the enabled set only Huihui fits solo (the two big
+# models are force_split), so this adds exactly the "Qwen3.6-27B-Huihui-NVFP4-MTP
+# [dual-GPU]" option — two copies fronted by adaptive_lb.py so the principal and
+# its sub-agents are served concurrently across both GPUs.
+OFFER_DUAL_GPU = True
 
 
 def build_local_model_configs():
@@ -133,10 +141,12 @@ def build_local_model_configs():
 
 LLAMACPP_MODELS = build_local_model_configs()
 
-# The abliterated 8-bit Qwen3.6-27B (FP8 + native in-checkpoint MTP, solo on GPU0)
-# is Aeon's main model: the picker's Enter-default on an interactive start, and the
-# straight-boot model for headless (-n) / no-TTY runs. Matches the catalog entry name.
-DEFAULT_MODEL = "Qwen3.6-27B-FP8-MTP"
+# The abliterated Qwen3.6-27B (Huihui NVFP4 + native in-checkpoint MTP, solo on
+# GPU0) is Aeon's main model: the picker's Enter-default on an interactive start,
+# and the straight-boot model for headless (-n) / no-TTY runs. A bare Enter boots
+# the SOLO placement (keeps GPU1 free for image/video/vision tools); the dual-GPU
+# copy is an explicit numbered choice. Matches the catalog entry name.
+DEFAULT_MODEL = "Qwen3.6-27B-Huihui-NVFP4-MTP"
 
 def is_container_running(name):
     try: return bool(subprocess.check_output(["docker", "ps", "-q", "-f", f"name={name}"], stderr=subprocess.DEVNULL, text=True).strip())
@@ -1138,9 +1148,8 @@ def cli():
     # --model NAME skips the menu either way.
     model_name = args.model
     if not model_name and args.dual:
-        # Dual-GPU is currently disabled (OFFER_DUAL_GPU=False); this name won't resolve,
-        # which yields the clear "not found / available" error below rather than silently
-        # falling back to solo.
+        # --dual boots the default model in dual-copy (both GPUs + load balancer).
+        # OFFER_DUAL_GPU=True so this name resolves to the menu's [dual-GPU] entry.
         model_name = f"{DEFAULT_MODEL} [dual-GPU]"
 
     if args.menu and not model_name:
