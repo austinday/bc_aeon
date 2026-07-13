@@ -151,6 +151,9 @@ class Worker:
         self.max_history_tokens = 30000
         self.current_objective = None
         self.last_say_to_user = None  # Most recent say_to_user text; a sub-agent's final report
+        # Set by the resume_previous_session tool to a restored objective; the run
+        # loop adopts it (with a fresh iteration budget) at the top of the next turn.
+        self._resume_objective = None
         self.model_name = None  # Set by main.py for restart persistence
         self.active_skill = None  # {'path': ..., 'content': ...} when a skill protocol is active
         # Screenshot(s) to attach to the NEXT prompt so the multimodal model SEES
@@ -991,6 +994,7 @@ class Worker:
         self._consecutive_passive_turns = 0
         self.visual_context = []
         self.last_say_to_user = None
+        self._resume_objective = None
 
     def serialize_state(self) -> dict:
         """Serialize worker state for persistence across restarts."""
@@ -1068,6 +1072,98 @@ class Worker:
         # aeon_output/ is gitignored and already the per-workspace output root, so
         # the file is naturally scoped to the project the agent is working in.
         return Path(os.getcwd()) / "aeon_output" / "session_state.json"
+
+    def _stop_dump_path(self) -> Path:
+        """Where an interrupted session's resumable state is written on stop.
+
+        Distinct from session_state.json (the per-iteration auto-checkpoint): the
+        NEXT process — e.g. one running the objective 'continue from where you left
+        off' — overwrites session_state.json every turn, so a dedicated stop-dump
+        is what the resume_previous_session tool reads to pick up the interrupted
+        work faithfully."""
+        return Path(os.getcwd()) / "aeon_output" / "interrupted_session.json"
+
+    def _write_stop_dump(self, reason: str = "interrupted"):
+        """Snapshot the current state to the stop-dump file so a later run can
+        resume this objective when the user says 'continue from where you left
+        off'. Best-effort: never raises into the shutdown/interrupt path."""
+        if not self.persist_session:
+            return
+        try:
+            path = self._stop_dump_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = self.serialize_state()
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            data['saved_at'] = ts
+            data['stopped_at'] = ts
+            data['stop_reason'] = reason
+            data['pid'] = os.getpid()
+            tmp = str(path) + ".tmp"
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, default=str)
+            os.replace(tmp, path)
+            self.print_func(
+                f"{C_YELLOW}\U0001F4BE State saved for resume ({path}). Next run, tell me "
+                f"'continue from where you left off' to pick this up.{C_RESET}")
+        except Exception as e:
+            self.logger.warning(f"Failed to write stop dump: {e}")
+
+    def resume_from_dump(self) -> str:
+        """Load the previous session's stop dump (or the latest auto-checkpoint)
+        and set up to CONTINUE its objective from where it left off. Restores
+        memories, plan, attempt log, active skill, and open files, and signals the
+        run loop to adopt the restored objective next turn. Returns a summary for
+        the model. Backs the resume_previous_session tool."""
+        # Prefer whichever of the stop-dump / auto-checkpoint is NEWER, so the most
+        # recent activity wins (a clean Ctrl+C dump, or the last iteration before a
+        # hard kill that never ran the stop path).
+        candidates = [p for p in (self._stop_dump_path(), self._session_state_path()) if p.exists()]
+        if not candidates:
+            return ("No previous session state was found in this workspace "
+                    f"({self._stop_dump_path()}). There is nothing to resume — ask the user what "
+                    "objective to work on, or start fresh.")
+        src = max(candidates, key=lambda p: p.stat().st_mtime)
+        try:
+            with open(src, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            return f"Found a state dump at {src} but could not read it: {e}. Ask the user to restate the task."
+
+        prev_obj = (data.get('objective') or '').strip()
+        if not prev_obj:
+            return (f"The state dump at {src} records no objective, so there is nothing concrete to "
+                    "resume. Ask the user to restate the task.")
+
+        mems = data.get('memories')
+        if isinstance(mems, dict):
+            self.memories = mems
+        self.action_log = list(data.get('action_log') or [])
+        self.action_log_summary = data.get('action_log_summary', "")
+        self._summarized_upto = min(int(data.get('summarized_upto', 0) or 0), len(self.action_log))
+        if data.get('current_plan'):
+            self.current_plan = data['current_plan']
+        self.active_skill = data.get('active_skill') or None
+        self.expanded_categories = set(data.get('expanded_categories') or [])
+        self.open_files_access_order = list(data.get('open_files_access_order') or [])
+        # Placeholders; _sync_open_files repopulates real content from disk next turn.
+        self.open_files = {p: "Restoring from state..." for p in (data.get('open_files_list') or [])}
+
+        # Signal the run loop to switch the live objective to the restored one.
+        self._resume_objective = prev_obj
+
+        stopped_at = data.get('stopped_at') or data.get('saved_at') or 'a previous session'
+        recent = self._collapse_repeated_entries(self.action_log[-4:]) if self.action_log else []
+        recent_str = "\n\n".join(recent) if recent else "(no prior actions recorded)"
+        return (
+            f"RESUMED the previous session (stopped {stopped_at}).\n"
+            f"- Objective restored: {prev_obj}\n"
+            f"- Plan restored: {self.current_plan}\n"
+            f"- Restored {len(self.memories)} memory item(s), {len(self.action_log)} attempt-log "
+            f"entr(ies), {len(self.open_files)} open file(s).\n"
+            f"- Most recent prior actions:\n{recent_str}\n\n"
+            f"You are now continuing THAT objective from where it left off. Review the restored plan and "
+            f"attempt log, then take the NEXT concrete step — do not restart work that is already done."
+        )
 
     def _persist_session_state(self):
         """Atomically write the current state to the stable session file. Best-effort:
@@ -1496,6 +1592,18 @@ class Worker:
                     objective, reset_iter = self._integrate_user_input(objective, pending, iteration)
                     if reset_iter:
                         iteration = 0
+
+                # The resume_previous_session tool restored a prior session and
+                # asked us to continue ITS objective — adopt it now with a fresh
+                # iteration budget, so the rest of the loop plans against the real
+                # task instead of the "continue from where you left off" instruction.
+                if self._resume_objective:
+                    objective = self._resume_objective
+                    self._resume_objective = None
+                    self._save_objective(objective)
+                    self.effective_iterations = 0
+                    iteration = 0
+                    self.print_func(f"{C_GREEN}▶ Resuming previous objective: {objective}{C_RESET}")
 
                 iter_start_time = time.time()
                 iteration += 1
@@ -2439,6 +2547,10 @@ class Worker:
                         continue
 
                     self.print_func(f"\n{C_RED}PAUSED (User Interrupt).{C_RESET}")
+                    # Snapshot resumable state NOW: if the user exits (or the
+                    # process is then killed), a later run can pick this objective
+                    # back up via the resume_previous_session tool.
+                    self._write_stop_dump("ctrl-c")
                     user_guidance = self._blocking_read_line(
                         f"{C_YELLOW}Enter guidance, press Enter to resume, or type 'exit' to quit.{C_RESET}\n"
                         f"{C_BLUE}User Guidance > {C_RESET}")

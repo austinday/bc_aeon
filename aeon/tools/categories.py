@@ -21,6 +21,7 @@ TOP_LEVEL_TOOLS = {
     'run_command_async', 'job_output', 'kill_job',
     'memorize', 'forget',
     'verify_self_modification', 'restart_aeon', 'revert_aeon', 'run_self_benchmark',
+    'resume_previous_session',
     'expand_tool_category', 'collapse_tool_category',
     'activate_skill', 'deactivate_skill', 'create_skill', 'read_skill', 'delete_skill',
     # Browser tools are TOP-LEVEL (always visible with full descriptions). They are

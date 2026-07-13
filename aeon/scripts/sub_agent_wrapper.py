@@ -22,6 +22,9 @@ SUB_AGENT_FORBIDDEN_TOOLS = {
     "get_sub_agent_status",
     "verify_self_modification",
     "restart_aeon",
+    # A sub-agent has its own short-lived objective; it must not resume the
+    # principal's interrupted session.
+    "resume_previous_session",
     # No detached background jobs either: a sub-agent is short-lived and exists to
     # return a report, so a job that would outlive it (and whose workload group
     # would orphan when the wrapper exits) has no owner. Use run_command instead.

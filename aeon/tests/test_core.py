@@ -1042,6 +1042,82 @@ class TestSensitiveMemoryGuard(unittest.TestCase):
         self.assertFalse(sens("build_command", "make -j8"))
 
 
+class TestResumePreviousSession(unittest.TestCase):
+    """A stopped session writes a resumable dump; the resume_previous_session tool
+    reads it and sets the loop up to continue the prior objective."""
+
+    def _worker(self):
+        from aeon.core.worker import Worker
+        w = Worker.__new__(Worker)
+        w.memories = {}
+        w.action_log = []
+        w.action_log_summary = ""
+        w._summarized_upto = 0
+        w.current_plan = "none"
+        w.active_skill = None
+        w.expanded_categories = set()
+        w.open_files = {}
+        w.open_files_access_order = []
+        w._resume_objective = None
+        return w
+
+    def test_tool_is_discoverable_and_top_level(self):
+        from aeon.tools.loader import load_tools_from_directory
+        from aeon.tools.categories import TOP_LEVEL_TOOLS
+        import types
+        names = {t.name for t in load_tools_from_directory(
+            'aeon.tools', dependencies={'worker': types.SimpleNamespace()})}
+        self.assertIn('resume_previous_session', names)
+        self.assertIn('resume_previous_session', TOP_LEVEL_TOOLS)
+
+    def test_resume_restores_state_and_objective(self):
+        import json as _json
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                dump = Path(td) / "aeon_output" / "interrupted_session.json"
+                dump.parent.mkdir(parents=True)
+                dump.write_text(_json.dumps({
+                    "objective": "Build the parser",
+                    "current_plan": "Focus: finish the tokenizer.",
+                    "action_log": ["[Iter 1]\n- Intent: start\n- Actions: x\n- Result: ok"],
+                    "action_log_summary": "",
+                    "memories": {"path": {"value": "/x", "category": "general"}},
+                    "open_files_list": [],
+                    "open_files_access_order": [],
+                    "summarized_upto": 0,
+                    "stopped_at": "2026-07-12 10:00:00",
+                    "stop_reason": "ctrl-c",
+                }))
+                w = self._worker()
+                out = w.resume_from_dump()
+                self.assertIn("Build the parser", out)
+                self.assertEqual(w._resume_objective, "Build the parser")
+                self.assertEqual(w.current_plan, "Focus: finish the tokenizer.")
+                self.assertEqual(len(w.action_log), 1)
+                self.assertIn("path", w.memories)
+            finally:
+                os.chdir(old)
+
+    def test_resume_with_no_dump_is_graceful(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                w = self._worker()
+                out = w.resume_from_dump()
+                self.assertIn("no previous session", out.lower())
+                self.assertIsNone(w._resume_objective)
+            finally:
+                os.chdir(old)
+
+
 class TestBootguardMarkerStability(unittest.TestCase):
     """The boot-pending marker must live at a cwd-INDEPENDENT path: a crashed
     relaunch in workspace A has to be recoverable by a fresh start in workspace B
