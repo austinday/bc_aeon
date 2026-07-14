@@ -806,6 +806,7 @@ class LLMClient:
                 raw_chunks =[]
                 server_completion_tokens = None
                 server_prompt_tokens = None
+                server_cached_tokens = None
                 finish_reason = None
 
                 for chunk in resp_stream:
@@ -824,6 +825,16 @@ class LLMClient:
                         server_completion_tokens = usage.completion_tokens
                     if usage is not None and getattr(usage, 'prompt_tokens', None):
                         server_prompt_tokens = usage.prompt_tokens
+                    # Prefix-cache hit count (vLLM reports it in prompt_tokens_details
+                    # when --enable-prefix-caching is on). Surfaced below so the
+                    # cache-friendly prompt ordering is visible per turn.
+                    if usage is not None:
+                        ptd = getattr(usage, 'prompt_tokens_details', None)
+                        cached = getattr(ptd, 'cached_tokens', None) if ptd is not None else None
+                        if cached is None and isinstance(ptd, dict):
+                            cached = ptd.get('cached_tokens')
+                        if cached is not None:
+                            server_cached_tokens = cached
 
                 # Calibrate estimate_tokens against the server's REAL prompt token
                 # count (free — it's already in the usage chunk), so the worker's
@@ -844,7 +855,18 @@ class LLMClient:
                 comp_tokens = server_completion_tokens or estimate_tokens(raw)
 
                 tps = comp_tokens / gen_time if gen_time > 0 else 0
-                print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s (TTFT: {ttft:.2f}s | {comp_tokens} tokens in {gen_time:.2f}s)\033[0m")
+                # Prompt / prefix-cache readout: high 'cached' across turns means the
+                # static prompt prefix is being reused (low TTFT). A low value turn
+                # after turn signals the ordering is being busted by volatile content.
+                if server_prompt_tokens:
+                    if server_cached_tokens is not None:
+                        pct = 100.0 * server_cached_tokens / max(1, server_prompt_tokens)
+                        prompt_str = f" | prompt {server_prompt_tokens} ({pct:.0f}% cached)"
+                    else:
+                        prompt_str = f" | prompt {server_prompt_tokens}"
+                else:
+                    prompt_str = ""
+                print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s (TTFT: {ttft:.2f}s | {comp_tokens} tokens in {gen_time:.2f}s{prompt_str})\033[0m")
 
                 if self.debug_path:
                     print(f"{C_YELLOW}[LLM RAW - PRIMARY AGENT]\n{raw}{C_RESET}")

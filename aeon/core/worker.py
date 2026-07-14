@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import List, Any, Dict, Callable, Optional
 
 from .llm import LLMClient
-from .system_info import get_runtime_info
+from .system_info import get_project_tree, get_system_stats
 from .logger import get_logger
 from .utils import estimate_tokens
 from .prompts import (
@@ -1395,11 +1395,29 @@ class Worker:
         self.pending_iteration_state = None
         return objective, reset_iteration
 
-    def _build_primary_agent_context(self, tool_list_str: str, system_specs: str,
+    def _build_primary_agent_context(self, tool_list_str: str, project_tree: str, stats_line: str,
                                      memories_str: str, objective: str, open_files_str: str,
                                      active_tool_directives: str, attempt_log_str: str,
                                      context_diagnostics: str = "", sub_agent_digest: str = "") -> str:
-        """Build the full context prompt for the Primary Agent."""
+        """Build the full context prompt for the Primary Agent.
+
+        ORDERING IS DELIBERATE — it is tuned for vLLM prefix caching. The server
+        can only reuse KV for the longest prompt PREFIX unchanged since last turn,
+        so everything static/semi-static is placed FIRST as one big cacheable
+        block, and the volatile state that changes every turn is placed LAST:
+
+          [CACHEABLE PREFIX]  directives, tools, skills, reminders, INSTRUCTIONS,
+                              OBJECTIVE, project tree, memories
+          [VOLATILE STATE]    stuck banner, plan, open files, attempt log, stats,
+                              diagnostics, last step result, sub-agents, skill
+          [RECENCY TAIL]      one-line refocus + the JSON-format reminder
+
+        The old layout put the 95-line instruction block and the objective at the
+        very BOTTOM (after the every-turn attempt log + a per-second timestamp), so
+        the whole static tail was re-prefilled every turn -> high TTFT. The tail
+        below restores recency (objective + format reminder last) without paying
+        that cost.
+        """
         reminders_section = f"**IMPORTANT REMINDERS**\n{self.important_reminders}\n\n" if self.important_reminders.strip() else ""
 
         tools_text = TOOLS_SECTION.format(tools=tool_list_str)
@@ -1412,11 +1430,13 @@ class Worker:
 
         sub_agent_section = f"\n{sub_agent_digest}\n" if sub_agent_digest else ""
 
-        # A STUCK banner (set by loop/oscillation detection on the previous turn)
-        # goes at the very TOP so a weak model can't miss it under the tool list.
+        # The STUCK banner leads the VOLATILE state block (prominent in recent
+        # context) rather than the very top of the prompt, where toggling it would
+        # bust the cached static prefix every time. It is also mirrored into LAST
+        # STEP RESULT, so salience is preserved.
         banner = f"{self._stuck_banner}\n\n" if self._stuck_banner else ""
 
-        return f"""{banner}{self.base_directives}
+        return f"""{self.base_directives}
 
 {self.docker_directives}
 
@@ -1427,15 +1447,17 @@ class Worker:
 
 {skills_text}
 
-{reminders_section}**PERSISTENT MEMORIES**
+{reminders_section}{PRIMARY_AGENT_INSTRUCTIONS}
+
+{objective_text}
+
+{project_tree}
+
+**PERSISTENT MEMORIES**
 {memories_str}
 
-**ATTEMPT LOG** (Historical record of intents and results)
-{attempt_log_str}
-
-{system_specs}
-{diag_section}
-**CURRENT PLAN**
+================= CURRENT STATE (updates every turn) =================
+{banner}**CURRENT PLAN**
 {self.current_plan}
 
 **OPEN FILES**
@@ -1443,12 +1465,16 @@ class Worker:
 {open_files_str}
 ===[ END OPEN FILES ]===
 
-**LAST STEP RESULT**
+**ATTEMPT LOG** (Historical record of intents and results)
+{attempt_log_str}
+
+{stats_line}
+{diag_section}**LAST STEP RESULT**
 {self.last_observation}
 {sub_agent_section}{active_skill_section}
-{PRIMARY_AGENT_INSTRUCTIONS}
-
-{objective_text}"""
+**NEXT ACTION**
+Continue toward the OBJECTIVE stated above. Read the LAST STEP RESULT and CURRENT PLAN, then take the next concrete step — where the next moves are independent (edits to different files, a batch of shell commands, a write plus the command that exercises it) queue them together in ONE turn rather than one tiny step at a time.
+Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes inside string values, escaped (newline \\n, quote \\", backslash \\\\); no markdown fences, no text before or after the JSON."""
 
     def _format_active_skill(self) -> str:
         """Render the pinned active skill protocol block, or '' if none is active.
@@ -1774,8 +1800,11 @@ class Worker:
                 # Re-format open files using the actual dynamic limit determined by pressure
                 open_files_str = self._format_open_files(max_content_len=dyn_limit)
 
-                # Gather final context components
-                system_specs = get_runtime_info()
+                # Gather final context components. The (semi-static) project tree
+                # and the (volatile) stats line are built separately so the prompt
+                # can cache the tree in its prefix while the stats churn in the tail.
+                project_tree = get_project_tree()
+                stats_line = get_system_stats()
                 attempt_log_str = self._get_compressed_attempt_log(pressure=pressure)
 
                 # Automatic Memory Compression: Trigger if pressure is high and memories are significant.
@@ -1815,7 +1844,7 @@ class Worker:
                     diagnostic_str = "\n".join(breakdown)
 
                 prompt = self._build_primary_agent_context(
-                    tool_list_str, system_specs, memories_str, objective, open_files_str,
+                    tool_list_str, project_tree, stats_line, memories_str, objective, open_files_str,
                     active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
                     sub_agent_digest=sub_agent_digest
                 )
@@ -1881,7 +1910,7 @@ class Worker:
                             shed.append(os.path.basename(victim))
                             open_files_str = self._format_open_files(max_content_len=dyn_limit)
                             prompt = self._build_primary_agent_context(
-                                tool_list_str, system_specs, memories_str, objective, open_files_str,
+                                tool_list_str, project_tree, stats_line, memories_str, objective, open_files_str,
                                 active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
                                 sub_agent_digest=sub_agent_digest)
                             prompt_tokens = estimate_tokens(prompt)

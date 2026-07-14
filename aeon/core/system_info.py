@@ -275,8 +275,14 @@ def _ensure_nvml():
     return _NVML_READY
 
 
-def get_runtime_info():
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+def get_system_stats() -> str:
+    """The small, VOLATILE per-turn stats line (datetime, cpu, mem, gpu). Kept
+    separate from the project tree so the prompt can place the (semi-static) tree
+    in its cacheable prefix while these few churning lines live in the volatile
+    tail — otherwise a per-turn timestamp busts the tree's prefix cache."""
+    # Minute precision (not seconds): the model never needs sub-minute resolution,
+    # and a per-second value is pure churn.
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
     # interval=None is non-blocking and reports utilization since the previous
     # call (~one iteration ago) — both faster (no 100ms/turn stall) and a more
     # meaningful per-iteration figure than a 0.1s sample.
@@ -303,5 +309,17 @@ def get_runtime_info():
             parts.append('gpu: n/a')
     else:
         parts.append('gpu: n/a')
+    return f"**STATS**\n{' | '.join(parts)}"
+
+
+def get_project_tree() -> str:
+    """The SEMI-STATIC workspace path + project tree. Changes only when files
+    change (not every turn), so it belongs in the cacheable prompt prefix rather
+    than being regenerated and re-prefilled every step."""
     dir_tree = get_directory_tree_str('.')
-    return f"**STATS**\n{' | '.join(parts)}\n\n**WORKSPACE**\n{STARTUP_DIR}\n\n**PROJECT TREE**\n{dir_tree}"
+    return f"**WORKSPACE**\n{STARTUP_DIR}\n\n**PROJECT TREE**\n{dir_tree}"
+
+
+def get_runtime_info() -> str:
+    """Backward-compatible combined view (stats + tree)."""
+    return f"{get_system_stats()}\n\n{get_project_tree()}"
