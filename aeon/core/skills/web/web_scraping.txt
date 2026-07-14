@@ -1,0 +1,35 @@
+# WEB SKILL: Scraping & extracting structured data from websites
+# Use when the task is to HARVEST data from web pages or web APIs — scraping, crawling,
+# collecting listings/prices/results, building a dataset from the web. (For getting PAST a
+# CAPTCHA/bot-check, see web/solving_challenges; for researching a topic, see research/.)
+# Goal: correct, complete structured data, fetched robustly and politely.
+
+1. FIND THE API FIRST (before parsing any HTML):
+- Most dynamic sites load their data from a JSON/XHR endpoint. Open the page and check the network requests (or try obvious endpoints); a hidden JSON API is faster, stabler, and cleaner than scraping rendered HTML. Scrape HTML only when there is no usable API.
+
+2. PICK THE RIGHT FETCH METHOD:
+- Static HTML (data present in the initial page source) -> `requests`/`httpx` + a parser. Fast and cheap.
+- JS-rendered / infinite-scroll / behind-login / bot-protected -> use the harness BROWSER tools (browser_navigate, browser_read, browser_interact). They render JavaScript, keep a session/cookies, and pass the passive bot checks this stealth browser is built for. Do NOT try to scrape a JS-only site with `requests` (you'll get an empty shell).
+
+3. PARSE PROPERLY:
+- Use an HTML parser — BeautifulSoup, lxml, or selectolax — NEVER regex on HTML (it breaks on any markup change and mis-nests). Select by STABLE attributes (id, data-* attributes, semantic tags, aria labels), not brittle nth-child/position chains that snap on redesign.
+
+4. CRAWL POLITELY & IDEMPOTENTLY:
+- Respect robots.txt and Terms of Service. Set a real User-Agent, add delays between requests, cap concurrency, and back off on 429/503. For a large crawl, run it as a background job (run_command_async) and CACHE each fetched page to disk so a rerun skips what's already downloaded (never re-hammer the site).
+
+5. HANDLE THE MESS:
+- Fix encodings; resolve relative URLs to absolute; tolerate missing fields (record null, don't crash); dedup; follow pagination and DETECT its end (don't loop forever on a repeating last page).
+
+6. STORE INCREMENTALLY:
+- Write to CSV/JSONL/SQLite as you go, so a crash keeps the partial dataset. Log the record count per page/section so silent data loss is visible.
+
+7. VALIDATE (a scraper that RAN is not one that got CORRECT data):
+- Check total record counts against expectations and spot-check a sample of extracted fields against the live page. Report counts and a sample, not "the scrape completed."
+
+COMMON MISTAKES:
+- Regex on HTML; ignoring the hidden JSON API and parsing rendered HTML the hard way.
+- Fighting a JavaScript site with `requests` (empty results) instead of using the browser tools.
+- Getting IP-banned by hammering with no delay/backoff; missing a real User-Agent.
+- Brittle position-based selectors; not handling pagination end; not resolving relative URLs.
+- No caching -> a rerun refetches everything; no incremental save -> a crash loses all data.
+- Scraping login-walled content without the browser session that holds the cookies.

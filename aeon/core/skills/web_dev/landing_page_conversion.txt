@@ -1,0 +1,32 @@
+# WEB SKILL: Conversion-focused landing page
+# Use when the goal of a page is to drive ONE action — a signup, purchase, lead, or download —
+# rather than to inform or navigate. Pairs with web_dev/website_build_deploy (to build/ship it)
+# and marketing/ad_creative_generation (for the traffic). Goal: a page optimized to convert.
+
+1. ONE GOAL, ONE PRIMARY CTA:
+- Decide the single desired action and design everything around it. REMOVE site navigation and competing links that let visitors wander off. Multiple competing CTAs split attention and lower conversion.
+
+2. WIN ABOVE THE FOLD (the first screen):
+- A clear value-proposition HEADLINE (what it is + who it's for + the benefit), a one-line subhead, the primary CTA button, and a supporting hero visual (use generate_image for a on-brief hero). A first-time visitor must "get it" in ~5 seconds.
+
+3. STRUCTURE THAT PERSUADES (top to bottom):
+- Hero -> the problem & the benefit -> how it works (3 steps) -> SOCIAL PROOF (testimonials, logos, real numbers) -> objection handling / short FAQ -> final CTA. Repeat the CTA down the page so it's always in reach.
+
+4. COPY THAT SELLS:
+- Benefit-led and specific, written in second person ("you"). Use PAS (Problem -> Agitate -> Solve) or AIDA (Attention, Interest, Desire, Action). Short, scannable paragraphs. Concrete numbers beat adjectives ("cut setup to 5 minutes" > "fast and easy"). Lead with outcomes, not feature lists.
+
+5. FRICTIONLESS FORM / CTA:
+- Ask for the MINIMUM (email-only converts best; every extra field costs conversions). Make the button copy action+benefit ("Get my free audit"), never "Submit". Put trust signals (guarantee, "no card required", privacy) next to the CTA.
+
+6. TRUST & SPEED:
+- Real social proof near the CTA. Fast load, mobile-first, no layout shift. A slow or janky page kills conversion regardless of copy.
+
+7. TEST TO IMPROVE:
+- Build 2 variants changing ONE element (headline, hero, or CTA) and A/B test. Optimize for the CONVERSION rate (signups/sales), not clicks or time-on-page.
+
+COMMON MISTAKES:
+- Several competing CTAs / a full nav bar that leaks attention.
+- A vague headline ("Welcome to X") instead of a value prop; listing features instead of benefits.
+- A long form asking for too much; a "Submit" button with no benefit.
+- No social proof; slow/heavy hero; not mobile-optimized (most visitors are on phones).
+- A/B "testing" by opinion instead of measured conversion.

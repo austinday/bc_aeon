@@ -1,0 +1,31 @@
+# MARKETING SKILL: Planning & running a marketing campaign
+# Use when the task is campaign STRATEGY — audience, positioning, channels, funnel, budget,
+# and KPIs — as opposed to producing a single asset (see marketing/ad_creative_generation,
+# web_dev/landing_page_conversion, marketing/seo_and_content). Goal: a coherent, measurable
+# campaign that spends toward one objective, not scattered activity.
+
+1. FOUNDATION (get this right or nothing downstream works):
+- TARGET AUDIENCE: a specific persona (their problem, where they spend attention, what they already use) — NOT "everyone." Broad targeting wastes budget.
+- POSITIONING: why you, vs the alternatives, in one sentence.
+- ONE primary OBJECTIVE with a measurable KPI (leads, signups, sales, ROAS) — not "awareness" with no number.
+
+2. FUNNEL & CHANNELS:
+- Map the funnel: awareness -> consideration -> conversion -> retention. Choose channels that fit the audience AND the stage: SEO/content for high-intent search (marketing/seo_and_content); paid social for reach and interruption; email for nurture/retention; partnerships/communities where the audience already is. Do 1-2 channels WELL rather than spreading thin.
+
+3. MESSAGE & OFFER:
+- A single core message per audience, reused consistently across every asset. A compelling OFFER with a genuine reason to act now (value, not fake scarcity).
+
+4. ASSETS (reuse the same core message):
+- Landing page (web_dev/landing_page_conversion), ad creative (marketing/ad_creative_generation), organic content/SEO (marketing/seo_and_content), email sequence. Consistency across touchpoints compounds.
+
+5. BUDGET, TEST, SCALE:
+- Start SMALL. Test creatives and audiences against each other; measure COST PER RESULT (CPA/CPL) and ROAS. Kill losers fast, pour budget into winners. Do not scale before a variant has proven it converts.
+
+6. MEASURE WHAT MATTERS:
+- Set up tracking BEFORE launch (UTM parameters on every link, analytics/conversion events). Judge on conversions and revenue/LTV, NOT vanity metrics (impressions, likes, reach) — those don't pay.
+
+COMMON MISTAKES:
+- Targeting "everyone"; no specific persona.
+- Optimizing vanity metrics; no conversion tracking set up before launch.
+- Too many channels at once, none done well; no clear offer or CTA.
+- Scaling spend before validating that the funnel converts; ignoring retention/LTV (only chasing new clicks).

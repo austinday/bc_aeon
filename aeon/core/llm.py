@@ -169,7 +169,11 @@ class LLMClient:
             from aeon.core.skills.manager import SkillsManager
             sm = SkillsManager()
             try:
-                categories = [d.name for d in sm.base_dir.iterdir() if d.is_dir()]
+                # Real skill categories only (skip __pycache__ / dot / empty dirs;
+                # skills/ is also a Python package).
+                categories = [d.name for d in sm.base_dir.iterdir()
+                              if d.is_dir() and not d.name.startswith(('__', '.'))
+                              and any(d.glob("*.txt"))]
             except Exception:
                 return ""
 

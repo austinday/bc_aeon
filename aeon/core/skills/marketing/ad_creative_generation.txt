@@ -1,0 +1,35 @@
+# MARKETING SKILL: Generating ad creative (visuals + copy)
+# Use when the task is to CREATE advertising creative — images, short videos, and copy — for
+# paid campaigns (Meta/Instagram, Google, TikTok, YouTube, LinkedIn). Leverages the harness
+# media tools (generate_image, edit_image, composite_image, generate_video). Goal: on-spec,
+# on-brief, testable creative ready to upload.
+
+1. BRIEF FIRST (creative without a brief is noise):
+- Nail down: platform & placement, objective (awareness / traffic / conversion), the target audience, the ONE core message, the offer, and the CTA. Everything else serves these.
+
+2. GET THE FORMAT SPEC RIGHT (wrong aspect ratio = auto-cropped or rejected):
+- Square 1:1 (1080x1080) — feed. Portrait 4:5 (1080x1350) — Instagram/FB feed, high-converting. Vertical 9:16 (1080x1920) — Stories/Reels/TikTok/Shorts. Landscape 16:9 (1200x628) — FB/Google display, YouTube.
+- Google Search ads are TEXT: Responsive Search Ads want up to 15 headlines (<=30 chars each) and 4 descriptions (<=90 chars). Meta: primary text is truncated around ~125 chars ("...See more"); headline ~27-40 chars. Respect these or your message gets cut mid-word.
+
+3. GENERATE THE VISUAL:
+- Static ads -> generate_image (or edit_image/composite_image to place a product/logo). Reels/TikTok/Shorts -> generate_video. Describe the intended look for the prompt enhancer; keep it brand-safe unless the brief is explicitly adult (the enhancer steers clean vs faithful automatically).
+- Leave SAFE ZONES for text/logo/CTA overlays and platform UI (the bottom third of 9:16 is covered by captions/buttons). Do NOT bake heavy text into the image — platforms de-rank text-heavy creative and it doesn't localize; add text as an overlay layer.
+
+4. WRITE THE COPY:
+- Hook in the FIRST 3 seconds (video) or the FIRST line (static/social) — a benefit, a bold claim, or a pattern-interrupt. One clear CTA. Frameworks: AIDA or PAS. Match the funnel stage: awareness = curiosity/story; conversion = concrete offer + reason to act now.
+
+5. MAKE VARIATIONS FOR TESTING:
+- Produce 3-5 variants per concept, each changing ONE variable (hook, visual, or CTA). A/B testing needs isolated variables; a single "perfect" ad can't be optimized.
+
+6. COMPLIANCE:
+- No unsubstantiated claims, no prohibited content per the platform's ad policy, honest offers (fake urgency/misleading creative gets accounts banned).
+
+7. DELIVER:
+- Hand over the creative files + the copy variants + the platform/placement/exact spec (size, ratio, char counts) for each, ready to upload. State which variable each variant tests.
+
+COMMON MISTAKES:
+- Wrong aspect ratio for the placement; heavy text baked into the image.
+- Ignoring headline/description character limits (truncated mid-sentence).
+- One creative instead of testable variants; a visual that doesn't match the message.
+- No clear single CTA; designing for desktop when the view is overwhelmingly mobile/vertical.
+- Putting key elements in the caption/CTA safe zone where the platform UI covers them.

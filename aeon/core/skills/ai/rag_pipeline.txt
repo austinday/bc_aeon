@@ -1,0 +1,34 @@
+# AI SKILL: Retrieval-Augmented Generation (RAG) pipelines
+# Use when building a system that answers questions over a document/knowledge corpus by
+# RETRIEVING relevant chunks and grounding an LLM's answer in them (docs Q&A, chatbot over
+# a knowledge base, semantic search). Goal: grounded, cited answers with measured retrieval.
+
+1. DO YOU EVEN NEED RAG?
+- If the whole corpus fits the context window and is small/static, long-context prompting may beat RAG. If the knowledge is stable and narrow, fine-tuning may fit. RAG wins for large, changing, or citation-requiring corpora.
+
+2. INGEST & CHUNK (chunking quality caps the whole system):
+- Clean the text (strip boilerplate/nav). Chunk by STRUCTURE (headings, paragraphs, sections) rather than blind fixed windows; ~200-800 tokens with a small overlap (~10-15%) is a sane default. Too-big chunks dilute the embedding and retrieve irrelevant text; too-small chunks lose the context needed to answer.
+- Attach METADATA to every chunk (source, title, section, date) — needed for citation and for metadata-filtered retrieval.
+
+3. EMBED:
+- Pick an embedding model; EMBED THE QUERY AND THE DOCUMENTS WITH THE SAME MODEL (a mismatch silently destroys retrieval). NORMALIZE vectors and be consistent about the similarity metric (cosine vs dot vs L2 — cosine on normalized vectors is the common default). Store in a vector DB (FAISS/Chroma/Qdrant/pgvector).
+
+4. RETRIEVE:
+- Start with top-k = 5-10. HYBRID retrieval (sparse BM25 + dense embeddings, fused) beats dense-only on keyword/rare-term/exact-match queries — dense alone misses names, codes, and jargon. Use MMR for diversity, and metadata filters (date/source) to scope.
+
+5. RERANK (cheap, huge precision gain):
+- Over-retrieve (e.g. top 30-50) then RERANK with a cross-encoder to the final 3-8. This consistently lifts answer quality more than tuning k.
+
+6. ASSEMBLE CONTEXT & CITE:
+- Put the reranked chunks into the prompt WITH source labels. Instruct the model to answer ONLY from the provided context, to CITE the source per claim, and to say "not found in the provided documents" when the answer isn't there. This is the main hallucination control.
+
+7. EVALUATE (both stages, separately):
+- Retrieval: recall@k — does the chunk containing the answer actually get retrieved? If not, no prompt fixes the answer. Generation: faithfulness/groundedness — is every claim supported by a retrieved chunk? Build a small gold Q->relevant-chunk set and measure.
+
+COMMON MISTAKES:
+- Query and document embedded with different models (or normalized inconsistently) — silent, catastrophic.
+- Dense-only retrieval missing exact terms/IDs (add BM25 hybrid).
+- No reranker; top-k too low; chunks that split a fact across the boundary.
+- Not reindexing when documents change (stale answers).
+- Dumping raw chunks with no citation instruction -> the model hallucinates confidently.
+- Measuring nothing, so you can't tell if a change helped retrieval or generation.

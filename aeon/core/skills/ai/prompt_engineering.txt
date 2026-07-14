@@ -1,0 +1,33 @@
+# AI SKILL: Prompt engineering
+# Use when the task is to WRITE or IMPROVE a prompt / system prompt for a language model —
+# to make its outputs more accurate, correctly formatted, or reliable (for an app, an agent,
+# an extraction/classification job, or a content generator). Goal: prompts that work the
+# first time and are improved empirically, not by guesswork.
+
+1. BE EXPLICIT — ambiguity is the #1 failure:
+- State the task, the audience/role, the exact output format, and the constraints. "Summarize this" is worse than "Summarize this in 3 bullet points, each <15 words, focused on financial risks."
+- Prefer POSITIVE instructions ("respond in JSON with keys a,b") over negatives ("don't add extra text") — models follow "do X" better than "don't do Y."
+
+2. SHOW, DON'T ONLY TELL:
+- Add 2-5 few-shot examples that demonstrate the format AND the tricky edge cases. A weaker model especially needs examples; a couple of good ones often beat paragraphs of instructions.
+
+3. SPECIFY (AND WHEN POSSIBLE CONSTRAIN) THE OUTPUT FORMAT:
+- Define the exact shape (JSON schema, delimiters, template). If the serving stack supports grammar-constrained decoding / JSON schema / tool calling, CONSTRAIN the output rather than merely requesting it — that eliminates format errors at the source (see ai/llm_app_development).
+
+4. DECOMPOSE HARD TASKS:
+- Break a complex task into ordered steps or a chain of prompts, each doing one thing well. For accuracy-critical reasoning, ask the model to reason step-by-step BEFORE the final answer — but NOT when you need a single constrained-JSON answer (reasoning breaks the format; do it in a separate field/turn).
+
+5. USE THE SYSTEM PROMPT for durable role/rules/persona/format, and keep it STABLE across calls (stable prefix = prompt caching = lower latency).
+
+6. DEFEND AGAINST INJECTION:
+- When inserting untrusted content (web pages, user files, tool output), DELIMIT it clearly (e.g. triple backticks or XML tags) and instruct the model to treat it strictly as data to be processed, never as instructions to follow.
+
+7. ITERATE EMPIRICALLY:
+- Change ONE thing at a time and test on a FIXED set of representative cases (including known failures). Keep what measurably wins. "It seems better" is not evidence.
+
+COMMON MISTAKES:
+- Over-constraining ("be extremely concise" + "cover everything") — conflicting instructions degrade output.
+- Relying on negations; vague format specs that drift over long outputs.
+- Assuming a prompt that works on a strong model transfers to a weak one — weaker models need more scaffolding (examples, smaller steps, constrained output).
+- Requesting reasoning AND strict JSON in the same single response.
+- Editing prompts by vibe with no fixed test cases, so you can't tell if a change helped or hurt.

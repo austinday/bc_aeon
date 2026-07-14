@@ -1,0 +1,31 @@
+# WEB SKILL: Building and deploying a website
+# Use when the task is to CREATE and/or DEPLOY a website — a marketing/brochure site, a
+# landing page, a portfolio, docs, or a small web app. (For a conversion-focused landing
+# page specifically, also load web_dev/landing_page_conversion; for SEO, marketing/seo_and_content.)
+# Goal: a fast, responsive, correctly-deployed site verified live in a real browser.
+
+1. CHOOSE THE STACK BY NEED (don't over-engineer):
+- Brochure/landing/docs (mostly static) -> plain HTML/CSS/JS, or a static-site generator (Astro/Eleventy/Hugo), or a framework in STATIC-EXPORT mode. Fast, cheap, great SEO.
+- Genuinely interactive app -> a framework (Next.js/SvelteKit/Vite+React). Do NOT reach for a heavy SPA to render a static page (worse SEO, slower first paint).
+
+2. BUILD IN A CONTAINER; KNOW THE OUTPUT DIR:
+- Dockerize the toolchain. Run the dev server bounded (run_command with a timeout) or, for a long-lived server, as a background job (run_command_async) so it doesn't block you. Know where the production build lands (dist/ build/ out/ public/) — deploying the wrong dir is a classic mistake.
+
+3. RESPONSIVE, ACCESSIBLE, FAST:
+- Mobile-FIRST CSS (most traffic is mobile). Include `<meta name="viewport" content="width=device-width, initial-scale=1">` — forgetting it breaks mobile entirely. Semantic HTML, alt text on images, sufficient contrast, keyboard-navigable. Compress/resize images (use generate_image/edit_image for assets, then optimize), lazy-load below-the-fold, minimize JS. Aim for good Core Web Vitals.
+
+4. SEO BASICS BAKED IN:
+- Unique `<title>` (~<60 chars) and meta description per page; ONE `<h1>`; semantic headings; Open Graph/Twitter tags for link previews; `sitemap.xml` + `robots.txt`; canonical URLs. IMPORTANT: a client-rendered SPA serves crawlers an empty shell — use SSR or prerendering/static export or the site won't rank.
+
+5. DEPLOY:
+- Static -> any static host / object storage + CDN / nginx-in-Docker. Dynamic -> a containerized server behind a reverse proxy. Serve over HTTPS (Let's Encrypt); avoid mixed HTTP/HTTPS content (it blocks). Set sensible cache headers. DNS: A/CNAME records with propagation delay (changes aren't instant).
+
+6. VERIFY LIVE (not just "build exited 0"):
+- Actually load the DEPLOYED url with browser_navigate at desktop AND mobile widths. Confirm it renders, links/forms work, no console errors, images load, and CSS/JS aren't 404ing. A green build with broken asset paths is the most common deploy failure.
+
+COMMON MISTAKES:
+- SPA with no SSR/prerender -> invisible to search engines.
+- Wrong asset base path -> CSS/JS 404 after deploy (works locally, broken live).
+- Missing viewport meta -> unusable on mobile; giant unoptimized hero images -> slow.
+- Mixed content / no HTTPS; CORS errors on API calls; deploying the wrong build directory.
+- Declaring done from a successful build without loading the live URL.

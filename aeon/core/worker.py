@@ -352,7 +352,13 @@ class Worker:
         # Since SkillsManager doesn't have a list_categories, we derive it from the filesystem
         try:
             skills_root = sm.base_dir
-            categories = [d.name for d in skills_root.iterdir() if d.is_dir()]
+            # Only real skill categories: a subdir that actually contains .txt
+            # protocols. skills/ is also a Python package, so this skips its
+            # __pycache__ (and any stray empty dir) instead of rendering an empty
+            # "[+] __pycache__: (0 skills)" line that clutters the top-level prompt.
+            categories = [d.name for d in skills_root.iterdir()
+                          if d.is_dir() and not d.name.startswith(('__', '.'))
+                          and any(d.glob("*.txt"))]
         except Exception as e:
             return f"Error loading skills categories: {e}"
 
