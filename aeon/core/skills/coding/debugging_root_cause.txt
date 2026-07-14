@@ -26,3 +26,8 @@
 
 6. ANTI-LOOP:
 - If the same fix attempt fails twice, your root-cause hypothesis is wrong. Stop. Return to step 2 and form new hypotheses. Do not re-run the same failing edit expecting a different result.
+
+7. KNOW THE ERROR-CLASS PLAYBOOKS (this method still applies; these add concrete common-cause checklists):
+- Setup / import / version / build / CUDA / Docker "won't run" -> troubleshooting/environment_and_dependencies.
+- HTTP / API / network / auth / CORS failures -> troubleshooting/http_and_api_errors.
+- Shape / dtype / NaN-inf / encoding / silent-data-loss -> troubleshooting/data_and_numerical_errors.

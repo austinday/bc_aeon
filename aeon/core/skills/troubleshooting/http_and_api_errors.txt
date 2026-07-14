@@ -1,0 +1,40 @@
+# TROUBLESHOOTING SKILL: HTTP, API, network & auth errors
+# Use when a web request or API call FAILS — a non-2xx status, a timeout, a connection/TLS
+# error, an auth rejection, a CORS block, or a response that won't parse. Applies to web
+# scraping, web apps/deploys, and LLM/third-party API calls. The status code localizes the
+# fault — read it first. Pair with coding/debugging_root_cause. Goal: pin the real cause fast.
+
+1. CAPTURE THE FULL RESPONSE, not "it failed":
+- Get the STATUS CODE, the response BODY, and the HEADERS. `curl -v <url>` (or the client's raw/verbose response) shows the real story; the body usually contains the exact error message. Never debug an API error from a generic "request failed" — read what the server actually said.
+
+2. DECODE THE STATUS CODE (it tells you WHERE the fault is):
+- 400 Bad Request -> YOUR payload/params are malformed (bad JSON, missing/invalid field). Read the body for which field.
+- 401 Unauthorized -> missing/invalid/expired credentials or wrong auth header.
+- 403 Forbidden -> authenticated but not permitted, OR blocked by a bot filter / WAF / geo rule (very common when scraping — the "auth is fine but I'm blocked" case).
+- 404 Not Found -> wrong URL / endpoint / resource id.
+- 405 -> wrong HTTP method (GET where POST is required, etc.).
+- 422 -> body is well-formed but semantically invalid (validation failed).
+- 429 Too Many Requests -> RATE LIMITED. This is a PACE problem, not a bug: honor `Retry-After`, back off exponentially, add delays, lower concurrency.
+- 5xx -> the SERVER failed (500 generic, 502/503/504 upstream/overloaded/timeout). Retry with backoff; if it persists, your request may be triggering a server bug — simplify it and isolate.
+
+3. AUTH SPECIFICS:
+- Right scheme and header (Bearer token vs `api-key` vs query param); token not expired; correct scope/permissions; and the key belongs to the RIGHT account/environment — mixing TEST and PROD keys (or dev vs live endpoints) is a classic silent 401/403.
+
+4. CORS (browser context only):
+- "blocked by CORS policy" is a BROWSER security decision, NOT a network failure — the request reached the server and got a response; the browser refused it because the response lacked `Access-Control-Allow-Origin`. You CANNOT fix CORS from client JS: fix it on the SERVER (allow the origin / add the header) or make the call server-side.
+
+5. NETWORK / TLS:
+- "Connection refused" -> nothing listening on that host:port (wrong port, server down). "Timeout" -> host unreachable, firewall, or slow upstream. DNS failure -> bad/typo'd hostname. SSL/certificate errors -> expired/self-signed/hostname-mismatch cert; fix the cert — do NOT blanket-disable verification in production.
+
+6. RESPONSE WON'T PARSE:
+- A JSON decode error on the RESPONSE usually means you got HTML, not JSON — an error page, a login/consent redirect, or a rate-limit page. PRINT the raw response text: it tells you immediately. Also check Content-Type on both sides (application/json vs form-encoded).
+
+7. REPRODUCE MINIMALLY:
+- Reproduce with a single `curl` before editing code, to isolate whether the fault is the request shape, the auth, or the server.
+
+COMMON MISTAKES:
+- Ignoring the status code / not reading the body; treating all failures as the same.
+- RETRYING a 4xx (your fault — it won't fix itself) while NOT backing off on 429/5xx.
+- Trying to fix CORS in client code; disabling TLS verification instead of fixing the cert.
+- Assuming a failed JSON parse is a code bug when the server actually returned an HTML error/login page.
+- Test-vs-prod key/endpoint mix-ups; missing or wrong auth header scheme.

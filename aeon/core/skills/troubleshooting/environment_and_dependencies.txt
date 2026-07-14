@@ -1,0 +1,37 @@
+# TROUBLESHOOTING SKILL: Environment, dependency, install & GPU/CUDA errors
+# Use when something WON'T INSTALL, WON'T IMPORT, or WON'T RUN — ModuleNotFoundError,
+# version conflicts, "command not found", build/compile failures, Docker build errors,
+# or CUDA/GPU setup problems. The #1 time-sink in ML/AI/compbio/web setup. Pair with the
+# coding/debugging_root_cause method. Goal: get to a working, reproducible environment fast.
+
+1. READ THE ACTUAL ERROR, BOTTOM-UP:
+- Capture the FULL error text, not a paraphrase. In a traceback the LAST lines name the real failure; the top is often just the call chain. `ModuleNotFoundError`, `ImportError: cannot import name`, "version conflict", "command not found", and non-zero exit codes each point somewhere specific — read which.
+
+2. IDENTIFY THE LAYER:
+- Is the thing MISSING (not installed), the WRONG VERSION, in the WRONG ENVIRONMENT, or failing to BUILD? Diagnose with `which python`, `python -m pip show <pkg>`, `pip list`, `python -c "import x; print(x.__version__)"`.
+- CLASSIC TRAP: installing into a DIFFERENT interpreter than the one running the code (system vs venv vs conda). Always use `python -m pip install ...` (ties pip to that exact python), and confirm `which python` is the one you think.
+
+3. DEPENDENCY CONFLICTS:
+- Read the resolver's message — it names the incompatible pins. Pin compatible versions explicitly; do NOT `pip install --upgrade` blindly (it silently breaks other packages' pins). When an env is badly polluted, a FRESH clean env (venv/conda/Docker) is faster than untangling it. Capture a requirements.txt / lockfile so the fix is reproducible.
+
+4. BUILD-FROM-SOURCE FAILURES (common with scientific/ML C-extensions):
+- The real error is usually a missing system library, compiler, or header — look for "fatal error: X.h: No such file", "gcc: not found", "cmake", or a missing `-dev`/`-devel` package. Install the system dep, OR (better) use a PREBUILT WHEEL or a conda-forge build instead of compiling. Containerize to pin the toolchain.
+
+5. GPU / CUDA (read carefully — versions confuse everyone):
+- The framework's CUDA build must be compatible with the DRIVER, not the system CUDA toolkit. `nvidia-smi` shows the driver and its MAX supported CUDA; a pip wheel (e.g. torch) bundles its OWN CUDA runtime. You do NOT need a matching system CUDA toolkit for pip wheels.
+- Symptoms: "CUDA driver version is insufficient for CUDA runtime" (driver too old for the wheel), "no kernel image is available for execution on the device" (wheel built for a different GPU arch), `torch.cuda.is_available()==False` (wrong build / driver / container without `--gpus`). Install the framework build that matches your driver and GPU arch.
+- "CUDA out of memory" is a RUNTIME problem, NOT a version bug: lower batch size, add gradient accumulation, use mixed precision (bf16) / gradient checkpointing, or clear cached memory (`torch.cuda.empty_cache()`). See machine_learning/deep_learning_training.
+
+6. DOCKER:
+- On a build failure, read WHICH layer failed. Use pinned base images; match the CUDA base image to the host driver; mount large data at run time (not baked into the image); and REBUILD after editing the Dockerfile (stale layer caching serves old code — `--no-cache` when in doubt).
+
+7. LOCK IT IN:
+- Once it works, freeze the exact working set (requirements.txt / lockfile / Dockerfile) so the fix reproduces and you never re-debug it.
+
+COMMON MISTAKES:
+- Paraphrasing the error instead of reading the last lines; guessing instead of checking versions/interpreter.
+- pip-installing into the wrong interpreter; `--upgrade` silently breaking other pins.
+- Compiling from source when a wheel/conda package exists.
+- Conflating the CUDA TOOLKIT version with the DRIVER version; assuming you need a matching system CUDA for pip wheels.
+- Treating "CUDA out of memory" as a version/install problem instead of a batch-size/runtime one.
+- Not rebuilding the Docker image after changing it (stale cache).
