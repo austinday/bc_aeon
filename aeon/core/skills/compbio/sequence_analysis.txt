@@ -25,3 +25,9 @@
 6. VALIDATE OUTPUTS:
 - Verify completion by checking actual outputs against expectations, not by the script merely exiting 0.
 - Report counts, ranges, and a small sample of results. Save a README describing the pipeline and provenance.
+
+7. TOOLING GOTCHAS — CORRECT CURRENT USAGE:
+- BLAST+: build the DB with `makeblastdb -dbtype nucl|prot`; query with `-outfmt 6` (tabular) for parseable output, plus `-evalue` and `-num_threads`. IMPORTANT: `-max_target_seqs 1` does NOT reliably return the single best hit — it is an early-stopping cutoff applied before final sorting, so it can return a non-best hit. To get the top hit, retrieve several and sort by bitscore yourself.
+- Use the RIGHT program/matrix for the alphabet: blastp (+BLOSUM62) for protein, blastn for nucleotide, blastx/tblastn when translating. Mixing alphabets or the wrong reading frame is a common silent error — verify the alphabet and frame before trusting hits.
+- Biopython: iterate with `Bio.SeqIO.parse(handle, "fasta"|"fastq"|"genbank")` rather than loading all records into RAM. Use `Bio.Align.PairwiseAligner` (the current API); `Bio.pairwise2` is DEPRECATED. `Bio.Entrez` requires `Entrez.email = "..."` and courteous rate-limiting (≤3 req/s without an API key).
+- FASTQ quality is Phred+33 (Sanger/Illumina 1.8+) essentially everywhere now; only ancient data is Phred+64 — assume +33 unless a QC tool says otherwise.

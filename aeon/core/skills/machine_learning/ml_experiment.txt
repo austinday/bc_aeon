@@ -26,3 +26,10 @@
 6. VALIDATE & DOCUMENT:
 - Sanity-check for too-good-to-be-true scores (a classic leakage signature) and investigate before celebrating.
 - Save a README with data version, splits, seeds, hyperparameters, baseline, and final metrics with variance.
+
+7. TOOLING GOTCHAS — CORRECT CURRENT USAGE (avoid the silent-mistake traps):
+- Prevent leakage MECHANICALLY with a sklearn `Pipeline`: put scalers/encoders/imputers/feature-selection INSIDE the Pipeline and pass the Pipeline to `cross_val_score`/`GridSearchCV`, so every preprocessing step is refit on each training fold only. Fitting a `StandardScaler` (or `SelectKBest`, or a target encoder) on all of X before splitting is the single most-common leakage bug and inflates scores.
+- Splits: `train_test_split(X, y, stratify=y, random_state=42)` for classification (stratify preserves class balance; omitting it skews small/imbalanced sets). Use `StratifiedKFold` for CV, `GroupKFold` when rows share a subject/group, `TimeSeriesSplit` for temporal data — a plain random `KFold` LEAKS in grouped/temporal settings.
+- Metrics: `roc_auc_score`, `average_precision_score`, and log-loss need PROBABILITIES (`model.predict_proba(X)[:, 1]`), not predicted labels — passing labels silently computes a wrong (deceptively low) AUC. For multiclass set `average="macro"`/`"weighted"` explicitly; bare `accuracy` is misleading under class imbalance.
+- Early-stopping APIs moved: XGBoost ≥2.0 takes `early_stopping_rounds` in the CONSTRUCTOR (or an `xgb.callback.EarlyStopping` callback), not in `.fit(...)`. LightGBM uses `callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]`; its old `.fit(early_stopping_rounds=...)` kwarg is removed. Both need an eval set passed to `.fit`.
+- Reproducibility: set `random_state`/`seed` on the SPLITTER, the MODEL, and any sampler/augmenter — one unseeded component makes runs non-reproducible. Report mean ± std across seeds or folds, never a single number.

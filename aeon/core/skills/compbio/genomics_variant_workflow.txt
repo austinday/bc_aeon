@@ -27,3 +27,11 @@
 6. VALIDATE & DOCUMENT:
 - Spot-check called variants against expectations or known sites. Report QC metrics, not just "the pipeline ran."
 - Save a README capturing reference build, tool versions, parameters, and QC summary.
+
+7. TOOLCHAIN GOTCHAS — CORRECT CURRENT USAGE (these fail SILENTLY when wrong):
+- Chromosome naming MUST match across the reference FASTA, the BAM, and the VCF: UCSC uses `chr1`/`chrM`, Ensembl/1000G/GRCh use `1`/`MT`. A mismatch makes tools return zero or wrong results with NO error. Pick one convention up front, or convert with `bcftools annotate --rename-chrs`.
+- GATK4 CLI is `gatk ToolName --arg ...` (Picard is built in: `gatk MarkDuplicates`). The GATK3 `java -jar GenomeAnalysisTK.jar -T HaplotypeCaller` syntax is OBSOLETE — do not emit it.
+- Indexing is mandatory and tool-specific: `bwa index ref.fa` before `bwa mem`; bwa-mem2 uses its OWN index (index with the same tool you align with). BAMs must be `samtools sort` (coordinate order) then `samtools index` before any random-access tool. The reference needs `samtools faidx ref.fa` (.fai) and, for GATK, `gatk CreateSequenceDictionary -R ref.fa` (.dict).
+- VCFs for tabix/bcftools must be BGZIP-compressed then tabix-indexed: `bgzip x.vcf && tabix -p vcf x.vcf.gz`. Plain `gzip` BREAKS tabix (bgzip is block-gzip: gzip-compatible but randomly indexable).
+- Before comparing/merging/annotating VCFs, normalize: `bcftools norm -f ref.fa -m -both` (left-align indels + split multiallelics). Un-normalized indels compare as false mismatches — a very common "my two callers disagree" artifact.
+- Use `-@`/`--threads` on samtools/bcftools/bwa to actually use the cores; the default is single-threaded.
