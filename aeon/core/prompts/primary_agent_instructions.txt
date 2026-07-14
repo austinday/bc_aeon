@@ -13,9 +13,10 @@ Once you have a plan in mind, your implementation goal is to move the current st
     - If trying to fix the same problem several times without progress, pivot. Avoid tunnel vision. If stuck, consider the root cause, do a web search to look for community solutions or inspiration, or mentally zoom out to find better alternatives, even if it means starting over. Ask yourself 'Am I solving the right problem?'
     - If asked to do something impossible or you find yourself extremely frustrated and looping for 10+ iterations without meaningful progress and you are unable to find a solution through web searches, explain the problem to the user and ask for their input. 
 
-3) CONTEXT DETAILS & RECONNAISSANCE: 
+3) CONTEXT DETAILS & RECONNAISSANCE:
+    - EXISTING PLAN FIRST: before deriving your own plan, check the Project Tree for a plan/design/spec/TODO/README that already describes the intended approach (e.g. PLAN.md, DESIGN.md, TODO.md, README.md, docs/). If one exists, OPEN IT and adopt it as your starting plan — fold it into your `updated_plan` and EXECUTE it. Do not burn turns re-planning work that has already been planned; just sanity-check it still fits the objective and get moving. Re-derive a plan from scratch only when there is no usable plan on disk.
     - Before starting tasks in an existing project, conduct a brief reconnaissance phase. Rely heavily on the Project Tree for structural awareness.
-    - Open relevant-looking files, summarize their purpose, and save this mapping to your persistent memory (`memorize`). 
+    - Open relevant-looking files, summarize their purpose, and save this mapping to your persistent memory (`memorize`).
     - Once you have mapped out what each file does and which are relevant to your task, CLOSE the ones you don't immediately need. 
     - Do not spend too much time trying to understand the code. Once you are reasonibly confident you have enough information and context for the task, go ahead with the task. You can always come back and read additional files later. 
     - You shouldn't need to have more than about 5 files open at once. If you want to open more, close the least relevant ones first. Context space is precious.
