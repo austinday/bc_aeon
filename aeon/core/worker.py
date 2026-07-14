@@ -154,6 +154,11 @@ class Worker:
         # Set by the resume_previous_session tool to a restored objective; the run
         # loop adopts it (with a fresh iteration budget) at the top of the next turn.
         self._resume_objective = None
+        # Opt-in message-history mode (real system/assistant/user chat instead of one
+        # giant per-turn prompt) — off by default; the single-prompt path is unchanged.
+        self.use_message_history = os.environ.get("AEON_MESSAGE_HISTORY", "") == "1"
+        self._history_messages = []   # [{role, content}] growing turn history
+        self._history_seeded = False
         self.model_name = None  # Set by main.py for restart persistence
         self.active_skill = None  # {'path': ..., 'content': ...} when a skill protocol is active
         # Screenshot(s) to attach to the NEXT prompt so the multimodal model SEES
@@ -995,6 +1000,8 @@ class Worker:
         self.visual_context = []
         self.last_say_to_user = None
         self._resume_objective = None
+        self._history_messages = []
+        self._history_seeded = False
 
     def serialize_state(self) -> dict:
         """Serialize worker state for persistence across restarts."""
@@ -1494,6 +1501,128 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
             f"--- BEGIN PROTOCOL ---\n{content}\n--- END PROTOCOL ---\n"
         )
 
+    # ==================================================================
+    # MESSAGE-HISTORY MODE (opt-in via AEON_MESSAGE_HISTORY=1)
+    # ------------------------------------------------------------------
+    # Instead of one giant user prompt per turn, send a real chat: a stable
+    # system message (directives + tools + instructions + objective), the growing
+    # turn history (assistant decision + brief result per turn), and one volatile
+    # "current state" user message (live tree/memories/plan/open files/result).
+    # vLLM prefix-caches the stable system + history, so only the newest turn is
+    # prefilled -> lower TTFT on long tasks. Live file sync and dynamic injections
+    # are preserved (they live in the current-state message). Default OFF; the
+    # single-prompt path is unchanged.
+    # ==================================================================
+    def _build_system_message(self, objective: str, tool_list_str: str,
+                              active_tool_directives: str) -> str:
+        """The STATIC system message: who you are, your tools/skills, the rules,
+        and the objective. Must stay stable within a run so the system+history
+        prefix caches (it changes only when tools/categories change — rare)."""
+        reminders_section = f"**IMPORTANT REMINDERS**\n{self.important_reminders}\n\n" if self.important_reminders.strip() else ""
+        tools_text = TOOLS_SECTION.format(tools=tool_list_str)
+        objective_text = OBJECTIVE_SECTION.format(objective=objective)
+        skills_text = self._get_skills_description()
+        return f"""{self.base_directives}
+
+{self.docker_directives}
+
+**OPEN TOOL DIRECTIVES**
+{active_tool_directives if active_tool_directives else 'None'}
+
+{tools_text}
+
+{skills_text}
+
+{reminders_section}{PRIMARY_AGENT_INSTRUCTIONS}
+
+{objective_text}"""
+
+    def _build_current_state_message(self, project_tree: str, stats_line: str, memories_str: str,
+                                     open_files_str: str, sub_agent_digest: str = "",
+                                     context_diagnostics: str = "") -> str:
+        """The VOLATILE current-state user message (rebuilt every turn): live
+        project tree, memories, plan, open files, the most recent result, and the
+        next-action nudge. Kept LAST so its churn never busts the cached history."""
+        diag_section = f"\n**CONTEXT DIAGNOSTICS**\n{context_diagnostics}\n" if context_diagnostics else ""
+        sub_agent_section = f"\n{sub_agent_digest}\n" if sub_agent_digest else ""
+        active_skill_section = self._format_active_skill()
+        banner = f"{self._stuck_banner}\n\n" if self._stuck_banner else ""
+        last_result = self._truncate_output(self.last_observation or "None.", max_chars=8000)
+        return f"""{banner}================= CURRENT STATE (this turn) =================
+{project_tree}
+
+**PERSISTENT MEMORIES**
+{memories_str}
+
+**CURRENT PLAN**
+{self.current_plan}
+
+**OPEN FILES**
+===[ IN WORKING MEMORY ]===
+{open_files_str}
+===[ END OPEN FILES ]===
+
+{stats_line}
+{diag_section}{sub_agent_section}{active_skill_section}
+**LAST STEP RESULT**
+{last_result}
+
+**NEXT ACTION**
+The messages above are the conversation so far; this block is your CURRENT live state (it supersedes any stale file contents shown earlier). Continue toward the OBJECTIVE in the system message — read the LAST STEP RESULT and CURRENT PLAN, then take the next concrete step, batching independent actions in one turn where you can.
+Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside string values, escaped (newline \\n, quote \\", backslash \\\\); no markdown fences, no text before or after the JSON."""
+
+    def _ensure_history_seeded(self):
+        """Bootstrap the turn history once. On a fresh run it stays empty (the
+        current-state message carries the initial observation); on a resumed /
+        restarted run it seeds one message with the restored attempt log so the
+        model still sees prior work even though the live history is empty."""
+        if getattr(self, "_history_seeded", False):
+            return
+        self._history_seeded = True
+        if not self._history_messages and self.action_log:
+            self._history_messages.append({
+                "role": "user",
+                "content": "[EARLIER WORK ON THIS TASK — restored from a prior session]\n"
+                           + self._format_attempt_log()})
+
+    def _append_history_turn(self, response_data, result_text: str):
+        """Record one completed turn: the assistant's decision + a BRIEF result.
+        The full latest result always rides in the current-state message; history
+        keeps only a short outcome so the decision trail stays compact and cacheable."""
+        try:
+            compact = json.dumps({
+                "thought": str(response_data.get("thought", ""))[:400],
+                "intent": response_data.get("intent", ""),
+                "actions": response_data.get("actions", []),
+            }, ensure_ascii=False, default=str)
+        except Exception:
+            compact = json.dumps({"intent": str(response_data.get("intent", ""))})
+        self._history_messages.append({"role": "assistant", "content": compact})
+        self._history_messages.append({
+            "role": "user",
+            "content": self._truncate_output(result_text or "(no output)", max_chars=800)})
+        self._trim_history()
+
+    def _trim_history(self, max_tokens: Optional[int] = None):
+        """Keep the newest history messages within a token budget (default ~45% of
+        the context window), dropping the oldest and noting the drop once. The full
+        record still lives in action_log; this only bounds the in-prompt history."""
+        if not self._history_messages:
+            return
+        if max_tokens is None:
+            max_tokens = max(4000, int(self.llm_client.context_limit * 0.45))
+        kept, total = [], 0
+        for m in reversed(self._history_messages):
+            t = estimate_tokens(LLMClient._msg_text(m))
+            if kept and total + t > max_tokens:
+                break
+            kept.append(m)
+            total += t
+        kept.reverse()
+        if len(kept) < len(self._history_messages):
+            kept.insert(0, {"role": "user", "content": "[earlier turns trimmed to fit the context window]"})
+        self._history_messages = kept
+
     def _normalize_actions(self, actions) -> list:
         """Coerce the model's `actions` field into a clean list of action dicts.
 
@@ -1843,118 +1972,151 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
                             breakdown.append(f"  - {os.path.basename(path)}: ~{estimate_tokens(content)} tokens")
                     diagnostic_str = "\n".join(breakdown)
 
-                prompt = self._build_primary_agent_context(
-                    tool_list_str, project_tree, stats_line, memories_str, objective, open_files_str,
-                    active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
-                    sub_agent_digest=sub_agent_digest
-                )
-
-                # Screenshot(s) the browser produced last turn, to attach to THIS
-                # call so the model sees the page. (The guidance note is appended
-                # after context-shedding below, so a rebuilt prompt can't drop it.)
+                # Screenshot(s) the browser produced last turn, attached to THIS call
+                # so the model sees the page. Shared by both assembly paths.
                 turn_images = list(self.visual_context)
+                screenshot_note = (
+                    "\n\n**ATTACHED SCREENSHOT (CURRENT BROWSER PAGE)**\n"
+                    "The image attached to this message is the page exactly as it renders in the "
+                    "browser right now — look at it directly, as a human would, to judge layout, read "
+                    "text, spot what changed, and catch anything visual (CAPTCHAs, consent walls, "
+                    "modals, errors). Then act using the [id]s in the INTERACTIVE ELEMENTS list, which "
+                    "index the exact same page. The screenshot and the element list describe ONE page; "
+                    "use both together."
+                ) if turn_images else ""
 
-                if max_iterations is not None:
-                    rem_iters = max_iterations - self.effective_iterations
-                    prompt += f"\n\nSYSTEM REMINDER: You have {rem_iters} effective iterations remaining to complete this task. Plan accordingly."
-                    if rem_iters <= 0:
-                        self.print_func(f"{C_RED}Iteration budget exhausted. Forcing final report.{C_RESET}")
-                        # Append to the PROMPT (already built): writing this to
-                        # last_observation here would be overwritten at end of turn
-                        # and never reach the model.
-                        prompt += ("\nSYSTEM ALERT: Iteration budget exhausted. You MUST use "
-                                   "'task_complete' THIS turn to report your final status.")
-
-                # Final token count and growth tracking
-                prompt_tokens = estimate_tokens(prompt)
-                growth = prompt_tokens - self.prev_prompt_tokens
-                growth_str = f"{growth:+} tokens" if self.prev_prompt_tokens > 0 else "N/A (first iter)"
-                self.prev_prompt_tokens = prompt_tokens
-
-                if prompt_tokens > ctx_limit * 0.85:
-                    pct = prompt_tokens / ctx_limit * 100
-                    self.print_func(f"{C_RED}WARNING: Prompt is ~{prompt_tokens} tokens ({pct:.0f}% of {ctx_limit} context limit). Close files or context will be truncated!{C_RESET}")
-                    
-                    # Size-aware LRU closing suggestions: prioritize old AND large files
-                    if self.open_files_access_order:
-                        scored_files = []
-                        for idx, path in enumerate(self.open_files_access_order):
-                            size = len(self.open_files.get(path, ""))
-                            score = size / (idx + 1)
-                            scored_files.append((score, path))
-                        
-                        scored_files.sort(key=lambda x: x[0], reverse=True)
-                        top_candidates = [p for s, p in scored_files[:2]]
-                        suggestions = ", ".join([os.path.basename(p) for p in top_candidates])
-                        
-                        # Inject suggestion into diagnostics so the agent sees it
-                        if diagnostic_str:
-                            diagnostic_str += f"\nSUGGESTION: Consider closing old/large files: {suggestions}"
-                        self.print_func(f"{C_YELLOW}Suggestion: Consider closing old/large files: {suggestions}{C_RESET}")
-
-                    if prompt_tokens > ctx_limit * 0.95:
-                        # GRACEFUL CONTEXT RECOVERY: rather than crash the whole
-                        # run, shed the largest/oldest open files until we are back
-                        # under 90%, then continue. The agent is told what was
-                        # closed so it can re-open or memorize as needed. We only
-                        # raise if there is nothing left to shed.
-                        target = ctx_limit * 0.90
-                        shed = []
-                        while prompt_tokens > target and self.open_files_access_order:
-                            scored = sorted(
-                                ((len(self.open_files.get(p, "")) / (i + 1), p)
-                                 for i, p in enumerate(self.open_files_access_order)),
-                                reverse=True)
-                            victim = scored[0][1]
-                            self.close_file(victim)
-                            shed.append(os.path.basename(victim))
-                            open_files_str = self._format_open_files(max_content_len=dyn_limit)
-                            prompt = self._build_primary_agent_context(
-                                tool_list_str, project_tree, stats_line, memories_str, objective, open_files_str,
-                                active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
-                                sub_agent_digest=sub_agent_digest)
-                            prompt_tokens = estimate_tokens(prompt)
-
-                        if shed:
-                            note = (f"SYSTEM: Context exceeded 95% of the {ctx_limit}-token limit. "
-                                    f"Auto-closed {len(shed)} large/old file(s) to recover: {', '.join(shed)}. "
-                                    f"Re-open any you still need with open_file, and memorize key facts so "
-                                    f"they survive future context pressure.")
-                            prompt += f"\n\n{note}"
-                            prompt_tokens = estimate_tokens(prompt)
-                            self.print_func(f"{C_YELLOW}{note}{C_RESET}")
-
-                        if prompt_tokens > ctx_limit * 0.95:
-                            raise RuntimeError(
-                                f"Context limit exceeded ({prompt_tokens} > {ctx_limit * 0.95:.0f}) "
-                                f"with no open files left to shed.")
-
-                # Append the screenshot guidance LAST — after any context-shedding
-                # rebuild above — so it is always present when an image is attached.
-                if turn_images:
-                    prompt += (
-                        "\n\n**ATTACHED SCREENSHOT (CURRENT BROWSER PAGE)**\n"
-                        "The image attached to this message is the page exactly as it renders in the "
-                        "browser right now — look at it directly, as a human would, to judge layout, read "
-                        "text, spot what changed, and catch anything visual (CAPTCHAs, consent walls, "
-                        "modals, errors). Then act using the [id]s in the INTERACTIVE ELEMENTS list, which "
-                        "index the exact same page. The screenshot and the element list describe ONE page; "
-                        "use both together."
+                if self.use_message_history:
+                    # --- MESSAGE-HISTORY MODE (opt-in) ---
+                    # Stable system + cached turn history + one volatile current-state
+                    # message. History is budget-trimmed instead of shedding open files.
+                    self._ensure_history_seeded()
+                    self._trim_history()
+                    system_msg = self._build_system_message(objective, tool_list_str, active_tool_directives)
+                    current_msg = self._build_current_state_message(
+                        project_tree, stats_line, memories_str, open_files_str,
+                        sub_agent_digest=sub_agent_digest, context_diagnostics=diagnostic_str)
+                    if max_iterations is not None:
+                        rem_iters = max_iterations - self.effective_iterations
+                        current_msg += f"\n\nSYSTEM REMINDER: You have {rem_iters} effective iterations remaining to complete this task. Plan accordingly."
+                        if rem_iters <= 0:
+                            self.print_func(f"{C_RED}Iteration budget exhausted. Forcing final report.{C_RESET}")
+                            current_msg += ("\nSYSTEM ALERT: Iteration budget exhausted. You MUST use "
+                                            "'task_complete' THIS turn to report your final status.")
+                    current_msg += screenshot_note
+                    call_messages = ([{"role": "system", "content": system_msg}]
+                                     + list(self._history_messages)
+                                     + [{"role": "user", "content": current_msg}])
+                    prompt_tokens = (estimate_tokens(system_msg) + estimate_tokens(current_msg)
+                                     + sum(estimate_tokens(LLMClient._msg_text(m)) for m in self._history_messages))
+                    growth = prompt_tokens - self.prev_prompt_tokens
+                    growth_str = f"{growth:+} tokens" if self.prev_prompt_tokens > 0 else "N/A (first iter)"
+                    self.prev_prompt_tokens = prompt_tokens
+                    self.print_func("Thinking (Primary Agent)...")
+                    if turn_images:
+                        self.print_func(f"{C_CYAN}\U0001F441 Attaching {len(turn_images)} page screenshot(s) for the model to see.{C_RESET}")
+                    self.visual_context = []
+                    response_str = self.llm_client.get_primary_agent_response(
+                        messages=call_messages, diagnostic_str=diagnostic_str, images=turn_images or None)
+                else:
+                    # --- SINGLE-PROMPT MODE (default) ---
+                    prompt = self._build_primary_agent_context(
+                        tool_list_str, project_tree, stats_line, memories_str, objective, open_files_str,
+                        active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
+                        sub_agent_digest=sub_agent_digest
                     )
 
-                self.print_func("Thinking (Primary Agent)...")
+                    if max_iterations is not None:
+                        rem_iters = max_iterations - self.effective_iterations
+                        prompt += f"\n\nSYSTEM REMINDER: You have {rem_iters} effective iterations remaining to complete this task. Plan accordingly."
+                        if rem_iters <= 0:
+                            self.print_func(f"{C_RED}Iteration budget exhausted. Forcing final report.{C_RESET}")
+                            # Append to the PROMPT (already built): writing this to
+                            # last_observation here would be overwritten at end of turn
+                            # and never reach the model.
+                            prompt += ("\nSYSTEM ALERT: Iteration budget exhausted. You MUST use "
+                                       "'task_complete' THIS turn to report your final status.")
 
-                # === PRIMARY AGENT CALL ===
-                # Attach the current page screenshot (if any) so the multimodal
-                # model sees the page itself. Consume it now: a view is shown for
-                # exactly the one decision that follows the browser action, never
-                # re-sent (the model re-looks by calling browser_read).
-                if turn_images:
-                    self.print_func(f"{C_CYAN}\U0001F441 Attaching {len(turn_images)} page screenshot(s) for the model to see.{C_RESET}")
-                self.visual_context = []
-                response_str = self.llm_client.get_primary_agent_response(
-                    prompt=prompt, diagnostic_str=diagnostic_str,
-                    images=turn_images or None)
+                    # Final token count and growth tracking
+                    prompt_tokens = estimate_tokens(prompt)
+                    growth = prompt_tokens - self.prev_prompt_tokens
+                    growth_str = f"{growth:+} tokens" if self.prev_prompt_tokens > 0 else "N/A (first iter)"
+                    self.prev_prompt_tokens = prompt_tokens
+
+                    if prompt_tokens > ctx_limit * 0.85:
+                        pct = prompt_tokens / ctx_limit * 100
+                        self.print_func(f"{C_RED}WARNING: Prompt is ~{prompt_tokens} tokens ({pct:.0f}% of {ctx_limit} context limit). Close files or context will be truncated!{C_RESET}")
+
+                        # Size-aware LRU closing suggestions: prioritize old AND large files
+                        if self.open_files_access_order:
+                            scored_files = []
+                            for idx, path in enumerate(self.open_files_access_order):
+                                size = len(self.open_files.get(path, ""))
+                                score = size / (idx + 1)
+                                scored_files.append((score, path))
+
+                            scored_files.sort(key=lambda x: x[0], reverse=True)
+                            top_candidates = [p for s, p in scored_files[:2]]
+                            suggestions = ", ".join([os.path.basename(p) for p in top_candidates])
+
+                            # Inject suggestion into diagnostics so the agent sees it
+                            if diagnostic_str:
+                                diagnostic_str += f"\nSUGGESTION: Consider closing old/large files: {suggestions}"
+                            self.print_func(f"{C_YELLOW}Suggestion: Consider closing old/large files: {suggestions}{C_RESET}")
+
+                        if prompt_tokens > ctx_limit * 0.95:
+                            # GRACEFUL CONTEXT RECOVERY: rather than crash the whole
+                            # run, shed the largest/oldest open files until we are back
+                            # under 90%, then continue. The agent is told what was
+                            # closed so it can re-open or memorize as needed. We only
+                            # raise if there is nothing left to shed.
+                            target = ctx_limit * 0.90
+                            shed = []
+                            while prompt_tokens > target and self.open_files_access_order:
+                                scored = sorted(
+                                    ((len(self.open_files.get(p, "")) / (i + 1), p)
+                                     for i, p in enumerate(self.open_files_access_order)),
+                                    reverse=True)
+                                victim = scored[0][1]
+                                self.close_file(victim)
+                                shed.append(os.path.basename(victim))
+                                open_files_str = self._format_open_files(max_content_len=dyn_limit)
+                                prompt = self._build_primary_agent_context(
+                                    tool_list_str, project_tree, stats_line, memories_str, objective, open_files_str,
+                                    active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
+                                    sub_agent_digest=sub_agent_digest)
+                                prompt_tokens = estimate_tokens(prompt)
+
+                            if shed:
+                                note = (f"SYSTEM: Context exceeded 95% of the {ctx_limit}-token limit. "
+                                        f"Auto-closed {len(shed)} large/old file(s) to recover: {', '.join(shed)}. "
+                                        f"Re-open any you still need with open_file, and memorize key facts so "
+                                        f"they survive future context pressure.")
+                                prompt += f"\n\n{note}"
+                                prompt_tokens = estimate_tokens(prompt)
+                                self.print_func(f"{C_YELLOW}{note}{C_RESET}")
+
+                            if prompt_tokens > ctx_limit * 0.95:
+                                raise RuntimeError(
+                                    f"Context limit exceeded ({prompt_tokens} > {ctx_limit * 0.95:.0f}) "
+                                    f"with no open files left to shed.")
+
+                    # Append the screenshot guidance LAST — after any context-shedding
+                    # rebuild above — so it is always present when an image is attached.
+                    prompt += screenshot_note
+
+                    self.print_func("Thinking (Primary Agent)...")
+
+                    # === PRIMARY AGENT CALL ===
+                    # Attach the current page screenshot (if any) so the multimodal
+                    # model sees the page itself. Consume it now: a view is shown for
+                    # exactly the one decision that follows the browser action, never
+                    # re-sent (the model re-looks by calling browser_read).
+                    if turn_images:
+                        self.print_func(f"{C_CYAN}\U0001F441 Attaching {len(turn_images)} page screenshot(s) for the model to see.{C_RESET}")
+                    self.visual_context = []
+                    response_str = self.llm_client.get_primary_agent_response(
+                        prompt=prompt, diagnostic_str=diagnostic_str,
+                        images=turn_images or None)
                 if self.debug_mode:
                     pass
 
@@ -2543,6 +2705,12 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
                     'actions': actions_taken_str,
                     'outcome': outcome,
                 }
+
+                # Record this completed turn in the chat history (message-history mode):
+                # the model's decision + a brief result. The full latest result rides in
+                # the next current-state message; history keeps a compact, cacheable trail.
+                if self.use_message_history:
+                    self._append_history_turn(response_data, self.last_observation)
 
                 # Persist after each completed iteration so memories/plan/log survive
                 # a crash or a clean exit, not just an in-process restart_aeon.

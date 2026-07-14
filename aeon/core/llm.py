@@ -732,6 +732,18 @@ class LLMClient:
                 parts.append({"type": "image_url", "image_url": {"url": url}})
         return parts if len(parts) > 1 else text
 
+    @staticmethod
+    def _msg_text(message: Dict) -> str:
+        """Text of a chat message whose content may be a plain string or a
+        multimodal [text, image...] parts list."""
+        c = message.get("content", "")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return " ".join(p.get("text", "") for p in c
+                            if isinstance(p, dict) and p.get("type") == "text")
+        return str(c)
+
     def _build_user_content(self, text: str, images: Optional[List[str]]):
         """Encode image FILE PATHS and build the user content (encodes each path).
         Used by direct callers/tests; the main loop pre-encodes once and calls
@@ -739,17 +751,35 @@ class LLMClient:
         urls = [self._encode_image_data_url(p) for p in (images or [])]
         return self._content_with_images(text, [u for u in urls if u])
 
-    def get_primary_agent_response(self, prompt: str, max_retries: int = 3,
+    def get_primary_agent_response(self, prompt: Optional[str] = None, max_retries: int = 3,
                                    diagnostic_str: Optional[str] = None,
-                                   images: Optional[List[str]] = None) -> str:
+                                   images: Optional[List[str]] = None,
+                                   messages: Optional[List[Dict]] = None) -> str:
         """Get combined reasoning and action from the Primary Agent (Strong Model).
 
         When ``images`` (file paths) are supplied — e.g. the current browser
         screenshot — they are attached to the user turn as a multimodal message so
         the deciding model looks at the rendered page itself, not a text summary of
         it. Requires a multimodal model (Gemma-4); a text-only model simply ignores
-        the image parts."""
-        current_prompt = prompt
+        the image parts.
+
+        When ``messages`` is given (message-history mode) it is used as the chat
+        message list: the LAST message is the current-turn user message (images and
+        any retry note attach to it), and the earlier messages (system + prior
+        turns) form the stable, cache-friendly prefix. Otherwise a single user
+        message is built from ``prompt`` (the default, unchanged behavior)."""
+        # Stable prefix (system + history) vs the current-turn user text. A retry
+        # note is applied to the user text only, so the prefix stays byte-identical
+        # across attempts (and across turns — that is the whole point of caching).
+        if messages:
+            prefix_messages = [dict(m) for m in messages[:-1]]
+            _last = messages[-1]
+            base_user_text = _last.get("content", "") if isinstance(_last.get("content"), str) else (prompt or "")
+        else:
+            prefix_messages = []
+            base_user_text = prompt or ""
+        retry_suffix = ""
+        full_prompt_text = base_user_text
         last_error = None
         # Encode attached screenshots ONCE, not once per retry attempt. If this
         # model has already told us it can't accept images (a text-only build),
@@ -763,6 +793,14 @@ class LLMClient:
         for attempt in range(max_retries):
             try:
                 start_time = time.time()
+
+                # Assemble this attempt's messages: stable prefix + the current user
+                # message (base text + optional retry note + images). full_prompt_text
+                # is the concatenation used for token calibration and debug logging.
+                user_text = base_user_text + retry_suffix
+                req_messages = prefix_messages + [
+                    {"role": "user", "content": self._content_with_images(user_text, image_urls)}]
+                full_prompt_text = "\n".join(self._msg_text(m) for m in req_messages)
 
                 # Grammar-constrained decoding: when the worker installed a turn
                 # schema, the server's sampler is constrained to it (vLLM/xgrammar
@@ -785,7 +823,7 @@ class LLMClient:
                 # Stream the response to accurately measure TTFT vs pure generation time
                 resp_stream = self.client.chat.completions.create(
                     model=self.api_model,
-                    messages=[{"role": "user", "content": self._content_with_images(current_prompt, image_urls)}],
+                    messages=req_messages,
                     temperature=0.2,
                     stream=True,
                     # Hard ceiling on one turn's output. Without this a low-temp model
@@ -843,7 +881,7 @@ class LLMClient:
                 if server_prompt_tokens and not image_urls:
                     try:
                         from .utils.tokens import calibrate
-                        calibrate(current_prompt, server_prompt_tokens)
+                        calibrate(full_prompt_text, server_prompt_tokens)
                     except Exception:
                         pass
 
@@ -871,7 +909,7 @@ class LLMClient:
                 if self.debug_path:
                     print(f"{C_YELLOW}[LLM RAW - PRIMARY AGENT]\n{raw}{C_RESET}")
 
-                self._log_to_debug("PRIMARY_AGENT", self.model, current_prompt, raw)
+                self._log_to_debug("PRIMARY_AGENT", self.model, full_prompt_text, raw)
 
                 # A response cut off at max_tokens can't be a complete JSON object
                 # (grammar-constrained or not). Retry with a terseness note rather
@@ -882,7 +920,7 @@ class LLMClient:
                     self.logger.warning(
                         f"Primary Agent attempt {attempt + 1}/{max_retries}: {last_error}")
                     if attempt < max_retries - 1:
-                        current_prompt = prompt + (
+                        retry_suffix = (
                             "\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS CUT OFF (too long) **\n"
                             "Your response exceeded the output limit and was truncated. Be BRIEF: "
                             "shorten 'thought' to a few sentences, and if you were writing a large "
@@ -953,7 +991,7 @@ class LLMClient:
                             print(f"{C_YELLOW}[LLM] Missing blocks detected: {missing_blocks}. Initiating recovery...{C_RESET}")
                         
                         for mb in missing_blocks:
-                            recovered_text = self._recover_missing_block(mb, parsed, current_prompt)
+                            recovered_text = self._recover_missing_block(mb, parsed, full_prompt_text)
                             if recovered_text:
                                 blocks[mb] = recovered_text
                             else:
@@ -1018,7 +1056,7 @@ class LLMClient:
                         print(f"{C_YELLOW}------------------------------{C_RESET}\n")
 
                     if attempt < max_retries - 1:
-                        current_prompt = prompt + f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output exactly ONE valid JSON object containing 'thought' and 'actions', and nothing else.\nCRITICAL: JSON values must be static strings with standard JSON escaping — newlines as \\n, quotes as \\\", backslashes as \\\\. No Python operations (like '+' or '*'), no markdown fences, no text before or after the JSON."
+                        retry_suffix = f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output exactly ONE valid JSON object containing 'thought' and 'actions', and nothing else.\nCRITICAL: JSON values must be static strings with standard JSON escaping — newlines as \\n, quotes as \\\", backslashes as \\\\. No Python operations (like '+' or '*'), no markdown fences, no text before or after the JSON."
 
             except (openai.APIConnectionError, openai.InternalServerError, requests.exceptions.ConnectionError) as e:
                 if self._handle_connection_error(e):
@@ -1046,7 +1084,7 @@ class LLMClient:
                     self._vision_supported = False
                     image_urls = []
                     continue  # retry this attempt without the image
-                self._log_to_debug("PRIMARY_AGENT_ERR", self.model, current_prompt, str(e))
+                self._log_to_debug("PRIMARY_AGENT_ERR", self.model, full_prompt_text, str(e))
                 self.logger.error(f"Primary Agent bad request: {e}")
                 last_error = f"API Error: {str(e)}"
                 if attempt < max_retries - 1:
@@ -1054,7 +1092,7 @@ class LLMClient:
                     continue
                 raise
             except Exception as e:
-                self._log_to_debug("PRIMARY_AGENT_ERR", self.model, current_prompt, str(e))
+                self._log_to_debug("PRIMARY_AGENT_ERR", self.model, full_prompt_text, str(e))
                 self.logger.error(f"Primary Agent LLM call failed: {e}")
                 last_error = f"API Error: {str(e)}"
                 if attempt < max_retries - 1:

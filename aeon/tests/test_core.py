@@ -1092,6 +1092,126 @@ class TestFittedGpuMemUtil(unittest.TestCase):
             self.assertLessEqual(float(p.env["AEON_GPU_MEM_UTIL"]), dp.SAFETY)
 
 
+class TestMessageHistoryMode(unittest.TestCase):
+    """Opt-in message-history mode: a stable system message + a growing turn
+    history + one volatile current-state message. Verifies the split (static vs
+    volatile), history seeding/append/trim, and the LLM messages path."""
+
+    def _worker(self):
+        import types
+        from aeon.core.worker import Worker
+        w = Worker.__new__(Worker)
+        w.important_reminders = "REMINDERVAL"
+        w.base_directives = "BASEVAL"
+        w.docker_directives = "DOCKVAL"
+        w.current_plan = "PLANVAL_XZ"
+        w.last_observation = "LASTOBS_XZ"
+        w._stuck_banner = ""
+        w.active_skill = None
+        w._history_messages = []
+        w._history_seeded = False
+        w.action_log = []
+        w.pending_iteration_state = None
+        w._get_skills_description = lambda: "SKILLSVAL"
+        w._format_active_skill = lambda: ""
+        w.llm_client = types.SimpleNamespace(context_limit=100000)
+        return w
+
+    def test_system_static_vs_current_state_volatile(self):
+        w = self._worker()
+        sm = w._build_system_message("MY_OBJECTIVE_XZ", "TOOLSVAL", "TOOLDIRVAL")
+        self.assertIn("BASEVAL", sm)
+        self.assertIn("TOOLSVAL", sm)
+        self.assertIn("MY_OBJECTIVE_XZ", sm)
+        # Volatile values must NOT be in the (cacheable) system message.
+        self.assertNotIn("LASTOBS_XZ", sm)
+        self.assertNotIn("PLANVAL_XZ", sm)
+
+        cm = w._build_current_state_message("TREEVAL", "STATSVAL", "MEMVAL", "FILESVAL",
+                                            sub_agent_digest="SUBVAL")
+        for token in ("TREEVAL", "MEMVAL", "PLANVAL_XZ", "FILESVAL", "LASTOBS_XZ", "STATSVAL",
+                      "SUBVAL", "NEXT ACTION"):
+            self.assertIn(token, cm)
+
+    def test_history_seed_from_action_log(self):
+        w = self._worker()
+        w.action_log = ["[Iter 1]\n- Intent: x\n- Actions: a\n- Result: ok"]
+        w._ensure_history_seeded()
+        self.assertEqual(len(w._history_messages), 1)
+        self.assertIn("EARLIER WORK", w._history_messages[0]["content"])
+        # Idempotent.
+        w._ensure_history_seeded()
+        self.assertEqual(len(w._history_messages), 1)
+
+    def test_append_turn_records_decision_and_brief_result(self):
+        w = self._worker()
+        resp = {"thought": "th", "intent": "do the thing",
+                "actions": [{"tool_name": "run_command", "parameters": {"command": "x"}}]}
+        w._append_history_turn(resp, "R" * 5000)
+        self.assertEqual(len(w._history_messages), 2)
+        self.assertEqual(w._history_messages[0]["role"], "assistant")
+        self.assertIn("do the thing", w._history_messages[0]["content"])
+        self.assertEqual(w._history_messages[1]["role"], "user")
+        self.assertLess(len(w._history_messages[1]["content"]), 5000)  # brief result truncated
+
+    def test_trim_history_bounds_and_notes(self):
+        w = self._worker()
+        for i in range(50):
+            w._history_messages.append({"role": "user", "content": "x" * 4000})
+        w._trim_history(max_tokens=2000)
+        joined = " ".join(m["content"] for m in w._history_messages)
+        self.assertIn("trimmed", joined)
+        # Bounded well below the original 50 messages.
+        self.assertLess(len(w._history_messages), 20)
+
+    def test_llm_uses_message_list_and_keeps_prefix_stable(self):
+        import json as _json
+        import logging
+        import types
+        from aeon.core.llm import LLMClient
+        c = LLMClient.__new__(LLMClient)
+        c.logger = logging.getLogger("t")
+        c.model = "M"
+        c.api_model = "M"
+        c.action_schema = None
+        c._structured_mode = "legacy"
+        c._vision_supported = True
+        c.debug_path = None
+        c.context_limit = 200000
+        good = ('{"thought":"t","previous_result_summary":"n","skill_check":"none",'
+                '"memory_check":"none","parallel_check":"none","intent":"go",'
+                '"actions":[{"tool_name":"run_command","parameters":{"command":"echo hi"}}]}')
+        captured = {}
+
+        def mk(o):
+            return types.SimpleNamespace(**o)
+
+        class Stream:
+            def __iter__(self):
+                yield mk({"choices": [mk({"delta": mk({"content": good}), "finish_reason": "stop"})], "usage": None})
+                yield mk({"choices": [], "usage": mk({"completion_tokens": 5, "prompt_tokens": 100,
+                                                      "prompt_tokens_details": None})})
+
+        class Chat:
+            class completions:
+                @staticmethod
+                def create(**k):
+                    captured["messages"] = k["messages"]
+                    return Stream()
+
+        c.client = types.SimpleNamespace(chat=Chat())
+        msgs = [{"role": "system", "content": "SYS"},
+                {"role": "assistant", "content": "A1"},
+                {"role": "user", "content": "STATE"}]
+        out = c.get_primary_agent_response(messages=msgs)
+        self.assertEqual(_json.loads(out)["intent"], "go")
+        sent = captured["messages"]
+        self.assertEqual(sent[0], {"role": "system", "content": "SYS"})
+        self.assertEqual(sent[1], {"role": "assistant", "content": "A1"})
+        self.assertEqual(sent[-1]["role"], "user")
+        self.assertIn("STATE", LLMClient._msg_text(sent[-1]))
+
+
 class TestInterruptionFieldCoercion(unittest.TestCase):
     """The interruption/resume integrators are asked for string fields but LLMs
     frequently return a LIST (e.g. `plan` as an array of steps). Calling .strip()
