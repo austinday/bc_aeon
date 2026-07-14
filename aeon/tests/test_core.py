@@ -1092,6 +1092,57 @@ class TestFittedGpuMemUtil(unittest.TestCase):
             self.assertLessEqual(float(p.env["AEON_GPU_MEM_UTIL"]), dp.SAFETY)
 
 
+class TestInterruptionFieldCoercion(unittest.TestCase):
+    """The interruption/resume integrators are asked for string fields but LLMs
+    frequently return a LIST (e.g. `plan` as an array of steps). Calling .strip()
+    on that raised 'list object has no attribute strip' INSIDE the Ctrl+C handler,
+    which killed the whole session. Fields must be coerced, never crash."""
+
+    def test_coerce_text_handles_list_dict_none(self):
+        from aeon.core.worker import Worker
+        c = Worker._coerce_text
+        self.assertEqual(c(None), "")
+        self.assertEqual(c("  hi  "), "hi")
+        self.assertEqual(c(["step 1", "step 2"]), "step 1\nstep 2")
+        self.assertEqual(c([]), "")
+        self.assertEqual(c({"a": "x", "b": "y"}), "a: x\nb: y")
+        self.assertEqual(c(42), "42")
+
+    def test_guidance_with_list_plan_does_not_crash(self):
+        # Reproduces the reported fatal: Ctrl+C guidance -> integrator returns
+        # `plan` as a list. Must integrate cleanly instead of raising.
+        import os
+        import tempfile
+        from aeon.core.worker import Worker
+
+        class _StubLLM:
+            def integrate_interruption(self, obj, plan, progress, inp):
+                return {"mode": "REVISE",
+                        "objective": "Refactor the parser and add tests",
+                        "plan": ["Write failing tests", "Refactor", "Make tests pass"],
+                        "directive": ["Do the tests first", "then refactor"],
+                        "reasoning": "user steered toward tests"}
+
+        w = Worker.__new__(Worker)
+        w.llm_client = _StubLLM()
+        w.current_plan = "old plan"
+        w.action_log = []
+        w.last_observation = ""
+        w.pending_iteration_state = None
+        w.print_func = lambda *a, **k: None
+        with tempfile.TemporaryDirectory() as td:
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                obj, reset = w._integrate_user_input("Old objective", "focus on tests", 5)
+            finally:
+                os.chdir(old)
+        self.assertEqual(obj, "Refactor the parser and add tests")
+        # The list plan was joined into a multi-line string, not crashed on.
+        self.assertEqual(w.current_plan, "Write failing tests\nRefactor\nMake tests pass")
+        self.assertIn("Do the tests first", w.last_observation)
+
+
 class TestResumePreviousSession(unittest.TestCase):
     """A stopped session writes a resumable dump; the resume_previous_session tool
     reads it and sets the loop up to continue the prior objective."""

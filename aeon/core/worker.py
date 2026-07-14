@@ -1158,8 +1158,12 @@ class Worker:
         if new_instruction and getattr(self, "llm_client", None) is not None:
             analysis = self.llm_client.integrate_resume(
                 prev_obj, self.current_plan, self._recent_progress_digest(), new_instruction)
-            merged_obj = (analysis.get("objective") or "").strip() or prev_obj
-            directive = (analysis.get("directive") or "").strip()
+            if not isinstance(analysis, dict):
+                analysis = {}
+            # Same coercion as _integrate_user_input: the model may return a list
+            # (e.g. objective as an array) where a string is expected.
+            merged_obj = self._coerce_text(analysis.get("objective")) or prev_obj
+            directive = self._coerce_text(analysis.get("directive"))
 
         # Signal the run loop to switch the live objective to the merged one.
         self._resume_objective = merged_obj
@@ -1308,6 +1312,25 @@ class Worker:
         except (EOFError, KeyboardInterrupt):
             return ''
 
+    @staticmethod
+    def _coerce_text(value) -> str:
+        """Coerce an LLM-produced JSON field to a stripped string. The integrator
+        models are asked for string fields but frequently return a LIST (e.g. a
+        `plan` or `objective` as an array of steps) or occasionally a dict; calling
+        .strip() on those raised 'list' object has no attribute 'strip' and — since
+        it happened inside the Ctrl+C handler — killed the whole session. A list is
+        joined into newline-separated lines (the sensible rendering of a step list);
+        a dict into 'key: value' lines; anything else is str()'d."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (list, tuple)):
+            return "\n".join(Worker._coerce_text(v) for v in value if v is not None).strip()
+        if isinstance(value, dict):
+            return "\n".join(f"{k}: {Worker._coerce_text(v)}" for k, v in value.items()).strip()
+        return str(value).strip()
+
     def _integrate_user_input(self, objective: str, user_text: str, iteration: int):
         """Fold a mid-run user interruption into the ongoing work intelligently
         instead of the old erase-or-ignore binary. The integrator sees the
@@ -1321,11 +1344,15 @@ class Worker:
         Returns (objective, reset_iteration)."""
         analysis = self.llm_client.integrate_interruption(
             objective, self.current_plan, self._recent_progress_digest(), user_text)
-        mode = (analysis.get('mode') or 'REVISE').strip().upper()
-        new_obj = (analysis.get('objective') or '').strip() or objective
-        new_plan = (analysis.get('plan') or '').strip()
-        directive = (analysis.get('directive') or '').strip()
-        reasoning = (analysis.get('reasoning') or '').strip()
+        if not isinstance(analysis, dict):
+            analysis = {}
+        # Coerce every field: the model may return a list/dict where a string is
+        # expected (e.g. `plan` as an array of steps), which used to crash here.
+        mode = (self._coerce_text(analysis.get('mode')) or 'REVISE').upper()
+        new_obj = self._coerce_text(analysis.get('objective')) or objective
+        new_plan = self._coerce_text(analysis.get('plan'))
+        directive = self._coerce_text(analysis.get('directive'))
+        reasoning = self._coerce_text(analysis.get('reasoning'))
         self.print_func(f"{C_CYAN}Interruption -> {mode} | {reasoning}{C_RESET}")
 
         reset_iteration = False
