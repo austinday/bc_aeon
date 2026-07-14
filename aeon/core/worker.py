@@ -2394,46 +2394,29 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
                             # unrelated edit). Escalate to the hard STUCK protocol AND arm
                             # an execution block only at 3x+, where it really is spinning.
                             if repeat_count <= 2:
-                                loop_warning = (
-                                    f"\n\n** REPEAT NOTICE: you ran the same action(s) twice with {out_phrase} — "
-                                    f"no real change. Before repeating again, confirm a repeat will actually do "
-                                    f"something different; if not, change the input, the approach, or the sub-task. **"
-                                )
-                                warn_color = C_YELLOW
+                                nudge = (
+                                    f"\n\n[repeat] Same action(s) ran twice with {out_phrase}. If a third run won't "
+                                    f"do something genuinely different, change the input, the approach, or the sub-task "
+                                    f"rather than repeating.")
+                                self.last_observation += nudge
+                                self.print_func(f"{C_YELLOW}{nudge}{C_RESET}")
                             else:
                                 # Publish the loop so that, IF this worker is a sub-agent, its
                                 # principal sees a LOOPING flag in the digest (a fast loop keeps
-                                # the heartbeat fresh, so it would otherwise look healthy).
+                                # the heartbeat fresh, so it would otherwise look healthy). Arm the
+                                # HARD block: next turn this exact action is refused outright (a weak
+                                # model ignores prose) even if padded with a think(). The persistent
+                                # banner (top of the CURRENT STATE block) carries the steer — no
+                                # separate ALL-CAPS wall duplicated into last_observation.
                                 self.stuck_reason = (f"self-reported loop: ran the same action(s) {repeat_count}x "
                                                      f"with {out_phrase}.")
-                                # Arm a HARD block on the consequential fingerprint: next turn
-                                # this action is refused outright (a weak model ignores prose
-                                # nudges) even if padded with a think(); raise a top-of-prompt
-                                # banner it cannot miss. Reset the escalation counter.
                                 self._loop_blocked_fingerprint = norm_cmd
                                 self._loop_block_hits = 0
                                 self._stuck_banner = (
-                                    "===[ ! STUCK — READ THIS FIRST ]===\n"
-                                    f"You have run the SAME action {repeat_count}x in a row with {out_phrase}. "
-                                    "Repeating it is now BLOCKED and will not execute — padding it with a think() "
-                                    "will NOT get it past the block. Do NOT try it again.\n"
-                                    "This turn: use `think` to diagnose the failure, then act on a DIFFERENT "
-                                    "target, change the approach, or switch to a different sub-task.\n"
-                                    "===[ END STUCK ]==="
-                                )
-                                loop_warning = (
-                                    f"\n\n** LOOP DETECTED: You have run the SAME action(s) {repeat_count} times in a row "
-                                    f"with {out_phrase}. The situation is NOT changing. **\n"
-                                    f"You MUST do something DIFFERENT now. You are STUCK.\n"
-                                    f"- Repeating this action is now BLOCKED — it will be refused, not executed, and "
-                                    f"padding it with a think() will not help.\n"
-                                    f"- Use the `think` tool to state the exact error, list three possible root "
-                                    f"causes, and select the most likely one.\n"
-                                    f"- Then act on a DIFFERENT target, change the approach, or switch sub-tasks."
-                                )
-                                warn_color = C_RED
-                            self.last_observation += loop_warning
-                            self.print_func(f"{warn_color}{loop_warning}{C_RESET}")
+                                    f"⚠ STUCK — READ THIS: the SAME action has run {repeat_count}x with {out_phrase} and "
+                                    f"is now BLOCKED (retrying it, even padded with a think(), will be refused). Diagnose "
+                                    f"the cause, then act on a DIFFERENT target or approach, or switch sub-task.")
+                                self.print_func(f"{C_RED}{self._stuck_banner}{C_RESET}")
 
                         # --- OSCILLATION (2-CYCLE) DETECTION ---
                         # The check above only catches CONSECUTIVE identical turns. An agent
@@ -2448,19 +2431,10 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
                                 self.stuck_reason = ("self-reported oscillation: alternating between two "
                                                      "states (A,B,A,B) with no net progress.")
                                 self._stuck_banner = (
-                                    "===[ ! STUCK — READ THIS FIRST ]===\n"
-                                    "You are alternating between TWO actions (A,B,A,B) and making no net progress. "
-                                    "Break the cycle: use `think`, then choose a THIRD, different approach.\n"
-                                    "===[ END STUCK ]==="
-                                )
-                                osc_warning = (
-                                    "\n\n** OSCILLATION DETECTED: You are alternating between TWO actions/states "
-                                    "(A, B, A, B) and making no net progress — each undoes or ignores the other. **\n"
-                                    "Stop the back-and-forth. Use the `think` tool to identify why these two steps "
-                                    "conflict, then choose a THIRD, different approach that breaks the cycle."
-                                )
-                                self.last_observation += osc_warning
-                                self.print_func(f"{C_RED}{osc_warning}{C_RESET}")
+                                    "⚠ STUCK — READ THIS: you are alternating between TWO actions (A,B,A,B) with no net "
+                                    "progress — each undoes or ignores the other. Break the cycle: think, then choose a "
+                                    "THIRD, different approach.")
+                                self.print_func(f"{C_RED}{self._stuck_banner}{C_RESET}")
 
                     # --- INTENT-LEVEL STALL DETECTION ---
                     # Catches spinning on the same GOAL across turns even when the exact
@@ -2486,12 +2460,10 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
                                 self._intent_similarity(ints[i], ints[i + 1]) >= 0.5
                                 for i in range(len(ints) - 1)):
                             stall_note = (
-                                f"\n\n** STALL WARNING: your stated intent has been essentially the same "
-                                f"for {self.recent_intents.maxlen} turns ('{intent[:120]}') without resolving it. "
-                                f"You may be making no real progress on this goal. Re-read your ATTEMPT LOG, "
-                                f"question the assumption behind this intent, and either change approach or switch "
-                                f"to a different sub-task. **"
-                            )
+                                f"\n\n[stall] Your intent has been essentially the same for "
+                                f"{self.recent_intents.maxlen} turns ('{intent[:120]}') without resolving it. Re-read "
+                                f"your ATTEMPT LOG, question the assumption behind it, and change approach or switch "
+                                f"sub-task.")
                             self.last_observation += stall_note
                             self.print_func(f"{C_YELLOW}{stall_note}{C_RESET}")
 
@@ -2518,23 +2490,19 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
                                 f"same move, all no-progress (varying a detail is not a new approach).")
                             if stop:
                                 self._stuck_banner = (
-                                    "===[ ! STUCK — READ THIS FIRST ]===\n"
-                                    f"{self._no_progress_streak} attempts at this SAME move have all failed the same "
-                                    "way. Tweaking one value (another username, another suffix) is NOT a new approach "
-                                    "and will keep failing. STOP this sub-task NOW: switch to a genuinely different "
-                                    "method/provider/target, or if none exists, report the blocker to the user "
-                                    "(say_to_user / task_complete). Do NOT attempt this move again.\n"
-                                    "===[ END STUCK ]===")
+                                    f"⚠ STUCK — READ THIS: {self._no_progress_streak} attempts at this SAME move have all "
+                                    "failed the same way. Tweaking one value is not a new approach and will keep failing. "
+                                    "STOP this sub-task now: switch to a genuinely different method/target, or report the "
+                                    "blocker to the user (say_to_user / task_complete). Do NOT attempt this move again.")
                             else:
                                 self._stuck_banner = (
-                                    "===[ ! STUCK — READ THIS FIRST ]===\n"
-                                    f"You have made the SAME move {self._no_progress_streak}x with the same no-progress "
-                                    "result, changing only an incidental detail each time — that is NOT progress. This "
-                                    "turn: use `think` to name the real blocker, then change the METHOD (different "
-                                    "target / provider / approach), not just another value.\n"
-                                    "===[ END STUCK ]===")
-                            self.last_observation += "\n\n" + self._stuck_banner
-                            self.print_func(f"{C_RED}\n\n{self._stuck_banner}{C_RESET}")
+                                    f"⚠ STUCK — READ THIS: you've made the SAME move {self._no_progress_streak}x with the "
+                                    "same no-progress result, changing only an incidental detail — that is not progress. "
+                                    "Think to name the real blocker, then change the METHOD (different target/approach), "
+                                    "not just another value.")
+                            # The banner renders at the top of the CURRENT STATE block next turn; do
+                            # not also append it to last_observation (that showed the same text twice).
+                            self.print_func(f"{C_RED}{self._stuck_banner}{C_RESET}")
 
                     if norm_cmd and not loop_detected and not no_progress:
                         # A CONSEQUENTIAL action ran, it was not a loop, and it actually
@@ -2556,12 +2524,9 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
                 # when there is a single lone sub-agent it is merely supervising.
                 if self._consecutive_passive_turns >= 2:
                     idle_note = (
-                        f"\n\n** IDLE WARNING: your last {self._consecutive_passive_turns} turns did NO real work "
-                        f"— only watching/polling background agents or thinking. Supervising is not a substitute "
-                        f"for working. THIS turn either advance your OWN orthogonal sub-task (edit/run/write), "
-                        f"spawn additional sub-agents for other independent threads, or collect a finished "
-                        f"report — do not poll again. **"
-                    )
+                        f"\n\n[idle] Your last {self._consecutive_passive_turns} turns did no real work (only "
+                        f"watching/polling/thinking). This turn, advance your OWN sub-task (edit/run/write), fan out "
+                        f"sub-agents for independent threads, or collect a finished report — don't poll again.")
                     self.last_observation += idle_note
                     self.print_func(f"{C_YELLOW}{idle_note}{C_RESET}")
 
