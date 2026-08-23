@@ -29,12 +29,14 @@ structured element snapshot AND the annotated screenshot.
 """
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import random
 import time
 from typing import Any, Dict, List, Optional
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import Request as URLRequest, urlopen
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -53,12 +55,36 @@ from patchright.async_api import async_playwright, Page, BrowserContext, Error a
 # runs `uvicorn server:app` from /app where both files sit side by side.
 from human_motion import mouse_path, scroll_ticks, type_delays, idle_drift_target
 from browser_util import (
-    is_destructive_dialog, parse_proxy, valid_timezone, primary_locale,
+    bearer_is_authorized, is_destructive_dialog, parse_proxy, primary_locale,
+    read_auth_token, valid_timezone,
 )
 
 app = FastAPI()
+BROWSER_API_VERSION = "human_v6"
 
 # --- Configuration ----------------------------------------------------------
+BROWSER_AUTH_TOKEN_FILE = os.environ.get(
+    "AEON_BROWSER_TOKEN_FILE", "/run/secrets/aeon_browser_token"
+)
+# Load this before accepting any request. A missing or insecure secret prevents
+# uvicorn from starting instead of silently exposing the persistent browser.
+BROWSER_AUTH_TOKEN = read_auth_token(BROWSER_AUTH_TOKEN_FILE)
+
+
+@app.middleware("http")
+async def require_browser_login(request: Request, call_next):
+    """Require the private login token for every endpoint, including health."""
+    if not bearer_is_authorized(
+        request.headers.get("authorization", ""), BROWSER_AUTH_TOKEN
+    ):
+        return JSONResponse(
+            status_code=401,
+            content={"status": "error", "detail": "Browser API login required"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await call_next(request)
+
+
 # Each agent gets its OWN browser context (own cookie jar, storage, history) so
 # parallel agents are independent identities instead of colliding in one profile.
 # A profile is a directory under PROFILE_ROOT; "default" (== the legacy
@@ -96,27 +122,55 @@ def _resolve_geo():
     loc = os.environ.get("AEON_BROWSER_LOCALE")
     geoloc = None
     if not (tz and loc):
-        try:
-            # Route the lookup through the SAME proxy the browser will use, so the
-            # reported location (and thus the tz/locale/coords we set) matches
-            # where the BROWSER appears from — not the host — when proxied.
-            proxy_raw = (os.environ.get("AEON_BROWSER_PROXY") or "").strip()
-            req = Request("https://ipapi.co/json/", headers={"User-Agent": "Mozilla/5.0"})
-            if proxy_raw:
-                from urllib.request import ProxyHandler, build_opener
-                opener = build_opener(ProxyHandler({"http": proxy_raw, "https": proxy_raw}))
-                resp = opener.open(req, timeout=5)
-            else:
-                resp = urlopen(req, timeout=4)
-            with resp as r:
-                d = json.loads(r.read().decode())
-            tz = tz or d.get("timezone")
-            loc = loc or primary_locale(d.get("languages", ""))  # "en-US,haw,fr" -> "en-US"
-            lat, lon = d.get("latitude"), d.get("longitude")
-            if lat is not None and lon is not None:
-                geoloc = {"latitude": float(lat), "longitude": float(lon), "accuracy": 50.0}
-        except Exception as e:
-            print(f"[browser] geo lookup failed ({e}); using configured defaults.")
+        # Route lookup through the SAME proxy as Chrome. ipapi routinely rate
+        # limits shared/cloud egress, so use two independent providers before
+        # falling back. No IP/address is logged or returned to the agent.
+        proxy_raw = (os.environ.get("AEON_BROWSER_PROXY") or "").strip()
+        opener = None
+        if proxy_raw:
+            from urllib.request import ProxyHandler, build_opener
+            opener = build_opener(ProxyHandler({"http": proxy_raw, "https": proxy_raw}))
+        country_locales = {
+            "US": "en-US", "GB": "en-GB", "CA": "en-CA", "AU": "en-AU",
+            "NZ": "en-NZ", "DE": "de-DE", "FR": "fr-FR", "ES": "es-ES",
+            "IT": "it-IT", "PT": "pt-PT", "BR": "pt-BR", "MX": "es-MX",
+            "JP": "ja-JP", "KR": "ko-KR", "CN": "zh-CN", "TW": "zh-TW",
+            "HK": "zh-HK", "IN": "en-IN", "NL": "nl-NL", "PL": "pl-PL",
+            "TR": "tr-TR", "SE": "sv-SE", "NO": "no-NO", "DK": "da-DK",
+            "FI": "fi-FI",
+        }
+        failures = []
+        for provider, endpoint in (
+            ("ipwho", "https://ipwho.is/"),
+            ("ipapi", "https://ipapi.co/json/"),
+        ):
+            try:
+                req = URLRequest(endpoint, headers={"User-Agent": "Mozilla/5.0"})
+                response = opener.open(req, timeout=5) if opener else urlopen(req, timeout=5)
+                with response as r:
+                    d = json.loads(r.read().decode())
+                if provider == "ipwho":
+                    if d.get("success") is False:
+                        raise ValueError(str(d.get("message") or "provider rejected lookup"))
+                    zone = (d.get("timezone") or {}).get("id")
+                    languages = ""
+                    country = str(d.get("country_code") or "").upper()
+                else:
+                    zone = d.get("timezone")
+                    languages = d.get("languages", "")
+                    country = str(d.get("country_code") or "").upper()
+                tz = tz or zone
+                loc = loc or primary_locale(languages) or country_locales.get(country)
+                lat, lon = d.get("latitude"), d.get("longitude")
+                if lat is not None and lon is not None:
+                    geoloc = {
+                        "latitude": float(lat), "longitude": float(lon), "accuracy": 50.0
+                    }
+                break
+            except Exception as exc:
+                failures.append(f"{provider}:{type(exc).__name__}")
+        if not (tz or loc or geoloc):
+            print(f"[browser] geo lookup failed ({', '.join(failures)}); using configured defaults.")
     tz = tz or TIMEZONE
     loc = loc or LOCALE
     # A malformed timezone from the lookup would make BOTH the Chrome and the
@@ -151,6 +205,10 @@ last_elements: Dict[str, Dict[int, Dict[str, Any]]] = {}
 frame_maps: Dict[str, Dict[int, Any]] = {}
 # id(page) -> list of recent dialog/download notes to surface in the next obs
 page_events: Dict[int, List[str]] = {}
+# id(page) -> one-shot native-dialog policy for the current action. Policies
+# expire quickly so an action that did not open a dialog cannot affect a later
+# unrelated prompt.
+dialog_policies: Dict[int, Dict[str, Any]] = {}
 _popup_counter = 0
 # Popup page-keys already announced to the agent, so each new tab is surfaced once.
 _announced_popups: set = set()
@@ -195,7 +253,7 @@ def _tabs_for(profile: str, session_id: str) -> List[str]:
 # Builds the stable element index. Stamps data-aeon-id on each visible
 # interactable/meaningful node and returns role/name/value/state/geometry.
 _EXTRACT_JS = r"""
-({maxEls, startId}) => {
+({maxEls, startId, searchText, roleFilter}) => {
   // Clear any previous marks so ids are reassigned deterministically.
   document.querySelectorAll('[data-aeon-id]').forEach(e => e.removeAttribute('data-aeon-id'));
 
@@ -209,6 +267,9 @@ _EXTRACT_JS = r"""
   // Semantic, non-interactive containers worth surfacing (e.g. inbox rows).
   const SEMANTIC = '[role=row],[role=listitem],[role=article],[role=heading],[role=gridcell],[role=cell]';
   const MATCH = INTERACTIVE + ',' + SEMANTIC;
+  const SEARCHABLE_TEXT = 'p,li,dt,dd,th,td,h1,h2,h3,h4,h5,h6,pre,code,blockquote';
+  const query = (searchText || '').trim().toLowerCase();
+  const wantedRole = (roleFilter || '').trim().toLowerCase();
 
   function implicitRole(el) {
     const tag = el.tagName.toLowerCase();
@@ -278,17 +339,78 @@ _EXTRACT_JS = r"""
   // Python by running this same script in every frame.
   const seen = new Set();
   const cands = [];
+  // Non-actionable visual regions used only to make lossless 2x crops for the
+  // multimodal model.  They deliberately do NOT receive action ids: the normal
+  // indexed element list remains the sole interaction contract.
+  const regions = [];
+  const regionKeys = new Set();
   function consider(el) {
     if (seen.has(el)) return;
     seen.add(el);
     let ok = false;
-    try { ok = el.matches && el.matches(MATCH); } catch (e) { ok = false; }
+    try {
+      ok = el.matches && (el.matches(MATCH) || (query && el.matches(SEARCHABLE_TEXT)));
+    } catch (e) { ok = false; }
+    if (ok && query) {
+      const hay = (accName(el) + ' ' + (el.value || '') + ' ' +
+                   (el.getAttribute('title') || '') + ' ' +
+                   (el.getAttribute('alt') || '')).toLowerCase();
+      if (!hay.includes(query)) ok = false;
+    }
+    if (ok && wantedRole) {
+      const actualRole = (el.getAttribute('role') || implicitRole(el)).toLowerCase();
+      if (actualRole !== wantedRole) ok = false;
+    }
     if (ok) {
       const s = window.getComputedStyle(el);
       if (!(s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity || '1') === 0)) {
         const r = el.getBoundingClientRect();
         if (r.width >= 2 && r.height >= 2) cands.push({ el: el, r: r });
       }
+    }
+    if (regions.length < 24) {
+      try {
+        const tag = (el.tagName || '').toLowerCase();
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        const ident = [el.id, el.className, el.getAttribute('aria-label'),
+                       el.getAttribute('title'), el.getAttribute('src')]
+          .map(x => String(x || '')).join(' ').toLowerCase();
+        let kind = '';
+        if (/captcha|recaptcha|hcaptcha|turnstile|verify.you.are.human|security.challenge/.test(ident)) {
+          kind = 'verification';
+        } else if (role === 'alert' || el.getAttribute('aria-invalid') === 'true' ||
+                   /(^|[ _-])(error|invalid|warning)([ _-]|$)/.test(ident)) {
+          kind = 'error';
+        } else if (tag === 'table' || role === 'table' || role === 'grid') {
+          kind = 'table';
+        } else if (tag === 'canvas' || tag === 'svg' ||
+                   ((tag === 'img' || role === 'img') && /chart|diagram|graph|plot|map/.test(ident))) {
+          kind = 'diagram';
+        }
+        if (kind) {
+          const s = window.getComputedStyle(el);
+          const r = el.getBoundingClientRect();
+          const visible = !(s.visibility === 'hidden' || s.display === 'none' ||
+                            parseFloat(s.opacity || '1') === 0);
+          const intersects = r.bottom > 0 && r.right > 0 &&
+                             r.top < window.innerHeight && r.left < window.innerWidth;
+          const minW = kind === 'error' ? 20 : 60;
+          const minH = kind === 'error' ? 10 : 30;
+          const key = kind + ':' + Math.round(r.x / 8) + ':' + Math.round(r.y / 8) + ':' +
+                      Math.round(r.width / 8) + ':' + Math.round(r.height / 8);
+          if (visible && intersects && r.width >= minW && r.height >= minH && !regionKeys.has(key)) {
+            regionKeys.add(key);
+            let label = accName(el).replace(/\s+/g, ' ').trim();
+            if (label.length > 160) label = label.slice(0, 160) + '…';
+            regions.push({
+              kind: kind,
+              label: label,
+              rect: {x: Math.round(r.x), y: Math.round(r.y),
+                     w: Math.round(r.width), h: Math.round(r.height)}
+            });
+          }
+        }
+      } catch (e) {}
     }
   }
   function walk(root) {
@@ -341,6 +463,7 @@ _EXTRACT_JS = r"""
   const de = document.scrollingElement || document.documentElement;
   return {
     elements: results,
+    visualRegions: regions,
     nextId: startId + n,
     page: {
       scrollY: Math.round(window.scrollY),
@@ -484,6 +607,52 @@ _READABILITY_JS = r"""
 }
 """
 
+# Compact grounded text for every normal observation. Unlike read_text (a full
+# article/document extraction), this is limited to meaningful blocks intersecting
+# the current viewport, so the agent can notice status banners, modal text, and
+# non-interactive results without paying for an entire page body every turn.
+_VISIBLE_TEXT_JS = r"""
+() => {
+  const selectors = [
+    'h1','h2','h3','h4','h5','h6','p','li','dt','dd','th','td','caption','legend',
+    '[role=alert]','[role=status]','[role=dialog]','[aria-live]','main','article'
+  ].join(',');
+  const out = [], seen = new Set();
+  for (const el of document.querySelectorAll(selectors)) {
+    const s = getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity || '1') === 0) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1 || r.bottom <= 0 || r.right <= 0 || r.top >= innerHeight || r.left >= innerWidth) continue;
+    let text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!text || text.length > 800 || seen.has(text)) continue;
+    seen.add(text); out.push(text);
+    if (out.join('\n').length >= 5000) break;
+  }
+  return out.join('\n').slice(0, 5000);
+}
+"""
+
+
+async def _visible_text(page: Page) -> str:
+    chunks = []
+    seen = set()
+    total = 0
+    for frame in page.frames[:12]:
+        try:
+            value = await frame.evaluate(_VISIBLE_TEXT_JS)
+        except Exception:
+            continue
+        value = str(value or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        room = 6000 - total
+        if room <= 0:
+            break
+        chunks.append(value[:room])
+        total += min(len(value), room)
+    return "\n\n".join(chunks)[:6000]
+
 
 # ============================================================================
 # Browser lifecycle
@@ -540,13 +709,9 @@ async def _ensure_browser(profile: str = DEFAULT_PROFILE):
         # navigator.webdriver=true (bot.sannysoft "WebDriver (New): present (failed)").
         # It's a launch flag — invisible to page JS, no detectable shim — that makes
         # navigator.webdriver read false exactly like a normal browser.
-        # NOTE: the window comes up at Chrome's small default (~945x973) because
-        # --start-maximized is a no-op under Xvfb (no window manager). Pages still
-        # render and read correctly at that size; a naive `--window-size=1920,1080`
-        # here does NOT fix it and in fact yields a 0-width window under this
-        # headed-Xvfb setup ("Cannot take screenshot with 0 width"), so enlarging
-        # the viewport needs a real fix (correct Xvfb geometry / a minimal WM /
-        # Playwright viewport sizing), not a flag swap. Left as-is deliberately.
+        # Openbox runs over Xvfb (entrypoint.sh), so --start-maximized produces a
+        # real, internally consistent 1920x1080 desktop instead of Chrome's small
+        # no-window-manager default (~945x973).
         args = ["--no-sandbox", "--disable-dev-shm-usage", "--start-maximized",
                 "--disable-blink-features=AutomationControlled"]
         # GPU-accelerated WebGL (only when the container has a GPU, signalled by
@@ -618,7 +783,58 @@ def _on_context_close(profile: str):
 
 
 def _note_event(page: Page, msg: str):
-    page_events.setdefault(id(page), []).append(msg)
+    """Record bounded, de-duplicated browser-engine evidence for the next turn."""
+    clean = str(msg or "").replace("\n", " ").strip()[:500]
+    if not clean:
+        return
+    events = page_events.setdefault(id(page), [])
+    if clean not in events[-12:]:
+        events.append(clean)
+    del events[:-40]
+
+
+def _event_url(raw: str) -> str:
+    """Remove query/fragment credentials from a diagnostic URL."""
+    try:
+        parts = urlsplit(str(raw or ""))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))[:240]
+    except Exception:
+        return "(unknown URL)"
+
+
+def _on_request_failed(page: Page, request):
+    try:
+        if request.resource_type not in {"document", "xhr", "fetch"}:
+            return
+        failure = request.failure or "request failed"
+        _note_event(
+            page,
+            f"[network:{request.resource_type}] {failure} — {_event_url(request.url)}",
+        )
+    except Exception:
+        pass
+
+
+def _on_response(page: Page, response):
+    try:
+        kind = response.request.resource_type
+        if response.status < 400 or kind not in {"document", "xhr", "fetch"}:
+            return
+        _note_event(
+            page,
+            f"[http:{response.status}:{kind}] {_event_url(response.url)}",
+        )
+    except Exception:
+        pass
+
+
+def _on_console(page: Page, message):
+    try:
+        level = str(message.type or "").lower()
+        if level in {"error", "warning"}:
+            _note_event(page, f"[console:{level}] {str(message.text or '')[:300]}")
+    except Exception:
+        pass
 
 
 def _setup_page(page: Page):
@@ -626,6 +842,10 @@ def _setup_page(page: Page):
     page.on("dialog", lambda d: asyncio.create_task(_handle_dialog(page, d)))
     page.on("download", lambda d: asyncio.create_task(_handle_download(page, d)))
     page.on("crash", lambda: _note_event(page, "[page crashed — reload or re-navigate]"))
+    page.on("requestfailed", lambda request: _on_request_failed(page, request))
+    page.on("response", lambda response: _on_response(page, response))
+    page.on("console", lambda message: _on_console(page, message))
+    page.on("pageerror", lambda error: _note_event(page, f"[page JS error] {str(error)[:300]}"))
 
 
 async def _handle_dialog(page: Page, dialog):
@@ -636,9 +856,48 @@ async def _handle_dialog(page: Page, dialog):
     # It is told, and can redo it deliberately if that was actually the intent.
     dtype = dialog.type
     msg = (dialog.message or "")[:200]
+    policy = dialog_policies.pop(id(page), None) or {}
+    if float(policy.get("expires", 0)) < time.monotonic():
+        policy = {}
+    requested = str(policy.get("action") or "auto").lower()
+    if requested == "dismiss":
+        _note_event(page, f"[dialog:{dtype}] {msg} -> DISMISSED (explicit response)")
+        try:
+            await dialog.dismiss()
+        except Exception:
+            pass
+        return
+    if requested == "accept":
+        prompt_text = str(policy.get("text") or "")
+        _note_event(
+            page,
+            f"[dialog:{dtype}] {msg} -> ACCEPTED (explicit response"
+            + (" with supplied prompt text)" if dtype == "prompt" else ")"),
+        )
+        try:
+            await dialog.accept(prompt_text if dtype == "prompt" else "")
+        except Exception:
+            try:
+                await dialog.dismiss()
+            except Exception:
+                pass
+        return
     if dtype in ("confirm", "prompt") and is_destructive_dialog(msg):
         _note_event(page, f"[dialog:{dtype}] {msg} -> DISMISSED (looked destructive; NOT auto-confirmed). "
-                          f"If you truly intended this, repeat the action to go through with it.")
+                          f"If intended, repeat with dialog_action='accept'.")
+        try:
+            await dialog.dismiss()
+        except Exception:
+            pass
+        return
+    # A prompt needs intentional text. Dismissing it is more truthful than
+    # silently submitting an empty value; the agent can repeat with dialog_text.
+    if dtype == "prompt":
+        _note_event(
+            page,
+            f"[dialog:prompt] {msg} -> DISMISSED (no dialog_text supplied; repeat with "
+            f"dialog_action='accept' and dialog_text='...')",
+        )
         try:
             await dialog.dismiss()
         except Exception:
@@ -927,6 +1186,11 @@ async def _human_type(page: Page, locator, text: str, clear_first: bool, then_en
     await _human_pause()
     if clear_first:
         await _human_field_clear(page, locator)
+    await _human_type_text(page, text, then_enter)
+
+
+async def _human_type_text(page: Page, text: str, then_enter: bool = False):
+    """Type into the currently focused target with a natural per-key cadence."""
     # Real per-key cadence with occasional inter-word hesitation (see type_delays).
     for ch, d in zip(text, type_delays(text)):
         await page.keyboard.type(ch)
@@ -934,6 +1198,52 @@ async def _human_type(page: Page, locator, text: str, clear_first: bool, then_en
     if then_enter:
         await _human_pause()
         await page.keyboard.press("Enter")
+
+
+async def _coordinate_target(page: Page, x: Optional[float], y: Optional[float]) -> Dict[str, Any]:
+    """Validate a screenshot coordinate and describe the DOM target under it."""
+    if x is None or y is None:
+        raise HTTPException(status_code=400, detail="coordinate action requires x and y.")
+    try:
+        px, py = float(x), float(y)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="x and y must be numbers.")
+    vp = await _viewport_size(page)
+    if not vp or not (0 <= px < vp["w"] and 0 <= py < vp["h"]):
+        dims = f"{vp['w']:.0f}x{vp['h']:.0f}" if vp else "unknown"
+        raise HTTPException(
+            status_code=400,
+            detail=f"coordinate ({px:g}, {py:g}) is outside the current viewport ({dims}).",
+        )
+    info = await page.evaluate(
+        """({x,y}) => {
+          const e = document.elementFromPoint(x,y);
+          if (!e) return {tag:'none', role:'', name:''};
+          const text = (e.getAttribute('aria-label') || e.getAttribute('title') ||
+                        e.innerText || e.value || '').replace(/\\s+/g,' ').trim();
+          return {tag:e.tagName.toLowerCase(), role:e.getAttribute('role') || '',
+                  name:text.slice(0,120)};
+        }""",
+        {"x": px, "y": py},
+    )
+    return {"x": px, "y": py, **(info or {})}
+
+
+async def _drag_points(page: Page, start: Dict[str, float], end: Dict[str, float]):
+    await _human_move_to(page, start["x"], start["y"])
+    await _human_pause()
+    await page.mouse.down()
+    await _human_pause(0.08, 0.16)
+    path = mouse_path(
+        (start["x"], start["y"]), (end["x"], end["y"]),
+        jitter=0.5, overshoot=False,
+    )
+    for px, py in path:
+        await page.mouse.move(px, py)
+        await asyncio.sleep(random.uniform(0.010, 0.024))
+    await _human_pause(0.06, 0.14)
+    await page.mouse.up()
+    _cursor["x"], _cursor["y"] = float(end["x"]), float(end["y"])
 
 
 async def _human_set_checked(page: Page, locator, desired: bool):
@@ -1069,13 +1379,15 @@ async def _frame_offset(page: Page, frame) -> Optional[Dict[str, float]]:
     return {"x": box["x"], "y": box["y"], "iw": 0, "ih": 0}
 
 
-async def _extract(page: Page, profile: str, session_id: str, tab_id: str) -> Dict[str, Any]:
+async def _extract(page: Page, profile: str, session_id: str, tab_id: str,
+                   search_text: str = "", role_filter: str = "") -> Dict[str, Any]:
     """Run the extractor in EVERY frame (main + same/cross-origin iframes), each
     piercing its own shadow DOM, and merge into one globally-numbered element list
     with absolute (main-viewport) coordinates. Tracks which frame owns each id so
     actions can target the right frame."""
     key = _key(profile, session_id, tab_id)
     elements: List[Dict[str, Any]] = []
+    visual_regions: List[Dict[str, Any]] = []
     fmap: Dict[int, Any] = {}
     main_state = {"scrollY": 0, "scrollHeight": 0, "clientHeight": 0,
                   "scrollX": 0, "scrollWidth": 0, "clientWidth": 1920,
@@ -1089,8 +1401,15 @@ async def _extract(page: Page, profile: str, session_id: str, tab_id: str) -> Di
         if off is None:
             continue
         try:
-            data = await frame.evaluate(_EXTRACT_JS, {"maxEls": MAX_INDEXED_ELEMENTS - (start - 1),
-                                                      "startId": start})
+            data = await frame.evaluate(
+                _EXTRACT_JS,
+                {
+                    "maxEls": MAX_INDEXED_ELEMENTS - (start - 1),
+                    "startId": start,
+                    "searchText": search_text,
+                    "roleFilter": role_filter,
+                },
+            )
         except Exception:
             continue
         # A frame can return an unexpected shape (JS quirk, detach mid-eval); skip
@@ -1114,11 +1433,26 @@ async def _extract(page: Page, profile: str, session_id: str, tab_id: str) -> Di
                 e["inFrame"] = True
             fmap[e["id"]] = frame
             elements.append(e)
+        for region in data.get("visualRegions") or []:
+            if not isinstance(region, dict) or not isinstance(region.get("rect"), dict):
+                continue
+            r = region["rect"]
+            ax, ay = r.get("x", 0) + ox, r.get("y", 0) + oy
+            w, h = r.get("w", 0), r.get("h", 0)
+            in_view = (ay + h > 0 and ax + w > 0 and ay < ih and ax < iw)
+            if not in_view:
+                continue
+            visual_regions.append({
+                "kind": str(region.get("kind") or "visual")[:32],
+                "label": str(region.get("label") or "")[:160],
+                "rect": {"x": round(ax), "y": round(ay), "w": w, "h": h},
+                "inFrame": frame != page.main_frame,
+            })
         start = data.get("nextId", start)
 
     last_elements[key] = {e["id"]: e for e in elements}
     frame_maps[key] = fmap
-    return {"elements": elements, "page": main_state}
+    return {"elements": elements, "visual_regions": visual_regions[:24], "page": main_state}
 
 
 # Detects the account the browser is CURRENTLY signed in as, from the page itself.
@@ -1190,12 +1524,16 @@ async def _ensure_paintable(page: Page, tries: int = 40, delay: float = 0.5):
 
 
 async def _build_response(page: Page, profile: str, session_id: str, tab_id: str,
-                          overlay: bool = True) -> Dict[str, Any]:
+                          overlay: bool = True, search_text: str = "",
+                          role_filter: str = "") -> Dict[str, Any]:
     # Reliably surface any tab the site just opened, and prune any that closed,
     # before we report open_tabs — so popup handling never races an async event.
     await _reconcile_pages(profile, page)
     _announce_new_tabs(profile, page)
-    extracted = await _extract(page, profile, session_id, tab_id)
+    extracted = await _extract(
+        page, profile, session_id, tab_id,
+        search_text=search_text, role_filter=role_filter,
+    )
 
     # Clean viewport screenshot (readable, real resolution) + Set-of-Mark overlay
     # drawn from the merged absolute coordinates (covers iframe/shadow elements).
@@ -1230,6 +1568,7 @@ async def _build_response(page: Page, profile: str, session_id: str, tab_id: str
 
     title = await page.title()
     identity = await _detect_identity(page)
+    visible_text = await _visible_text(page)
     # Drain any dialog/download notes captured since the last observation.
     events = page_events.pop(id(page), [])
     return {
@@ -1239,10 +1578,15 @@ async def _build_response(page: Page, profile: str, session_id: str, tab_id: str
         "url": page.url,
         "title": title,
         "identity": identity,
+        "visible_text": visible_text,
+        "content_hash": hashlib.sha256(visible_text.encode("utf-8")).hexdigest()[:16],
+        "search": ({"text": search_text, "role": role_filter}
+                   if search_text or role_filter else None),
         "clean_b64": base64.b64encode(clean_bytes).decode(),
         # Present only when the numbered overlay was actually drawn this call.
         "overlay_b64": base64.b64encode(overlay_bytes).decode() if overlay_bytes is not None else None,
         "elements": extracted["elements"],
+        "visual_regions": extracted["visual_regions"],
         "page_state": extracted["page"],
         "validation": await _scrape_validation(page),
         "events": events,
@@ -1301,6 +1645,16 @@ class TabRequest(BaseModel):
     overlay: Optional[bool] = True
 
 
+class FindRequest(TabRequest):
+    text: str
+    role: Optional[str] = None
+
+
+class ExtractRequest(TabRequest):
+    mode: str
+    max_items: int = 200
+
+
 class ProfileRequest(BaseModel):
     profile: str = DEFAULT_PROFILE
 
@@ -1322,6 +1676,12 @@ class InteractRequest(BaseModel):
     clear_first: Optional[bool] = True      # for type
     then_enter: Optional[bool] = False      # for type
     duration: Optional[int] = 2000          # press_and_hold ms
+    x: Optional[float] = None               # screenshot-space coordinate actions
+    y: Optional[float] = None
+    to_x: Optional[float] = None            # drag_at destination
+    to_y: Optional[float] = None
+    dialog_action: Optional[str] = None      # auto | accept | dismiss
+    dialog_text: Optional[str] = None        # text for a native prompt
     overlay: Optional[bool] = True          # draw+shoot the Set-of-Mark overlay (skip when no vision needed)
 
 
@@ -1331,6 +1691,85 @@ class CaptureRequest(BaseModel):
     profile: str = DEFAULT_PROFILE
     media_id: Optional[int] = None          # which enumerated item to save; None -> just list them
     duration_s: Optional[int] = 8           # for the video screen-recording fallback
+
+
+_STRUCTURED_EXTRACT_JS = r"""
+({mode, maxItems}) => {
+  const clean = v => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  const roots = [document];
+  const seen = new Set();
+  for (let ri = 0; ri < roots.length; ri++) {
+    const root = roots[ri];
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot && !seen.has(el.shadowRoot)) {
+        seen.add(el.shadowRoot); roots.push(el.shadowRoot);
+      }
+    }
+  }
+  const all = selector => {
+    const out = [];
+    for (const root of roots) for (const el of root.querySelectorAll(selector)) out.push(el);
+    return out;
+  };
+  const visible = el => {
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0 &&
+           (r.width > 0 || r.height > 0);
+  };
+  const label = el => {
+    const aria = clean(el.getAttribute('aria-label'));
+    if (aria) return aria;
+    const ids = clean(el.getAttribute('aria-labelledby'));
+    if (ids) {
+      const t = clean(ids.split(/\s+/).map(id => document.getElementById(id)?.innerText || '').join(' '));
+      if (t) return t;
+    }
+    if (el.labels?.length) {
+      const t = clean(Array.from(el.labels).map(x => x.innerText).join(' '));
+      if (t) return t;
+    }
+    return clean(el.placeholder || el.title || el.name || el.id || '');
+  };
+  if (mode === 'links') {
+    return all('a[href]').filter(visible).slice(0, maxItems).map(a => ({
+      text: clean(a.innerText || a.getAttribute('aria-label') || a.title).slice(0, 500),
+      href: a.href, target: a.target || '', rel: a.rel || ''
+    }));
+  }
+  if (mode === 'forms') {
+    const controls = all('input,select,textarea,button,[contenteditable=true],[role=textbox],[role=combobox]')
+      .filter(el => visible(el) && String(el.type || '').toLowerCase() !== 'hidden')
+      .slice(0, maxItems);
+    return controls.map(el => {
+      const type = String(el.type || el.getAttribute('role') || el.tagName).toLowerCase();
+      const isSecret = type === 'password';
+      const item = {
+        tag: el.tagName.toLowerCase(), type, label: label(el), name: el.name || '',
+        id: el.id || '', required: !!el.required || el.getAttribute('aria-required') === 'true',
+        disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+        checked: typeof el.checked === 'boolean' ? el.checked : null,
+        value: isSecret ? '[REDACTED]' : clean(el.value || el.innerText).slice(0, 1000),
+        form: clean(el.form?.getAttribute('aria-label') || el.form?.name || el.form?.id || '')
+      };
+      if (el.tagName.toLowerCase() === 'select') {
+        item.options = Array.from(el.options).slice(0, 200).map(o => ({
+          label: clean(o.text), value: o.value, selected: o.selected, disabled: o.disabled
+        }));
+      }
+      return item;
+    });
+  }
+  if (mode === 'tables') {
+    return all('table,[role=table],[role=grid]').filter(visible).slice(0, 50).map((table, index) => {
+      const rows = Array.from(table.querySelectorAll('tr,[role=row]')).slice(0, maxItems);
+      const matrix = rows.map(row => Array.from(row.querySelectorAll('th,td,[role=columnheader],[role=rowheader],[role=gridcell],[role=cell]'))
+        .slice(0, 50).map(cell => clean(cell.innerText).slice(0, 1000)));
+      return {index, caption: clean(table.caption?.innerText || table.getAttribute('aria-label') || ''), rows: matrix};
+    });
+  }
+  return [];
+}
+"""
 
 
 # ============================================================================
@@ -1348,12 +1787,12 @@ async def _pwerror_handler(request: Request, exc: PWError):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "auth_required": True, "api_version": BROWSER_API_VERSION}
 
 
 @app.get("/ping")
 async def ping():
-    return {"status": "pong", "version": "human_v2"}
+    return {"status": "pong", "auth_required": True, "version": BROWSER_API_VERSION}
 
 
 # Schemes that are complete as-is (no host to prepend). "javascript" is
@@ -1472,6 +1911,18 @@ async def interact(req: InteractRequest):
         a = "select_option"
     if a == "select_option" and req.value is None and req.text is not None:
         req.value = req.text
+    dialog_action = str(req.dialog_action or "auto").strip().lower()
+    if dialog_action not in {"auto", "accept", "dismiss"}:
+        raise HTTPException(
+            status_code=400,
+            detail="dialog_action must be auto, accept, or dismiss.",
+        )
+    request_dialog_policy = {
+        "action": dialog_action,
+        "text": req.dialog_text or "",
+        "expires": time.monotonic() + 30.0,
+    }
+    dialog_policies[id(page)] = request_dialog_policy
 
     # ---- page-level actions that need no element ----
     try:
@@ -1512,8 +1963,12 @@ async def interact(req: InteractRequest):
             await _settle_action(page)
             return await _build_response(page, profile, req.session_id, req.tab_id, overlay=req.overlay)
         if a == "wait_for":
-            await _do_wait(page, req)
-            return await _build_response(page, profile, req.session_id, req.tab_id, overlay=req.overlay)
+            wait_note = await _do_wait(page, req)
+            response = await _build_response(
+                page, profile, req.session_id, req.tab_id, overlay=req.overlay
+            )
+            response.setdefault("events", []).insert(0, wait_note)
+            return response
         if a == "read_text":
             # PDFs render in Chrome's viewer plugin, so their text is NOT in the
             # DOM. Fetch the bytes through the browser context (same cookies/proxy)
@@ -1554,6 +2009,65 @@ async def interact(req: InteractRequest):
         if a in ("get_page_text", "get_text") and req.element_id is None:
             return {"text": (await page.inner_text("body"))[:14000]}
 
+        # Screenshot-coordinate actions are the fallback for canvas, maps, remote
+        # desktops, games, and controls with no useful DOM/accessibility node.
+        # Coordinates are always validated against the CURRENT viewport, and the
+        # DOM target beneath the point is surfaced as ground truth afterward.
+        if a in {
+            "click_at", "double_click_at", "right_click_at", "hover_at",
+            "type_at", "drag_at", "press_and_hold_at",
+        }:
+            source_url = page.url
+            point = await _coordinate_target(page, req.x, req.y)
+            if a == "hover_at":
+                await _human_move_to(page, point["x"], point["y"])
+            elif a == "drag_at":
+                end = await _coordinate_target(page, req.to_x, req.to_y)
+                await _drag_points(page, point, end)
+            elif a == "press_and_hold_at":
+                await _human_move_to(page, point["x"], point["y"])
+                await page.mouse.down()
+                await asyncio.sleep(max(0, min(int(req.duration or 2000), 120000)) / 1000)
+                await page.mouse.up()
+            else:
+                await _human_move_to(page, point["x"], point["y"])
+                await _human_pause()
+                button = "right" if a == "right_click_at" else "left"
+                clicks = 2 if a == "double_click_at" else 1
+                await page.mouse.click(
+                    point["x"], point["y"], button=button, click_count=clicks,
+                    delay=random.randint(40, 110),
+                )
+                if a == "type_at":
+                    await _human_pause()
+                    if req.clear_first:
+                        await page.keyboard.press("Control+A")
+                        await _human_pause(0.03, 0.09)
+                        await page.keyboard.press("Delete")
+                    await _human_type_text(
+                        page, req.text or "", bool(req.then_enter)
+                    )
+            await _settle_action(page)
+            resp = await _build_response(
+                page, profile, req.session_id, req.tab_id, overlay=req.overlay
+            )
+            target = f"{point.get('tag') or 'unknown'}"
+            if point.get("role"):
+                target += f" role={point['role']}"
+            if point.get("name"):
+                target += f" name={point['name']!r}"
+            resp.setdefault("events", []).insert(
+                0, f"[coordinate target] ({point['x']:g}, {point['y']:g}) -> {target}",
+            )
+            if page.url == source_url:
+                resp["action_focus"] = {
+                    "label": target,
+                    "source_url": source_url,
+                    "rect": {"x": point["x"] - 2, "y": point["y"] - 2,
+                             "w": 4, "h": 4},
+                }
+            return resp
+
         # ---- element-targeted actions ----
         if req.element_id is None:
             raise HTTPException(status_code=400, detail=f"action '{a}' requires element_id.")
@@ -1578,6 +2092,29 @@ async def interact(req: InteractRequest):
         except PWError:
             raise HTTPException(status_code=404,
                                 detail=f"Element [{req.element_id}] is no longer on the page. Re-read it.")
+
+        action_focus = None
+        if a != "get_text":
+            try:
+                # Capture the resolved target before the action.  The post-action
+                # extractor reassigns ids and therefore cannot safely recover this
+                # rectangle after a re-render.
+                await loc.scroll_into_view_if_needed(timeout=5000)
+                box = await loc.bounding_box()
+                if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                    snap = last_elements.get(
+                        _key(profile, req.session_id, req.tab_id), {}
+                    ).get(req.element_id, {})
+                    label = str(snap.get("name") or snap.get("value") or
+                                f"element [{req.element_id}]")[:160]
+                    action_focus = {
+                        "label": label,
+                        "source_url": page.url,
+                        "rect": {"x": round(box["x"]), "y": round(box["y"]),
+                                 "w": round(box["width"]), "h": round(box["height"])},
+                    }
+            except PWError:
+                action_focus = None
 
         # Pre-click enabled guard: a coordinate click bypasses Playwright's enabled
         # check, so clicking a disabled control silently does nothing. Wait briefly
@@ -1665,12 +2202,19 @@ async def interact(req: InteractRequest):
         # did not change, rather than inferring "rejected/taken" and looping.
         if click_blocked_note:
             resp.setdefault("events", []).insert(0, click_blocked_note)
+        if action_focus and page.url == action_focus["source_url"]:
+            resp["action_focus"] = action_focus
         return resp
 
     except HTTPException:
         raise
     except PWError as e:
         raise HTTPException(status_code=500, detail=f"Browser action '{a}' failed: {e}")
+    finally:
+        # Do not let an explicit response leak into a later unrelated dialog if
+        # this action never opened one. Identity-check protects a newer request.
+        if dialog_policies.get(id(page)) is request_dialog_policy:
+            dialog_policies.pop(id(page), None)
 
 
 # Scrolls the nearest scrollable ancestor of an element on the requested axis
@@ -1792,31 +2336,28 @@ async def _do_drag(page: Page, src_id: int, dst_id: int, profile: str = None,
         raise HTTPException(status_code=500,
                             detail="Could not locate drag source/target geometry (both must be on-screen; "
                                    "scroll them into view first).")
-    await _human_move_to(page, sc["x"], sc["y"])
-    await _human_pause()
-    await page.mouse.down()
-    # Humans press, pause, THEN drag; a drag path is straighter and steadier than
-    # a free move (no overshoot), but still curved and time-sampled so drag-aware
-    # UIs (sortables, canvases, sliders) register natural motion.
-    await _human_pause(0.08, 0.16)
-    path = mouse_path((sc["x"], sc["y"]), (dc["x"], dc["y"]),
-                      jitter=0.5, overshoot=False)
-    for (px, py) in path:
-        await page.mouse.move(px, py)
-        await asyncio.sleep(random.uniform(0.010, 0.024))
-    await _human_pause(0.06, 0.14)
-    await page.mouse.up()
-    _cursor["x"], _cursor["y"] = float(dc["x"]), float(dc["y"])
+    # Humans press, pause, THEN drag; _drag_points provides the same bounded,
+    # time-sampled path for element and coordinate drags.
+    await _drag_points(page, sc, dc)
 
 
-async def _do_wait(page: Page, req: InteractRequest):
+async def _do_wait(page: Page, req: InteractRequest) -> str:
+    started = time.monotonic()
     if req.text:
         try:
             await page.get_by_text(req.text, exact=False).first.wait_for(timeout=(req.duration or 10000))
-        except PWError:
-            pass
+        except PWError as exc:
+            elapsed = time.monotonic() - started
+            return (
+                f"[wait:TIMEOUT after {elapsed:.1f}s] text {req.text!r} did not appear; "
+                f"condition was NOT satisfied ({str(exc).splitlines()[0][:120]})."
+            )
+        elapsed = time.monotonic() - started
+        return f"[wait:satisfied after {elapsed:.1f}s] text {req.text!r} appeared."
     else:
-        await asyncio.sleep((req.duration or 2000) / 1000)
+        delay_ms = max(0, min(int(req.duration or 2000), 120000))
+        await asyncio.sleep(delay_ms / 1000)
+        return f"[wait:completed] paused for {delay_ms / 1000:.1f}s."
 
 
 @app.post("/observe")
@@ -1834,6 +2375,77 @@ async def observe(req: TabRequest):
         except Exception:
             pass
     return await _build_response(page, profile, req.session_id, req.tab_id, overlay=req.overlay)
+
+
+@app.post("/find")
+async def find_on_page(req: FindRequest):
+    """Return a filtered, actionable observation for semantic page matches."""
+    profile = _safe_profile(req.profile)
+    await _ensure_browser(profile)
+    page = await _get_page(profile, req.session_id, req.tab_id)
+    query = (req.text or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="find requires non-empty text")
+    return await _build_response(
+        page, profile, req.session_id, req.tab_id, overlay=req.overlay,
+        search_text=query[:300], role_filter=(req.role or "")[:80],
+    )
+
+
+@app.post("/extract")
+async def extract_page(req: ExtractRequest):
+    """Return grounded text or structured links/forms/tables across all frames."""
+    profile = _safe_profile(req.profile)
+    await _ensure_browser(profile)
+    page = await _get_page(profile, req.session_id, req.tab_id)
+    mode = (req.mode or "").strip().lower()
+    if mode not in {"text", "links", "forms", "tables"}:
+        raise HTTPException(status_code=400, detail="extract mode must be text, links, forms, or tables")
+    limit = max(1, min(int(req.max_items or 200), 500))
+    if mode == "text":
+        best = ""
+        for frame in page.frames[:MAX_FRAMES]:
+            try:
+                value = await frame.evaluate(_READABILITY_JS)
+            except Exception:
+                continue
+            if value and len(value) > len(best):
+                best = value
+        if not best:
+            try:
+                best = await page.inner_text("body")
+            except PWError:
+                best = ""
+        return {"text": (best or "")[:50000]}
+
+    frames = []
+    remaining = limit
+    for frame in page.frames[:MAX_FRAMES]:
+        if remaining <= 0:
+            break
+        try:
+            items = await frame.evaluate(
+                _STRUCTURED_EXTRACT_JS,
+                {"mode": mode, "maxItems": remaining},
+            )
+        except Exception:
+            continue
+        if items:
+            frames.append({"frame_url": frame.url, "items": items})
+            # Tables are grouped objects; count their rows toward the requested
+            # bound. Other modes have one array item per extracted entity.
+            if mode == "tables":
+                used = sum(len(t.get("rows") or []) for t in items)
+            else:
+                used = len(items)
+            remaining -= max(1, used)
+    result = {
+        "mode": mode,
+        "page_url": page.url,
+        "truncated": remaining <= 0,
+        "frames": frames,
+    }
+    return {"text": json.dumps(result, ensure_ascii=False, indent=2)[:50000]}
 
 
 # --- Media capture (save an image/video the agent sees on the page) ----------

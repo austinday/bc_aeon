@@ -15,7 +15,12 @@
 
 4) PERSISTENCE: Always write outputs to a mounted volume -v host_dir:container_dir.
 
-5) GPU USAGE: Always use --gpus flag when running GPU workloads. Default to using gpu1 and avoid using -all. Check gpu usage before allocating memory to avoid a crash.
+5) GPU USAGE: Never assume GPU0/GPU1 or use `nvidia-smi` as inventory. On the
+   managed fleet, obtain every GPU through the cooperative coordinator on .177,
+   launch with its UUID plus claim ID and truthful hard VRAM cap, and preserve at
+   least 6 GB for renters. A single sufficiently large GPU may host both the LLM
+   and a tool under separate shareable leases; the coordinator decides admission.
+   Never use `--gpus all`.
 
 6) OWNERSHIP: Always use -u $(id -u):$(id -g) to match Host user. Avoids root output files.
 

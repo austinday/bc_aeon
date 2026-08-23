@@ -1,11 +1,28 @@
 Metadata-Version: 2.4
 Name: aeon
-Version: 0.1.0
-Requires-Python: >=3.6
+Version: 0.2.0
+Requires-Python: >=3.10
 Requires-Dist: openai>=1.12.0
 Requires-Dist: psutil
 Requires-Dist: nvidia-ml-py3
 Requires-Dist: requests
 Requires-Dist: huggingface_hub
+Requires-Dist: prompt_toolkit>=3.0
+Requires-Dist: Pillow
+Requires-Dist: tiktoken
+Requires-Dist: PyYAML
+Provides-Extra: analysis
+Requires-Dist: numpy; extra == "analysis"
+Requires-Dist: pandas; extra == "analysis"
+Requires-Dist: h5py; extra == "analysis"
+Requires-Dist: biopython; extra == "analysis"
+Requires-Dist: PyMuPDF; extra == "analysis"
+Requires-Dist: nbformat; extra == "analysis"
+Provides-Extra: remote
+Requires-Dist: fastapi>=0.115; extra == "remote"
+Requires-Dist: uvicorn[standard]>=0.30; extra == "remote"
+Requires-Dist: argon2-cffi>=23.1; extra == "remote"
+Requires-Dist: psutil>=5.9; extra == "remote"
+Dynamic: provides-extra
 Dynamic: requires-dist
 Dynamic: requires-python

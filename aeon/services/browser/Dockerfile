@@ -1,9 +1,13 @@
 FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 
+# start_browser.sh refuses older images without this marker so a stale,
+# unauthenticated browser backend can never be launched accidentally.
+LABEL com.bc_aeon.browser.auth="required-v1"
+
 # Install REAL Google Chrome (for channel='chrome' max-stealth browsing) plus
 # Xvfb so Chrome can run HEADED (far less detectable than headless).
-RUN apt-get update && apt-get install -y \
-    xvfb curl wget gnupg python3-pip ffmpeg \
+RUN export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install -y \
+    xvfb openbox curl wget gnupg python3-pip ffmpeg tzdata \
  && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
       | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
  && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
@@ -25,6 +29,10 @@ RUN python3 -m patchright install chromium
 RUN mkdir -p /profiles
 
 COPY . .
+
+# Capability marker checked by the launcher so an authenticated but stale image
+# cannot silently run without coordinate actions/dialog policy/extraction.
+LABEL com.bc_aeon.browser.api="human-v6"
 
 # COPY . . placed server.py and entrypoint.sh directly in /app, which matches
 # entrypoint.sh running `uvicorn server:app` from /app.

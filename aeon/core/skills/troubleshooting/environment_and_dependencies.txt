@@ -18,7 +18,10 @@
 - The real error is usually a missing system library, compiler, or header — look for "fatal error: X.h: No such file", "gcc: not found", "cmake", or a missing `-dev`/`-devel` package. Install the system dep, OR (better) use a PREBUILT WHEEL or a conda-forge build instead of compiling. Containerize to pin the toolchain.
 
 5. GPU / CUDA (read carefully — versions confuse everyone):
-- The framework's CUDA build must be compatible with the DRIVER, not the system CUDA toolkit. `nvidia-smi` shows the driver and its MAX supported CUDA; a pip wheel (e.g. torch) bundles its OWN CUDA runtime. You do NOT need a matching system CUDA toolkit for pip wheels.
+- The framework's CUDA build must be compatible with the driver, not necessarily
+  the system CUDA toolkit; a pip wheel may bundle its own CUDA runtime. On the
+  managed fleet, do not use NVML-visible devices as inventory—use the coordinator
+  and inspect package/runtime versions independently.
 - Symptoms: "CUDA driver version is insufficient for CUDA runtime" (driver too old for the wheel), "no kernel image is available for execution on the device" (wheel built for a different GPU arch), `torch.cuda.is_available()==False` (wrong build / driver / container without `--gpus`). Install the framework build that matches your driver and GPU arch.
 - "CUDA out of memory" is a RUNTIME problem, NOT a version bug: lower batch size, add gradient accumulation, use mixed precision (bf16) / gradient checkpointing, or clear cached memory (`torch.cuda.empty_cache()`). See machine_learning/deep_learning_training.
 

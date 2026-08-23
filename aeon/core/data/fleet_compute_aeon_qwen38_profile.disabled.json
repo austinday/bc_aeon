@@ -1,0 +1,40 @@
+{
+  "profile_id": "aeon-qwen38-standard",
+  "version": 1,
+  "enabled": false,
+  "mode": "service",
+  "project": "aeon",
+  "purpose": "Qwen3.8-27B primary control and multimodal inference for active Aeon sessions",
+  "adapter": "aeon-qwen38-runtime-v1",
+  "vram_budget_gb": 48.7,
+  "min_physical_vram_gb": 90.0,
+  "exclusive": true,
+  "min_host_memory_gb": 96,
+  "min_host_commit_gb": 96,
+  "min_disk_free_gb": 32,
+  "min_shm_free_gb": 16,
+  "idle_timeout_seconds": 180,
+  "heartbeat_interval_seconds": 240,
+  "startup_timeout_seconds": 2100,
+  "demand_ttl_seconds": 300,
+  "target_concurrency": 4,
+  "max_replicas": 1,
+  "max_attempts": 3,
+  "personal_priority": 30,
+  "retry_base_seconds": 15,
+  "retry_max_seconds": 120,
+  "hard_cap_mechanism": "exclusive lease plus release-bound vLLM gpu_memory_utilization=0.415; lease GPU_MEM_LIMIT_GB and UUID/claim bindings are mandatory",
+  "artifact_identity": {
+    "image": "d57400972ab0ae46baac64d4bfcc49cb136c07d8b0c50a76c7e2d81bd8a9fe47",
+    "model_manifest": "1a3ba1eb88d0507bdef3798a6db59830dc076199b7db7d111201f6997588220e",
+    "model_sha256s": "e7eca7ebee03c4f27482d4fe421ca1fac9f1d9986663a51fd7614361010c1237",
+    "runtime_capabilities": "52e2d54b70c14eefac3d5cae796b1f1ce40ececb95961a42d1c8ec6457254b6a"
+  },
+  "placements": [
+    {
+      "host": "192.168.0.177",
+      "physical_gpu": 0,
+      "enabled": true
+    }
+  ]
+}

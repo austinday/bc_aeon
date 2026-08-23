@@ -28,7 +28,8 @@ TOP_LEVEL_TOOLS = {
     # a core capability; hiding them in a collapsed category left the model unable
     # to see HOW to use them, so it improvised (curl to "navigate", a hallucinated
     # browser_driver module to type). Always-visible is worth the tokens here.
-    'browser_navigate', 'browser_interact', 'browser_read',
+    'browser_navigate', 'browser_interact', 'browser_read', 'browser_find',
+    'browser_extract',
     'browser_switch_tab', 'browser_close_tab', 'browser_capture_media',
 }
 
@@ -37,7 +38,7 @@ TOP_LEVEL_TOOLS = {
 # When expanded, subcategories and/or tool descriptions become visible.
 TOOL_CATEGORIES = {
     'image_tools': {
-        'description': 'AI image generation, editing, analysis, and print preprocessing (FLUX/ComfyUI, Gemma-4 vision)',
+        'description': 'AI image generation, editing, analysis, and print preprocessing (FLUX/ComfyUI, Qwen3.8 vision)',
         'tools': [
             'generate_image',
             'edit_image',

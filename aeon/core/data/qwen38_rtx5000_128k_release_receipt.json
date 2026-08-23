@@ -1,0 +1,44 @@
+{
+  "schema_version": "aeon-qwen38-rtx5000-release-v1",
+  "status": "passed",
+  "completed_at": "2026-08-23T01:28:00Z",
+  "capability_candidate_manifest_sha256": "a12a42546be7fb174e2e1f583491a7aace2bddbd7569a0129a35c7fc119f803a",
+  "host": "192.168.0.180",
+  "hostname": "DAY2XRTX5000PRO-2",
+  "gpu_model": "NVIDIA RTX PRO 5000 Blackwell",
+  "memory_total_mib": 48935,
+  "vram_budget_gib": 41.25,
+  "context_tokens": 131072,
+  "runtime": {
+    "image_id": "sha256:d57400972ab0ae46baac64d4bfcc49cb136c07d8b0c50a76c7e2d81bd8a9fe47",
+    "model_manifest_sha256": "1a3ba1eb88d0507bdef3798a6db59830dc076199b7db7d111201f6997588220e",
+    "model_sha256s_sha256": "e7eca7ebee03c4f27482d4fe421ca1fac9f1d9986663a51fd7614361010c1237",
+    "vllm_version": "0.23.0",
+    "weight_kernel": "FlashInferCutlassNvFp4LinearKernel",
+    "attention_backend": "TRITON_ATTN",
+    "kv_cache_dtype": "fp8_per_token_head",
+    "mtp_k": 3,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 8192,
+    "available_kv_tokens": 290230,
+    "largest_sampled_memory_used_mib": 35254
+  },
+  "gates": {
+    "structured_text_and_vision_warmup": true,
+    "semantic_mtp_requests_passed": 8,
+    "serial_median_decode_tps": 104.77155118981536,
+    "long_prompt_tokens": 125985,
+    "long_context_exact_recall": true,
+    "batch_8_aggregate_decode_tps": 529.7566102061243,
+    "batch_scale_vs_suite_serial": 6.683947626994925,
+    "normal_aeon_spill_start": true,
+    "normal_aeon_vision_selftest": true,
+    "normal_aeon_workspace_pwd": "/home/aday/bc_aeon",
+    "exact_teardown_and_release": true
+  },
+  "raw_reports": {
+    "mtp_k3_sha256": "407fc29128d5559b0ff03c5ebb513c52903ea9188456d67f091b5fd33d304985",
+    "long_batch_sha256": "4a59fbc47ffcd6f92007790a0027dab208de1d26f0bf50838750e8313140e780",
+    "full_release_receipt_sha256": "6e366082f0f9d71b44f23d147ad422e52903d9356b71fd9bb00c2ae0b1bb59f4"
+  }
+}

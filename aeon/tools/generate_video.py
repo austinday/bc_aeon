@@ -258,7 +258,7 @@ class GenerateVideoTool(ComfyUITool):
         staged_video = None
 
         try:
-            self._ensure_comfyui_running(required_vram=24.0)
+            self._ensure_comfyui_running(required_vram=36.0)
 
             if mode == "extend_video":
                 # Seed from the last frame of the input video, then image_to_video.

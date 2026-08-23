@@ -12,6 +12,14 @@ export DISPLAY=:99
 # Wait for X server to be ready
 sleep 2
 
+# Xvfb is only a display server; without a window manager Chrome ignores
+# --start-maximized and opens at roughly 945x973. A tiny real WM gives Chrome the
+# full common 1920x1080 desktop, fitting more controls into each observation and
+# keeping screen/window geometry internally consistent like a normal desktop.
+echo "Starting Openbox window manager..."
+openbox >/tmp/openbox.log 2>&1 &
+sleep 1
+
 echo "Starting Uvicorn on port ${PORT:-8000}..."
 # Run from /app where server.py is located
 exec python3 -m uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}

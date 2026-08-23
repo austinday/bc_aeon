@@ -114,54 +114,29 @@ else
     log_step "WARNING: no GPU detected; skipping local model downloads."
 fi
 
-# Pre-cache the abliterated Gemma-4 NVFP4 build (the vLLM catalog entry) and its MTP
-# draft into the HF hub cache that the vLLM launcher mounts, so the first agent launch
-# doesn't pay a ~20 GB download. VRAM-gated like the catalog loop above; if skipped, the
-# vLLM launcher still fetches at runtime. The downloader's chown step also repairs the
-# (root-owned) ~/.cache/huggingface so the host user can manage it afterwards.
-# NOTE: google/gemma-4-31B-it-assistant may be gated -- accept its terms once with the
-# account that owns your HF token before running setup, or this phase will fail.
-if python3 -c "import sys; sys.exit(0 if float('${MIN_VRAM}')>0 else 1)" 2>/dev/null \
-   && python3 -c "import sys; sys.exit(0 if 21.0 <= 1.5*float('${MIN_VRAM}') else 1)" 2>/dev/null; then
-    log_step "PHASE 5.6c: Pre-cache Gemma-4-31B NVFP4 (abliterated) + assistant draft for vLLM"
-    HF_HUB_CACHE_DIR="$HOME/.cache/huggingface"
-    mkdir -p "$HF_HUB_CACHE_DIR"
-    GEMMA4_NVFP4_CMD="hf download aday777/gemma-4-31B-it-abliterated-NVFP4 && \
-         hf download google/gemma-4-31B-it-assistant"
-    run_downloader "$HF_HUB_CACHE_DIR/.aeon_gemma4_nvfp4_state" "$SETUP_VERSION:gemma4-nvfp4-vllm" \
-        "$HF_HUB_CACHE_DIR:/root/.cache/huggingface" "$GEMMA4_NVFP4_CMD"
+# Qwen3.8-27B is a locally built, checksum-validated NVFP4 artifact rather than
+# a mutable Hub tag. setup never substitutes or downloads a different model.
+# The build/install workflow places it at this exact path; the runtime catalog
+# hides it until BUILD_MANIFEST.json says complete+validated.
+QWEN38_LOCAL_DIR="$AEON_HOME/models/Qwen3.8-27B-ARA-abliterated-NVFP4-MTP"
+if [ -f "$QWEN38_LOCAL_DIR/BUILD_MANIFEST.json" ]; then
+    log_step "PHASE 5.6d: Found local Qwen3.8-27B ARA NVFP4 + native MTP artifact"
+else
+    log_step "PHASE 5.6d: Qwen3.8 artifact not installed at $QWEN38_LOCAL_DIR"
 fi
 
-# Pre-cache the abliterated Qwen3.6-27B FP8 (8-bit) build for vLLM. NATIVE MTP: the
-# MTP head is baked into this checkpoint, so there is NO separate draft repo to fetch
-# (unlike Gemma-4's assistant). ~31 GiB; VRAM-gated at the same 1.5x-of-one-GPU rule as
-# the catalog entry (weights_gib=32.0). Skipped on small GPUs; the launcher still
-# fetches at runtime if this phase is skipped.
-if python3 -c "import sys; sys.exit(0 if float('${MIN_VRAM}')>0 else 1)" 2>/dev/null \
-   && python3 -c "import sys; sys.exit(0 if 32.0 <= 1.5*float('${MIN_VRAM}') else 1)" 2>/dev/null; then
-    log_step "PHASE 5.6d: Pre-cache Qwen3.6-27B FP8 (abliterated, native MTP) for vLLM"
-    HF_HUB_CACHE_DIR="$HOME/.cache/huggingface"
-    mkdir -p "$HF_HUB_CACHE_DIR"
-    QWEN36_FP8_CMD="hf download kasimat/Qwen3.6-27B-AEON-Ultimate-Uncensored-FP8-MTP"
-    run_downloader "$HF_HUB_CACHE_DIR/.aeon_qwen36_fp8_state" "$SETUP_VERSION:qwen36-27b-fp8-vllm" \
-        "$HF_HUB_CACHE_DIR:/root/.cache/huggingface" "$QWEN36_FP8_CMD"
-fi
-
-# (Removed) PHASE 5.7 used to download the Qwen3.6-35B-A3B GGUF for a dedicated GPU1
-# vision server. Vision now runs on the multimodal Gemma-4 already loaded on GPU0
+# (Removed) PHASE 5.7 used to download a legacy 35B-A3B GGUF for a dedicated GPU1
+# vision server. Vision now runs on the already-loaded multimodal Qwen3.8;
+# topology-aware placement may share one sufficiently large GPU with media tools.
 # (analyze_image reuses it), so that ~21 GB download is no longer needed.
 
 log_step "PHASE 6: Build aeon_vllm:latest Docker image"
 build_image "aeon_vllm:latest" "$PROJECT_ROOT/aeon/services/vllm/Dockerfile" "$PROJECT_ROOT/aeon/services/vllm/"
 
-# (Removed) aeon_llamacpp + aeon_gemma4_mtp builds: the only catalog entries that used
-# them (Qwen3.6-35B text and Gemma-4 Q8_0) were retired in favor of Gemma-4 NVFP4 (vLLM).
-# DeepSeek-V4-Flash uses its own aeon_ds4 image, built below on 96 GB machines.
+# Retired alternate language-model images are intentionally not built. Qwen3.8
+# is Aeon's sole text and vision model and uses aeon_vllm.
 
 if [[ "$LITE_MODE" != "true" ]]; then
-    log_step "PHASE 6.8c: Build aeon_ds4:latest (DeepSeek-V4-Flash fork) Docker image"
-    build_image "aeon_ds4:latest" "$PROJECT_ROOT/aeon/llamacpp/Dockerfile.ds4" "$PROJECT_ROOT/aeon/llamacpp/"
-
     log_step "PHASE 6.9: Build aeon_comfyui:latest Docker image"
     build_image "aeon_comfyui:latest" "$PROJECT_ROOT/aeon/services/comfyui/Dockerfile" "$PROJECT_ROOT/aeon/services/comfyui/"
 
@@ -249,9 +224,6 @@ if [[ "$LITE_MODE" != "true" ]]; then
          rm -rf /models/tmp"
     run_downloader "$COMFY_MODELS_DIR/.ltx_setup_state" "$SETUP_VERSION:ltx_10eros_v12_ablit_${LTX_QUANT}" "$COMFY_MODELS_DIR:/models" "$CMD"
 
-    # PHASE 11 (CyberNeurova DeepSeek V4) is now handled by the GPU-adaptive
-    # catalog loop in PHASE 5.6: it downloads DeepSeek only on machines whose
-    # VRAM can deploy it (e.g. 2x 96 GB), and skips it elsewhere.
     :
 fi
 

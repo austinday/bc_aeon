@@ -1,0 +1,27 @@
+# REVIEW TEMPLATE ONLY.
+# Fleet policy currently forbids installing/enabling another daemon without an
+# explicit policy exception. This file is intentionally not installed.
+[Unit]
+Description=Aeon authenticated remote console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/aday/bc_aeon
+Environment=AEON_REMOTE_ORIGINS=https://aeon.example.com
+Environment=AEON_REMOTE_HOSTS=aeon.example.com
+Environment=AEON_REMOTE_ALLOWED_ROOTS=/home/aday/aeon_workspaces:/home/aday/website_hosting
+Environment=AEON_REMOTE_STATE_DIR=/home/aday/.aeon/remote
+# Optional, mode-0600 local file. It is not created or populated automatically.
+EnvironmentFile=-/home/aday/.config/aeon/external-expert.env
+ExecStart=/home/aday/.local/bin/aeon-remote serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+# Only the web process is managed here. Exact tmux sessions intentionally survive
+# a web-service restart and retain the normal user environment Aeon needs.
+KillMode=process
+UMask=0077
+
+[Install]
+WantedBy=default.target

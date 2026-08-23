@@ -1,5 +1,8 @@
 import psutil
+import json
 import os
+import socket
+import subprocess
 import time
 import fnmatch
 from datetime import datetime
@@ -258,21 +261,69 @@ def get_directory_tree_str(startpath='.', max_depth=None):
     return '\n'.join(lines)
 
 
-# NVML is initialized at most once per process; re-running nvmlInit() every
-# iteration is wasteful. None = not yet tried, True = ready, False = unavailable.
-_NVML_READY = None
+_COORDINATOR = "/home/aday/website_hosting/gpu_coord.py"
+_COORDINATOR_CWD = "/home/aday/website_hosting/ads"
+_COORDINATOR_HOSTNAME = "DAY2RTX6000PRO"
+_COORDINATOR_HOST = "192.168.0.177"
+_GPU_STATUS_CACHE = (0.0, [])
 
 
-def _ensure_nvml():
-    global _NVML_READY
-    if _NVML_READY is None:
-        try:
-            from pynvml import nvmlInit
-            nvmlInit()
-            _NVML_READY = True
-        except Exception:
-            _NVML_READY = False
-    return _NVML_READY
+def _coordinator_gpu_parts():
+    """Return sanitized local GPU status from the sole fleet control plane.
+
+    Direct NVML discovery is forbidden on renter hosts because ACL-hidden devices
+    can be renumbered or disappear.  Physical numbers below are explicitly
+    diagnostic labels from coordinator output, never CUDA selectors.
+    """
+    global _GPU_STATUS_CACHE
+    if socket.gethostname() != _COORDINATOR_HOSTNAME:
+        return ["gpu: coordinator view available only on .177"]
+    now = time.monotonic()
+    cached_at, cached = _GPU_STATUS_CACHE
+    if cached and now - cached_at < 10:
+        return list(cached)
+    try:
+        result = subprocess.run(
+            ["python3", _COORDINATOR, "status", "--json"],
+            cwd=_COORDINATOR_CWD,
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=True,
+        )
+        inventory = json.loads(result.stdout)
+        if not isinstance(inventory, list):
+            raise ValueError("coordinator status is not a list")
+        parts = []
+        for item in inventory:
+            if not isinstance(item, dict) or item.get("host") != _COORDINATOR_HOST:
+                continue
+            try:
+                physical = int(item["physical_gpu"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            state = str(item.get("state") or "UNKNOWN").upper()
+            if not all(ch.isalnum() or ch == "_" for ch in state):
+                state = "UNKNOWN"
+            label = f"physical-gpu{physical}(diagnostic): {state}"
+            util = item.get("utilization_pct")
+            capacity = item.get("vram_share_capacity_mib")
+            if state in {"AVAILABLE", "SHARED_AVAILABLE", "RESERVED", "RESERVED_RUNNING"}:
+                try:
+                    label += f" {max(0, min(100, float(util))):.0f}% util"
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    label += f" {max(0.0, float(capacity)) / 1024.0:.1f}gb allocatable"
+                except (TypeError, ValueError):
+                    pass
+            parts.append(label)
+        if not parts:
+            parts = ["gpu: no local coordinator inventory"]
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
+        return ["gpu: coordinator status unavailable"]
+    _GPU_STATUS_CACHE = (now, list(parts))
+    return parts
 
 
 def get_system_stats() -> str:
@@ -293,22 +344,7 @@ def get_system_stats() -> str:
         f'cpu: {cpu_percent}%',
         f'mem: {svmem.percent}% ({svmem.available / (1024 ** 3):.1f}gb free)',
     ]
-    if _ensure_nvml():
-        try:
-            from pynvml import (nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex,
-                                nvmlDeviceGetUtilizationRates, nvmlDeviceGetMemoryInfo)
-            for i in range(nvmlDeviceGetCount()):
-                try:
-                    handle = nvmlDeviceGetHandleByIndex(i)
-                    util = nvmlDeviceGetUtilizationRates(handle)
-                    mem = nvmlDeviceGetMemoryInfo(handle)
-                    parts.append(f'gpu{i}: {util.gpu}% ({mem.free / (1024 ** 3):.1f}gb free)')
-                except Exception:
-                    parts.append(f'gpu{i}: n/a')
-        except Exception:
-            parts.append('gpu: n/a')
-    else:
-        parts.append('gpu: n/a')
+    parts.extend(_coordinator_gpu_parts())
     return f"**STATS**\n{' | '.join(parts)}"
 
 

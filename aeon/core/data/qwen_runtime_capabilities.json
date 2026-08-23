@@ -1,0 +1,104 @@
+{
+  "capabilities": [
+    {
+      "allowed_physical_gpus": [
+        0
+      ],
+      "compute_profile": "qwen38-vllm",
+      "context_tokens": 114688,
+      "disabled_reason": null,
+      "enabled": true,
+      "exclusive": true,
+      "host": "192.168.0.177",
+      "hostname": "DAY2RTX6000PRO",
+      "image_id": "sha256:d57400972ab0ae46baac64d4bfcc49cb136c07d8b0c50a76c7e2d81bd8a9fe47",
+      "gpu_memory_utilization": 0.415,
+      "key": "qwen38-standard-177-local-docker",
+      "max_batched_tokens": 32768,
+      "max_num_seqs": 1,
+      "model_manifest_sha256": "1a3ba1eb88d0507bdef3798a6db59830dc076199b7db7d111201f6997588220e",
+      "model_sha256s_sha256": "e7eca7ebee03c4f27482d4fe421ca1fac9f1d9986663a51fd7614361010c1237",
+      "min_physical_vram_gb": 90.0,
+      "release_profile": "qwen38-standard-114688-k3",
+      "runtime_adapter": "local-docker",
+      "release_receipt_sha256": null,
+      "vram_budget_gb": 48.7
+    },
+    {
+      "allowed_physical_gpus": [
+        0,
+        1
+      ],
+      "compute_profile": "qwen38-vllm",
+      "context_tokens": 114688,
+      "disabled_reason": "No reviewed aday-owned runtime, transport, or host release receipt exists on .179.",
+      "enabled": false,
+      "exclusive": true,
+      "host": "192.168.0.179",
+      "hostname": "DAY2XRTX6000-2",
+      "image_id": null,
+      "gpu_memory_utilization": 0.415,
+      "key": "qwen38-standard-179-awaiting-runtime",
+      "max_batched_tokens": 32768,
+      "max_num_seqs": 1,
+      "model_manifest_sha256": "1a3ba1eb88d0507bdef3798a6db59830dc076199b7db7d111201f6997588220e",
+      "model_sha256s_sha256": "e7eca7ebee03c4f27482d4fe421ca1fac9f1d9986663a51fd7614361010c1237",
+      "min_physical_vram_gb": 90.0,
+      "release_profile": "qwen38-standard-114688-k3",
+      "runtime_adapter": "remote-bare-unreleased",
+      "release_receipt_sha256": null,
+      "vram_budget_gb": 48.7
+    },
+    {
+      "allowed_physical_gpus": [
+        0,
+        1
+      ],
+      "compute_profile": "qwen38-vllm",
+      "context_tokens": 65536,
+      "disabled_reason": "The 48 GB compact profile has no truthful <=41.7 GiB release receipt.",
+      "enabled": false,
+      "exclusive": true,
+      "host": "192.168.0.178",
+      "hostname": "DAY2XRTX5000",
+      "image_id": "sha256:d57400972ab0ae46baac64d4bfcc49cb136c07d8b0c50a76c7e2d81bd8a9fe47",
+      "gpu_memory_utilization": 0.674,
+      "key": "qwen38-compact-178-disabled",
+      "max_batched_tokens": 32768,
+      "max_num_seqs": 1,
+      "model_manifest_sha256": "1a3ba1eb88d0507bdef3798a6db59830dc076199b7db7d111201f6997588220e",
+      "model_sha256s_sha256": "e7eca7ebee03c4f27482d4fe421ca1fac9f1d9986663a51fd7614361010c1237",
+      "min_physical_vram_gb": 47.0,
+      "release_profile": "qwen38-compact-64k-unreleased",
+      "runtime_adapter": "remote-docker",
+      "release_receipt_sha256": null,
+      "vram_budget_gb": 41.7
+    },
+    {
+      "allowed_physical_gpus": [
+        0,
+        1
+      ],
+      "compute_profile": "qwen38-vllm",
+      "context_tokens": 131072,
+      "disabled_reason": null,
+      "enabled": true,
+      "exclusive": true,
+      "host": "192.168.0.180",
+      "hostname": "DAY2XRTX5000PRO-2",
+      "image_id": "sha256:d57400972ab0ae46baac64d4bfcc49cb136c07d8b0c50a76c7e2d81bd8a9fe47",
+      "gpu_memory_utilization": 0.7,
+      "key": "qwen38-compact-180-128k",
+      "max_batched_tokens": 8192,
+      "max_num_seqs": 8,
+      "model_manifest_sha256": "1a3ba1eb88d0507bdef3798a6db59830dc076199b7db7d111201f6997588220e",
+      "model_sha256s_sha256": "e7eca7ebee03c4f27482d4fe421ca1fac9f1d9986663a51fd7614361010c1237",
+      "min_physical_vram_gb": 47.0,
+      "release_profile": "qwen38-compact-128k-k3",
+      "runtime_adapter": "remote-docker",
+      "release_receipt_sha256": "5eda720a4e168733fd0881cedb144a69f892c707439a8e64304e24ec6a04a91a",
+      "vram_budget_gb": 41.25
+    }
+  ],
+  "schema_version": "aeon-qwen-runtime-capabilities-v1"
+}

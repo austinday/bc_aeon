@@ -1,0 +1,57 @@
+{
+  "base_url": "http://127.0.0.1:8033",
+  "batch": {
+    "best_aggregate_decode_tps": 529.7566102061243,
+    "best_concurrency": 8,
+    "levels": [
+      {
+        "aggregate_decode_tps": 79.25804326571311,
+        "completion_tokens": 384,
+        "concurrency": 1,
+        "max_request_seconds": 4.844257747987285,
+        "median_request_seconds": 4.844257747987285,
+        "wall_seconds": 4.844934143940918
+      },
+      {
+        "aggregate_decode_tps": 105.90181903352908,
+        "completion_tokens": 768,
+        "concurrency": 2,
+        "max_request_seconds": 7.250431544962339,
+        "median_request_seconds": 6.8985257759923115,
+        "wall_seconds": 7.252000079024583
+      },
+      {
+        "aggregate_decode_tps": 285.6030059963973,
+        "completion_tokens": 1536,
+        "concurrency": 4,
+        "max_request_seconds": 5.375533280079253,
+        "median_request_seconds": 5.0626949880388565,
+        "wall_seconds": 5.378094654995948
+      },
+      {
+        "aggregate_decode_tps": 529.7566102061243,
+        "completion_tokens": 3072,
+        "concurrency": 8,
+        "max_request_seconds": 5.796188718057238,
+        "median_request_seconds": 5.681693027494475,
+        "wall_seconds": 5.798889416037127
+      }
+    ],
+    "passed": true,
+    "throughput_scale_vs_serial": 6.683947626994925
+  },
+  "created_at": "2026-08-23T01:24:11.862000+00:00",
+  "long_context": {
+    "answer_tail": "AEON-128K-NEEDLE-7F3C91B2",
+    "completion_tokens": 183,
+    "contains_answer": true,
+    "elapsed_seconds": 172.16435005899984,
+    "exact_answer": true,
+    "passed": true,
+    "prompt_tokens_measured": 125985,
+    "prompt_tokens_reported": 125985
+  },
+  "model": "Qwen3.8-27B-ARA-NVFP4-MTP",
+  "passed": true,
+  "schema_version": 1
+}

@@ -3,7 +3,7 @@ import re
 import time
 import sys
 import os
-import uuid
+import psutil
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -12,6 +12,12 @@ from typing import List, Any, Dict, Callable, Optional
 from .llm import LLMClient
 from .system_info import get_project_tree, get_system_stats
 from .logger import get_logger
+from .presence import Presence, manifest_process_is_live, process_instance_id
+from .runtime_instructions import (
+    format_aeon_runtime_instructions,
+    load_runtime_instructions,
+)
+from .workspace_instructions import load_workspace_instruction_section
 from .utils import estimate_tokens
 from .prompts import (
     CORE_DIRECTIVES,
@@ -58,7 +64,11 @@ PASSIVE_TOOLS = OBSERVATION_TOOLS | {"think", "say_to_user"}
 # read() — which is exactly what the STUCK directive tells it to do, and exactly
 # how a real run slipped the guard (thought it was clicking a button forever).
 # browser_read is included: re-reading the page is inspection, not progress.
-NON_CONSEQUENTIAL_TOOLS = PASSIVE_TOOLS | {"browser_read"}
+# External advice is also observation; only the later action that applies and
+# verifies it may clear a failure streak.
+NON_CONSEQUENTIAL_TOOLS = PASSIVE_TOOLS | {
+    "browser_read", "browser_find", "browser_extract", "consult_external_expert"
+}
 
 # Substrings a tool emits when a state-changing action failed or changed nothing.
 # Shared by _derive_ground_truth_outcome (builds the log tag) and
@@ -66,7 +76,7 @@ NON_CONSEQUENTIAL_TOOLS = PASSIVE_TOOLS | {"browser_read"}
 # two never drift.
 NO_PROGRESS_ERROR_MARKERS = ("COMMAND FAILED", "Tool Execution Error", "Tool Parameter Error",
                              "Browser Error during", "Browser action failed", "Error during ",
-                             "Error executing")
+                             "Error executing", "Error:")
 
 # Parameters that only change how a result is PRESENTED or ASSERTED, never what
 # the action does to the page/world. The loop guard must ignore them when it
@@ -81,7 +91,7 @@ INCIDENTAL_PARAM_KEYS = frozenset({
 
 
 class Worker:
-    def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False, debug_log_path: Optional[str] = None):
+    def __init__(self, llm_client: LLMClient, tools: List[Any] = None, print_func: Callable = print, debug_mode: bool = False, debug_log_path: Optional[str] = None, presence: Optional[Presence] = None):
         self.llm_client = llm_client
         self.debug_log_path = debug_log_path
         self.tools = {tool.name: tool for tool in tools} if tools else {}        
@@ -91,6 +101,14 @@ class Worker:
         ensure_prompt_files(list(self.tools.keys()), get_all_category_paths())
         
         self.logger = get_logger()
+        self.presence = presence
+        self._presence_initialization_attempted = presence is not None
+        # The owning CLI may install a foreground compute-reconciliation hook.
+        # It runs outside the per-iteration recovery ``try`` so an ambiguous
+        # runtime/claim can block inference instead of becoming a two-second
+        # retry loop. The hook itself owns bounded, cancelable waiting when
+        # exact lost compute can safely be re-admitted.
+        self.compute_guard: Optional[Callable[[], None]] = None
         self.print_func = print_func
         self.debug_mode = debug_mode
         if self.tools:
@@ -128,13 +146,29 @@ class Worker:
         self._loop_blocked_fingerprint = None  # Consequential command under a hard loop block (refused until it changes)
         self._loop_block_hits = 0  # How many turns in a row the block has refused the same action (escalation)
         self._no_progress_streak = 0  # Consecutive state-changing turns that made no progress under the same approach
+        self._failures_since_external_consult = 0  # Any consecutive failed local turns; external advice resets this pair counter
         self._last_struct_fp = ""  # Structural fingerprint (tool+verb, text dropped) of the last consequential turn
         self._stuck_banner = ""  # Top-of-prompt STUCK banner, set by loop/oscillation detection
         self.prev_prompt_tokens = 0  # Tracks context size of previous iteration for growth metrics
         self.action_log_summary = ""  # Non-destructive summary of older action log entries
         self._summarized_upto = 0  # Index into action_log below which entries are already folded into the summary
-        self.instance_id = str(uuid.uuid4())[:8]  # Unique ID for this Aeon run instance
-        # Cross-run session persistence (aeon_output/session_state.json). The
+        # A validated dashboard identity wins when one was supplied at launch;
+        # otherwise this is a stable UUID for the current process.  Presence files
+        # still have a separate per-run UUID, so parallel agents never collide.
+        self.instance_id = (
+            str(getattr(presence, "instance_id"))
+            if presence is not None and getattr(presence, "instance_id", None)
+            else process_instance_id()
+        )
+        try:
+            self.process_create_time = float(
+                getattr(presence, "process_create_time", None)
+                or psutil.Process(os.getpid()).create_time()
+            )
+        except (TypeError, ValueError, psutil.Error, OSError):
+            self.process_create_time = None
+        # Cross-run session persistence
+        # (aeon_output/sessions/<instance-id>/session_state.json). The
         # sub-agent wrapper turns this OFF: sub-agents share the principal's cwd
         # (workspace symlink), so with it on they clobber the principal's session
         # file every iteration AND inherit its memories at boot.
@@ -154,10 +188,11 @@ class Worker:
         # Set by the resume_previous_session tool to a restored objective; the run
         # loop adopts it (with a fresh iteration budget) at the top of the next turn.
         self._resume_objective = None
-        # Opt-in message-history mode (real system/assistant/user chat instead of one
-        # giant per-turn prompt) — off by default; the single-prompt path is unchanged.
-        self.use_message_history = os.environ.get("AEON_MESSAGE_HISTORY", "") == "1"
-        self._history_messages = []   # [{role, content}] growing turn history
+        # Real message history is the default because Qwen3.8 can preserve and
+        # reuse native thinking traces from earlier assistant turns. Set
+        # AEON_MESSAGE_HISTORY=0 for a compatibility escape hatch.
+        self.use_message_history = os.environ.get("AEON_MESSAGE_HISTORY", "1") != "0"
+        self._history_messages = []   # [{role, content, reasoning_content?}]
         self._history_seeded = False
         self.model_name = None  # Set by main.py for restart persistence
         self.active_skill = None  # {'path': ..., 'content': ...} when a skill protocol is active
@@ -168,7 +203,42 @@ class Worker:
         # Browser isolation unit: the principal uses the shared, persistent
         # 'default' profile (logins survive); sub_agent_wrapper overrides this so
         # each sub-agent browses in its own isolated context (own cookies/session).
-        self.browser_profile = "default"
+        self.browser_profile = os.environ.get("AEON_BROWSER_PROFILE", "default")
+
+    def _ensure_presence(self) -> Optional[Presence]:
+        """Lazily register Workers that were not created through aeon.main."""
+        if self.presence is not None or self._presence_initialization_attempted:
+            return self.presence
+        self._presence_initialization_attempted = True
+        try:
+            self.presence = Presence(cwd=os.getcwd())
+            self.instance_id = self.presence.instance_id
+            self.process_create_time = self.presence.process_create_time
+            if self.model_name:
+                self.presence.update(model=self.model_name)
+        except Exception as exc:
+            # Presence is observability, never a reason to stop useful agent work.
+            self.logger.warning("Unable to initialize Aeon presence: %s", exc)
+            self.presence = None
+        return self.presence
+
+    def _presence_update(self, **fields: Any) -> None:
+        presence = self.presence
+        if presence is None:
+            return
+        try:
+            presence.update(**fields)
+        except Exception as exc:
+            self.logger.warning("Unable to update Aeon presence: %s", exc)
+
+    def _presence_error(self, error: BaseException) -> None:
+        presence = self.presence
+        if presence is None:
+            return
+        try:
+            presence.mark_error(error)
+        except Exception as exc:
+            self.logger.warning("Unable to record Aeon error presence: %s", exc)
 
     def _init_debug_logging(self):
         """Initialize debug logging once per worker instance."""
@@ -898,6 +968,83 @@ class Worker:
             tag = (tag + streak) if tag else ("NO PROGRESS —" + streak.lstrip())
         return tag
 
+    def _external_replan_context(
+        self,
+        *,
+        objective: str,
+        intent: str,
+        actions: list[str],
+        latest_result: str,
+    ) -> tuple[str, str, str]:
+        """Build the same factual state the next local replanning turn receives."""
+        problem = (
+            "LOCAL OBJECTIVE\n"
+            + self._truncate_output(str(objective or "(unspecified)"), max_chars=2500)
+            + "\n\nFAILED TURN INTENT\n"
+            + self._truncate_output(str(intent or "(unavailable)"), max_chars=1200)
+        )
+        attempt_log = self._get_compressed_attempt_log(pressure="High")
+        attempts = (
+            "CURRENT PLAN\n"
+            + self._truncate_output(str(self.current_plan or "(none)"), max_chars=2500)
+            + "\n\nREGULAR REPLANNING ATTEMPT LOG\n"
+            + self._truncate_output(attempt_log, max_chars=4000)
+            + "\n\nLATEST FAILED ACTIONS\n"
+            + self._truncate_output(", ".join(actions) or "(none)", max_chars=1200)
+            + "\n\nLATEST ERROR / TOOL RESULT\n"
+            + self._truncate_output(str(latest_result or "(no output)"), max_chars=4500)
+            + "\n\nRETRY STATE\n"
+            + f"{self._failures_since_external_consult} consecutive local failures "
+              "since the previous external consultation or verified progress."
+        )
+        question = (
+            "Using exactly this replanning evidence, identify the likely missed "
+            "assumption and recommend the safest materially different next step. "
+            "Say what local evidence would verify or falsify it."
+        )
+        return problem, attempts, question
+
+    def _maybe_auto_consult_external(
+        self,
+        *,
+        objective: str,
+        intent: str,
+        actions: list[str],
+        latest_result: str,
+    ) -> str:
+        """Automatically escalate each pair of consecutive local failures."""
+        if self._failures_since_external_consult < 2:
+            return ""
+        tool = self.tools.get("consult_external_expert")
+        if tool is None:
+            return ""
+        problem, attempts, question = self._external_replan_context(
+            objective=objective,
+            intent=intent,
+            actions=actions,
+            latest_result=latest_result,
+        )
+        self.print_func(
+            f"{C_YELLOW}Two consecutive local failures — consulting the configured "
+            f"external expert with the regular replanning context.{C_RESET}"
+        )
+        try:
+            result = str(tool.execute(
+                problem=problem,
+                attempts=attempts,
+                question=question,
+            ))
+        except Exception as exc:
+            result = (
+                "Error: Automatic external consultation failed: "
+                f"{type(exc).__name__}: {str(exc).splitlines()[0][:300]}"
+            )
+        finally:
+            # A consultation is not task progress. This only starts the next pair
+            # counter; the ordinary STUCK/no-progress state remains armed.
+            self._failures_since_external_consult = 0
+        return result
+
     def _collapse_repeated_entries(self, lines: list) -> list:
         """Collapse runs of attempt-log entries with the same actions AND result
         into a single entry annotated with the repeat count, so the model can
@@ -990,6 +1137,7 @@ class Worker:
         self._loop_blocked_fingerprint = None
         self._loop_block_hits = 0
         self._no_progress_streak = 0
+        self._failures_since_external_consult = 0
         self._last_struct_fp = ""
         self._stuck_banner = ""
         self.recent_intents.clear()
@@ -1023,8 +1171,11 @@ class Worker:
             'notified_jobs': list(self.notified_jobs),
             'active_skill': self.active_skill,
             'instance_id': self.instance_id,
+            'pid': os.getpid(),
+            'process_create_time': self.process_create_time,
             'open_files_list': list(self.open_files.keys()),
             'open_files_access_order': list(self.open_files_access_order),
+            'history_messages': list(self._history_messages),
         }
 
     def restore_state(self, state: dict):
@@ -1038,6 +1189,11 @@ class Worker:
         self.notified_jobs = set(state.get('notified_jobs', []))
         self.active_skill = state.get('active_skill', None)
         self.open_files_access_order = state.get('open_files_access_order', [])
+        history = state.get('history_messages', [])
+        self._history_messages = [dict(m) for m in history
+                                  if isinstance(m, dict) and m.get('role') in {'user', 'assistant'}]
+        self._history_seeded = bool(self._history_messages)
+        self._trim_history()
         
         # Restore the list of open files (placeholders will be synced to actual content by _sync_open_files)
         open_files_list = state.get('open_files_list', [])
@@ -1076,25 +1232,51 @@ class Worker:
 
     # --- CROSS-RUN PERSISTENCE ---
     # serialize_state/restore_state above cover the in-process restart_aeon hop
-    # (via a /tmp pid file). These persist the same state to a STABLE, project-local
-    # path so memories — and, for a resumed objective, the plan and attempt log —
-    # survive the process exiting entirely. Without this a fresh `aeon.main` starts
-    # with total amnesia despite "persistent memory" being a headline feature.
+    # (via a /tmp pid file). These persist to an INSTANCE-SCOPED project-local
+    # path. Multiple Aeon processes may legitimately share a cwd, so a singleton
+    # aeon_output/session_state.json would make them overwrite and inherit one
+    # another's plans. Legacy singleton files remain readable for migration only.
+
+    def _instance_state_dir(self) -> Path:
+        instance_id = str(getattr(self, 'instance_id', '') or process_instance_id())
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", instance_id):
+            instance_id = process_instance_id()
+        return Path(os.getcwd()) / "aeon_output" / "sessions" / instance_id
 
     def _session_state_path(self) -> Path:
-        # aeon_output/ is gitignored and already the per-workspace output root, so
-        # the file is naturally scoped to the project the agent is working in.
-        return Path(os.getcwd()) / "aeon_output" / "session_state.json"
+        return self._instance_state_dir() / "session_state.json"
 
     def _stop_dump_path(self) -> Path:
         """Where an interrupted session's resumable state is written on stop.
 
-        Distinct from session_state.json (the per-iteration auto-checkpoint): the
-        NEXT process — e.g. one running the objective 'continue from where you left
-        off' — overwrites session_state.json every turn, so a dedicated stop-dump
-        is what the resume_previous_session tool reads to pick up the interrupted
-        work faithfully."""
+        Distinct from session_state.json (the per-iteration auto-checkpoint), so
+        resume can prefer an intentional Ctrl+C boundary while retaining the last
+        crash-safe iteration checkpoint as a fallback."""
+        return self._instance_state_dir() / "interrupted_session.json"
+
+    @staticmethod
+    def _legacy_session_state_path() -> Path:
+        return Path(os.getcwd()) / "aeon_output" / "session_state.json"
+
+    @staticmethod
+    def _legacy_stop_dump_path() -> Path:
         return Path(os.getcwd()) / "aeon_output" / "interrupted_session.json"
+
+    def _resume_state_paths(self) -> List[Path]:
+        """Enumerate resumable snapshots without treating active peers as state."""
+        root = Path(os.getcwd()) / "aeon_output"
+        paths = [
+            self._stop_dump_path(),
+            self._session_state_path(),
+            self._legacy_stop_dump_path(),
+            self._legacy_session_state_path(),
+        ]
+        sessions = root / "sessions"
+        if sessions.is_dir():
+            paths.extend(sessions.glob("*/interrupted_session.json"))
+            paths.extend(sessions.glob("*/session_state.json"))
+        # Preserve order while removing the current paths duplicated by glob.
+        return list(dict.fromkeys(paths))
 
     def _write_stop_dump(self, reason: str = "interrupted"):
         """Snapshot the current state to the stop-dump file so a later run can
@@ -1105,6 +1287,7 @@ class Worker:
         try:
             path = self._stop_dump_path()
             path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(path.parent, 0o700)
             data = self.serialize_state()
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             data['saved_at'] = ts
@@ -1114,7 +1297,9 @@ class Worker:
             tmp = str(path) + ".tmp"
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, default=str)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, path)
+            os.chmod(path, 0o600)
             self.print_func(
                 f"{C_YELLOW}\U0001F4BE State saved for resume ({path}). Next run, tell me "
                 f"'continue from where you left off' to pick this up.{C_RESET}")
@@ -1127,20 +1312,27 @@ class Worker:
         memories, plan, attempt log, active skill, and open files, and signals the
         run loop to adopt the restored objective next turn. Returns a summary for
         the model. Backs the resume_previous_session tool."""
-        # Prefer whichever of the stop-dump / auto-checkpoint is NEWER, so the most
-        # recent activity wins (a clean Ctrl+C dump, or the last iteration before a
-        # hard kill that never ran the stop path).
-        candidates = [p for p in (self._stop_dump_path(), self._session_state_path()) if p.exists()]
+        # Prefer the newest INACTIVE snapshot. PID alone is insufficient because
+        # it can be reused; new snapshots carry psutil create time as well. This
+        # prevents "resume" from cloning a parallel agent that is still running.
+        candidates = []
+        for path in self._resume_state_paths():
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                data = json.loads(path.read_text(encoding='utf-8'))
+                if int(data.get('pid') or -1) == os.getpid():
+                    continue
+                if data.get('process_create_time') and manifest_process_is_live(data):
+                    continue
+                candidates.append((path.stat().st_mtime, path, data))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
         if not candidates:
             return ("No previous session state was found in this workspace "
                     f"({self._stop_dump_path()}). There is nothing to resume — ask the user what "
                     "objective to work on, or start fresh.")
-        src = max(candidates, key=lambda p: p.stat().st_mtime)
-        try:
-            with open(src, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as e:
-            return f"Found a state dump at {src} but could not read it: {e}. Ask the user to restate the task."
+        _, src, data = max(candidates, key=lambda item: item[0])
 
         prev_obj = (data.get('objective') or '').strip()
         if not prev_obj:
@@ -1158,6 +1350,11 @@ class Worker:
         self.active_skill = data.get('active_skill') or None
         self.expanded_categories = set(data.get('expanded_categories') or [])
         self.open_files_access_order = list(data.get('open_files_access_order') or [])
+        history = data.get('history_messages') or []
+        self._history_messages = [dict(m) for m in history
+                                  if isinstance(m, dict) and m.get('role') in {'user', 'assistant'}]
+        self._history_seeded = bool(self._history_messages)
+        self._trim_history()
         # Placeholders; _sync_open_files repopulates real content from disk next turn.
         self.open_files = {p: "Restoring from state..." for p in (data.get('open_files_list') or [])}
 
@@ -1215,12 +1412,15 @@ class Worker:
         try:
             path = self._session_state_path()
             path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(path.parent, 0o700)
             data = self.serialize_state()
             data['saved_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             fd, tmp = None, str(path) + ".tmp"
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, path)
+            os.chmod(path, 0o600)
         except Exception as e:
             self.logger.warning(f"Failed to persist session state: {e}")
 
@@ -1243,6 +1443,13 @@ class Worker:
         if self.memories or self.action_log:
             return
         path = self._session_state_path()
+        # One-time compatibility for the old workspace singleton. Never fall
+        # back to another new-format instance automatically; explicit resume is
+        # required so concurrent agents remain isolated.
+        if not path.exists():
+            legacy = self._legacy_session_state_path()
+            if legacy.is_file() and not legacy.is_symlink():
+                path = legacy
         if not path.exists():
             return
         try:
@@ -1268,6 +1475,13 @@ class Worker:
             if data.get('current_plan'):
                 self.current_plan = data['current_plan']
                 restored.append("plan")
+            history = data.get('history_messages') or []
+            self._history_messages = [dict(m) for m in history
+                                      if isinstance(m, dict) and m.get('role') in {'user', 'assistant'}]
+            self._history_seeded = bool(self._history_messages)
+            self._trim_history()
+            if self._history_messages:
+                restored.append(f"{len(self._history_messages)} history message(s)")
 
         if restored:
             saved_at = data.get('saved_at', 'a previous session')
@@ -1432,6 +1646,7 @@ class Worker:
         that cost.
         """
         reminders_section = f"**IMPORTANT REMINDERS**\n{self.important_reminders}\n\n" if self.important_reminders.strip() else ""
+        runtime_instructions = self._runtime_instruction_section()
 
         tools_text = TOOLS_SECTION.format(tools=tool_list_str)
         objective_text = OBJECTIVE_SECTION.format(objective=objective)
@@ -1460,7 +1675,7 @@ class Worker:
 
 {skills_text}
 
-{reminders_section}{PRIMARY_AGENT_INSTRUCTIONS}
+{reminders_section}{PRIMARY_AGENT_INSTRUCTIONS}{runtime_instructions}
 
 {objective_text}
 
@@ -1508,7 +1723,7 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
         )
 
     # ==================================================================
-    # MESSAGE-HISTORY MODE (opt-in via AEON_MESSAGE_HISTORY=1)
+    # MESSAGE-HISTORY MODE (default; disable with AEON_MESSAGE_HISTORY=0)
     # ------------------------------------------------------------------
     # Instead of one giant user prompt per turn, send a real chat: a stable
     # system message (directives + tools + instructions + objective), the growing
@@ -1516,15 +1731,132 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
     # "current state" user message (live tree/memories/plan/open files/result).
     # vLLM prefix-caches the stable system + history, so only the newest turn is
     # prefilled -> lower TTFT on long tasks. Live file sync and dynamic injections
-    # are preserved (they live in the current-state message). Default OFF; the
-    # single-prompt path is unchanged.
+    # are preserved (they live in the current-state message). Qwen3.8's native
+    # reasoning fields travel with assistant turns so later turns can reuse them.
     # ==================================================================
+    def _select_reasoning_effort(self, objective: str, has_images: bool = False,
+                                 context_diagnostics: str = "") -> str:
+        """Choose low/medium/xhigh Qwen3.8 reasoning for this primary turn."""
+        override = os.environ.get("AEON_REASONING_EFFORT", "adaptive").strip().lower()
+        if override in {"low", "medium", "xhigh"}:
+            return override
+
+        observation = str(getattr(self, "last_observation", "") or "")
+        combined = f"{objective or ''}\n{observation}\n{context_diagnostics or ''}".lower()
+
+        # Recovery signals always receive the deepest reasoning, even when the
+        # original task looked simple.
+        if (getattr(self, "_failures_since_external_consult", 0) > 0
+                or getattr(self, "_no_progress_streak", 0) > 0
+                or bool(getattr(self, "_stuck_banner", ""))
+                or re.search(r"\b(retry|failed|failure|exception|traceback|timed? out|"
+                             r"stuck|looping|blocked|invalid json|parse error)\b", combined)):
+            return "xhigh"
+
+        if re.search(
+                r"\b(implement|build|code|coding|debug|fix|refactor|migrate|architect|"
+                r"design|investigate|diagnose|review|security|optimi[sz]e|benchmark|"
+                r"plan|reason|prove|research|integrate|deploy|configure|test suite)\b",
+                combined):
+            return "xhigh"
+
+        simple_task = re.match(
+            r"\s*(summari[sz]e|extract|list|read|find|look up|lookup|identify|describe|"
+            r"transcribe|open|visit|navigate to|go to|click|tell me (?:what|who|where|when))\b",
+            objective or "",
+            flags=re.IGNORECASE)
+        if simple_task and len(objective or "") <= 600:
+            return "low"
+
+        if has_images:
+            return "medium"
+
+        # Open-ended first turns are planning turns; established routine turns
+        # settle to medium after the plan exists.
+        if getattr(getattr(self, "llm_client", None), "current_iteration", 0) <= 1:
+            return "xhigh"
+        return "medium"
+
+    def _local_search_candidate_count(self, objective: str, reasoning_effort: str,
+                                      has_images: bool = False,
+                                      context_diagnostics: str = "") -> int:
+        """Return 1 for the fast path, or 2–3 for a genuinely hard turn.
+
+        Local search is intentionally selective: it is most valuable after an
+        observed failure, on a visually ambiguous browser challenge, or for the
+        first decision of an unusually high-risk/diagnostic task.  Routine turns
+        remain one model call.  ``AEON_LOCAL_SEARCH=off|adaptive|2|3|always`` is an
+        operator escape hatch; all modes still use only the local model.
+        """
+        mode = os.environ.get("AEON_LOCAL_SEARCH", "adaptive").strip().lower()
+        if mode in {"0", "off", "false", "disabled", "none"}:
+            return 1
+        if mode in {"3", "always", "full"}:
+            return 3
+        if mode == "2":
+            return 2
+
+        failures = int(getattr(self, "_failures_since_external_consult", 0) or 0)
+        stalled = int(getattr(self, "_no_progress_streak", 0) or 0)
+        stuck = bool(getattr(self, "_stuck_banner", ""))
+        observation = str(getattr(self, "last_observation", "") or "")
+        combined = f"{objective or ''}\n{observation}\n{context_diagnostics or ''}".lower()
+
+        if stuck or failures >= 2 or stalled >= 2:
+            return 3
+        if failures or stalled or re.search(
+                r"\b(traceback|exception|command failed|tool execution error|timed? out|"
+                r"parse error|invalid json|no change|loop detected|ambiguous|conflict)\b",
+                combined):
+            return 2
+
+        # Visual controls whose decisive evidence is often a tiny/localized patch
+        # deserve two independent readings, but ordinary screenshot turns do not.
+        if has_images and re.search(
+                r"\b(captcha|verify you are human|verification|challenge|form validation|"
+                r"consent wall|small error|blank screenshot|dense table|diagram)\b",
+                combined):
+            return 2
+
+        iteration = int(getattr(getattr(self, "llm_client", None),
+                                "current_iteration", 0) or 0)
+        hard_first_decision = (
+            reasoning_effort == "xhigh" and iteration <= 1 and re.search(
+                r"\b(architect|migration|migrate|security|benchmark|race condition|"
+                r"intermittent|diagnose|forensic|integration review|code review)\b",
+                combined)
+        )
+        return 2 if hard_first_decision else 1
+
+    def _local_search_evidence_hint(self, objective: str) -> str:
+        """Name the authoritative evidence channel for the local verifier."""
+        observation = str(getattr(self, "last_observation", "") or "")
+        low = f"{objective or ''}\n{observation}".lower()
+        if "--- browser:" in low or "interactive elements" in low:
+            return (
+                "Browser task: treat the current DOM element list, validation/events, URL, and attached "
+                "full screenshot/target crops as ground truth; reject stale ids or visual guesses."
+            )
+        if getattr(self, "open_files", None):
+            return (
+                "Code/edit task: ground the choice in current file contents and the latest command/test "
+                "output; prefer a scoped change followed by a targeted test and diff inspection."
+            )
+        return (
+            "System task: ground the choice in the latest command output and observed state; prefer a "
+            "read-only discriminating check before an irreversible action."
+        )
+
     def _build_system_message(self, objective: str, tool_list_str: str,
                               active_tool_directives: str) -> str:
-        """The STATIC system message: who you are, your tools/skills, the rules,
-        and the objective. Must stay stable within a run so the system+history
-        prefix caches (it changes only when tools/categories change — rare)."""
+        """The mostly-static system message: tools, instructions, and objective.
+
+        A managed instance's private Nexus layers are intentionally reloaded on
+        each build.  They normally remain stable (and cacheable), but an explicit
+        dashboard save becomes visible without restarting Aeon.
+        """
         reminders_section = f"**IMPORTANT REMINDERS**\n{self.important_reminders}\n\n" if self.important_reminders.strip() else ""
+        runtime_instructions = self._runtime_instruction_section()
         tools_text = TOOLS_SECTION.format(tools=tool_list_str)
         objective_text = OBJECTIVE_SECTION.format(objective=objective)
         skills_text = self._get_skills_description()
@@ -1539,9 +1871,21 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
 
 {skills_text}
 
-{reminders_section}{PRIMARY_AGENT_INSTRUCTIONS}
+{reminders_section}{PRIMARY_AGENT_INSTRUCTIONS}{runtime_instructions}
 
 {objective_text}"""
+
+    @staticmethod
+    def _runtime_instruction_section() -> str:
+        """Reload private and workspace instruction layers for every prompt."""
+
+        private_layers = format_aeon_runtime_instructions(
+            load_runtime_instructions(
+                expected_instance_id=os.environ.get("AEON_REMOTE_INSTANCE_ID") or None,
+                expected_agent_kind="aeon",
+            )
+        )
+        return private_layers + load_workspace_instruction_section()
 
     def _build_current_state_message(self, project_tree: str, stats_line: str, memories_str: str,
                                      open_files_str: str, sub_agent_digest: str = "",
@@ -1603,7 +1947,16 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
             }, ensure_ascii=False, default=str)
         except Exception:
             compact = json.dumps({"intent": str(response_data.get("intent", ""))})
-        self._history_messages.append({"role": "assistant", "content": compact})
+        assistant_message = {"role": "assistant", "content": compact}
+        reasoning = str(getattr(self.llm_client, "last_reasoning_content", "") or "")
+        if reasoning:
+            # Preserve normal traces verbatim. Bound only a pathological single
+            # trace so it cannot evict the entire action history by itself.
+            max_chars = max(16000, min(96000, int(self.llm_client.context_limit * 1.2)))
+            reasoning = self._truncate_output(reasoning, max_chars=max_chars)
+            assistant_message["reasoning_content"] = reasoning
+            assistant_message["reasoning"] = reasoning
+        self._history_messages.append(assistant_message)
         self._history_messages.append({
             "role": "user",
             "content": self._truncate_output(result_text or "(no output)", max_chars=800)})
@@ -1759,10 +2112,30 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
         background stdin listener is live for its whole duration (letting the user
         type a message mid-run to interrupt it) and is always torn down afterward,
         handing stdin back to the REPL."""
+        presence = self._ensure_presence()
+        if presence is not None:
+            try:
+                presence.start_objective(objective, model=self.model_name)
+            except Exception as exc:
+                self.logger.warning("Unable to start Aeon objective presence: %s", exc)
         self._start_input_listener()
         try:
-            return self._run_objective(objective, max_iterations=max_iterations,
-                                       step_callback=step_callback, terminal_tools=terminal_tools)
+            result = self._run_objective(
+                objective,
+                max_iterations=max_iterations,
+                step_callback=step_callback,
+                terminal_tools=terminal_tools,
+            )
+        except BaseException as exc:
+            self._presence_error(exc)
+            raise
+        else:
+            if presence is not None:
+                try:
+                    presence.mark_completed(current_plan=self.current_plan)
+                except Exception as exc:
+                    self.logger.warning("Unable to complete Aeon presence: %s", exc)
+            return result
         finally:
             self._stop_input_listener()
 
@@ -1776,6 +2149,9 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
         iteration = 0
         self.last_observation = f"User input received: {objective}"
         self._maybe_load_persisted_state(objective)
+
+        if self.compute_guard is not None:
+            self.compute_guard()
 
         # Pre-flight skill routing: one utility-model call that names the best-
         # matching skill protocol (or nothing) so the agent activates it on turn 1
@@ -1794,6 +2170,12 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
         graceful_exit_triggered = False
 
         while True:
+            # A failed Qwen lease heartbeat is a foreground lifecycle event.
+            # Keep this outside the broad iteration exception handler: the
+            # guard either restores exact compute with bounded backoff or
+            # propagates/cancels without a short retry loop.
+            if self.compute_guard is not None:
+                self.compute_guard()
             try:
                 # Type-ahead backstop: if the user submitted a message while the
                 # previous step ran, fold it in before doing anything else. The
@@ -1821,11 +2203,18 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                 iter_start_time = time.time()
                 iteration += 1
                 self.llm_client.set_iteration(iteration)
+                self._presence_update(
+                    phase="thinking",
+                    iteration=iteration,
+                    objective=objective,
+                    current_plan=self.current_plan,
+                    model=self.model_name,
+                )
 
                 display_max = max_iterations if max_iterations is not None else 999
                 if step_callback:
                     # Use the current intent as the step description for telemetry
-                    step_desc = intent if 'intent' in locals() else "Thinking"
+                    step_desc = locals().get("intent", "Thinking")
                     step_callback(iteration, display_max, step_desc)
 
                 if max_iterations is not None and iteration > max_iterations:
@@ -1982,17 +2371,20 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                 # so the model sees the page. Shared by both assembly paths.
                 turn_images = list(self.visual_context)
                 screenshot_note = (
-                    "\n\n**ATTACHED SCREENSHOT (CURRENT BROWSER PAGE)**\n"
-                    "The image attached to this message is the page exactly as it renders in the "
-                    "browser right now — look at it directly, as a human would, to judge layout, read "
-                    "text, spot what changed, and catch anything visual (CAPTCHAs, consent walls, "
-                    "modals, errors). Then act using the [id]s in the INTERACTIVE ELEMENTS list, which "
-                    "index the exact same page. The screenshot and the element list describe ONE page; "
-                    "use both together."
+                    "\n\n**ATTACHED BROWSER VISION (CURRENT PAGE)**\n"
+                    "The attached image set contains the full rendered page and, when a small/dense "
+                    "region matters, lossless 2x crops of that SAME frame. Follow the explicit image "
+                    "ordering in LAST STEP RESULT: use the full frame for context, crops for fine text "
+                    "and local geometry, and before/after frames only for comparison. Catch visual "
+                    "evidence such as verification panels, consent walls, modals, errors, tables, and "
+                    "diagrams. Act only using [id]s from the current INTERACTIVE ELEMENTS list."
                 ) if turn_images else ""
+                reasoning_effort = self._select_reasoning_effort(
+                    objective, has_images=bool(turn_images),
+                    context_diagnostics=diagnostic_str)
 
                 if self.use_message_history:
-                    # --- MESSAGE-HISTORY MODE (opt-in) ---
+                    # --- MESSAGE-HISTORY MODE ---
                     # Stable system + cached turn history + one volatile current-state
                     # message. History is budget-trimmed instead of shedding open files.
                     self._ensure_history_seeded()
@@ -2017,14 +2409,37 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                     growth = prompt_tokens - self.prev_prompt_tokens
                     growth_str = f"{growth:+} tokens" if self.prev_prompt_tokens > 0 else "N/A (first iter)"
                     self.prev_prompt_tokens = prompt_tokens
-                    self.print_func("Thinking (Primary Agent)...")
+                    self.print_func(
+                        f"Thinking (Primary Agent, reasoning={reasoning_effort})...")
                     if turn_images:
                         self.print_func(f"{C_CYAN}\U0001F441 Attaching {len(turn_images)} page screenshot(s) for the model to see.{C_RESET}")
                     self.visual_context = []
-                    response_str = self.llm_client.get_primary_agent_response(
-                        messages=call_messages, diagnostic_str=diagnostic_str, images=turn_images or None)
+                    search_count = self._local_search_candidate_count(
+                        objective, reasoning_effort, has_images=bool(turn_images),
+                        context_diagnostics=diagnostic_str)
+                    if search_count > 1 and hasattr(
+                            self.llm_client, "get_verified_primary_agent_response"):
+                        self.print_func(
+                            f"{C_CYAN}Selective local search: generating {search_count} independent "
+                            "Qwen proposals, then grounding one choice in current evidence.{C_RESET}")
+                        response_str = self.llm_client.get_verified_primary_agent_response(
+                            messages=call_messages, diagnostic_str=diagnostic_str,
+                            images=turn_images or None, reasoning_effort="xhigh",
+                            candidate_count=search_count,
+                            evidence_hint=self._local_search_evidence_hint(objective))
+                        search_info = getattr(self.llm_client, "last_local_search", {}) or {}
+                        if search_info:
+                            self.print_func(
+                                f"{C_GREEN}Local verifier selected candidate "
+                                f"{search_info.get('selected_candidate', 1)}/{search_info.get('requested', search_count)}: "
+                                f"{str(search_info.get('reason', ''))[:240]}{C_RESET}")
+                    else:
+                        response_str = self.llm_client.get_primary_agent_response(
+                            messages=call_messages, diagnostic_str=diagnostic_str,
+                            images=turn_images or None,
+                            reasoning_effort=reasoning_effort)
                 else:
-                    # --- SINGLE-PROMPT MODE (default) ---
+                    # --- SINGLE-PROMPT COMPATIBILITY MODE ---
                     prompt = self._build_primary_agent_context(
                         tool_list_str, project_tree, stats_line, memories_str, objective, open_files_str,
                         active_tool_directives, attempt_log_str, context_diagnostics=diagnostic_str,
@@ -2110,7 +2525,8 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                     # rebuild above — so it is always present when an image is attached.
                     prompt += screenshot_note
 
-                    self.print_func("Thinking (Primary Agent)...")
+                    self.print_func(
+                        f"Thinking (Primary Agent, reasoning={reasoning_effort})...")
 
                     # === PRIMARY AGENT CALL ===
                     # Attach the current page screenshot (if any) so the multimodal
@@ -2120,9 +2536,30 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                     if turn_images:
                         self.print_func(f"{C_CYAN}\U0001F441 Attaching {len(turn_images)} page screenshot(s) for the model to see.{C_RESET}")
                     self.visual_context = []
-                    response_str = self.llm_client.get_primary_agent_response(
-                        prompt=prompt, diagnostic_str=diagnostic_str,
-                        images=turn_images or None)
+                    search_count = self._local_search_candidate_count(
+                        objective, reasoning_effort, has_images=bool(turn_images),
+                        context_diagnostics=diagnostic_str)
+                    if search_count > 1 and hasattr(
+                            self.llm_client, "get_verified_primary_agent_response"):
+                        self.print_func(
+                            f"{C_CYAN}Selective local search: generating {search_count} independent "
+                            "Qwen proposals, then grounding one choice in current evidence.{C_RESET}")
+                        response_str = self.llm_client.get_verified_primary_agent_response(
+                            prompt=prompt, diagnostic_str=diagnostic_str,
+                            images=turn_images or None, reasoning_effort="xhigh",
+                            candidate_count=search_count,
+                            evidence_hint=self._local_search_evidence_hint(objective))
+                        search_info = getattr(self.llm_client, "last_local_search", {}) or {}
+                        if search_info:
+                            self.print_func(
+                                f"{C_GREEN}Local verifier selected candidate "
+                                f"{search_info.get('selected_candidate', 1)}/{search_info.get('requested', search_count)}: "
+                                f"{str(search_info.get('reason', ''))[:240]}{C_RESET}")
+                    else:
+                        response_str = self.llm_client.get_primary_agent_response(
+                            prompt=prompt, diagnostic_str=diagnostic_str,
+                            images=turn_images or None,
+                            reasoning_effort=reasoning_effort)
                 if self.debug_mode:
                     pass
 
@@ -2131,6 +2568,7 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                 except json.JSONDecodeError as e:
                     self.print_func(f"{C_RED}Primary Agent JSON Parse Error: {e}{C_RESET}")
                     self.last_observation = f"JSON Parse Error: {e}"
+                    self._presence_error(e)
                     continue
 
                 # Extract fields
@@ -2159,6 +2597,14 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                         self.current_plan = "\n".join(updated_plan)
                     else:
                         self.current_plan = str(updated_plan)
+
+                self._presence_update(
+                    phase="acting",
+                    iteration=iteration,
+                    intent=intent,
+                    current_plan=self.current_plan,
+                    model=self.model_name,
+                )
 
                 self.print_func(f"\n{C_CYAN}--- PREVIOUS RESULT SUMMARY ---{C_RESET}")
                 self.print_func(f"{previous_result_summary}")
@@ -2268,6 +2714,11 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                     proposed_fp = self._consequential_fp(actions)
                     if proposed_fp and proposed_fp == self._loop_blocked_fingerprint:
                         self._loop_block_hits += 1
+                        expert_option = (
+                            "\n- Re-read the automatic external replan already requested after "
+                            "the second failure, then choose a materially different action."
+                            if "consult_external_expert" in self.tools else ""
+                        )
                         if self._loop_block_hits >= 3:
                             # Repeatedly hammering the same dead action: escalate from
                             # "try something different" to "this path is confirmed dead;
@@ -2280,7 +2731,8 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                                 "This turn you MUST do ONE of:\n"
                                 "- Act on a DIFFERENT element / URL / target, or\n"
                                 "- Execute your stated FALLBACK plan (a different method entirely), or\n"
-                                "- If no path forward exists, call task_complete and report the blocker plainly.\n"
+                                "- If no path forward exists, call task_complete and report the blocker plainly."
+                                f"{expert_option}\n"
                                 "Do NOT re-issue the blocked action; it will keep being refused."
                             )
                         else:
@@ -2529,6 +2981,21 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                     # neither counts as a repeat nor resets an in-progress streak.
                     norm_cmd = self._consequential_fp(actions)
                     no_progress = self._turn_made_no_progress(raw_output, bool(norm_cmd))
+                    if norm_cmd and no_progress:
+                        self._failures_since_external_consult += 1
+                        external_advice = self._maybe_auto_consult_external(
+                            objective=objective,
+                            intent=intent,
+                            actions=actions_taken_str,
+                            latest_result=self.last_observation,
+                        )
+                        if external_advice:
+                            self.last_observation += (
+                                "\n\n**AUTOMATIC EXTERNAL REPLAN AFTER TWO LOCAL FAILURES**\n"
+                                + external_advice
+                            )
+                    elif norm_cmd:
+                        self._failures_since_external_consult = 0
                     if norm_cmd:
                         norm_out = self._normalize_output(raw_output)
                         self._recent_commands.append(norm_cmd)
@@ -2657,11 +3124,18 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                                 f"semantic stall: {self._no_progress_streak} consecutive attempts at the "
                                 f"same move, all no-progress (varying a detail is not a new approach).")
                             if stop:
+                                expert_hint = (
+                                    " External replanning is automatic after each pair of local "
+                                    "failures; use its latest advice only as a hypothesis and verify "
+                                    "the next action locally."
+                                    if "consult_external_expert" in self.tools else ""
+                                )
                                 self._stuck_banner = (
                                     f"⚠ STUCK — READ THIS: {self._no_progress_streak} attempts at this SAME move have all "
                                     "failed the same way. Tweaking one value is not a new approach and will keep failing. "
                                     "STOP this sub-task now: switch to a genuinely different method/target, or report the "
-                                    "blocker to the user (say_to_user / task_complete). Do NOT attempt this move again.")
+                                    "blocker to the user (say_to_user / task_complete). Do NOT attempt this move again."
+                                    f"{expert_hint}")
                             else:
                                 self._stuck_banner = (
                                     f"⚠ STUCK — READ THIS: you've made the SAME move {self._no_progress_streak}x with the "
@@ -2728,6 +3202,7 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
             except Exception as e:
                 self.print_func(f"\n{C_RED}CRITICAL ERROR IN ITERATION: {e}{C_RESET}")
                 self.logger.error(f"Iteration failed: {e}", exc_info=True)
+                self._presence_error(e)
                 if "Context limit exceeded" in str(e):
                     raise
                 # Surface the failure to the model so the NEXT turn can adapt
@@ -2748,6 +3223,18 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code inside st
                     self.last_observation = (
                         f"SYSTEM: The previous iteration failed with an error and was skipped. "
                         f"Reassess and try a different, simpler next step.\n(Error: {err_str[:300]})"
+                    )
+                self._failures_since_external_consult += 1
+                external_advice = self._maybe_auto_consult_external(
+                    objective=objective,
+                    intent="Iteration failed before completing a valid local step",
+                    actions=[],
+                    latest_result=self.last_observation,
+                )
+                if external_advice:
+                    self.last_observation += (
+                        "\n\n**AUTOMATIC EXTERNAL REPLAN AFTER TWO LOCAL FAILURES**\n"
+                        + external_advice
                     )
                 time.sleep(2)
 

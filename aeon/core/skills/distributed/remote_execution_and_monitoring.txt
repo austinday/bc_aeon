@@ -1,0 +1,72 @@
+# DISTRIBUTED SKILL: Run, monitor & control work on remote hosts over SSH.
+# Use to run commands, launch long detached jobs, watch remote GPU/CPU load, or
+# collect logs/results from machines other than this one.
+
+## OBJECTIVE
+Run work on remote hosts reliably: nothing hangs, nothing dies when the SSH session drops, everything you start can be found and killed, and you always know what the hardware is actually doing.
+
+## 1. THE TWO TIMEOUT TRAPS (internalize these — they cause most wasted runs)
+- **Your own tool cap:** `run_command` defaults to 300s and is HARD-CAPPED at 1800s. Any remote job longer than that MUST NOT be run in the foreground — it will be killed mid-flight and you'll misread the kill as a crash.
+- **SSH death kills children:** when the SSH session ends, its remote processes get a SIGHUP and die. A "backgrounded" `ssh host 'python train.py &'` returns instantly and the job dies with the connection. Backgrounding on the remote side is NOT the same as detaching.
+- Both are solved by DETACHING the remote process from the session, then polling a log file with short commands.
+
+## 2. LAUNCH PATTERN FOR LONG WORK (detach + log + record the handle)
+- tmux is the best option — the job survives, and you can re-attach and inspect it later:
+  `ssh gpu1 'tmux new-session -d -s aeon_train "cd /work && ./run.sh > /work/train.log 2>&1"'`
+  Check it: `ssh gpu1 'tmux ls'` / `ssh gpu1 'tmux capture-pane -p -t aeon_train | tail -30'`. Stop it: `ssh gpu1 'tmux kill-session -t aeon_train'`.
+- No tmux? Use `setsid`+`nohup` and CAPTURE THE PID — a job you can't find is a job you can't stop:
+  `ssh gpu1 'cd /work && setsid nohup python train.py > train.log 2>&1 < /dev/null & echo $!'`
+  Record that PID with the host. Stop only the exact verified owned PID with SIGTERM;
+  do not signal an uncertain process or anything inside a renter container.
+- Redirect BOTH streams (`> log 2>&1`) and `< /dev/null`. A remote process that writes to a closed stderr or waits on stdin will block forever with no visible reason.
+- Then poll cheaply and briefly: `ssh gpu1 'tail -5 /work/train.log'` — a fast command with a small, readable answer. Never hold a foreground SSH open for the life of a job.
+
+## 3. PARALLEL FAN-OUT (use your own async jobs)
+- One `run_command_async` per host, then read each with `job_output`. This is the native way to work N hosts at once: it starts no model loop, it's cheap, and finished jobs surface in your BACKGROUND JOBS context automatically.
+- **Do not idle-poll.** Launch the fan-out, go do other work, and read the results when the jobs report done.
+- For GPU capacity, use one coordinator status call on `.177`; do not fan out
+  NVML inventory commands. For CPU-only host probes, parallelized `hostname; nproc`
+  checks are fine.
+- Always label output by host. Unlabeled interleaved output from a parallel fan-out is unreadable and you will misattribute failures.
+
+## 4. THE NON-LOGIN SHELL TRAP (silent, constant, and it will bite you)
+- `ssh host 'python train.py'` runs a NON-INTERACTIVE shell that skips `.bashrc`/`.bash_profile` interactive sections. Your conda env / venv / module loads / PATH edits DO NOT APPLY. You get the system python, a missing package, or the wrong CUDA — and the error looks like a broken install rather than a shell issue.
+- Fix by being explicit, never by hoping:
+  `ssh host 'source /opt/venv/bin/activate && python train.py'`, or use the absolute interpreter: `ssh host '/opt/venv/bin/python train.py'` (most robust — no shell state at all), or for conda: `ssh host 'source ~/miniconda3/etc/profile.d/conda.sh && conda activate ml && python ...'`.
+- Verify the env you *think* you have before the real run: `ssh host '/opt/venv/bin/python -c "import torch;print(torch.__version__, torch.cuda.is_available())"'`.
+- Same principle for paths: `~`, cwd, and mount points differ per host. Use absolute paths and `cd` explicitly.
+
+## 5. QUOTING (local vs remote expansion)
+- Single quotes send the string to the remote host UNEXPANDED: `ssh host 'echo $HOSTNAME'` → the REMOTE hostname.
+- Double quotes expand LOCALLY first: `ssh host "echo $HOSTNAME"` → your own hostname. Both are useful; pick deliberately. Nearly every mystery here is this.
+- For anything with nested quotes or pipes, write a script, `scp` it over, and run it. Fighting a quoting chain through SSH is a waste of time.
+
+## 6. MONITORING GPU/CPU
+- Use coordinator `status`, the claim heartbeat, and exact application logs or
+  checkpoints. Never infer physical availability from NVML-visible numbering.
+- Do not install or launch persistent GPU monitor loops. At each useful progress
+  check (at least every 15 minutes for a live lease), combine one liveness/ACL/
+  coordinator check with the heartbeat and then schedule the next meaningful check.
+- CPU/RAM/IO: `uptime` (load vs `nproc`), `free -g`, `iostat -x 2 3`, `top -bn1 | head -15`.
+- READ THE NUMBERS, DON'T JUST COLLECT THEM. GPU util ~0% while a job "runs" = the GPU is starved (dataloader/IO/CPU-bound), not working. Util ~100% with tiny VRAM use = batch far too small. Rising VRAM each step = a leak (accumulating tensors that still hold their graph). See machine_learning/deep_learning_training.
+
+## 7. MOVING DATA & COLLECTING RESULTS
+- `rsync -az --info=progress2 <src> host:<dst>` beats `scp` — it resumes, it skips unchanged files, it compresses. Use it for code and datasets both.
+- Pull logs/results back to one place, namespaced per host: `rsync -az gpu1:/work/out/ ./results/gpu1/`.
+- If a shared NFS mount exists on all hosts, use it and skip the copying entirely — but verify every host actually sees the same path (`ssh $h 'ls /shared'`), and know that NFS is often too slow to feed a GPU dataloader. For hot training data, stage to LOCAL disk on each node.
+- Big transfers are long jobs too: run them via `run_command_async`, not a foreground command.
+
+## 8. CLEAN UP — ALWAYS
+- Keep a record of everything you started: host, tmux session name or PID, log path. Write it next to the inventory (e.g. `aeon_output/cluster/running.json`).
+- When done or aborting, stop exact owned sessions, verify the tagged process
+  exited, release the claim, and confirm the coordinator reports the expected state.
+- Orphaned remote processes hold VRAM indefinitely and are invisible to you next session — they're the reason the "free" GPU isn't. Never kill PIDs you didn't start; if a host looks occupied by someone else, report it and use another.
+
+## COMMON MISTAKES
+- Foreground SSH for a job longer than the tool cap; reading the resulting kill as a crash.
+- `ssh host 'cmd &'` and assuming it survives — it doesn't. Detach with tmux/setsid.
+- Losing the PID/session name, then being unable to stop a runaway job.
+- Assuming conda/venv is active over SSH (it isn't) and misdiagnosing the ImportError as a broken install.
+- Idle-polling a job instead of launching async and doing other work.
+- Unlabeled parallel output; misattributing one host's failure to another.
+- Leaving monitor loops or dead jobs running after the task ends.

@@ -1,20 +1,17 @@
-"""GPU detection for portable, VRAM-adaptive model deployment.
-
-Single detection path (nvidia-smi) shared by the Python runtime, the deploy
-planner, and setup_environment.sh (via the JSON CLI: `python -m aeon.core.gpu`).
-
-The harness only targets symmetric dual-Blackwell machines (2x RTX 5000 = 48 GB
-each, or 2x RTX 6000 PRO = 96 GB each), so callers generally use min() VRAM
-across the detected GPUs defensively rather than assuming all are identical.
-"""
+"""Coordinator-backed GPU discovery for renter-safe deployment planning."""
 from __future__ import annotations
 
 import json
+import socket
 import subprocess
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import List
 
 MIB_PER_GIB = 1024.0
+COORD = "/home/aday/website_hosting/gpu_coord.py"
+COORD_DIR = "/home/aday/website_hosting/ads"
+LOCAL_HOST = "192.168.0.177"
+LOCAL_HOSTNAME = "DAY2RTX6000PRO"
 
 
 @dataclass(frozen=True)
@@ -26,41 +23,39 @@ class GpuInfo:
 
 
 def detect_gpus(timeout: int = 15) -> List[GpuInfo]:
-    """Return per-GPU info via nvidia-smi. Empty list if no GPUs / no driver."""
-    try:
-        out = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,name,memory.total,memory.free",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=timeout,
-            stderr=subprocess.DEVNULL,
-        )
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+    """Return only coordinator-approved, ACL-open GPUs on the local host."""
+    if socket.gethostname() != LOCAL_HOSTNAME:
         return []
-
-    gpus: List[GpuInfo] = []
-    for line in out.strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 4:
-            continue
-        try:
-            idx = int(parts[0])
-            name = parts[1]
-            total = float(parts[2]) / MIB_PER_GIB
-            free = float(parts[3]) / MIB_PER_GIB
-        except ValueError:
-            continue
-        gpus.append(GpuInfo(index=idx, name=name, total_gib=round(total, 2), free_gib=round(free, 2)))
-    gpus.sort(key=lambda g: g.index)
-    return gpus
+    try:
+        result = subprocess.run(
+            ["python3", COORD, "status", "--json"], cwd=COORD_DIR,
+            capture_output=True, text=True, timeout=timeout, check=True,
+        )
+        inventory = json.loads(result.stdout)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return []
+    allowed = {
+        "AVAILABLE", "SHARED_AVAILABLE", "RESERVED", "RESERVED_RUNNING",
+        "RESERVED_STALE",
+    }
+    gpus = [
+        GpuInfo(
+            index=int(item["physical_gpu"]),
+            name=str(item.get("model") or "coordinator GPU"),
+            total_gib=round(float(item["memory_total_mib"]) / MIB_PER_GIB, 2),
+            free_gib=round(float(item.get("vram_share_capacity_mib") or 0) / MIB_PER_GIB, 2),
+        )
+        for item in inventory
+        if item.get("host") == LOCAL_HOST
+        and item.get("acl") == "OPEN"
+        and item.get("state") in allowed
+        and item.get("memory_total_mib") is not None
+    ]
+    return sorted(gpus, key=lambda gpu: gpu.index)
 
 
 def min_total_vram_gib(gpus: List[GpuInfo]) -> float:
-    """Smallest per-GPU total VRAM, the safe planning denominator."""
-    return min((g.total_gib for g in gpus), default=0.0)
+    return min((gpu.total_gib for gpu in gpus), default=0.0)
 
 
 def num_gpus(gpus: List[GpuInfo]) -> int:
@@ -72,7 +67,7 @@ def _main() -> None:
     print(json.dumps({
         "count": len(gpus),
         "min_total_gib": min_total_vram_gib(gpus),
-        "gpus": [asdict(g) for g in gpus],
+        "gpus": [asdict(gpu) for gpu in gpus],
     }))
 
 

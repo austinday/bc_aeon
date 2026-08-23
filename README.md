@@ -1,37 +1,184 @@
 # Aeon
 
-Aeon is an autonomous, self-modifying agent harness. A single LLM drives a
+Aeon is an autonomous, self-modifying agent harness. A single control LLM drives a
 plan→act→observe loop with collapsible tools, reusable skill protocols,
 parallel sub-agents, persistent memory, and live context-pressure management.
-The same repo is portable across machines: local models are auto-deployed to fit
-the detected GPUs, and cloud models (Gemini/Vertex/Grok) work out of the box.
+Qwen3.8-27B is the only primary/control model and also handles image analysis
+and browser screenshots. Tool-owned image, edit, video, and future specialist
+models remain separate implementation details behind their tools.
 
 ## Quick start
 
 ```bash
-pip install .                      # installs the `aeon` console script
-python3 -m aeon.main               # interactive start: model picker (Enter = Qwen3.6-27B-FP8, solo GPU0)
-python3 -m aeon.main --model Qwen3.5-397B-A17B-Q3K   # skip the picker, name a model directly
-python3 -m aeon.main -n --start "Do X"               # headless: no picker, boots the default model
+python3 -m pip install --user -e .  # one-time install; creates the `aeon` command
+cd /path/to/a/project
+aeon                              # starts Qwen3.8 in this directory
+aeon --start "Summarize this repo"
+aeon -n --start "Do X"            # headless: exit when the objective completes
+aeon doctor                       # read-only install/backend readiness check
 ```
+
+`aeon` preserves the caller's working directory, stores project-local session
+state beneath that workspace's `aeon_output/`, and loads applicable `AGENTS.md`
+files from `~/AGENTS.md` down through the workspace hierarchy. More-specific
+files are applied last. `aeon --help`, `aeon --version`, and `aeon doctor` use a
+lightweight front door and never perform model/container cleanup.
+
+The Qwen3.8 model is the locally built and validated artifact at
+`$AEON_HOME/models/Qwen3.8-27B-ARA-abliterated-NVFP4-MTP`. Aeon does not
+silently substitute a Hub model when it is missing or incomplete.
+
+Native MTP depth is treated as a measured serving parameter, not an architecture
+default. The historical direct-Docker `run_qwen38_mtp_sweep.sh` entrypoint is now
+fail-closed: a future sweep must first be implemented as a reviewed benchmark mode
+inside the same coordinator-verified, journaled Qwen lifecycle.
+`benchmark_qwen38_mtp.py` remains an endpoint-side analysis client; it does not
+launch GPU work. The recorded release sweep attempted 12 real-turn requests per K
+across code recovery, browser screenshot grounding, safe system diagnosis, and
+verified completion. A depth is eligible only when every response satisfies
+the actual Aeon turn schema and repeatedly selects the exact intended tool and
+arguments under the same deterministic profile used by the live control loop.
+The release then chooses the highest
+median decode throughput among eligible depths, preferring lower K within 1%,
+and refuses to select any candidate below 100 tok/s.
+The versioned result in
+`aeon/core/data/qwen38_mtp_selection.json` is bound to the exact model
+`BUILD_MANIFEST.json`, `SHA256SUMS`, and vLLM image ID. The production launcher
+revalidates all three and refuses a guessed or stale draft depth.
+
+The 2026-08-19 production-profile sweep selected **K=3** on a 48 GB RTX PRO
+5000. K=0/1/2/3 each passed all 12/12 exact text, vision, browser, code,
+system-diagnosis, and completion decisions at 59.12, 85.94, 99.18, and 103.51
+median decode tok/s respectively. K=4 reached 101.48 tok/s but selected the
+wrong action in 3/12 trials, so the correctness gate rejected it. The selected
+K=3 profile also delivered 101.32 median end-to-end generation tok/s. The
+runtime includes a source-hash-guarded backport of vLLM's upstream fix for
+native MTP crossing Qwen's reasoning-to-structured-output boundary.
+The historical 64k compact retest passed all 12/12 decisions at 103.93 median
+decode and 101.58 median end-to-end tok/s. The promoted `.180` release now runs
+the stronger measured 128k profile: dynamic per-token/head FP8 KV, MTP K=3,
+8 scheduler sequences, and 8k chunked-prefill batches. Its release run passed
+at 104.77 median serial decode tok/s, recalled an exact key from a measured
+125,985-token prompt, and reached 529.76 aggregate decode tok/s at concurrency
+8. The machine-readable receipt is in
+`insights/qwen38_rtx5000_128k_20260822T1822/release_receipt.json`.
 
 Common flags:
 
 ```bash
-python3 -m aeon.main --start "Summarize this repo"
-python3 -m aeon.main --start "Build X and test it" --max-iterations 40
-python3 -m aeon.main --help        # full flag list
+aeon --start "Summarize this repo"
+aeon --start "Build X and test it" --max-iterations 40
+aeon --help
 ```
 
 | Flag | Purpose |
 |------|---------|
 | `--model NAME` | Skip the menu and use a specific model |
-| `--menu` / `-i` | Force the interactive model picker (choose solo vs dual-GPU, etc.) |
-| `--dual` | Deploy the main model across BOTH GPUs (a copy per GPU + routing) instead of the default single-GPU/solo placement |
+| `--menu` / `-i` | Open the optional account/configuration menu |
+| `--dual` | Reserved for a future coordinator-safe dual-copy deployment; current releases use solo placement |
 | `--start "..."` | Run an objective immediately, then drop into the REPL |
 | `--max-iterations N` | Cap iterations per objective (forces a final report at the limit) |
 | `--no-warmup` | Skip model warmup (faster startup) |
 | `--debug` / `--debug-log PATH` | Verbose LLM/reasoning logging |
+
+### Qwen compute placement
+
+Aeon's default backend mode is `auto`. Once Fleet Compute is running and
+advertises the enabled `aeon-qwen38-standard` service profile, Aeon requests an
+expiring demand ticket over its owner-only Unix socket and consumes only the
+sanitized ready endpoint. The broker owns placement, lease heartbeat, runtime
+lifecycle, and idle scale-down. While that profile is not deployed, Aeon keeps
+using its existing coordinator-managed compatibility lifecycle. A present but
+unhealthy broker fails closed instead of falling back and risking two control
+planes. Operators can require one path explicitly with
+`AEON_COMPUTE_BACKEND=broker|coordinator`; ordinary starts should leave it at
+`auto`.
+
+The broker is not installed or started by Aeon. Its service/profile rollout is a
+separate fleet-control operation and remains disabled until its adapter has the
+required release evidence. The exact handoff and disabled profile draft are in
+[docs/FLEET_COMPUTE_INTEGRATION.md](docs/FLEET_COMPUTE_INTEGRATION.md).
+
+Aeon searches enabled release capabilities in deterministic fleet order. It
+prefers `.177`, then tries each compatible worker/GPU through the central
+coordinator. Raw free VRAM is never enough: a worker is eligible only after its
+exact model, runtime, launcher, transport, resource profile and teardown path
+have a machine-readable release receipt. Physical GPU 1 on `.177` remains
+quarantined. `.179` has no `aday`-accessible release runtime and `.178`
+currently lacks safe staging space. `.180` is enabled through the exact
+`qwen38-compact-180-128k` remote-Docker capability on either coordinator-safe
+physical GPU. Live renter ACL, lease, UUID, host-resource, and network checks
+still decide whether it is usable for a particular start.
+
+The orchestrating Aeon process remains on `.177`. A worker placement runs the
+same UUID-pinned container behind a receipted loopback SSH tunnel. Heartbeats use
+the exact remote container PID. If a renter preempts it, Aeon preserves the
+durable job, proves the old process gone, releases only its exact claim, and
+re-enters `.177`-first fleet admission. An unreachable or identity-ambiguous
+worker is quarantined rather than force-released.
+
+The `.177` profile uses a 48.7 GiB measured plan at 114688 tokens. The `.180`
+profile uses the live-coordinator-admissible 41.25 GiB budget at 131072 tokens;
+its largest sampled use during a 125,985-token prefill was 35,254 MiB. Each is a
+measured aggregate peak plan and release accounting bound, not a generic PyTorch
+or cgroup cap. Qwen uses the
+fleet policy's exclusive-lease exception, pins every process to the coordinator
+UUID, and retains at least 6 GiB for Vast. Because the claim is exclusive,
+ComfyUI must use another coordinator-safe card or remain durably waiting.
+
+Before reserve Aeon fully verifies the selected host's canonical model exact
+checksummed file set, ownership and immutable permissions, plus the exact
+preinstalled image ID.
+The post-reserve transaction revalidates that inode/stat receipt, stages only its
+small claim-owned source allowlist, and immediately before Docker create repeats
+the exact coordinator claim, physical-node ACL, 96 GiB RAM, 96 GiB commit, 32 GiB
+home and Docker-root disk, and 16 GiB shared-memory floors. CUDA selection uses
+only the returned UUID; physical GPU 0 is diagnostic only for the ACL check.
+
+The canonical Docker receipt binds the immutable container ID, random launch
+nonce, exact image/argv/environment/labels, three read-only bind inodes, loopback
+port, private 8 GiB `/dev/shm`, private 8 GiB compiler-cache tmpfs, finite PID
+limit, non-root/read-only/cap-drop/no-new-privileges settings, and bounded local
+Docker logs. Hugging Face and Transformers are offline and no global host cache
+is mounted. Reuse and stop require that same full receipt; stop addresses only
+the immutable ID. A durable releasing journal makes a crash between container
+removal, coordinator release, and receipt cleanup idempotently recoverable.
+
+`waiting_for_compute` means a live Aeon process is presently inside its
+cancelable coordinator admission loop. Each reserve call and sleep is bounded;
+the delay backs off from 15 seconds to a two-minute maximum, and no lease is held
+between attempts. The loop remains foreground work in that Aeon/tmux process—no
+daemon or background relaunch is created. Ctrl-C or **End agent** cancels the wait,
+records `unavailable`, and leaves the durable Project Manager row resumable.
+A process/service/machine interruption likewise leaves the row resumable, and
+dead presence is never presented as an active queue.
+
+## Aeon Remote
+
+Aeon includes an optional authenticated, mobile-first web console for persistent
+agent terminal tabs. It can create workspaces beneath configured roots, launch and
+reattach to tmux-backed Aeon instances, stop or resume them, and display sanitized
+host/coordinator resource usage. It does not expose a general browser shell.
+
+Install with pip install '.[remote]', then follow the security and HTTPS setup in
+[docs/AEON_REMOTE.md](docs/AEON_REMOTE.md). The included service and nginx files are
+review templates; they are not installed or enabled automatically.
+
+### Optional external expert
+
+Aeon can keep Qwen3.8 as its only control model while exposing a tightly budgeted
+`consult_external_expert` tool that is called automatically after two consecutive
+failed local turns. The feature is
+off by default. On interactive startup, choose **External expert account** from the
+model picker to use an official Codex/ChatGPT, Claude Code, or Gemini CLI login; Aeon
+stores only the provider choice, not the OAuth token. It sends no files
+automatically and gives the hosted adviser no tool or execution authority. Before
+anything is sent, local Qwen reviews the exact redacted prompt and blocks content
+that may require an uncensored model, trigger hosted-model moderation/refusal, or
+contain information the operator may not want disclosed to a large technology
+company; uncertainty or review failure also blocks the call. A
+separate API-key path is also supported. See
+[docs/EXTERNAL_EXPERT.md](docs/EXTERNAL_EXPERT.md).
 
 ## How the loop works
 
@@ -46,6 +193,29 @@ escaped into JSON strings.
 
 Built-in robustness:
 
+- **Adaptive Qwen reasoning**: simple extraction, summarization, and browser
+  actions use `low`; ordinary established turns use `medium`; planning, coding,
+  ambiguous recovery, and retries use `xhigh`. Set
+  `AEON_REASONING_EFFORT=low|medium|xhigh` to force a tier for benchmarking, or
+  leave it unset for adaptive selection.
+- **Separated thinking and constrained actions**: Qwen uses deterministic
+  control sampling (`temperature=0`, `top_p=1`, `top_k=-1`, `min_p=0`) in a
+  dedicated reasoning stream. Repeated production-schema trials showed that
+  the former stochastic profile could change grounded tool decisions on
+  identical evidence; greedy control is both more reliable and more favorable
+  to MTP acceptance. The JSON grammar activates only after `</think>`, so hidden
+  reasoning stays free-form while the final tool-action object cannot emit an
+  unknown shape or invalid JSON.
+- **Selective local search**: ambiguous browser challenges, failed/stalled turns,
+  and difficult first decisions generate two or three independent local Qwen
+  proposals. A separate grammar-constrained local verifier selects one using the
+  current tests/command output, DOM/screenshots, or file contents/diffs; only that
+  proposal executes. Routine work remains a single call. Set
+  `AEON_LOCAL_SEARCH=off|adaptive|2|3|always` to override the policy.
+- **Native thinking continuity**: real chat history is enabled by default and
+  carries Qwen3.8's `reasoning_content` / `reasoning` fields with
+  `preserve_thinking=true`. History is context-budgeted and persisted across
+  restarts. Set `AEON_MESSAGE_HISTORY=0` only as a compatibility escape hatch.
 - **Context pressure** is estimated every turn; the attempt log and memories are
   auto-compressed, and at >95% of the limit the largest/oldest open files are
   shed automatically instead of crashing.
@@ -141,7 +311,26 @@ with select-all+delete, and even the pointer drifts a little while "reading."
 Combined with the host's residential IP, the goal is to be indistinguishable from
 a person.
 
-Perception is **first-person**: the agent *is* the multimodal model (Gemma-4), so
+The browser controller is not a public web service. Docker publishes it only on
+`127.0.0.1:8030`, and every route—including health and API documentation—requires
+a randomly generated bearer login stored at `~/.aeon/browser_api_token` with mode
+`0600`. Aeon's browser tools supply that credential automatically. The launcher
+refuses stale browser images that predate authentication, so it cannot silently
+fall back to the old unauthenticated controller.
+
+The human-v6 browser contract also provides semantic `browser_find` across
+off-screen content, iframes, and open shadow roots; grounded visible page text on
+every observation; explicit wait success/timeouts; privately staged workspace
+uploads; and bounded HTTP/XHR/console failure events. A minimal window manager
+gives headed Chrome a real 1920×1080 desktop instead of Xvfb's small default
+window. It also supports screenshot-coordinate interaction for canvas/map/remote
+desktop UIs, explicit native-dialog responses, and structured `browser_extract`
+for forms, tables, links, and page text. Named persistent profiles can be selected
+with `--browser-profile NAME` or `AEON_BROWSER_PROFILE=NAME`. The launcher requires
+the human-v6 image marker, so an older authenticated
+container cannot silently omit these capabilities.
+
+Perception is **first-person**: the agent *is* the multimodal Qwen3.8 model, so
 each browser action attaches the **actual rendered screenshot** to its next turn —
 it looks at the page exactly as a human would and decides from the pixels, not
 from a secondhand text caption. That view is paired with a **stable, indexed
@@ -152,7 +341,11 @@ off-screen, scroll-group). So the model sees the page *and* has exact `[id]`s to
 act on (no selector guessing). By default the screenshot carries small numbered
 `[id]` marks (Set-of-Mark, for precise grounding); `visual="clean"` gives the pure
 render, `visual="both"` gives both, and `include_vision=false` skips the image for
-a faster element-list-only turn.
+a faster element-list-only turn. Human-v6 additionally pairs the full 1920-pixel
+frame with up to two lossless 2× PNG crops around the resolved intended control,
+verification/CAPTCHA panel, small validation error, or dense table/diagram. The
+service captures target geometry before acting, so a post-action re-render cannot
+silently reuse the same numeric id and crop the wrong control.
 
 Actions (`browser_interact`) cover the full human repertoire by id: click /
 double / right-click, hover, type (real keystrokes, optional submit), press_key,

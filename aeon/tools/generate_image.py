@@ -4,23 +4,18 @@ import time
 import random
 import requests
 import subprocess
-import threading
 from .base import BaseTool
 from ..core.prompts import TOOL_DESC_GENERATE_IMAGE, TOOL_DESC_EDIT_IMAGE
-from ..core.gpu_queue import wait_for_vram, release_vram
+from ..core.gpu_queue import (
+    current_lease,
+    heartbeat_vram,
+    release_vram,
+    wait_for_vram,
+)
 from ..core.prompt_enhancer import enhance_prompt
 from ..core.paths import resolve_output_dir
 
-# ComfyUI is a SHARED, VRAM-heavy service (image gen, image edit, and video all
-# hit one container). It must free its ~20GB for other tools when the agent moves
-# on — but tearing it down after every single call cold-started the model on each
-# image and caused an unreachable-server timeout loop. So we debounce: keep it
-# warm across a burst of comfy ops, then reap it once none has run for a grace
-# period. Tune with AEON_COMFYUI_IDLE_S (seconds).
-_COMFY_IDLE_GRACE_S = float(os.environ.get("AEON_COMFYUI_IDLE_S", "90"))
-_reaper_lock = threading.Lock()
-_reaper_timer = None  # module-global debounced timer, re-armed on each op finish
-
+FLEET_LOW_PRIORITY = "/home/aday/bin/fleet-low-priority"
 
 class ComfyUITool(BaseTool):
     """Base class for tools using ComfyUI to handle VRAM and registry management."""
@@ -57,8 +52,8 @@ class ComfyUITool(BaseTool):
         except requests.exceptions.RequestException:
             return False
 
-    def _manage_registry(self, action: str, gpu_id: int = None):
-        """Manage active users of ComfyUI and track the assigned GPU."""
+    def _manage_registry(self, action: str):
+        """Manage active users and reap only Aeon's exact labeled container."""
         import fcntl
         registry_path = "/tmp/aeon_comfyui_registry.json"
         lock_path = "/tmp/aeon_comfyui_registry.lock"
@@ -71,9 +66,9 @@ class ComfyUITool(BaseTool):
                     with open(registry_path, 'r') as f:
                         state = json.load(f)
                 else:
-                    state = {"pids": [], "gpu_id": None}
+                    state = {"pids": []}
             except (json.JSONDecodeError, EOFError):
-                state = {"pids": [], "gpu_id": None}
+                state = {"pids": []}
                 
             # Clean up dead PIDs
             cleaned_pids = []
@@ -88,8 +83,6 @@ class ComfyUITool(BaseTool):
             if action == 'register':
                 if pid not in state["pids"]:
                     state["pids"].append(pid)
-                if gpu_id is not None:
-                    state["gpu_id"] = gpu_id
             elif action == 'unregister':
                 if pid in state["pids"]:
                     state["pids"].remove(pid)
@@ -100,10 +93,25 @@ class ComfyUITool(BaseTool):
                 # either bumps the count before we check (we skip) or starts a
                 # fresh container after our teardown (clean) — no half-dead race.
                 if not state["pids"]:
-                    subprocess.run(["docker", "rm", "-f", "aeon_comfyui"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    state["gpu_id"] = None
-                    state["reaped"] = True
+                    label = subprocess.run(
+                        ["docker", "inspect", "-f",
+                         "{{ index .Config.Labels \"com.bc_aeon.component\" }}",
+                         "aeon_comfyui"], capture_output=True, text=True)
+                    if label.returncode == 0 and label.stdout.strip() != "comfyui":
+                        raise RuntimeError(
+                            "Refusing to remove an aeon_comfyui container without "
+                            "the bc_aeon ownership label."
+                        )
+                    if label.returncode == 0:
+                        stopped = subprocess.run(
+                            ["docker", "rm", "-f", "aeon_comfyui"],
+                            capture_output=True, text=True)
+                        if stopped.returncode != 0:
+                            raise RuntimeError(stopped.stderr.strip() or "Could not stop ComfyUI")
+                    remains = subprocess.run(
+                        ["docker", "inspect", "aeon_comfyui"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    state["reaped"] = remains.returncode != 0
                 else:
                     state["reaped"] = False
 
@@ -114,54 +122,40 @@ class ComfyUITool(BaseTool):
             count = len(state["pids"])
             if action == 'reap_if_idle':
                 return count, reaped
-            return count, state.get("gpu_id")
+            return count, None
 
     def _finish_comfy_session(self):
-        """Call from a tool's `finally`: drop our in-flight slot + VRAM reservation,
-        then arm a debounced idle reaper. ComfyUI stays warm across rapid
-        sequential ops (generate -> edit -> video reuse one loaded server) but is
-        torn down — freeing its VRAM for other tools — once no comfy op has run for
-        _COMFY_IDLE_GRACE_S. Restores the original bring-up/tear-down VRAM sharing
-        without the per-call cold-start thrash. Session-exit cleanup (main.py's
-        _safe_cleanup) remains the backstop."""
-        try:
+        """Drop our slot, then stop and release only after the last caller exits."""
+        import fcntl
+        with open("/tmp/aeon_comfyui_start.lock", 'w') as start_fd:
+            fcntl.flock(start_fd, fcntl.LOCK_EX)
             self._manage_registry('unregister')
-        finally:
-            release_vram()
-        global _reaper_timer
-        with _reaper_lock:
-            if _reaper_timer is not None:
-                _reaper_timer.cancel()
-            _reaper_timer = threading.Timer(_COMFY_IDLE_GRACE_S, self._reap_if_idle)
-            _reaper_timer.daemon = True
-            _reaper_timer.start()
-        print(f"{self.C_CYAN}Comfy op done. ComfyUI stays warm for "
-              f"{int(_COMFY_IDLE_GRACE_S)}s of idle, then its VRAM is released.{self.C_RESET}")
+            _, reaped = self._manage_registry('reap_if_idle')
+            if reaped and current_lease():
+                release_vram("Aeon ComfyUI container stopped after final tool call")
+                print(f"{self.C_CYAN}ComfyUI stopped and its coordinator lease was released."
+                      f"{self.C_RESET}")
 
     def _reap_if_idle(self):
-        """Debounced-timer callback: tear the shared ComfyUI container down iff no
-        comfy op is in flight. A new op that arrived during the grace window keeps
-        it alive (its finish re-arms this timer)."""
+        """Tear down the shared container iff no Comfy operation is in flight."""
         try:
             _, reaped = self._manage_registry('reap_if_idle')
-            if reaped:
-                print(f"{self.C_CYAN}ComfyUI idle for {int(_COMFY_IDLE_GRACE_S)}s — "
-                      f"container reaped, VRAM released for other tools.{self.C_RESET}")
+            if reaped and current_lease():
+                release_vram("Aeon ComfyUI container stopped while idle")
         except Exception:
             pass
 
-    def _registry_gpu(self):
-        """Peek the GPU the shared ComfyUI was last started on (or None)."""
-        import fcntl
+    @staticmethod
+    def _container_pid():
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Pid}}", "aeon_comfyui"],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
         try:
-            with open("/tmp/aeon_comfyui_registry.lock", 'w') as lock_fd:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                if os.path.exists("/tmp/aeon_comfyui_registry.json"):
-                    with open("/tmp/aeon_comfyui_registry.json") as f:
-                        return json.load(f).get("gpu_id")
-        except Exception:
-            pass
-        return None
+            return int(result.stdout.strip())
+        except ValueError:
+            return None
 
     def _ensure_comfyui_running(self, required_vram: float = 20.0):
         """Ensure the SHARED ComfyUI is up, safely under concurrent agents.
@@ -173,8 +167,11 @@ class ComfyUITool(BaseTool):
           - If it needs starting, do so under a cross-process START lock so only
             ONE agent runs start_comfyui.sh; the rest block, then find it healthy.
         """
-        # Fast path: warm and healthy -> reuse, no reservation, no restart.
+        self._manage_registry('register')
+
+        # Fast path: reuse only when its live coordinator lease can be refreshed.
         if self._check_comfyui_health():
+            heartbeat_vram(self._container_pid(), "Aeon reused healthy ComfyUI")
             return True
 
         import fcntl
@@ -182,31 +179,49 @@ class ComfyUITool(BaseTool):
             fcntl.flock(lock_fd, fcntl.LOCK_EX)  # serialize starts across all agents
             # Someone may have started it while we waited for the lock.
             if self._check_comfyui_health():
+                heartbeat_vram(self._container_pid(), "Aeon reused healthy ComfyUI")
                 return True
 
-            # Reserve VRAM only now, for the actual model load. Prefer the GPU the
-            # server last used; else any GPU with room. wait_for_vram blocks (with
-            # its own timeout) if the GPU is full -> callers wait in line, not crash.
-            current_gpu = self._registry_gpu()
-            print(f"{self.C_CYAN}Reserving {required_vram}GB VRAM for ComfyUI "
-                  f"(target GPU: {current_gpu if current_gpu is not None else 'any'})...{self.C_RESET}")
-            allocated_gpu = wait_for_vram(required_vram, gpu_id=current_gpu)
-            self._manage_registry('register', gpu_id=allocated_gpu)
+            print(f"{self.C_CYAN}Requesting a coordinator-approved, hard-capped "
+                  f"{required_vram:g}GB ComfyUI lease on .177...{self.C_RESET}")
+            if not os.path.isfile(FLEET_LOW_PRIORITY) or not os.access(
+                FLEET_LOW_PRIORITY, os.X_OK
+            ):
+                raise RuntimeError(
+                    f"Renter-yielding launcher is unavailable: {FLEET_LOW_PRIORITY}"
+                )
+            lease = wait_for_vram(required_vram)
 
-            print(f"{self.C_CYAN}Starting ComfyUI on GPU {allocated_gpu}...{self.C_RESET}")
+            placement = ("shared with Qwen under independent hard caps"
+                         if lease.get("shared_with_qwen") else "separate tool placement")
+            print(f"{self.C_CYAN}Starting ComfyUI on leased UUID {lease['gpu_uuid']} "
+                  f"({placement})...{self.C_RESET}")
             script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "start_comfyui.sh"))
             env = os.environ.copy()
             env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
-            env["COMFYUI_GPU"] = str(allocated_gpu)
-            res = subprocess.run(["bash", script_path], capture_output=True, text=True, env=env)
+            env["GPU_AGENT_CLAIM_ID"] = lease["claim_id"]
+            env["CUDA_VISIBLE_DEVICES"] = lease["gpu_uuid"]
+            env["GPU_MEM_LIMIT_GB"] = f"{lease['vram_budget_gb']:g}"
+            env["GPU_RESERVE_GB"] = "6"
+            res = subprocess.run(
+                [FLEET_LOW_PRIORITY, "bash", script_path],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
             if res.returncode != 0:
+                release_vram("ComfyUI launch failed before a GPU process started")
                 raise RuntimeError(f"Error starting ComfyUI: {res.stderr}")
 
             print(f"{self.C_CYAN}Waiting for ComfyUI to become healthy...{self.C_RESET}")
             for _ in range(90):  # up to ~180s for a cold container + first boot
                 if self._check_comfyui_health():
+                    heartbeat_vram(self._container_pid(), "Aeon ComfyUI started and is healthy")
                     return True
                 time.sleep(2)
+            subprocess.run(["docker", "rm", "-f", "aeon_comfyui"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            release_vram("ComfyUI failed its startup health check and was stopped")
             raise RuntimeError("Error: ComfyUI failed to become healthy after starting.")
 
     def _prompt_in_queue(self, prompt_id: str) -> bool:
@@ -230,8 +245,12 @@ class ComfyUITool(BaseTool):
         or the (generous) hard cap. `hard_timeout` counts wall time, but a job that
         is still visibly in the queue never trips the 'lost' check."""
         start = time.time()
+        next_heartbeat = start + 300
         missing = 0
         while time.time() - start < hard_timeout:
+            if time.time() >= next_heartbeat:
+                heartbeat_vram(self._container_pid(), f"Aeon ComfyUI job {prompt_id} is active")
+                next_heartbeat = time.time() + 300
             try:
                 hist = requests.get(f"{self.comfy_url}/history/{prompt_id}", timeout=10).json()
             except requests.RequestException:
@@ -277,17 +296,14 @@ class ComfyUITool(BaseTool):
 class GenerateImageTool(ComfyUITool):
     """Generate images with an abliterated/uncensored FLUX model via local ComfyUI.
 
-    Default model is FLUX.1-dev-abliterated-V2 (fully abliterated, open/ungated),
-    using the FLUX.1 dual-encoder graph (t5xxl + clip_l). FLUX.2-dev is a drop-in
-    upgrade once its abliterated Mistral text encoder is available: drop a
-    `mistral*flux2*.safetensors` into text_encoders and the resolver switches to
-    the higher-quality FLUX.2 graph automatically.
+    Prefers the installed uncensored FLUX.2-klein GGUF pair and falls back to the
+    abliterated FLUX.1-dev GGUF plus its dual text encoders.
     """
     def __init__(self, llm_client=None):
         super().__init__(
             name="generate_image",
             description=TOOL_DESC_GENERATE_IMAGE,
-            underlying_model='FLUX.1-dev-abliterated-V2 (uncensored GGUF)'
+            underlying_model='FLUX.2-klein uncensored GGUF (FLUX.1 abliterated fallback)'
         )
         self.llm_client = llm_client
 
@@ -303,11 +319,10 @@ class GenerateImageTool(ComfyUITool):
         return default
 
     def _flux2_dev_te(self):
-        """The FLUX.2-dev Mistral text encoder (safetensors), if present — its
-        arrival is what upgrades generation from FLUX.1 to FLUX.2-dev. Prefers an
-        abliterated build over a base one. Returns None when not installed yet."""
+        """Resolve an uncensored/abliterated FLUX.2 encoder, GGUF preferred."""
         return self._resolve("text_encoders",
-                             ("*mistral*abliterated*flux2*.safetensors", "*flux2*abliterated*.safetensors",
+                             ("*flux2*klein*uncensored*.gguf", "*flux2*uncensored*.gguf",
+                              "*mistral*abliterated*flux2*.safetensors", "*flux2*abliterated*.safetensors",
                               "*mistral*flux2*.safetensors", "*flux2*dev*te*.safetensors"))
 
     def _flux1_models(self):
@@ -322,8 +337,10 @@ class GenerateImageTool(ComfyUITool):
         return unet, clip_l, t5, vae
 
     def _flux2_dev_models(self, te):
-        """Resolve the FLUX.2-dev set (used only once the Mistral TE `te` is present)."""
-        unet = self._resolve("unet", ("*flux2*dev*.gguf", "*flux-2-dev*.gguf"), "flux2-dev-Q8_0.gguf")
+        """Resolve the FLUX.2 set matching the selected text encoder."""
+        unet = self._resolve("unet", ("*flux-2-klein*.gguf", "*flux2*klein*.gguf",
+                                      "*flux2*dev*.gguf", "*flux-2-dev*.gguf"),
+                             "flux-2-klein-9b-Q8_0.gguf")
         vae = self._resolve("vae", ("*flux2*vae*.safetensors", "flux2-vae*.safetensors"), "flux2-vae.safetensors")
         return unet, te, vae
 
@@ -371,19 +388,18 @@ class GenerateImageTool(ComfyUITool):
         try:
             # Register this agent as an active user and ensure server is running on allocated VRAM
             self._manage_registry('register')
-            self._ensure_comfyui_running(required_vram=20.0)
+            self._ensure_comfyui_running(required_vram=24.0)
 
             seed = random.randint(1, 0xffffffffffffffff)
             flux2_te = self._flux2_dev_te()
             if flux2_te:
-                # FLUX.2-dev (higher quality) — active once the abliterated Mistral
-                # text encoder is installed: GGUF UNet + safetensors Mistral TE via
-                # native CLIPLoader + flux2 VAE/latent/scheduler.
+                # FLUX.2 with its uncensored encoder and matching VAE.
                 unet, te, vae = self._flux2_dev_models(flux2_te)
-                print(f"{self.C_CYAN}Model: FLUX.2-dev ({unet}) + {te}{self.C_RESET}")
+                print(f"{self.C_CYAN}Model: FLUX.2 ({unet}) + {te}{self.C_RESET}")
+                clip_loader = "CLIPLoaderGGUF" if te.lower().endswith(".gguf") else "CLIPLoader"
                 workflow = self._flux_workflow(
                     unet_node={"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": unet}},
-                    clip_node={"class_type": "CLIPLoader", "inputs": {"clip_name": te, "type": "flux2"}},
+                    clip_node={"class_type": clip_loader, "inputs": {"clip_name": te, "type": "flux2"}},
                     vae_name=vae,
                     latent_node={"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
                     scheduler_node={"class_type": "Flux2Scheduler", "inputs": {"steps": 20, "width": width, "height": height}},
@@ -473,7 +489,7 @@ class EditImageTool(ComfyUITool):
         try:
             # Register this agent as an active user and ensure server is running on allocated VRAM
             self._manage_registry('register')
-            self._ensure_comfyui_running(required_vram=20.0)
+            self._ensure_comfyui_running(required_vram=40.0)
 
             n_imgs = 1 + len(extra_paths)
             print(f"{self.C_CYAN}Uploading {n_imgs} image(s) to ComfyUI...{self.C_RESET}")

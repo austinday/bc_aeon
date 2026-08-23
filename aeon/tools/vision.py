@@ -4,15 +4,17 @@ import time
 import base64
 import requests
 import subprocess
+import re
 from PIL import Image
 import io
 from .base import BaseTool
 from ..core.prompts import TOOL_DESC_ANALYZE_IMAGE
+from ..core.model_catalog import VISION_MODEL_NAME
 
 
 class AnalyzeImageTool(BaseTool):
     """Standalone image-analysis tool. Runs on the selected multimodal primary
-    model (Gemma-4), whose OpenAI-compatible endpoint main.py exports as
+    model (Qwen3.8), whose OpenAI-compatible endpoint main.py exports as
     AEON_VISION_*. There is no separate vision server or GPU model — it reuses the
     already-loaded primary. (The main browser loop no longer routes through this
     tool; it attaches screenshots to the agent's own multimodal prompt directly.
@@ -70,8 +72,17 @@ class AnalyzeImageTool(BaseTool):
         b64 = base64.b64encode(buffer.read()).decode('utf-8')
         return b64, 'image/jpeg'
 
+    @staticmethod
+    def _reasoning_effort(prompt: str) -> str:
+        """Use low for perception and xhigh when the request needs visual reasoning."""
+        if re.search(
+                r"\b(reason|solve|diagnos|debug|compare|infer|prove|ambiguous|unclear|"
+                r"diagram|chart|code|error|plan)\w*\b", prompt or "", re.IGNORECASE):
+            return "xhigh"
+        return "low"
+
     def execute(self, image_path: str, prompt: str, auto_cleanup: bool = True,
-                max_tokens: int = 1024, temperature: float = 0.2) -> str:
+                max_tokens: int = 1024, temperature: float = 1.0) -> str:
         if not image_path:
             return "Error: 'image_path' parameter is required."
         if not prompt:
@@ -86,15 +97,17 @@ class AnalyzeImageTool(BaseTool):
         if validation_error:
             return validation_error
 
-        # Runs on the selected multimodal primary (Gemma-4), whose endpoint main.py
+        # Runs on the selected Qwen3.8 multimodal primary, whose endpoint main.py
         # exports as AEON_VISION_*. If a text-only model is selected there is no
         # local vision backend -> return a clear, actionable error.
         primary_base = os.environ.get('AEON_VISION_BASE_URL')
         primary_model = os.environ.get('AEON_VISION_MODEL')
         if not (primary_base and primary_model):
-            return ("Error: image analysis requires a multimodal model. The current model does "
-                    "not serve vision. Restart Aeon and select the multimodal Gemma-4 model "
-                    "to use analyze_image.")
+            return ("Error: image analysis requires Aeon's Qwen3.8 vision model. The current "
+                    f"session does not serve vision. Restart Aeon and select {VISION_MODEL_NAME}.")
+        if primary_model != VISION_MODEL_NAME:
+            return (f"Error: refusing to send image data to '{primary_model}'. Aeon's only "
+                    f"approved vision model is '{VISION_MODEL_NAME}'.")
         vision_url = primary_base.rstrip('/') + '/chat/completions'  # base already ends in /v1
         vision_model = primary_model
 
@@ -133,6 +146,16 @@ class AnalyzeImageTool(BaseTool):
                 'messages': messages,
                 'max_tokens': int(max_tokens),
                 'temperature': float(temperature),
+                'top_p': 0.95,
+                'presence_penalty': 0.0,
+                'top_k': 20,
+                'min_p': 0.0,
+                'repetition_penalty': 1.0,
+                'reasoning_effort': self._reasoning_effort(prompt),
+                'chat_template_kwargs': {
+                    'enable_thinking': True,
+                    'preserve_thinking': True,
+                },
             }
 
             print(f"Sending request to vision endpoint ({vision_model})...")
@@ -166,5 +189,5 @@ class AnalyzeImageTool(BaseTool):
 
         except Exception as e:
             return self.format_error_message(e, 'analyzing image on the multimodal model',
-                                             'confirming a multimodal model (Gemma-4) is selected')
+                                             f'confirming {VISION_MODEL_NAME} is selected')
         # No teardown: the multimodal primary is owned by the session, not this tool.

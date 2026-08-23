@@ -1,0 +1,57 @@
+# DISTRIBUTED SKILL: Spread INDEPENDENT work over many machines' GPUs/CPUs.
+# Default for "use all the computers": sweeps, many models/seeds, batch inference,
+# dataset processing, eval. No NCCL, tolerates slow links.
+
+## OBJECTIVE
+Saturate every usable GPU/CPU on the network with independent work units, load-balanced across unequal machines, with every result accounted for and failures retried — not lost.
+
+## 1. CHOOSE THIS SHAPE FIRST
+- If the units are INDEPENDENT, do NOT reach for torchrun/NCCL/DDP. No collectives means no interconnect bottleneck, no rendezvous, no version-skew hangs, and near-linear scaling even over 1 GbE. It is strictly the easier and faster path.
+- Only if ONE model must be trained across machines (or doesn't fit on one) → `distributed/distributed_training`.
+- Many people reflexively "distribute training" when what they have is a sweep. A 20-config sweep on 4 machines is 4 independent 5-config jobs. That's this skill.
+
+## 2. SIZE THE WORKER POOL TO REAL CAPACITY
+- Use the verified inventory (`distributed/cluster_discovery_and_access`) — free VRAM, not total.
+- GPU work: reserve every process through the `.177` coordinator and pin it with
+  the returned UUID, claim ID, and hard cap. Sharing one physical GPU is allowed
+  when the coordinator admits the combined truthful budgets plus the 6 GB renter
+  reserve; use exclusive leases when compute contention makes sharing wasteful.
+- CPU work: about `nproc` workers per host, fewer if each is itself threaded. Watch for the double-count trap: N processes × an unpinned BLAS/torch using all cores each → massive oversubscription and a slowdown. Pin with `OMP_NUM_THREADS=<k>` / `torch.set_num_threads(k)`.
+- Heterogeneous machines are the norm. Don't hand a 5-year-old GPU the same share as a fresh one.
+
+## 3. SHARDING STRATEGY — PREFER PULL OVER PUSH
+- **Static sharding** (`--shard i --of N`, or `sed -n "${i}~${N}p" tasks.txt`) is simplest and fine when units are uniform AND machines are matched. Its failure mode: the slowest host holds up the whole run while fast hosts sit idle.
+- **Pull-based work queue** is better and barely harder — each worker atomically claims the next unit, finishes it, claims another. It self-balances across unequal hardware and unequal unit costs, and a dead worker costs you one unit instead of a whole shard. This is the right default for a mixed lab network.
+  - Cheap queue without new infrastructure: a directory of task files on shared storage, claimed by atomic rename (`mv task.json claimed/$(hostname).task.json` — rename is atomic on a local FS, and `mkdir <lockdir>` is the portable atomic-claim primitive on NFS). Or `flock` a counter file. Or GNU parallel: `parallel --sshloginfile hosts.txt -j <slots> < commands.txt` handles distribution and balancing for you.
+  - Real scale / dynamic needs → Ray (`ray start --head` + `ray start --address=...`, then `@ray.remote(num_gpus=1)`); it does placement and fault handling properly. Worth it above ~dozens of nodes or when you need elasticity; overkill for 4 machines and a shell loop.
+
+## 4. MAKE EVERY UNIT IDEMPOTENT AND CRASH-SAFE
+Workers WILL be interrupted, re-run, or duplicated. Design so that's harmless:
+- **Skip completed work on start**: if the output exists and is valid, return immediately. This makes "just rerun the whole thing" a safe recovery, which is the property you want at 2am.
+- **Write output atomically**: write to `out.tmp` then `mv out.tmp out.json` (rename is atomic). A worker killed mid-write must never leave a half-file that later reads as "done" — this is how a sweep silently poisons its own results.
+- **Namespace every output** by unit id and host so parallel writers can't collide.
+- One unit's failure must not kill the batch: catch it, log it with the unit id, exit non-zero, and move on.
+
+## 5. EXECUTE
+- Stage code + data to each host (`rsync`), or use shared storage — but for GPU-fed data, stage to LOCAL disk; NFS usually can't feed a dataloader. Verify the env on each host explicitly (the non-login shell trap — see `distributed/remote_execution_and_monitoring`).
+- Launch only after recording the coordinator result. Pass
+  `GPU_AGENT_CLAIM_ID=gc-... CUDA_VISIBLE_DEVICES=GPU-... GPU_MEM_LIMIT_GB=<lease>`
+  to the exact process, use a distinct run/log directory, and heartbeat the claim.
+- Fan the launches out with `run_command_async` (one job per host), record every PID/tmux name, then go do other work. Don't idle-poll.
+- Mid-run, heartbeat through the coordinator and verify real application progress
+  from logs/checkpoints. Progress is units completed, not merely a live PID.
+
+## 6. COLLECT & RECONCILE — THE STEP EVERYONE SKIPS
+- Pull results to one place: `rsync -az gpu1:/work/out/ ./results/gpu1/`.
+- **Count them.** Completed units MUST equal expected units. If 200 configs went out and 197 came back, you do not have a result — you have a silent hole in the sweep, and any conclusion drawn from it is wrong.
+- Identify the missing/failed units by id, read their logs, fix, and re-run ONLY those (idempotency from step 4 makes this trivial).
+- Report honestly: N/M units completed, which failed and why. Never present a partial sweep as complete — see the ground-truth/honesty rules; a fabricated or silently-truncated result set is worse than a failed run.
+- Clean up: stop only exact owned workers, verify exit, then release their claims.
+
+## COMMON MISTAKES
+- Reaching for DDP/torchrun when the work is embarrassingly parallel.
+- Static shards across unequal machines → fast hosts idle while one straggler finishes.
+- Non-idempotent units + non-atomic writes → corrupt/duplicate outputs after any retry.
+- Oversubscription: N processes each spawning `nproc` BLAS threads.
+- Assuming total VRAM is free VRAM; stacking workers onto a GPU someone else is using.
+- Not reconciling counts at the end — missing units go unnoticed and quietly invalidate the analysis.

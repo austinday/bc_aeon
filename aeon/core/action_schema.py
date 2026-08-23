@@ -14,8 +14,9 @@ Design constraints (deliberate):
   vary by grammar backend; an unsupported keyword would 400 the request and
   needlessly downgrade the whole session to the legacy parse path.
 - Property order matters: xgrammar emits object properties in schema order, so
-  'thought' comes FIRST — the model reasons before it acts, inside the grammar
-  (there is no room for <think> preambles: the grammar owns token 0 onward).
+  the final envelope's short 'thought' summary comes before its actions. Qwen's
+  native private reasoning is a separate ``reasoning_content`` stream; the
+  server activates this grammar only after the model closes ``</think>``.
 - 'parameters' is a free-form object (additionalProperties: true). We constrain
   WHAT tool is called, not its arguments: over-constraining args from
   introspected signatures risks the grammar forbidding a legitimate call, and
@@ -55,7 +56,7 @@ def build_turn_schema(tool_names: List[str]) -> Dict:
     return {
         "type": "object",
         "properties": {
-            # Order = generation order (xgrammar preserves it): reason first.
+            # Order = final-envelope generation order (xgrammar preserves it).
             "thought": {"type": "string"},
             "previous_result_summary": {"type": "string"},
             "skill_check": {"type": "string"},

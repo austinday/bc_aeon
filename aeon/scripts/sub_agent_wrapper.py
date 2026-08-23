@@ -44,8 +44,10 @@ def _release_browser_profile(agent_id):
     agent never browsed (service not running / profile never created)."""
     try:
         import requests
+        from aeon.tools.browser import browser_auth_headers
         requests.post("http://localhost:8030/release_profile",
-                      json={"profile": f"agent-{agent_id}"}, timeout=5)
+                      json={"profile": f"agent-{agent_id}"},
+                      headers=browser_auth_headers(), timeout=5)
     except Exception:
         pass
 

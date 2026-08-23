@@ -6,8 +6,11 @@ import requests
 import subprocess
 import json
 import fcntl
+import hashlib
 import io
 import shutil
+import stat
+import uuid
 from datetime import datetime
 from PIL import Image
 from .base import BaseTool
@@ -19,13 +22,96 @@ from ..core.prompts import (
     TOOL_DESC_BROWSER_CAPTURE_MEDIA,
 )
 from ..core.paths import resolve_output_dir
+from ..core.model_catalog import VISION_MODEL_NAME
+from ..services.browser.browser_util import read_auth_token
 
 BROWSER_API_URL = "http://localhost:8030"
+BROWSER_API_VERSION = "human_v6"
 
 # Cap the structured element list so a huge page can't flood context. The agent
 # can scroll to reveal more; function is primary but context still must survive.
 MAX_ELEMENT_LINES = 160
 MAX_ELEMENTS_CHARS = 14000
+MAX_VISIBLE_TEXT_CHARS = 5000
+MAX_BROWSER_UPLOAD_BYTES = 512 * 1024 * 1024
+MAX_TARGET_CROPS = 2
+TARGET_CROP_SCALE = 2
+TARGET_CROP_MAX_SOURCE_DIM = 960  # 2x stays within LLMClient.VISION_MAX_DIM=1920
+
+_BROWSER_ACTION_ALIASES = {
+    "scroll_down": ("scroll", "down"),
+    "scroll_up": ("scroll", "up"),
+    "scroll_to_bottom": ("scroll", "bottom"),
+    "scroll_to_top": ("scroll", "top"),
+    "scroll_left": ("scroll", "left"),
+    "scroll_right": ("scroll", "right"),
+    "scroll_to_left": ("scroll", "leftmost"),
+    "scroll_to_right": ("scroll", "rightmost"),
+    "enter": ("press_key", None),
+    "wait": ("wait_for", None),
+    "select": ("select_option", None),
+    "choose": ("select_option", None),
+    "pick": ("select_option", None),
+}
+_BROWSER_ACTIONS = frozenset({
+    "click", "double_click", "right_click", "hover", "type", "press_key",
+    "scroll", "select_option", "check", "uncheck", "clear", "drag",
+    "press_and_hold", "upload_file", "go_back", "go_forward", "reload",
+    "wait_for", "get_text", "read_text", "click_at", "double_click_at",
+    "right_click_at", "hover_at", "type_at", "drag_at", "press_and_hold_at",
+})
+
+
+def _normalize_browser_action(action, text, duration, direction, key, value):
+    """Canonicalize legacy/human action names through one tested contract."""
+    original = str(action or "").strip().lower()
+    canonical, implied_direction = _BROWSER_ACTION_ALIASES.get(
+        original, (original, None)
+    )
+    if canonical == "scroll" and direction is None:
+        direction = implied_direction
+    if original == "enter":
+        key = key or "Enter"
+    if canonical == "select_option" and value is None and text is not None:
+        value = text
+    # Backward compatibility for the old documented wait action: wait(text="5")
+    # meant five seconds.  Canonical wait_for(text="Ready") still waits for text.
+    if original == "wait" and text is not None:
+        try:
+            seconds = float(str(text).strip())
+        except (TypeError, ValueError):
+            pass
+        else:
+            duration = max(0, min(int(seconds * 1000), 120000))
+            text = None
+    return canonical, text, duration, direction, key, value
+
+
+def _stage_browser_upload(file_path):
+    """Copy a host workspace file into the browser's private mounted volume."""
+    if not file_path or not str(file_path).strip():
+        raise ValueError("upload_file requires 'file_path'.")
+    source = os.path.realpath(os.path.expanduser(str(file_path)))
+    try:
+        info = os.stat(source, follow_symlinks=True)
+    except OSError as exc:
+        raise ValueError(f"upload source is unavailable: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("upload source must be a regular file.")
+    if info.st_size > MAX_BROWSER_UPLOAD_BYTES:
+        raise ValueError(
+            f"upload source exceeds the {MAX_BROWSER_UPLOAD_BYTES // (1024 * 1024)} MB limit."
+        )
+    host_dir = os.path.join(_host_download_dir(), "..", "uploads")
+    host_dir = os.path.realpath(host_dir)
+    os.makedirs(host_dir, mode=0o700, exist_ok=True)
+    os.chmod(host_dir, 0o700)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(source)) or "upload"
+    staged_name = f"{uuid.uuid4().hex}-{safe_name}"
+    staged_host = os.path.join(host_dir, staged_name)
+    shutil.copy2(source, staged_host)
+    os.chmod(staged_host, 0o600)
+    return staged_host, f"/profiles/uploads/{staged_name}"
 
 # --- Ground-truth diagnostics -------------------------------------------------
 # The agent's own "PREVIOUS RESULT SUMMARY" is model narration and, on a weak
@@ -38,6 +124,30 @@ BROWSER_DIAG_LOG = os.path.expanduser("~/.aeon/logs/browser_diag.log")
 _diag_last_url = {}       # (session, tab) -> last URL, to flag actions that didn't navigate
 _diag_run_started = False  # so we stamp a "NEW RUN" banner once per process
 _last_page_sig = {}       # (session, tab) -> signature of the last observed page (model-facing no-op detector)
+
+
+def _browser_token_path():
+    return os.environ.get(
+        "AEON_BROWSER_TOKEN_FILE",
+        os.path.join(os.environ.get("AEON_HOME") or os.path.expanduser("~/.aeon"),
+                     "browser_api_token"),
+    )
+
+
+def browser_auth_headers():
+    """Login header for the localhost browser controller.
+
+    Read on every request so credential rotation does not require restarting
+    Aeon. ``read_auth_token`` rejects missing or over-permissive secret files.
+    """
+    token = read_auth_token(_browser_token_path())
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _worker_uses_qwen38_vision(worker):
+    """True only when browser screenshots would reach the approved Qwen3.8 ID."""
+    return (getattr(getattr(worker, "llm_client", None), "api_model", None)
+            == VISION_MODEL_NAME)
 
 
 def _page_signature(data):
@@ -54,7 +164,12 @@ def _page_signature(data):
          tuple(e.get("states") or []))
         for e in els
     )
-    return (data.get("url", ""), el_sig)
+    # Ignore changing numbers (clocks, unread counts, ad timers) so they do not
+    # masquerade as task progress, while still noticing real non-interactive text
+    # changes such as an error banner, article transition, or modal message.
+    visible = re.sub(r"\d+", "#", str(data.get("visible_text") or ""))
+    visible = re.sub(r"\s+", " ", visible).strip()[:MAX_VISIBLE_TEXT_CHARS]
+    return (data.get("url", ""), el_sig, visible)
 
 
 def _format_validation(validation):
@@ -114,6 +229,198 @@ def _screenshot_health(clean_bytes):
         tiny = size < 3000
         note = "  <-- suspiciously small (possibly blank)" if tiny else ""
         return f"bytes={size} (decode failed: {e}){note}", tiny
+
+
+def _valid_viewport_rect(rect):
+    """Normalize a browser viewport rect, or return None for malformed geometry."""
+    if not isinstance(rect, dict):
+        return None
+    try:
+        x, y = float(rect.get("x", 0)), float(rect.get("y", 0))
+        w, h = float(rect.get("w", 0)), float(rect.get("h", 0))
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _rect_iou(a, b):
+    ax2, ay2 = a["x"] + a["w"], a["y"] + a["h"]
+    bx2, by2 = b["x"] + b["w"], b["y"] + b["h"]
+    iw = max(0.0, min(ax2, bx2) - max(a["x"], b["x"]))
+    ih = max(0.0, min(ay2, by2) - max(a["y"], b["y"]))
+    inter = iw * ih
+    union = a["w"] * a["h"] + b["w"] * b["h"] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _target_crop_regions(data, focus_element_id=None, focus_point=None,
+                         focus_text=""):
+    """Rank grounded viewport regions that merit a lossless enlarged crop.
+
+    Sources, in priority order: the control/coordinate just acted on; explicit
+    CAPTCHA/verification and error regions reported by the browser service;
+    invalid form controls; dense tables and diagrams.  This is deterministic and
+    uses browser geometry only—there is no extra caption-model call.
+    """
+    candidates = []
+
+    def add(priority, kind, label, rect):
+        normalized = _valid_viewport_rect(rect)
+        if normalized is None:
+            return
+        for existing in candidates:
+            if _rect_iou(existing["rect"], normalized) >= 0.72:
+                return
+        candidates.append({
+            "priority": int(priority),
+            "kind": str(kind or "target")[:32],
+            "label": re.sub(r"\s+", " ", str(label or "")).strip()[:120],
+            "rect": normalized,
+        })
+
+    # The service captures this rectangle before acting, after resolving stale ids
+    # and scrolling the real target into view.  Prefer it to looking the numeric id
+    # up in the post-action DOM, where navigation/re-rendering may have reused that
+    # id for a completely different control.
+    action_focus = data.get("action_focus") or {}
+    if isinstance(action_focus, dict):
+        source_url = str(action_focus.get("source_url") or "")
+        current_url = str(data.get("url") or "")
+        if not source_url or source_url == current_url:
+            add(0, "target", action_focus.get("label") or "intended control",
+                action_focus.get("rect"))
+
+    elements = [e for e in (data.get("elements") or [])
+                if isinstance(e, dict) and e.get("inViewport")]
+    if focus_element_id is not None and not any(c["priority"] == 0 for c in candidates):
+        for element in elements:
+            if element.get("id") == focus_element_id:
+                add(0, "target", f"element [{focus_element_id}]", element.get("rect"))
+                break
+    if focus_text and not any(c["priority"] == 0 for c in candidates):
+        needle = re.sub(r"\s+", " ", str(focus_text)).strip().casefold()
+        if needle:
+            matches = []
+            for element in elements:
+                hay = re.sub(
+                    r"\s+", " ", str(element.get("name") or element.get("value") or "")
+                ).strip().casefold()
+                if hay and (needle in hay or hay in needle):
+                    matches.append(element)
+            if len(matches) == 1:
+                add(0, "target", "intended control", matches[0].get("rect"))
+    if focus_point and not any(c["priority"] == 0 for c in candidates):
+        try:
+            px, py = float(focus_point[0]), float(focus_point[1])
+            add(0, "target", "coordinate target", {"x": px - 2, "y": py - 2,
+                                                     "w": 4, "h": 4})
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    region_priority = {"verification": 1, "captcha": 1, "error": 2,
+                       "table": 3, "diagram": 4}
+    for region in data.get("visual_regions") or []:
+        if not isinstance(region, dict):
+            continue
+        kind = str(region.get("kind") or "visual").lower()
+        if kind not in region_priority:
+            continue
+        add(region_priority[kind], kind, region.get("label") or kind,
+            region.get("rect"))
+
+    # Native/ARIA validation identifies the bad field even when an error banner
+    # itself has no useful rectangle.
+    validation_labels = [
+        str(item.get("label") or "").strip().casefold()
+        for item in ((data.get("validation") or {}).get("invalid") or [])
+        if isinstance(item, dict) and item.get("label")
+    ]
+    for label in validation_labels:
+        for element in elements:
+            name = str(element.get("name") or "").strip().casefold()
+            if name and (label in name or name in label):
+                add(2, "error", "invalid form control", element.get("rect"))
+                break
+
+    # Older browser-service responses do not have visual_regions. Preserve a
+    # useful fallback by unioning a dense cluster of row/cell geometry.
+    dense = [e for e in elements if str(e.get("role") or "").lower()
+             in {"row", "cell", "gridcell"} and _valid_viewport_rect(e.get("rect"))]
+    if len(dense) >= 6 and not any(c["kind"] == "table" for c in candidates):
+        rects = [_valid_viewport_rect(e["rect"]) for e in dense]
+        x1, y1 = min(r["x"] for r in rects), min(r["y"] for r in rects)
+        x2 = max(r["x"] + r["w"] for r in rects)
+        y2 = max(r["y"] + r["h"] for r in rects)
+        add(3, "table", "dense table/grid", {"x": x1, "y": y1,
+                                               "w": x2 - x1, "h": y2 - y1})
+
+    candidates.sort(key=lambda item: (item["priority"],
+                                      item["rect"]["w"] * item["rect"]["h"]))
+    return candidates
+
+
+def _crop_box_for_region(rect, image_size, kind="target"):
+    """Expand a viewport region to a useful context window, clamped to the image."""
+    image_w, image_h = image_size
+    cx = rect["x"] + rect["w"] / 2
+    cy = rect["y"] + rect["h"] / 2
+    if kind in {"table", "diagram"}:
+        desired_w = max(640.0, rect["w"] + 120.0)
+        desired_h = max(420.0, rect["h"] + 120.0)
+    else:
+        desired_w = max(480.0, rect["w"] * 3.0 + 160.0)
+        desired_h = max(320.0, rect["h"] * 5.0 + 140.0)
+    desired_w = min(float(image_w), float(TARGET_CROP_MAX_SOURCE_DIM), desired_w)
+    desired_h = min(float(image_h), float(TARGET_CROP_MAX_SOURCE_DIM), desired_h)
+    left = max(0.0, min(float(image_w) - desired_w, cx - desired_w / 2))
+    top = max(0.0, min(float(image_h) - desired_h, cy - desired_h / 2))
+    return (int(round(left)), int(round(top)),
+            int(round(left + desired_w)), int(round(top + desired_h)))
+
+
+def _write_target_crops(clean_path, output_dir, data, focus_element_id=None,
+                        focus_point=None, focus_text="", limit=MAX_TARGET_CROPS):
+    """Write up to ``limit`` atomic, lossless 2x PNG crops; return (path,label)."""
+    try:
+        regions = _target_crop_regions(
+            data, focus_element_id=focus_element_id,
+            focus_point=focus_point, focus_text=focus_text)
+        if not regions:
+            return []
+        results = []
+        with Image.open(clean_path) as source:
+            source.load()
+            image_size = source.size
+            for region in regions:
+                if len(results) >= max(0, int(limit)):
+                    break
+                box = _crop_box_for_region(region["rect"], image_size, region["kind"])
+                crop_w, crop_h = box[2] - box[0], box[3] - box[1]
+                # Enlarging almost the entire 1920px frame adds no visual detail;
+                # the full screenshot already supplies that context.
+                if crop_w * crop_h >= image_size[0] * image_size[1] * 0.82:
+                    continue
+                crop = source.crop(box)
+                resampling = getattr(Image, "Resampling", Image)
+                crop = crop.resize(
+                    (crop_w * TARGET_CROP_SCALE, crop_h * TARGET_CROP_SCALE),
+                    resampling.LANCZOS,
+                )
+                path = os.path.join(
+                    output_dir, f"target_{len(results) + 1}_{region['kind']}_2x.png")
+                tmp = path + ".tmp"
+                crop.save(tmp, format="PNG")
+                os.replace(tmp, path)
+                label = (f"lossless 2x {region['kind']} crop"
+                         + (f" ({region['label']})" if region["label"] else ""))
+                results.append((path, label))
+        return results
+    except Exception:
+        # A crop is an enhancement; the full screenshot remains authoritative and
+        # must never be lost because one malformed page rectangle reached us.
+        return []
 
 
 def _compact_elements(elements, limit=80):
@@ -247,7 +554,19 @@ def _manage_browser_registry(action='register'):
 
 def _browser_healthy():
     try:
-        return requests.get(f"{BROWSER_API_URL}/health", timeout=2).status_code == 200
+        response = requests.get(
+            f"{BROWSER_API_URL}/health", headers=browser_auth_headers(), timeout=2
+        )
+        if response.status_code != 200:
+            return False
+        body = response.json()
+        # Do not treat the legacy unauthenticated server as healthy merely
+        # because it ignores our Authorization header and returns HTTP 200.
+        return (
+            body.get("status") == "ok"
+            and body.get("auth_required") is True
+            and body.get("api_version") == BROWSER_API_VERSION
+        )
     except Exception:
         return False
 
@@ -345,7 +664,47 @@ def _profile_for(worker):
     """The browser profile (isolation unit) for this agent. The principal uses
     'default' (shared, persistent — logins survive); each sub-agent sets its own
     on the worker so it browses as an independent identity."""
-    return getattr(worker, "browser_profile", "default") or "default"
+    raw = str(getattr(worker, "browser_profile", "default") or "default")
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in raw)
+    return safe.strip("-.")[:64] or "default"
+
+
+class _BrowserTabLock:
+    """Cross-process lock for one persistent browser profile/session/tab.
+
+    Aeon agents may share the browser service. Serializing only the tab being
+    acted on prevents a read/action race without unnecessarily blocking other
+    profiles or tabs.
+    """
+
+    def __init__(self, profile, session_id, tab_id):
+        identity = f"{profile}\0{session_id}\0{tab_id}".encode("utf-8")
+        digest = hashlib.sha256(identity).hexdigest()
+        root = os.path.join(
+            os.environ.get("AEON_HOME") or os.path.expanduser("~/.aeon"),
+            "browser_locks",
+        )
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        self.path = os.path.join(root, f"{digest}.lock")
+        self.fd = None
+
+    def __enter__(self):
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        self.fd = os.open(self.path, flags, 0o600)
+        os.fchmod(self.fd, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
 
 
 def _format_elements(elements):
@@ -474,7 +833,8 @@ def _format_media_list(data):
 
 def process_browser_response(data, action_desc, session_id, tab_id,
                              include_vision=True, visual="overlay", worker=None,
-                             compare=False):
+                             compare=False, focus_element_id=None,
+                             focus_point=None, focus_text=""):
     if data.get("status") == "error":
         _log_browser_diag(data, action_desc, session_id, tab_id)
         return f"Browser Error during {action_desc}: {data.get('msg')}"
@@ -482,7 +842,7 @@ def process_browser_response(data, action_desc, session_id, tab_id,
     # Plain-text results (get_text / read_text) have no screenshot payload.
     if "clean_b64" not in data and "text" in data:
         _log_browser_diag(data, action_desc, session_id, tab_id)
-        return f"--- {action_desc} ---\nExtracted text:\n{data['text'][:8000]}"
+        return f"--- {action_desc} ---\nExtracted text:\n{data['text'][:20000]}"
 
     output_dir = os.path.expanduser(f"~/.aeon/temp/browser_output_{session_id}_{tab_id}")
     os.makedirs(output_dir, exist_ok=True)
@@ -535,7 +895,8 @@ def process_browser_response(data, action_desc, session_id, tab_id,
     _last_page_sig[key] = sig
     # A read is meant only to re-observe; a click/type/navigate is meant to change
     # something, so an unchanged page there is a wasted action worth flagging hard.
-    is_passive_read = action_desc.strip().lower().startswith("read page")
+    lowered_action = action_desc.strip().lower()
+    is_passive_read = lowered_action.startswith("read page") or lowered_action.startswith("find ")
     if no_change and not is_passive_read:
         no_change_block = (
             "\n⚠ NO CHANGE: the URL and EVERY interactive element are identical to before this "
@@ -552,6 +913,13 @@ def process_browser_response(data, action_desc, session_id, tab_id,
         no_change_block = ""
 
     elements_str = _format_elements(data.get("elements", []))
+    visible_text = str(data.get("visible_text") or "").strip()
+    if len(visible_text) > MAX_VISIBLE_TEXT_CHARS:
+        visible_text = visible_text[:MAX_VISIBLE_TEXT_CHARS] + "\n… [visible text truncated]"
+    visible_text_block = (
+        "\n=== VISIBLE PAGE TEXT (grounded DOM text) ===\n" + visible_text + "\n"
+        if visible_text else ""
+    )
     scroll_str = _format_scroll(data.get("page_state"))
     page_title = data.get("title", "Unknown")
     page_url = data.get("url", "Unknown")
@@ -567,39 +935,67 @@ def process_browser_response(data, action_desc, session_id, tab_id,
     #   clean             -> the pure render, no marks (closest to a bare human view)
     #   both              -> clean first, then the numbered overlay
     attached = []
-    if include_vision and worker is not None:
+    attachment_labels = []
+    target_crops = []
+    worker_vision_model = getattr(getattr(worker, "llm_client", None), "api_model", None)
+    qwen38_vision_ready = _worker_uses_qwen38_vision(worker)
+    if include_vision and worker is not None and qwen38_vision_ready:
         if visual in ("clean", "both"):
             attached.append(clean_path)
+            attachment_labels.append("current full clean screenshot")
         if visual in ("overlay", "both") and have_overlay:
             attached.append(overlay_path)
+            attachment_labels.append("current full screenshot with numbered [id] marks")
         if not attached:  # e.g. overlay requested but server didn't render it
             attached.append(clean_path)
+            attachment_labels.append("current full clean screenshot")
         # Before/after: prepend last turn's matching frame so the model can diff
         # what this action changed (the "video" case, done as two still frames).
         prev_for_compare = prev_overlay_path if (have_overlay and visual != "clean") else prev_clean_path
         compared = compare and os.path.exists(prev_for_compare)
         if compared:
             attached = [prev_for_compare] + attached
+            attachment_labels = ["previous full screenshot (before this action)"] + attachment_labels
+        if not screenshot_is_blank:
+            target_crops = _write_target_crops(
+                clean_path, output_dir, data,
+                focus_element_id=focus_element_id,
+                focus_point=focus_point,
+                focus_text=focus_text,
+            )
+            for crop_path, crop_label in target_crops:
+                attached.append(crop_path)
+                attachment_labels.append(crop_label)
         try:
             worker.set_visual_context(attached)
         except Exception:
             attached = []
+            attachment_labels = []
+            target_crops = []
             compared = False
     else:
         compared = False
 
     if attached:
         marks = " (with numbered [id] marks)" if any(p in (overlay_path, prev_overlay_path) for p in attached) else ""
-        if compared:
-            vision_note = (f"TWO screenshots{marks} are attached to your NEXT turn: the FIRST is the page "
-                           f"BEFORE this action, the SECOND is AFTER. Compare them to see exactly what "
-                           f"changed, then act by [id].")
-        else:
-            vision_note = (f"A screenshot of this page{marks} is attached to your NEXT turn — look at it "
-                           f"directly to see the page as a human would, then act by [id].")
+        ordering = "; ".join(
+            f"{index}) {label}" for index, label in enumerate(attachment_labels, 1))
+        vision_note = (
+            f"{len(attached)} image{'s are' if len(attached) != 1 else ' is'} attached to your NEXT "
+            f"turn{marks}. Order: {ordering}. Use the full frame for page context and every lossless "
+            "2x crop for fine text/local geometry; the crops are enlargements of the SAME current frame, "
+            "not separate pages. "
+            + ("Compare the previous/current full frames before acting. " if compared else "")
+            + "Act only by [id] from the current INTERACTIVE ELEMENTS list."
+        )
     elif not include_vision:
         vision_note = ("(screenshot NOT attached this step for speed — you are acting on the element "
                        "list alone; set include_vision=true or call browser_read to see the page.)")
+    elif worker is not None and not qwen38_vision_ready:
+        vision_note = (
+            f"(screenshot was NOT attached: vision is restricted to {VISION_MODEL_NAME}, "
+            f"but this session is using {worker_vision_model or 'an unknown model'}. "
+            "Restart Aeon with the Qwen3.8 model to analyze browser screenshots.)")
     else:
         vision_note = ("(no multimodal context available to attach the screenshot; acting on the "
                        "element list. Screenshots saved to disk below.)")
@@ -622,6 +1018,8 @@ def process_browser_response(data, action_desc, session_id, tab_id,
     events_str = ("\n=== EVENTS ===\n" + "\n".join(f"- {e}" for e in events) + "\n") if events else ""
 
     shots = f"clean={clean_path}" + (f" | numbered={overlay_path}" if have_overlay else "")
+    if target_crops:
+        shots += " | targeted=" + ",".join(path for path, _ in target_crops)
     validation_str = _format_validation(data.get("validation"))
     validation_block = f"\n{validation_str}\n" if validation_str else ""
     # Ground-truth identity: the account the browser is ACTUALLY signed in as. The
@@ -652,6 +1050,7 @@ def process_browser_response(data, action_desc, session_id, tab_id,
         f"{scroll_str}\n"
         f"{events_str}"
         f"{validation_block}\n"
+        f"{visible_text_block}"
         f"=== INTERACTIVE ELEMENTS (act on these by [id]) ===\n"
         f"{elements_str}\n\n"
         f"=== PAGE VIEW ===\n{vision_note}\n"
@@ -668,7 +1067,13 @@ def _post(endpoint, payload, action_desc, tab_id, timeout=90,
         # latency cut (one screenshot + two page evals).
         want_overlay = include_vision and visual in ("overlay", "both")
         payload = {**payload, "overlay": want_overlay, "profile": _profile_for(worker)}
-        resp = requests.post(f"{BROWSER_API_URL}/{endpoint}", json=payload, timeout=timeout)
+        with _BrowserTabLock(
+            payload["profile"], payload.get("session_id", "default"), tab_id
+        ):
+            resp = requests.post(
+                f"{BROWSER_API_URL}/{endpoint}", json=payload,
+                headers=browser_auth_headers(), timeout=timeout,
+            )
         if resp.status_code != 200:
             # The server returns a helpful 'detail' for 4xx (e.g. expected_text mismatch).
             try:
@@ -678,7 +1083,13 @@ def _post(endpoint, payload, action_desc, tab_id, timeout=90,
             return f"Browser action failed ({action_desc}): HTTP {resp.status_code}: {detail}"
         return process_browser_response(resp.json(), action_desc, payload.get("session_id"),
                                         tab_id, include_vision=include_vision,
-                                        visual=visual, worker=worker, compare=compare)
+                                        visual=visual, worker=worker, compare=compare,
+                                        focus_element_id=payload.get("element_id"),
+                                        focus_point=((payload.get("x"), payload.get("y"))
+                                                     if payload.get("x") is not None
+                                                     and payload.get("y") is not None else None),
+                                        focus_text=(payload.get("text") if endpoint == "find"
+                                                    else payload.get("expected_text") or ""))
     except Exception as e:
         return f"Error during {action_desc}: {type(e).__name__}: {e}"
 
@@ -710,24 +1121,27 @@ class BrowserInteractTool(BaseTool):
                 direction: str = None, to_element_id: int = None,
                 clear_first: bool = True, then_enter: bool = False,
                 duration: int = 2000, include_vision: bool = True,
-                visual: str = "overlay", compare: bool = False, **kwargs) -> str:
+                visual: str = "overlay", compare: bool = False,
+                x: float = None, y: float = None, to_x: float = None,
+                to_y: float = None, dialog_action: str = None,
+                dialog_text: str = None, **kwargs) -> str:
         if not action:
             return "Error: 'action' is required."
         tab_id = _resolve_tab(self.worker, tab_id)
         _remember_tab(self.worker, tab_id)
-        # Friendly aliases so common phrasings just work.
-        alias = {"scroll_down": ("scroll", "down"), "scroll_up": ("scroll", "up"),
-                 "scroll_to_bottom": ("scroll", "bottom"), "scroll_to_top": ("scroll", "top"),
-                 "scroll_left": ("scroll", "left"), "scroll_right": ("scroll", "right"),
-                 "scroll_to_left": ("scroll", "leftmost"), "scroll_to_right": ("scroll", "rightmost"),
-                 "enter": ("press_key", None)}
-        if action in alias:
-            mapped, d = alias[action]
-            if mapped == "scroll" and direction is None:
-                direction = d
-            if action == "enter":
-                key = key or "Enter"
-            action = mapped
+        action, text, duration, direction, key, value = _normalize_browser_action(
+            action, text, duration, direction, key, value
+        )
+        if action not in _BROWSER_ACTIONS:
+            allowed = ", ".join(sorted(_BROWSER_ACTIONS))
+            return f"Error: unsupported browser action {action!r}. Use one of: {allowed}."
+
+        staged_host = None
+        if action == "upload_file":
+            try:
+                staged_host, file_path = _stage_browser_upload(file_path)
+            except ValueError as exc:
+                return f"Error: {exc}"
 
         payload = {
             "session_id": _session_id(), "tab_id": tab_id, "action": action,
@@ -735,10 +1149,21 @@ class BrowserInteractTool(BaseTool):
             "expected_text": expected_text, "key": key, "value": value,
             "file_path": file_path, "amount": amount, "direction": direction or "down",
             "clear_first": clear_first, "then_enter": then_enter, "duration": duration,
+            "x": x, "y": y, "to_x": to_x, "to_y": to_y,
+            "dialog_action": dialog_action, "dialog_text": dialog_text,
         }
         desc = f"{action}" + (f" on [{element_id}]" if element_id is not None else "")
-        return _post("interact", payload, desc, tab_id, include_vision=include_vision,
-                     visual=visual, worker=self.worker, compare=compare)
+        if action.endswith("_at") and x is not None and y is not None:
+            desc += f" at ({x:g}, {y:g})"
+        try:
+            return _post("interact", payload, desc, tab_id, include_vision=include_vision,
+                         visual=visual, worker=self.worker, compare=compare)
+        finally:
+            if staged_host:
+                try:
+                    os.unlink(staged_host)
+                except OSError:
+                    pass
 
 
 class BrowserReadTool(BaseTool):
@@ -769,6 +1194,74 @@ class BrowserReadTool(BaseTool):
                      include_vision=include_vision, visual=visual, worker=self.worker)
 
 
+class BrowserFindTool(BaseTool):
+    """Search the rendered page semantically and return actionable matches."""
+
+    def __init__(self, worker=None):
+        super().__init__(
+            name="browser_find",
+            description=(
+                "Find text or controls anywhere in the current rendered page, including off-screen "
+                "content, iframes, and open shadow roots. Returns a filtered indexed element list "
+                "and a numbered screenshot; matches can be used immediately with browser_interact. "
+                "Schema: text (required substring), role (optional accessibility role), tab_id "
+                "(optional), include_vision (default true), visual ('overlay'|'clean'|'both')."
+            ),
+        )
+        self.worker = worker
+
+    def execute(self, text: str, role: str = None, tab_id: str = None,
+                include_vision: bool = True, visual: str = "overlay", **kwargs) -> str:
+        if not text or not str(text).strip():
+            return "Error: browser_find requires non-empty 'text'."
+        tab_id = _resolve_tab(self.worker, tab_id)
+        _remember_tab(self.worker, tab_id)
+        payload = {
+            "session_id": _session_id(), "tab_id": tab_id,
+            "text": str(text).strip(), "role": str(role or "").strip() or None,
+        }
+        desc = f"Find {text!r}" + (f" with role {role!r}" if role else "")
+        return _post("find", payload, desc, tab_id, include_vision=include_vision,
+                     visual=visual, worker=self.worker)
+
+
+class BrowserExtractTool(BaseTool):
+    """Extract structured page content without forcing the model to OCR it."""
+
+    def __init__(self, worker=None):
+        super().__init__(
+            name="browser_extract",
+            description=(
+                "Extract structured content from the current rendered page and its iframes. "
+                "Use mode='forms' to inspect controls/labels/options, mode='tables' for headers "
+                "and rows, mode='links' for link text and resolved URLs, or mode='text' for main "
+                "page text. Schema: mode (required), tab_id (optional), max_items (default 200, "
+                "maximum 500). This is read-only and returns grounded text/JSON without a screenshot."
+            ),
+        )
+        self.worker = worker
+
+    def execute(self, mode: str, tab_id: str = None, max_items: int = 200,
+                **kwargs) -> str:
+        mode = str(mode or "").strip().lower()
+        if mode not in {"text", "links", "forms", "tables"}:
+            return "Error: browser_extract mode must be text, links, forms, or tables."
+        try:
+            max_items = max(1, min(int(max_items), 500))
+        except (TypeError, ValueError):
+            return "Error: browser_extract max_items must be an integer."
+        tab_id = _resolve_tab(self.worker, tab_id)
+        _remember_tab(self.worker, tab_id)
+        payload = {
+            "session_id": _session_id(), "tab_id": tab_id,
+            "mode": mode, "max_items": max_items,
+        }
+        return _post(
+            "extract", payload, f"Extract {mode}", tab_id,
+            include_vision=False, visual="clean", worker=self.worker,
+        )
+
+
 class BrowserCloseTabTool(BaseTool):
     def __init__(self, worker=None):
         super().__init__(name="browser_close_tab", description=TOOL_DESC_BROWSER_CLOSE_TAB)
@@ -777,9 +1270,12 @@ class BrowserCloseTabTool(BaseTool):
     def execute(self, tab_id: str) -> str:
         try:
             ensure_browser_running()
-            resp = requests.post(f"{BROWSER_API_URL}/close_tab",
-                                 json={"session_id": _session_id(), "tab_id": tab_id,
-                                       "profile": _profile_for(self.worker)}, timeout=15)
+            profile = _profile_for(self.worker)
+            with _BrowserTabLock(profile, _session_id(), tab_id):
+                resp = requests.post(f"{BROWSER_API_URL}/close_tab",
+                                     json={"session_id": _session_id(), "tab_id": tab_id,
+                                           "profile": profile},
+                                     headers=browser_auth_headers(), timeout=15)
             if resp.status_code != 200:
                 return f"HTTP Error {resp.status_code} from browser API: {resp.text}"
             data = resp.json()
@@ -830,7 +1326,11 @@ class BrowserCaptureMediaTool(BaseTool):
                        "profile": _profile_for(self.worker), "media_id": media_id,
                        "duration_s": duration_s}
             # Generous timeout: a video screen-recording fallback runs for duration_s.
-            resp = requests.post(f"{BROWSER_API_URL}/capture_media", json=payload, timeout=300)
+            with _BrowserTabLock(payload["profile"], payload["session_id"], tab_id):
+                resp = requests.post(
+                    f"{BROWSER_API_URL}/capture_media", json=payload,
+                    headers=browser_auth_headers(), timeout=300,
+                )
             if resp.status_code != 200:
                 try:
                     detail = resp.json().get("detail", resp.text)

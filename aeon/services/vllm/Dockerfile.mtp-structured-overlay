@@ -1,0 +1,10 @@
+# Fast migration overlay for hosts that still have Aeon's exact pre-backport
+# runtime. Pin the immutable base ID: after ``aeon_vllm:latest`` is promoted,
+# resolving that mutable tag here would try to patch an already-patched image.
+# Clean installations should build the fully pinned primary Dockerfile instead.
+ARG BASE_IMAGE=aeon_vllm@sha256:c38ede76f716f6991f81a5d23e63f6ac0c852b79dd66a83c8f9657153991caca
+FROM ${BASE_IMAGE}
+
+COPY apply_mtp_structured_output_backport.py /tmp/apply_mtp_structured_output_backport.py
+RUN python3 /tmp/apply_mtp_structured_output_backport.py \
+    && rm /tmp/apply_mtp_structured_output_backport.py

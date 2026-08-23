@@ -1,0 +1,1 @@
+Use browser_find when the desired text or control is not present in the current bounded element list, is off-screen, or occurs inside an iframe/open shadow root. Provide the text substring and optionally an accessibility role. The returned filtered ids are immediately actionable, but still pass expected_text to browser_interact because dynamic pages can change after the search.

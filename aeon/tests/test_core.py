@@ -36,6 +36,32 @@ def _bare_llm_client():
     return client
 
 
+def _exact_qwen_tool_lease():
+    """Return the release-bound local receipt used by tool-placement tests."""
+
+    from aeon.core.compute_profile import QWEN38_VLLM_PROFILE
+    from aeon.core.qwen_capabilities import active_qwen_runtime_capability
+
+    capability, manifest_sha256 = active_qwen_runtime_capability()
+    return {
+        "claim_id": "gc-hermetic-tool-exclusion",
+        "host": capability.host,
+        "physical_gpu": capability.coordinator_gpu,
+        "memory_total_mib": 97887,
+        "vram_budget_gb": capability.vram_budget_gb,
+        "vram_budget_mib": round(capability.vram_budget_gb * 1024),
+        "exclusive": True,
+        "compute_profile": QWEN38_VLLM_PROFILE.key,
+        "min_host_memory_gb": QWEN38_VLLM_PROFILE.min_host_memory_gb,
+        "min_host_commit_gb": QWEN38_VLLM_PROFILE.min_host_commit_gb,
+        "min_disk_free_gb": QWEN38_VLLM_PROFILE.min_disk_free_gb,
+        "min_shm_free_gb": QWEN38_VLLM_PROFILE.min_shm_free_gb,
+        "runtime_capability_key": capability.key,
+        "runtime_capability_manifest_sha256": manifest_sha256,
+        "runtime_adapter": capability.runtime_adapter,
+    }
+
+
 class TestJsonExtraction(unittest.TestCase):
     def setUp(self):
         self.c = _bare_llm_client()
@@ -526,6 +552,95 @@ class TestBrowserSnapshotFormat(unittest.TestCase):
         self.assertIn("more below", _format_scroll({"scrollY": 0, "scrollHeight": 3000, "clientHeight": 1000}))
         self.assertIn("fits in view", _format_scroll({"scrollY": 0, "scrollHeight": 800, "clientHeight": 1000}))
 
+    def test_visible_text_participates_in_noop_signature_without_timer_noise(self):
+        from aeon.tools.browser import _page_signature
+        base = {"url": "https://example.test", "elements": self._els()}
+        first = _page_signature({**base, "visible_text": "Status: ready in 10 seconds"})
+        timer_only = _page_signature({**base, "visible_text": "Status: ready in 9 seconds"})
+        changed = _page_signature({**base, "visible_text": "Status: submission rejected"})
+        self.assertEqual(first, timer_only)
+        self.assertNotEqual(first, changed)
+
+
+class TestBrowserV6Capabilities(unittest.TestCase):
+    def test_action_aliases_use_one_canonical_contract(self):
+        from aeon.tools.browser import _normalize_browser_action
+        self.assertEqual(
+            _normalize_browser_action("wait", "5", 2000, None, None, None),
+            ("wait_for", None, 5000, None, None, None),
+        )
+        self.assertEqual(
+            _normalize_browser_action("select", "California", 2000, None, None, None),
+            ("select_option", "California", 2000, None, None, "California"),
+        )
+        self.assertEqual(
+            _normalize_browser_action("enter", None, 2000, None, None, None),
+            ("press_key", None, 2000, None, "Enter", None),
+        )
+
+    def test_workspace_upload_is_staged_inside_private_browser_mount(self):
+        import os
+        import tempfile
+        from unittest.mock import patch
+        from aeon.tools.browser import _stage_browser_upload
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "report with spaces.txt"
+            source.write_text("private local test", encoding="utf-8")
+            aeon_home = Path(td) / "aeon-home"
+            with patch.dict(os.environ, {"AEON_HOME": str(aeon_home)}):
+                host_path, container_path = _stage_browser_upload(str(source))
+            staged = Path(host_path)
+            self.assertTrue(staged.is_file())
+            self.assertEqual(staged.read_text(encoding="utf-8"), "private local test")
+            self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
+            self.assertTrue(container_path.startswith("/profiles/uploads/"))
+
+    def test_browser_find_calls_filtered_endpoint(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from aeon.tools.browser import BrowserFindTool
+
+        worker = SimpleNamespace(_last_browser_tab="docs", browser_profile="default")
+        with patch("aeon.tools.browser._post", return_value="matches") as post:
+            result = BrowserFindTool(worker=worker).execute("billing", role="button")
+        self.assertEqual(result, "matches")
+        self.assertEqual(post.call_args.args[0], "find")
+        self.assertEqual(post.call_args.args[1]["text"], "billing")
+        self.assertEqual(post.call_args.args[1]["role"], "button")
+
+    def test_coordinate_action_payload_and_dialog_policy(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from aeon.tools.browser import BrowserInteractTool
+
+        worker = SimpleNamespace(_last_browser_tab="map", browser_profile="travel")
+        with patch("aeon.tools.browser._post", return_value="clicked") as post:
+            result = BrowserInteractTool(worker=worker).execute(
+                "click_at", x=120.5, y=240, dialog_action="accept",
+                dialog_text="Austin",
+            )
+        self.assertEqual(result, "clicked")
+        payload = post.call_args.args[1]
+        self.assertEqual((payload["x"], payload["y"]), (120.5, 240))
+        self.assertEqual(payload["dialog_action"], "accept")
+        self.assertEqual(payload["dialog_text"], "Austin")
+
+    def test_browser_extract_calls_structured_endpoint(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from aeon.tools.browser import BrowserExtractTool
+
+        worker = SimpleNamespace(_last_browser_tab="docs", browser_profile="default")
+        with patch("aeon.tools.browser._post", return_value="table json") as post:
+            result = BrowserExtractTool(worker=worker).execute("tables", max_items=40)
+        self.assertEqual(result, "table json")
+        self.assertEqual(post.call_args.args[0], "extract")
+        self.assertEqual(post.call_args.args[1]["mode"], "tables")
+        self.assertEqual(post.call_args.args[1]["max_items"], 40)
+        from aeon.tools.categories import TOP_LEVEL_TOOLS
+        self.assertIn("browser_extract", TOP_LEVEL_TOOLS)
+
 
 class TestOscillationLogic(unittest.TestCase):
     """Mirrors the worker's 2-cycle detection predicate."""
@@ -723,9 +838,16 @@ class TestMultimodalPerception(unittest.TestCase):
         # Non-existent path -> encoder returns None -> plain string, never raises.
         self.assertEqual(c._build_user_content("look", ["/no/such/file.png"]), "look")
 
+    def test_image_payloads_fail_closed_for_non_qwen_model(self):
+        from aeon.core.llm import LLMClient
+        c = LLMClient.__new__(LLMClient)
+        c.api_model = "some-other-model"
+        with self.assertRaisesRegex(RuntimeError, "only approved vision model"):
+            c.get_primary_agent_response(prompt="look", images=["/tmp/shot.jpg"])
+
     def test_jpeg_passthrough_no_reencode(self):
         # A right-sized JPEG (the browser case) must be base64'd verbatim — no
-        # second lossy re-encode. A PNG must be converted to JPEG (bytes differ).
+        # second lossy re-encode. Targeted PNG crops also pass through verbatim.
         import base64, os, tempfile
         from PIL import Image
         c = self._client()
@@ -739,8 +861,52 @@ class TestMultimodalPerception(unittest.TestCase):
 
             pn = os.path.join(d, "shot.png")
             Image.new("RGB", (200, 120), (30, 60, 90)).save(pn, "PNG")
+            with open(pn, "rb") as f:
+                png_raw = f.read()
             purl = c._encode_image_data_url(pn)
-            self.assertTrue(purl.startswith("data:image/jpeg;base64,"), "PNG should be re-encoded to JPEG")
+            self.assertTrue(purl.startswith("data:image/png;base64,"))
+            self.assertEqual(base64.b64decode(purl.split(",", 1)[1]), png_raw,
+                             "targeted PNG crops must stay lossless")
+
+    def test_targeted_browser_crop_is_lossless_enlarged_and_ranked(self):
+        import os, tempfile
+        from PIL import Image
+        from aeon.tools.browser import _target_crop_regions, _write_target_crops
+
+        data = {
+            "url": "https://example.test/form",
+            "action_focus": {
+                "label": "resolved Country control",
+                "source_url": "https://example.test/form",
+                "rect": {"x": 850, "y": 430, "w": 120, "h": 30},
+            },
+            "elements": [
+                {"id": 17, "role": "combobox", "name": "Country",
+                 # Simulate a post-action re-render reusing id 17 elsewhere.
+                 "inViewport": True, "rect": {"x": 180, "y": 120, "w": 60, "h": 20}},
+            ],
+            "visual_regions": [
+                {"kind": "error", "label": "Country is required",
+                 "rect": {"x": 820, "y": 410, "w": 280, "h": 90}},
+                {"kind": "table", "label": "Results",
+                 "rect": {"x": 100, "y": 100, "w": 700, "h": 600}},
+            ],
+            "validation": {"invalid": [{"label": "Country", "reason": "required"}]},
+        }
+        ranked = _target_crop_regions(data, focus_element_id=17)
+        self.assertEqual(ranked[0]["kind"], "target")
+        self.assertEqual(ranked[0]["rect"]["x"], 850)
+        self.assertIn("error", [item["kind"] for item in ranked])
+        with tempfile.TemporaryDirectory() as d:
+            source = os.path.join(d, "clean.jpg")
+            Image.new("RGB", (1920, 1080), (240, 240, 240)).save(source, "JPEG")
+            crops = _write_target_crops(source, d, data, focus_element_id=17, limit=1)
+            self.assertEqual(len(crops), 1)
+            crop_path, label = crops[0]
+            self.assertIn("lossless 2x target crop", label)
+            with Image.open(crop_path) as crop:
+                self.assertEqual(crop.format, "PNG")
+                self.assertEqual(crop.size, (1040, 640))
 
     def test_worker_visual_context_replaces_not_accumulates(self):
         from aeon.core.worker import Worker
@@ -753,6 +919,67 @@ class TestMultimodalPerception(unittest.TestCase):
         self.assertEqual(w.visual_context, ["/tmp/b.jpg", "/tmp/c.jpg", "/tmp/d.jpg"])
         w.set_visual_context([None, ""])                    # empties are dropped
         self.assertEqual(w.visual_context, [])
+
+    def test_analyze_image_uses_only_qwen38_served_id(self):
+        import os
+        import tempfile
+        from unittest.mock import Mock, patch
+        from PIL import Image
+        from aeon.core.model_catalog import VISION_MODEL_NAME
+        from aeon.tools.vision import AnalyzeImageTool
+
+        with tempfile.TemporaryDirectory() as d:
+            image_path = os.path.join(d, "probe.png")
+            Image.new("RGB", (32, 24), (12, 34, 56)).save(image_path)
+            response = Mock(status_code=200, text="")
+            response.json.return_value = {
+                "choices": [{"message": {"content": "visible"}}]
+            }
+            env = {
+                "AEON_VISION_BASE_URL": "http://localhost:8033/v1",
+                "AEON_VISION_MODEL": VISION_MODEL_NAME,
+            }
+            with patch.dict(os.environ, env, clear=False), \
+                    patch("aeon.tools.vision.requests.post", return_value=response) as post:
+                result = AnalyzeImageTool().execute(image_path, "Describe this")
+            self.assertIn("visible", result)
+            payload = post.call_args.kwargs["json"]
+            self.assertEqual(payload["model"], VISION_MODEL_NAME)
+            self.assertEqual(payload["reasoning_effort"], "low")
+            self.assertTrue(payload["chat_template_kwargs"]["preserve_thinking"])
+
+    def test_analyze_image_rejects_non_qwen_vision_env(self):
+        import os
+        import tempfile
+        from unittest.mock import patch
+        from PIL import Image
+        from aeon.tools.vision import AnalyzeImageTool
+
+        with tempfile.TemporaryDirectory() as d:
+            image_path = os.path.join(d, "probe.png")
+            Image.new("RGB", (16, 16), (1, 2, 3)).save(image_path)
+            env = {
+                "AEON_VISION_BASE_URL": "http://localhost:9999/v1",
+                "AEON_VISION_MODEL": "retired-vision-model",
+            }
+            with patch.dict(os.environ, env, clear=False), \
+                    patch("aeon.tools.vision.requests.post") as post:
+                result = AnalyzeImageTool().execute(image_path, "Describe this")
+            self.assertIn("refusing to send image data", result)
+            post.assert_not_called()
+
+    def test_browser_screenshots_are_qwen38_only(self):
+        from types import SimpleNamespace
+        from aeon.core.model_catalog import VISION_MODEL_NAME
+        from aeon.tools.browser import _worker_uses_qwen38_vision
+
+        qwen_worker = SimpleNamespace(
+            llm_client=SimpleNamespace(api_model=VISION_MODEL_NAME))
+        other_worker = SimpleNamespace(
+            llm_client=SimpleNamespace(api_model="retired-vision-model"))
+        self.assertTrue(_worker_uses_qwen38_vision(qwen_worker))
+        self.assertFalse(_worker_uses_qwen38_vision(other_worker))
+        self.assertFalse(_worker_uses_qwen38_vision(None))
 
 
 class TestBrowserUtil(unittest.TestCase):
@@ -791,6 +1018,67 @@ class TestBrowserUtil(unittest.TestCase):
         self.assertEqual(self.bu.primary_locale("de-DE"), "de-DE")
         self.assertEqual(self.bu.primary_locale("", "en-US"), "en-US")
         self.assertIsNone(self.bu.primary_locale(""))
+
+    def test_bearer_login_is_exact_and_constant_time_safe(self):
+        token = "a" * self.bu.MIN_AUTH_TOKEN_BYTES
+        self.assertTrue(self.bu.bearer_is_authorized(f"Bearer {token}", token))
+        self.assertTrue(self.bu.bearer_is_authorized(f"bearer {token}", token))
+        self.assertFalse(self.bu.bearer_is_authorized("", token))
+        self.assertFalse(self.bu.bearer_is_authorized(token, token))
+        self.assertFalse(self.bu.bearer_is_authorized("Basic " + token, token))
+        self.assertFalse(self.bu.bearer_is_authorized("Bearer " + "b" * len(token), token))
+
+    def test_auth_token_file_must_be_private_regular_and_strong(self):
+        import os
+        import tempfile
+
+        token = "secret-" + "x" * self.bu.MIN_AUTH_TOKEN_BYTES
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "browser_api_token"
+            path.write_text(token + "\n", encoding="utf-8")
+            path.chmod(0o600)
+            self.assertEqual(self.bu.read_auth_token(str(path)), token)
+
+            path.chmod(0o644)
+            with self.assertRaisesRegex(RuntimeError, "0600"):
+                self.bu.read_auth_token(str(path))
+
+            path.chmod(0o600)
+            link = Path(td) / "token-link"
+            os.symlink(path, link)
+            with self.assertRaisesRegex(RuntimeError, "regular file"):
+                self.bu.read_auth_token(str(link))
+
+            path.write_text("short\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "at least"):
+                self.bu.read_auth_token(str(path))
+
+    def test_browser_health_requires_authenticated_v6_response(self):
+        import os
+        import tempfile
+        from unittest.mock import Mock, patch
+        from aeon.tools import browser
+
+        with tempfile.TemporaryDirectory() as td:
+            token_path = Path(td) / "browser_api_token"
+            token = "t" * 48
+            token_path.write_text(token + "\n", encoding="utf-8")
+            token_path.chmod(0o600)
+            response = Mock(status_code=200)
+            with patch.dict(os.environ, {"AEON_BROWSER_TOKEN_FILE": str(token_path)}), \
+                    patch.object(browser.requests, "get", return_value=response) as get:
+                response.json.return_value = {"status": "ok"}  # legacy, unauthenticated
+                self.assertFalse(browser._browser_healthy())
+                response.json.return_value = {
+                    "status": "ok", "auth_required": True, "api_version": "human_v4"
+                }
+                self.assertFalse(browser._browser_healthy())
+                response.json.return_value = {
+                    "status": "ok", "auth_required": True, "api_version": "human_v6"
+                }
+                self.assertTrue(browser._browser_healthy())
+            self.assertEqual(get.call_args.kwargs["headers"],
+                             {"Authorization": f"Bearer {token}"})
 
 
 class TestActionSchema(unittest.TestCase):
@@ -885,6 +1173,99 @@ class TestStructuredRequestModes(unittest.TestCase):
         self.c.set_action_schema(self.c.action_schema)
         self.assertIsNone(self.c._structured_mode)
 
+    def test_reasoning_controls_merge_with_schema(self):
+        kw = self.c._merge_reasoning_kwargs(
+            self.c._structured_request_kwargs(), "xhigh")
+        self.assertEqual(kw["reasoning_effort"], "xhigh")
+        self.assertIn("response_format", kw)
+        self.assertEqual(kw["extra_body"]["top_k"], -1)
+        self.assertEqual(kw["extra_body"]["min_p"], 0.0)
+        self.assertEqual(kw["extra_body"]["repetition_penalty"], 1.0)
+        template = kw["extra_body"]["chat_template_kwargs"]
+        self.assertTrue(template["enable_thinking"])
+        self.assertTrue(template["preserve_thinking"])
+
+    def test_invalid_effort_falls_back_to_medium(self):
+        kw = self.c._reasoning_request_kwargs("turbo")
+        self.assertEqual(kw["reasoning_effort"], "medium")
+
+
+class TestAdaptiveReasoningProfiles(unittest.TestCase):
+    def _worker(self, iteration=2):
+        import types
+        from aeon.core.worker import Worker
+        w = Worker.__new__(Worker)
+        w.llm_client = types.SimpleNamespace(current_iteration=iteration)
+        w.last_observation = "The previous step completed normally."
+        w._failures_since_external_consult = 0
+        w._no_progress_streak = 0
+        w._stuck_banner = ""
+        return w
+
+    def test_simple_extraction_is_low(self):
+        w = self._worker()
+        self.assertEqual(w._select_reasoning_effort("Summarize this page"), "low")
+        self.assertEqual(w._select_reasoning_effort("Click the Search button"), "low")
+
+    def test_normal_turn_is_medium(self):
+        w = self._worker()
+        self.assertEqual(w._select_reasoning_effort("Continue the current task"), "medium")
+        self.assertEqual(w._select_reasoning_effort(
+            "Continue the current task", has_images=True), "medium")
+
+    def test_complex_first_turn_and_recovery_are_xhigh(self):
+        w = self._worker(iteration=1)
+        self.assertEqual(w._select_reasoning_effort("Handle this request"), "xhigh")
+        w = self._worker()
+        self.assertEqual(w._select_reasoning_effort("Implement the parser"), "xhigh")
+        w._failures_since_external_consult = 1
+        self.assertEqual(w._select_reasoning_effort("Summarize this page"), "xhigh")
+
+    def test_selective_local_search_only_on_hard_or_failed_turns(self):
+        w = self._worker(iteration=2)
+        self.assertEqual(w._local_search_candidate_count(
+            "Continue the current task", "medium"), 1)
+        w._failures_since_external_consult = 1
+        self.assertEqual(w._local_search_candidate_count(
+            "Continue the current task", "xhigh"), 2)
+        w._failures_since_external_consult = 2
+        self.assertEqual(w._local_search_candidate_count(
+            "Continue the current task", "xhigh"), 3)
+
+    def test_visual_verification_challenge_gets_two_candidates(self):
+        w = self._worker(iteration=3)
+        w.last_observation = "--- BROWSER: read --- Verify you are human challenge"
+        self.assertEqual(w._local_search_candidate_count(
+            "Continue", "medium", has_images=True), 2)
+
+
+class TestSelectiveLocalCandidateVerification(unittest.TestCase):
+    def test_only_selected_candidate_and_reasoning_survive(self):
+        import json as _json
+        c = _bare_llm_client()
+        c.last_local_search = {}
+        c.last_reasoning_content = ""
+        c.last_reasoning_effort = ""
+        produced = []
+
+        def proposal(**kwargs):
+            index = len(produced)
+            c.last_reasoning_content = f"reasoning-{index}"
+            c.last_reasoning_effort = "xhigh"
+            value = _json.dumps({"thought": f"candidate {index}", "actions": [
+                {"tool_name": "run_command", "parameters": {"command": f"check-{index}"}}
+            ]})
+            produced.append(value)
+            return value
+
+        c.get_primary_agent_response = proposal
+        c._verify_primary_candidates = lambda candidates, **kwargs: (1, "test output supports it")
+        out = c.get_verified_primary_agent_response(prompt="state", candidate_count=3)
+        self.assertEqual(_json.loads(out)["actions"][0]["parameters"]["command"], "check-1")
+        self.assertEqual(c.last_reasoning_content, "reasoning-1")
+        self.assertEqual(c.last_local_search["selected_candidate"], 2)
+        self.assertEqual(len(produced), 3)
+
 
 class TestStructuredEndToEnd(unittest.TestCase):
     """get_primary_agent_response with a stubbed server: the structured fast
@@ -943,11 +1324,36 @@ class TestStructuredEndToEnd(unittest.TestCase):
                 '"intent": "run it", "actions": [{"tool_name": "run_command", '
                 '"parameters": {"command": "echo hi"}}]}')
         c = self._client_returning([('{"thought": "endless...', "length"), (good, "stop")])
-        out = c.get_primary_agent_response("PROMPT")
+        out = c.get_primary_agent_response("PROMPT", reasoning_effort="low")
         self.assertEqual(_json.loads(out)["intent"], "run it")
         self.assertEqual(len(c.requests), 2)
+        self.assertEqual(c.requests[0]["reasoning_effort"], "low")
+        self.assertEqual(c.requests[1]["reasoning_effort"], "xhigh")
         retry_prompt = c.requests[1]["messages"][0]["content"]
         self.assertIn("CUT OFF", retry_prompt)
+
+    def test_streamed_reasoning_is_captured_separately(self):
+        from types import SimpleNamespace as NS
+        import json as _json
+        good = ('{"thought":"brief","previous_result_summary":"N/A",'
+                '"skill_check":"none","memory_check":"none",'
+                '"parallel_check":"none","intent":"go","actions":[]}')
+        c = self._client_returning([])
+
+        def create(**kwargs):
+            c.requests.append(kwargs)
+            return iter([
+                NS(choices=[NS(delta=NS(reasoning_content="reason ", content=None),
+                                      finish_reason=None)], usage=None),
+                NS(choices=[NS(delta=NS(reasoning="continued", content=good),
+                                      finish_reason="stop")], usage=None),
+            ])
+
+        c.client = NS(chat=NS(completions=NS(create=create)))
+        out = c.get_primary_agent_response("PROMPT", reasoning_effort="medium")
+        self.assertEqual(_json.loads(out)["intent"], "go")
+        self.assertEqual(c.last_reasoning_content, "reason continued")
+        self.assertEqual(c.last_reasoning_effort, "medium")
 
 
 class TestSubAgentReportIntegrity(unittest.TestCase):
@@ -1052,48 +1458,381 @@ class TestFittedGpuMemUtil(unittest.TestCase):
         from aeon.core.gpu import GpuInfo
         return [GpuInfo(index=i, name="test", total_gib=gib, free_gib=gib) for i in range(n)]
 
+    def test_qwen38_is_the_only_qwen_language_catalog_entry(self):
+        from aeon.core import model_catalog as c
+        self.assertEqual([entry.name for entry in c.CATALOG], [c.QWEN38_MODEL_NAME])
+        entry = c.CATALOG[0]
+        self.assertEqual(entry.local_model_dir, "Qwen3.8-27B-ARA-abliterated-NVFP4-MTP")
+        self.assertEqual(entry.hf_model, "/models")
+        self.assertEqual(entry.mtp.method, "mtp")
+        self.assertEqual(entry.mtp.n_max, 3)
+        self.assertEqual(entry.kv_quant, "fp8_per_token_head")
+        self.assertEqual(entry.attention_backend, "TRITON_ATTN")
+        self.assertEqual(entry.max_num_seqs, 1)
+        self.assertEqual(
+            entry.mtp.selection_manifest,
+            "data/qwen38_mtp_selection.json",
+        )
+        self.assertTrue(entry.multimodal)
+        self.assertEqual(entry.served_name, c.VISION_MODEL_NAME)
+        self.assertEqual(
+            [model.name for model in c.CATALOG if model.multimodal],
+            [c.QWEN38_MODEL_NAME],
+        )
+
     def test_solo_util_fits_footprint_not_whole_card(self):
         from aeon.core import model_catalog as c, deploy_planner as dp
         gpus = self._gpus()
-        e = c.by_name("Qwen3.6-27B-Huihui-NVFP4-MTP")
+        e = c.by_name("Qwen3.8-27B-ARA-NVFP4-MTP")
         p = dp.plan(e, gpus, mode="solo")
         self.assertEqual(p.tier, "solo")
+        self.assertEqual(
+            p.env["AEON_MTP_SELECTION_MANIFEST"],
+            "data/qwen38_mtp_selection.json",
+        )
+        self.assertEqual(p.env["AEON_MTP_NMAX"], "3")
+        self.assertEqual(p.env["AEON_VLLM_ATTENTION_BACKEND"], "TRITON_ATTN")
+        self.assertEqual(p.env["AEON_MAX_NUM_SEQS"], "1")
+        self.assertTrue(p.mtp)
         util = float(p.env["AEON_GPU_MEM_UTIL"])
-        reserved = util * gpus[0].total_gib
+        allocated = util * gpus[0].total_gib
+        lease_budget = float(p.env["AEON_LLM_VRAM_BUDGET_GB"])
         kv = p.context_limit * e.kv_gib_per_64k / 65536.0
-        expected = e.weights_gib + kv + dp.KV_POOL_HEADROOM_GIB
-        self.assertAlmostEqual(reserved, expected, delta=0.5)
-        # Well below the old flat 0.85 fill, and the KV pool still holds full ctx.
-        self.assertLess(util, 0.6)
-        self.assertGreaterEqual(reserved - e.weights_gib, kv)
+        steady_expected = e.weights_gib + kv + dp.VLLM_ALLOCATION_HEADROOM_GIB
+        peak_expected = e.weights_gib + kv + dp.KV_POOL_HEADROOM_GIB
+        self.assertAlmostEqual(allocated, steady_expected, delta=0.5)
+        self.assertGreaterEqual(lease_budget, peak_expected - 0.1)
+        self.assertLess(allocated, lease_budget)
+        # Sized to the measured MTP-expanded KV footprint without consuming the
+        # separate transient peak allowance as permanent KV.
+        self.assertLess(util, 0.85)
+        self.assertGreaterEqual(allocated - e.weights_gib, kv)
+
+    def test_single_gpu_uses_real_physical_index_and_reserves_tool_capacity(self):
+        from aeon.core import model_catalog as c, deploy_planner as dp
+        from aeon.core.gpu import GpuInfo
+
+        gpu = GpuInfo(index=7, name="single", total_gib=95.6, free_gib=95.6)
+        e = c.by_name("Qwen3.8-27B-ARA-NVFP4-MTP")
+        p = dp.plan(e, [gpu], mode="solo")
+
+        self.assertEqual(p.tier, "solo")
+        self.assertEqual(p.nodes[0]["devices"], "7")
+        self.assertEqual(p.env["AEON_TOOL_GPU_POLICY"], "exclusive-separate-required")
+        self.assertEqual(p.context_limit, 114688)
+        self.assertEqual(float(p.env["AEON_GPU_MEM_UTIL"]), 0.415)
+        self.assertEqual(float(p.env["AEON_LLM_VRAM_BUDGET_GB"]), 48.7)
+
+    def test_48gb_single_gpu_keeps_renter_reserve_and_64k_context(self):
+        from aeon.core import model_catalog as c, deploy_planner as dp
+        from aeon.core.gpu import GpuInfo
+
+        gpu = GpuInfo(index=3, name="RTX PRO 5000", total_gib=47.79, free_gib=47.79)
+        entry = c.by_name("Qwen3.8-27B-ARA-NVFP4-MTP")
+        with self.assertRaisesRegex(ValueError, ">=90 GiB"):
+            dp.plan(entry, [gpu], mode="solo")
+
+
+    def test_dual_uses_coordinator_physical_indices_not_ordinal_positions(self):
+        from aeon.core import model_catalog as c, deploy_planner as dp
+        from aeon.core.gpu import GpuInfo
+
+        gpus = [
+            GpuInfo(index=2, name="a", total_gib=95.6, free_gib=95.6),
+            GpuInfo(index=7, name="b", total_gib=95.6, free_gib=95.6),
+        ]
+        p = dp.plan(c.by_name("Qwen3.8-27B-ARA-NVFP4-MTP"), gpus, mode="dual")
+        self.assertEqual([node["devices"] for node in p.nodes], ["2", "7"])
 
     def test_dual_util_is_fitted_per_gpu(self):
         from aeon.core import model_catalog as c, deploy_planner as dp
         gpus = self._gpus()
-        e = c.by_name("Qwen3.6-27B-Huihui-NVFP4-MTP")
+        e = c.by_name("Qwen3.8-27B-ARA-NVFP4-MTP")
         p = dp.plan(e, gpus, mode="dual")
         self.assertEqual(p.tier, "dual")
         self.assertTrue(p.env["AEON_GPU_MEM_UTIL"])
-        self.assertLess(float(p.env["AEON_GPU_MEM_UTIL"]), 0.6)
+        self.assertLess(float(p.env["AEON_GPU_MEM_UTIL"]), 0.85)
 
     def test_split_keeps_tier_default(self):
         from aeon.core import model_catalog as c, deploy_planner as dp
-        e = c.by_name("Qwen3.5-397B-A17B-Q3K")  # force_split flagship
+        # Exercise the generic future force-split path without cataloguing a
+        # second language model.
+        e = c.CatalogEntry(
+            name="synthetic-force-split", family="test", provider="vllm",
+            image="test", weights_gib=153.0, kv_gib_per_64k=1.0,
+            max_ctx=262144, ports={"lb": 1, "node0": 2, "node1": 3},
+            hf_model="unused", force_split=True,
+        )
         p = dp.plan(e, self._gpus())
         self.assertIn(p.tier, ("split", "offload"))
         self.assertEqual(p.env["AEON_GPU_MEM_UTIL"], "")
 
     def test_util_never_exceeds_safety_cap(self):
         from aeon.core import model_catalog as c, deploy_planner as dp
-        # Tiny cards force the footprint above the cap -> util clamps to SAFETY.
-        e = c.by_name("Qwen3.6-27B-Huihui-NVFP4-MTP")
-        p = dp.plan(e, self._gpus(gib=40.0), mode="solo")
-        if p.tier == "solo":
-            self.assertLessEqual(float(p.env["AEON_GPU_MEM_UTIL"]), dp.SAFETY)
+        # The promoted Qwen release is not admissible on 48 GB-class cards.
+        e = c.by_name("Qwen3.8-27B-ARA-NVFP4-MTP")
+        with self.assertRaisesRegex(ValueError, ">=90 GiB"):
+            dp.plan(e, self._gpus(gib=40.0), mode="solo")
+
+
+class TestMtpSelectionManifest(unittest.TestCase):
+    @staticmethod
+    def _manifest(selected=2):
+        from aeon.core.mtp_tuning import (
+            MIN_RELEASE_REQUESTS_PER_K,
+            MIN_SELECTED_DECODE_TPS,
+            SCHEMA_VERSION,
+            SELECTION_POLICY,
+        )
+        scores = [80.0, 103.0, 120.0, 119.5, 110.0]
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "validated",
+            "complete": True,
+            "entry_name": "Qwen3.8-27B-ARA-NVFP4-MTP",
+            "selection_policy": SELECTION_POLICY,
+            "selected_k": selected,
+            "artifact": {
+                "build_manifest_sha256": "model-hash",
+                "sha256s_sha256": "sums-hash",
+            },
+            "runtime": {
+                "image_id": "sha256:runtime",
+                "attention_backend": "TRITON_ATTN",
+                "kv_cache_dtype": "fp8_per_token_head",
+            },
+            "release_gate": {
+                "minimum_requests_per_k": MIN_RELEASE_REQUESTS_PER_K,
+                "minimum_selected_decode_tps": MIN_SELECTED_DECODE_TPS,
+            },
+            "candidates": [
+                {"k": k, "passed": True, "probe_passed": True,
+                 "schema_valid": True, "semantic_equivalent": True,
+                 "deterministic": True, "request_count": 12,
+                 "successful_requests": 12, "median_decode_tps": score}
+                for k, score in enumerate(scores)
+            ],
+        }
+
+    def test_valid_manifest_recomputes_lower_k_tie_winner(self):
+        from aeon.core.mtp_tuning import validate_selection_manifest
+        selected = validate_selection_manifest(
+            self._manifest(), expected_entry="Qwen3.8-27B-ARA-NVFP4-MTP",
+            expected_model_build_sha256="model-hash",
+            expected_sha256s_sha256="sums-hash",
+            expected_image_id="sha256:runtime",
+            expected_attention_backend="TRITON_ATTN",
+            expected_kv_cache_dtype="fp8_per_token_head",
+        )
+        self.assertEqual(selected, 2)  # K=3 is within 1%, so prefer lower K=2.
+
+    def test_packaged_selection_matches_catalog_model_runtime_and_harness(self):
+        from aeon.core import model_catalog
+        from aeon.core.mtp_tuning import load_selection, sha256_file
+        from aeon.scripts import benchmark_qwen38_mtp as bench
+
+        entry = model_catalog.by_name("Qwen3.8-27B-ARA-NVFP4-MTP")
+        path = Path(model_catalog.__file__).resolve().parent / entry.mtp.selection_manifest
+        selected, data = load_selection(
+            path,
+            expected_entry=entry.name,
+            expected_model_build_sha256=(
+                "1a3ba1eb88d0507bdef3798a6db59830dc076199b7db7d111201f6997588220e"),
+            expected_sha256s_sha256=(
+                "e7eca7ebee03c4f27482d4fe421ca1fac9f1d9986663a51fd7614361010c1237"),
+            expected_image_id=(
+                "sha256:d57400972ab0ae46baac64d4bfcc49cb136c07d8b0c50a76c7e2d81bd8a9fe47"),
+            expected_attention_backend="TRITON_ATTN",
+            expected_kv_cache_dtype="fp8_per_token_head",
+        )
+        self.assertEqual(selected, 3)
+        self.assertEqual(selected, entry.mtp.n_max)
+        self.assertEqual(data["suite_sha256"], bench._suite_sha256())
+        self.assertEqual(data["benchmark_script_sha256"],
+                         sha256_file(Path(bench.__file__)))
+
+    def test_vllm_023_total_suffix_metrics_are_captured(self):
+        from unittest.mock import Mock, patch
+        from aeon.scripts.benchmark_qwen38_mtp import _metric_snapshot
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.text = (
+            '# TYPE vllm:spec_decode_num_draft_tokens_total counter\n'
+            'vllm:spec_decode_num_draft_tokens_total{engine="0"} 2311\n'
+            'vllm:spec_decode_num_accepted_tokens_total{engine="0"} 1920\n'
+            'vllm:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 1920\n'
+        )
+        with patch("aeon.scripts.benchmark_qwen38_mtp.requests.get",
+                   return_value=response):
+            metrics = _metric_snapshot("http://127.0.0.1:1")
+        self.assertEqual(
+            metrics['vllm:spec_decode_num_draft_tokens_total{engine="0"}'],
+            2311.0,
+        )
+        self.assertEqual(len(metrics), 3)
+
+    def test_semantic_warmup_failure_writes_disqualification_report(self):
+        import json
+        import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from aeon.scripts import benchmark_qwen38_mtp as bench
+
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"version": "test"}
+        record = {
+            "case": "case", "repeat": 0, "schema_valid": True,
+            "semantic_valid": True,
+            "elapsed_seconds": 1.0, "decode_tps": 10.0,
+            "total_tps": 9.0, "response_sha256": "hash", "final_sha256": "hash",
+        }
+        # The excluded warmup is malformed, but all timed requests finish.
+        # The K must be recorded as disqualified so the sweep can continue.
+        timed_count = 2 * len(bench.CASES)
+        side_effects = [ValueError("wrong structured keys")] + [dict(record) for _ in range(timed_count)]
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(bench.requests, "get", return_value=response), \
+                patch.object(bench, "_metric_snapshot", side_effect=[{}, {}]), \
+                patch.object(bench, "_stream_request", side_effect=side_effects):
+            output = Path(tmp) / "k1.json"
+            result = bench.run_probe(SimpleNamespace(
+                base_url="http://127.0.0.1:1", model="model",
+                entry_name=bench.ENTRY_NAME, k=1, repeats=2,
+                attention_backend="TRITON_ATTN",
+                kv_cache_dtype="fp8_per_token_head",
+                runtime_image_id="sha256:runtime",
+                output=str(output)))
+            report = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, 1)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["successful_requests"], timed_count)
+        self.assertIn("excluded warmup", report["errors"][0])
+        self.assertEqual(report["benchmark_script_sha256"],
+                         bench.sha256_file(Path(bench.__file__)))
+
+    def test_probe_summary_is_recomputed_from_request_records(self):
+        import statistics
+        from aeon.scripts import benchmark_qwen38_mtp as bench
+
+        records = []
+        for repeat in range(3):
+            for index, case in enumerate(bench.CASES):
+                serial = repeat * len(bench.CASES) + index + 1
+                records.append({
+                    "case": case["name"], "repeat": repeat,
+                    "schema_valid": True, "semantic_valid": True,
+                    "elapsed_seconds": float(serial),
+                    "decode_tps": 50.0 + serial, "total_tps": 40.0 + serial,
+                    "response_sha256": f"{serial:064x}",
+                    "final_sha256": f"{serial + 100:064x}",
+                    "action_sha256": f"{serial + 200:064x}",
+                })
+        report = {
+            "schema_version": bench.PROBE_SCHEMA_VERSION,
+            "suite_version": bench.SUITE_VERSION,
+            "suite_sha256": bench._suite_sha256(),
+            "benchmark_script_sha256": bench.sha256_file(Path(bench.__file__)),
+            "entry_name": bench.ENTRY_NAME, "model": "served", "k": 2,
+            "repeats": 3, "request_count": 12, "successful_requests": 12,
+            "schema_valid": True, "semantic_valid": True,
+            "passed": True, "errors": [],
+            "records": records,
+            "median_decode_tps": statistics.median(r["decode_tps"] for r in records),
+            "median_total_tps": statistics.median(r["total_tps"] for r in records),
+            "p95_latency_seconds": bench._percentile(
+                [r["elapsed_seconds"] for r in records], 0.95),
+        }
+        stats = bench._validated_probe_stats(
+            report, expected_k=2, expected_entry=bench.ENTRY_NAME,
+            script_hash=bench.sha256_file(Path(bench.__file__)))
+        self.assertTrue(stats["passed"])
+        self.assertEqual(stats["successful_requests"], 12)
+
+        tampered = dict(report)
+        tampered["median_decode_tps"] += 100
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            bench._validated_probe_stats(
+                tampered, expected_k=2, expected_entry=bench.ENTRY_NAME,
+                script_hash=bench.sha256_file(Path(bench.__file__)))
+
+    def test_stale_or_non_semantic_manifest_fails_closed(self):
+        from aeon.core.mtp_tuning import MtpSelectionError, validate_selection_manifest
+        data = self._manifest()
+        data["candidates"][2]["semantic_equivalent"] = False
+        data["candidates"][2]["passed"] = False
+        data["selected_k"] = 1
+        data["candidates"][1]["median_decode_tps"] = 120.0
+        with self.assertRaises(MtpSelectionError):
+            bad = dict(data)
+            bad["candidates"] = [dict(item) for item in data["candidates"]]
+            bad["candidates"][2]["passed"] = True
+            validate_selection_manifest(
+                bad, expected_entry="Qwen3.8-27B-ARA-NVFP4-MTP",
+                expected_model_build_sha256="model-hash")
+        # A measured-but-disqualified K remains valid evidence as long as it is
+        # not selected; the winner is recomputed among eligible candidates.
+        self.assertEqual(validate_selection_manifest(
+            data, expected_entry="Qwen3.8-27B-ARA-NVFP4-MTP"), 1)
+        with self.assertRaisesRegex(MtpSelectionError, "stale"):
+            validate_selection_manifest(
+                self._manifest(), expected_entry="Qwen3.8-27B-ARA-NVFP4-MTP",
+                expected_model_build_sha256="different-hash")
+        with self.assertRaisesRegex(MtpSelectionError, "stale"):
+            validate_selection_manifest(
+                self._manifest(), expected_entry="Qwen3.8-27B-ARA-NVFP4-MTP",
+                expected_sha256s_sha256="different-sums-hash")
+
+    def test_selected_candidate_must_clear_100_tps_release_floor(self):
+        from aeon.core.mtp_tuning import MtpSelectionError, validate_selection_manifest
+
+        data = self._manifest(selected=1)
+        for candidate in data["candidates"]:
+            candidate["median_decode_tps"] = 99.9 - candidate["k"]
+        with self.assertRaisesRegex(MtpSelectionError, "minimum is 100.0"):
+            validate_selection_manifest(
+                data, expected_entry="Qwen3.8-27B-ARA-NVFP4-MTP")
+
+    def test_runtime_warmup_requires_the_exact_agent_action(self):
+        import json
+        from unittest.mock import Mock, patch
+        from aeon.scripts import warmup_qwen38_vllm as warmup
+
+        turn = {
+            "thought": "ready",
+            "previous_result_summary": "none",
+            "skill_check": "none",
+            "memory_check": "none",
+            "parallel_check": "none",
+            "intent": warmup.MARKER,
+            "actions": [{
+                "tool_name": "task_complete",
+                "parameters": {"reason": warmup.REASON},
+            }],
+        }
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(turn)}}],
+            "usage": {"completion_tokens": 42},
+        }
+        with patch.object(warmup.requests, "post", return_value=response):
+            self.assertEqual(warmup.warm("http://localhost:1", "qwen"),
+                             {"completion_tokens": 42})
+
+        turn["actions"][0]["parameters"]["reason"] = "wrong"
+        response.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(turn)}}],
+        }
+        with patch.object(warmup.requests, "post", return_value=response), \
+                self.assertRaisesRegex(RuntimeError, "wrong Aeon action"):
+            warmup.warm("http://localhost:1", "qwen")
 
 
 class TestMessageHistoryMode(unittest.TestCase):
-    """Opt-in message-history mode: a stable system message + a growing turn
+    """Message-history mode: a stable system message + a growing turn
     history + one volatile current-state message. Verifies the split (static vs
     volatile), history seeding/append/trim, and the LLM messages path."""
 
@@ -1153,6 +1892,18 @@ class TestMessageHistoryMode(unittest.TestCase):
         self.assertIn("do the thing", w._history_messages[0]["content"])
         self.assertEqual(w._history_messages[1]["role"], "user")
         self.assertLess(len(w._history_messages[1]["content"]), 5000)  # brief result truncated
+
+    def test_append_turn_preserves_native_reasoning(self):
+        from aeon.core.llm import LLMClient
+        w = self._worker()
+        w.llm_client.last_reasoning_content = "native hidden reasoning"
+        w._append_history_turn({"intent": "continue", "actions": []}, "ok")
+        assistant = w._history_messages[0]
+        self.assertEqual(assistant["reasoning_content"], "native hidden reasoning")
+        self.assertEqual(assistant["reasoning"], "native hidden reasoning")
+        # Token accounting counts one reasoning alias, not both aliases.
+        self.assertEqual(
+            LLMClient._msg_text(assistant).count("native hidden reasoning"), 1)
 
     def test_trim_history_bounds_and_notes(self):
         w = self._worker()
@@ -1291,6 +2042,24 @@ class TestResumePreviousSession(unittest.TestCase):
         self.assertIn('resume_previous_session', names)
         self.assertIn('resume_previous_session', TOP_LEVEL_TOOLS)
 
+    def test_parallel_instances_have_distinct_checkpoint_paths(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                first = self._worker()
+                second = self._worker()
+                first.instance_id = "1" * 32
+                second.instance_id = "2" * 32
+                self.assertNotEqual(first._session_state_path(), second._session_state_path())
+                self.assertNotEqual(first._stop_dump_path(), second._stop_dump_path())
+                self.assertIn(first.instance_id, str(first._session_state_path()))
+                self.assertIn(second.instance_id, str(second._session_state_path()))
+            finally:
+                os.chdir(old)
+
     def _write_dump(self, td):
         import json as _json
         from pathlib import Path
@@ -1412,16 +2181,448 @@ class TestBootguardMarkerStability(unittest.TestCase):
                     os.environ["AEON_HOME"] = old_home
 
 
-class TestLocalProviderEndpoint(unittest.TestCase):
-    """Provider 'local' (Ollama) must talk to the brain's port 8000 (mapped from
-    11434 in start_brain.sh), NOT 8013 — that's the llama.cpp/vLLM load balancer,
-    which would silently route Ollama chats to a different model."""
+class TestQwenOnlyProvider(unittest.TestCase):
+    """No alternate model or provider may enter Aeon's inference client."""
 
-    def test_local_provider_uses_ollama_port(self):
+    def test_llm_client_rejects_every_non_qwen_model(self):
+        from unittest.mock import patch
         from aeon.core.llm import LLMClient
-        c = LLMClient.__new__(LLMClient)
-        client = c._create_client({'provider': 'local'})
-        self.assertIn(":8000", str(client.base_url))
+        config = {
+            "provider": "vllm",
+            "model": "retired-model",
+            "api_model": "retired-model",
+        }
+        with patch.object(LLMClient, "_create_client") as create_client, \
+                self.assertRaisesRegex(ValueError, "Qwen3.8-only vLLM"):
+            LLMClient(config)
+        create_client.assert_not_called()
+
+    def test_llm_client_rejects_qwen_name_on_wrong_provider(self):
+        from unittest.mock import patch
+        from aeon.core.llm import LLMClient
+        from aeon.core.model_catalog import VISION_MODEL_NAME
+        config = {
+            "provider": "local",
+            "model": VISION_MODEL_NAME,
+            "api_model": VISION_MODEL_NAME,
+        }
+        with patch.object(LLMClient, "_create_client") as create_client, \
+                self.assertRaisesRegex(ValueError, "Qwen3.8-only vLLM"):
+            LLMClient(config)
+        create_client.assert_not_called()
+
+
+class TestCliReadOnlyHelp(unittest.TestCase):
+    def test_help_does_not_run_container_cleanup(self):
+        import contextlib
+        import io
+        import sys
+        from unittest.mock import patch
+        from aeon import main
+
+        with patch.object(sys, "argv", ["aeon", "--help"]), \
+                patch.object(main, "cleanup_ghost_llamacpp_containers") as cleanup, \
+                patch.object(main, "_auto_adopt_tmux") as adopt, \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as exited:
+                main.cli()
+        self.assertEqual(exited.exception.code, 0)
+        cleanup.assert_not_called()
+        adopt.assert_not_called()
+
+    def test_auto_adoption_scope_is_interactive_outside_tmux_only(self):
+        import types
+        from unittest.mock import patch
+        from aeon import main
+
+        args = types.SimpleNamespace(non_interactive=False)
+        tty = types.SimpleNamespace(isatty=lambda: True)
+        with patch.object(main.sys, "stdin", tty), patch.object(main.sys, "stdout", tty), \
+                patch.dict(main.os.environ, {}, clear=True):
+            self.assertTrue(main._should_auto_adopt_tmux(args))
+            args.non_interactive = True
+            self.assertFalse(main._should_auto_adopt_tmux(args))
+            args.non_interactive = False
+            main.os.environ["TMUX"] = "/tmp/tmux"
+            self.assertFalse(main._should_auto_adopt_tmux(args))
+            del main.os.environ["TMUX"]
+            main.os.environ["AEON_REMOTE_INSTANCE_ID"] = "a" * 32
+            self.assertFalse(main._should_auto_adopt_tmux(args))
+
+
+class TestFleetSafeModelTools(unittest.TestCase):
+    """Model-serving entrypoints must remain coordinator-bound and renter-safe."""
+
+    def test_coordinator_transport_allows_bounded_multi_worker_census(self):
+        import subprocess
+        from unittest.mock import patch
+        from aeon.core import gpu_queue
+
+        completed = subprocess.CompletedProcess([], 0, "[]", "")
+        with patch.object(gpu_queue, "_assert_coordinator_host"), \
+                patch.object(
+                    gpu_queue.subprocess, "run", return_value=completed
+                ) as run:
+            self.assertIs(gpu_queue._coord("status", "--json"), completed)
+
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            gpu_queue.COORDINATOR_COMMAND_TIMEOUT_SECONDS,
+        )
+        self.assertGreaterEqual(gpu_queue.COORDINATOR_COMMAND_TIMEOUT_SECONDS, 45)
+        self.assertLessEqual(gpu_queue.COORDINATOR_COMMAND_TIMEOUT_SECONDS, 60)
+
+    def test_gpu_inventory_never_calls_nvidia_smi(self):
+        for rel in (
+            "aeon/core/gpu.py",
+            "aeon/core/gpu_queue.py",
+            "aeon/core/system_info.py",
+            "aeon/scripts/launch_vllm_adaptive.sh",
+            "aeon/scripts/run_qwen38_mtp_sweep.sh",
+            "aeon/scripts/start_comfyui.sh",
+            "aeon/scripts/start_browser.sh",
+        ):
+            source = (_root / rel).read_text()
+            self.assertNotIn("nvidia-smi", source, rel)
+            if rel == "aeon/core/system_info.py":
+                self.assertNotIn("pynvml", source, rel)
+
+    def test_system_stats_gpu_view_uses_coordinator_status(self):
+        import json
+        import subprocess
+        from unittest.mock import patch
+        from aeon.core import system_info
+
+        payload = [{
+            "host": "192.168.0.177",
+            "physical_gpu": 0,
+            "state": "AVAILABLE",
+            "utilization_pct": 17,
+            "vram_share_capacity_mib": 8192,
+        }]
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        system_info._GPU_STATUS_CACHE = (0.0, [])
+        with patch.object(system_info.socket, "gethostname", return_value="DAY2RTX6000PRO"), \
+                patch.object(system_info.subprocess, "run", return_value=completed) as run:
+            parts = system_info._coordinator_gpu_parts()
+        self.assertIn("physical-gpu0(diagnostic): AVAILABLE", parts[0])
+        self.assertIn("8.0gb allocatable", parts[0])
+        command = run.call_args.args[0]
+        self.assertEqual(command[-2:], ["status", "--json"])
+    def test_gpu_launchers_require_claim_uuid_and_cap(self):
+        source = (_root / "aeon/scripts/start_comfyui.sh").read_text()
+        for marker in (
+            "GPU_AGENT_CLAIM_ID",
+            "CUDA_VISIBLE_DEVICES",
+            "GPU_MEM_LIMIT_GB",
+            "GPU_RESERVE_GB",
+            'device=${',
+        ):
+            self.assertIn(marker, source, f"start_comfyui.sh: missing {marker}")
+        sweep = (_root / "aeon/scripts/run_qwen38_mtp_sweep.sh").read_text()
+        self.assertIn("direct Qwen benchmark launching is disabled", sweep)
+        self.assertNotIn("docker run", sweep)
+        qwen = (_root / "aeon/core/qwen_runtime.py").read_text()
+        for marker in (
+            "GPU_AGENT_CLAIM_ID",
+            "CUDA_VISIBLE_DEVICES",
+            "GPU_PLANNED_VRAM_GB",
+            "GPU_RESERVE_GB",
+            'f"device={state[\'gpu_uuid\']}"',
+        ):
+            self.assertIn(marker, qwen)
+
+    def test_compute_profiles_become_truthful_coordinator_filters(self):
+        import json
+        import subprocess
+        import tempfile
+        from unittest.mock import patch
+        from aeon.core import gpu_queue
+        from aeon.core.compute_profile import QWEN38_VLLM_PROFILE
+
+        lease_payload = {
+            "claim_id": "gc-test",
+            "owner": "owner-test",
+            "project": gpu_queue.PROJECT,
+            "purpose": "test profile",
+            "host": gpu_queue.LOCAL_COORD_HOST,
+            "gpu_uuid": "GPU-test",
+            "physical_gpu": 0,
+            "memory_total_mib": 97887,
+            "vram_budget_mib": round(48.7 * 1024),
+            "exclusive": True,
+        }
+        replies = [
+            subprocess.CompletedProcess([], 0, "owner-test\n", ""),
+            subprocess.CompletedProcess([], 0, json.dumps(lease_payload), ""),
+        ]
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(gpu_queue, "_coord", side_effect=replies) as coord, \
+                patch.object(gpu_queue, "_update_compute_presence") as presence:
+            state_file = Path(temp) / "lease.json"
+            lease = gpu_queue.reserve_named_lease(
+                required_gb=48.7,
+                purpose="test profile",
+                state_file=state_file,
+                profile=QWEN38_VLLM_PROFILE,
+                timeout=0,
+                min_vram_gb=90,
+                gpu_id=0,
+                exclusive=True,
+            )
+        reserve_args = coord.call_args_list[1].args
+        self.assertIn("--host", reserve_args)
+        self.assertEqual(
+            reserve_args[reserve_args.index("--host") + 1],
+            gpu_queue.LOCAL_COORD_HOST,
+        )
+        expected = {
+            "--min-host-memory-gb": "96",
+            "--min-host-commit-gb": "96",
+            "--min-disk-free-gb": "32",
+            "--min-shm-free-gb": "16",
+        }
+        for option, value in expected.items():
+            self.assertEqual(reserve_args[reserve_args.index(option) + 1], value)
+        self.assertEqual(lease["compute_profile"], "qwen38-vllm")
+        self.assertEqual(presence.call_args_list[0].args[0], "waiting_for_compute")
+        self.assertEqual(presence.call_args_list[-1].args[0], "allocated")
+
+    def test_reservation_timeout_becomes_unavailable_after_active_wait_ends(self):
+        import subprocess
+        import tempfile
+        from unittest.mock import patch
+        from aeon.core import gpu_queue
+        from aeon.core.compute_profile import COMFYUI_PROFILE
+
+        replies = [
+            subprocess.CompletedProcess([], 0, "owner-test\n", ""),
+            subprocess.CompletedProcess([], 2, "", "no capacity"),
+        ]
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(gpu_queue, "_coord", side_effect=replies), \
+                patch.object(gpu_queue, "_update_compute_presence") as presence:
+            with self.assertRaises(TimeoutError):
+                gpu_queue.reserve_named_lease(
+                    required_gb=24,
+                    purpose="test timeout",
+                    state_file=Path(temp) / "lease.json",
+                    profile=COMFYUI_PROFILE,
+                    timeout=0,
+                )
+        self.assertEqual(presence.call_args_list[0].args[0], "waiting_for_compute")
+        self.assertEqual(presence.call_args_list[-1].args[0], "unavailable")
+
+    def test_periodic_lease_heartbeat_is_pid_bound_and_at_most_ten_minutes(self):
+        from aeon.core.gpu_queue import PeriodicLeaseHeartbeat
+
+        calls = []
+        heartbeat = PeriodicLeaseHeartbeat(
+            state_file=Path("/tmp/test-aeon-heartbeat.json"),
+            note="test owner",
+            pid_provider=lambda: 4321,
+            interval_seconds=300,
+            heartbeat_func=lambda *args: calls.append(args),
+        )
+        heartbeat.beat_once()
+        self.assertEqual(
+            calls,
+            [(4321, "test owner", Path("/tmp/test-aeon-heartbeat.json"))],
+        )
+        self.assertLessEqual(heartbeat.interval_seconds, 600)
+        with self.assertRaises(ValueError):
+            PeriodicLeaseHeartbeat(
+                state_file=Path("/tmp/nope"),
+                note="too slow",
+                interval_seconds=601,
+            )
+
+    def test_qwen_startup_lock_serializes_cross_thread_callers(self):
+        import tempfile
+        import threading
+        import time
+        from unittest.mock import patch
+        from aeon import main
+
+        active = 0
+        maximum = 0
+        guard = threading.Lock()
+        entered = threading.Barrier(2)
+
+        def fake_start(config):
+            nonlocal active, maximum
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.04)
+            with guard:
+                active -= 1
+            return True
+
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(main, "QWEN_STARTUP_LOCK_PATH", str(Path(temp) / "start.lock")), \
+                patch.object(main, "start_llamacpp_server", side_effect=fake_start):
+            results = []
+
+            def invoke():
+                entered.wait()
+                results.append(main.start_llamacpp_server_serialized({"model": "test"}))
+
+            threads = [threading.Thread(target=invoke) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+        self.assertEqual(results, [True, True])
+        self.assertEqual(maximum, 1)
+
+    def test_gpu_containers_are_loopback_only_and_renter_yielding(self):
+        qwen = (_root / "aeon/core/qwen_runtime.py").read_text()
+        comfy = (_root / "aeon/scripts/start_comfyui.sh").read_text()
+        for marker in ("--oom-score-adj", "--cpu-shares", "--blkio-weight"):
+            self.assertIn(marker, qwen)
+        for marker in ("--oom-score-adj 1000", "--cpu-shares 2", "--blkio-weight 10"):
+            self.assertIn(marker, comfy)
+        self.assertIn('FLEET_LOW_PRIORITY = Path("/home/aday/bin/fleet-low-priority")', qwen)
+        self.assertIn('"--entrypoint",\n        "/usr/local/bin/fleet-low-priority"', qwen)
+        self.assertIn("--entrypoint /usr/local/bin/fleet-low-priority", comfy)
+        self.assertIn('f"127.0.0.1:{state[\'local_port\']}:{state[\'remote_port\']}"', qwen)
+        self.assertIn("-p 127.0.0.1:8188:8188", comfy)
+        self.assertNotIn("-p 8188:8188", comfy)
+
+    def test_qwen_launcher_separates_native_reasoning(self):
+        launcher = (_root / "aeon/core/qwen_runtime.py").read_text()
+        main_source = (_root / "aeon/main.py").read_text()
+        self.assertIn('"--reasoning-parser"', launcher)
+        self.assertIn('"qwen3"', launcher)
+        self.assertIn('"--structured-outputs-config.enable_in_reasoning=False"', launcher)
+        self.assertNotIn("--structured-outputs-config.enable_in_reasoning=True", launcher)
+        self.assertIn('"--attention-backend"', launcher)
+        self.assertIn('"--max-num-seqs"', launcher)
+        self.assertIn("expected_attention_backend=attention", launcher)
+        self.assertIn("expected_kv_cache_dtype=kv_dtype", launcher)
+        self.assertIn("warmup_qwen38_vllm.py", launcher)
+        self.assertIn('f"127.0.0.1:{state[\'local_port\']}:{state[\'remote_port\']}"', launcher)
+        sweep = (_root / "aeon/scripts/run_qwen38_mtp_sweep.sh").read_text()
+        self.assertIn("direct Qwen benchmark launching is disabled", sweep)
+        self.assertNotIn("docker run", sweep)
+        self.assertIn("float(capability.vram_budget_gb)", main_source)
+        self.assertIn("enabled_qwen_runtime_capabilities()", main_source)
+
+    def test_vllm_runtime_pins_and_applies_the_mtp_schema_backport(self):
+        dockerfile = (_root / "aeon/services/vllm/Dockerfile").read_text()
+        overlay = (_root / "aeon/services/vllm/Dockerfile.mtp-structured-overlay").read_text()
+        backport = (_root / "aeon/services/vllm/apply_mtp_structured_output_backport.py").read_text()
+
+        self.assertIn('"torch==2.11.0"', dockerfile)
+        self.assertIn('"vllm==0.23.0"', dockerfile)
+        self.assertIn("a61d5f9e4fc184cff66938ff6c521cc358b5e024", dockerfile)
+        self.assertIn("apply_mtp_structured_output_backport.py", dockerfile)
+        self.assertIn("sha256:c38ede76f716f6991f81a5d23e63f6ac0c852b79dd66a83c8f9657153991caca", overlay)
+        self.assertIn("https://github.com/vllm-project/vllm/pull/44993", backport)
+        self.assertIn("BASE_SHA256", backport)
+        self.assertIn("PATCHED_SHA256", backport)
+
+    def test_primary_and_release_gate_share_deterministic_sampling(self):
+        from aeon.core.sampling import (
+            QWEN_CONTROL_TEMPERATURE,
+            QWEN_CONTROL_TOP_K,
+            QWEN_CONTROL_TOP_P,
+        )
+        from aeon.scripts import benchmark_qwen38_mtp as benchmark
+
+        self.assertEqual(
+            (QWEN_CONTROL_TEMPERATURE, QWEN_CONTROL_TOP_P, QWEN_CONTROL_TOP_K),
+            (0.0, 1.0, -1),
+        )
+        source = (_root / "aeon/core/llm.py").read_text()
+        self.assertNotIn("temperature=1.0", source)
+        self.assertNotIn("top_p=0.95", source)
+        self.assertIs(benchmark.QWEN_CONTROL_TEMPERATURE, QWEN_CONTROL_TEMPERATURE)
+        from aeon.scripts import warmup_qwen38_vllm as warmup
+        self.assertIs(warmup.QWEN_CONTROL_TEMPERATURE, QWEN_CONTROL_TEMPERATURE)
+        self.assertIs(warmup.QWEN_CONTROL_TOP_P, QWEN_CONTROL_TOP_P)
+        self.assertIs(warmup.QWEN_CONTROL_TOP_K, QWEN_CONTROL_TOP_K)
+
+    def test_browser_has_no_gpu_passthrough(self):
+        source = (_root / "aeon/scripts/start_browser.sh").read_text()
+        self.assertNotIn("--gpus", source)
+        self.assertIn("software WebGL", source)
+
+    def test_browser_is_localhost_only_and_requires_login_secret(self):
+        launcher = (_root / "aeon/scripts/start_browser.sh").read_text()
+        server = (_root / "aeon/services/browser/server.py").read_text()
+        dockerfile = (_root / "aeon/services/browser/Dockerfile").read_text()
+        self.assertIn("-p 127.0.0.1:$PORT:8030", launcher)
+        self.assertIn('com.bc_aeon.browser.api="human-v6"', dockerfile)
+        self.assertIn("AEON_BROWSER_TOKEN_FILE", launcher)
+        self.assertIn(":ro", launcher)
+        self.assertIn("authenticated_healthcheck", launcher)
+        self.assertIn('com.bc_aeon.browser.auth="required-v1"', dockerfile)
+        self.assertIn('@app.middleware("http")', server)
+        self.assertIn("bearer_is_authorized", server)
+
+    def test_uncensored_flux2_pair_is_preferred(self):
+        import os
+        import tempfile
+        from aeon.tools.generate_image import GenerateImageTool
+
+        old_home = os.environ.get("AEON_HOME")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "models/comfyui"
+            (root / "unet").mkdir(parents=True)
+            (root / "text_encoders").mkdir()
+            (root / "vae").mkdir()
+            (root / "unet/flux-2-klein-9b-Q8_0.gguf").touch()
+            (root / "text_encoders/flux2-klein-9b-uncensored-q8_0.gguf").touch()
+            (root / "vae/flux2-vae.safetensors").touch()
+            os.environ["AEON_HOME"] = td
+            try:
+                tool = GenerateImageTool()
+                te = tool._flux2_dev_te()
+                self.assertEqual(te, "flux2-klein-9b-uncensored-q8_0.gguf")
+                self.assertEqual(
+                    tool._flux2_dev_models(te),
+                    ("flux-2-klein-9b-Q8_0.gguf", te, "flux2-vae.safetensors"),
+                )
+            finally:
+                if old_home is None:
+                    os.environ.pop("AEON_HOME", None)
+                else:
+                    os.environ["AEON_HOME"] = old_home
+
+    def test_single_qwen_gpu_is_excluded_when_lease_is_exclusive(self):
+        from aeon.core.gpu_queue import select_tool_gpu
+
+        inventory = [{
+            "host": "192.168.0.177", "physical_gpu": 0, "acl": "OPEN",
+            "state": "SHARED_AVAILABLE", "vram_share_capacity_mib": 48 * 1024,
+        }]
+        qwen = _exact_qwen_tool_lease()
+        self.assertIsNone(select_tool_gpu(inventory, 40, qwen))
+
+    def test_multiple_gpus_use_only_non_qwen_device_for_exclusive_lease(self):
+        from aeon.core.gpu_queue import select_tool_gpu
+
+        inventory = [
+            {"host": "192.168.0.177", "physical_gpu": 0, "acl": "OPEN",
+             "state": "SHARED_AVAILABLE", "vram_share_capacity_mib": 45 * 1024},
+            {"host": "192.168.0.177", "physical_gpu": 1, "acl": "OPEN",
+             "state": "AVAILABLE", "vram_share_capacity_mib": 42 * 1024},
+        ]
+        qwen = _exact_qwen_tool_lease()
+        self.assertEqual(select_tool_gpu(inventory, 40, qwen), 1)
+        inventory[1]["vram_share_capacity_mib"] = 10 * 1024
+        self.assertIsNone(select_tool_gpu(inventory, 40, qwen))
+
+    def test_retired_model_launchers_are_absent(self):
+        for rel in (
+            "aeon/scripts/start_vllm.sh",
+            "aeon/scripts/launch_llamacpp_adaptive.sh",
+            "aeon/scripts/start_brain.sh",
+            "aeon/scripts/start_cyberneurova.sh",
+        ):
+            self.assertFalse((_root / rel).exists(), rel)
 
 
 def load_tests(loader, standard_tests, pattern):

@@ -26,7 +26,7 @@ def _get_encoder():
 
 
 # --- SERVER CALIBRATION ---
-# cl100k_base is not the served model's tokenizer (Qwen3.6/Gemma-4); on
+# cl100k_base is not the served model's tokenizer (Qwen3.8/Gemma-4); on
 # code-heavy context the counts can drift 10-30%, making the context-pressure
 # thresholds mushy. Every primary-agent call already returns the server's REAL
 # prompt_tokens in its usage chunk, so the LLM client feeds (text, actual)

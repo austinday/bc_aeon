@@ -1,16 +1,8 @@
-import os
-import shutil
 from setuptools import setup, find_packages
-
-# Automatically wipe stale build/cache directories before installing
-for cache_dir in ['build', 'aeon.egg-info']:
-    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_dir)
-    if os.path.exists(cache_path):
-        shutil.rmtree(cache_path, ignore_errors=True)
 
 setup(
     name="aeon",
-    version="0.1.0",
+    version="0.2.0",
     packages=find_packages(),
     include_package_data=True,
     package_data={
@@ -21,9 +13,11 @@ setup(
             "core/prompts/*.txt",
             "core/prompts/categories/*.txt",
             "core/prompts/tools/*.txt",
+            "core/data/*.json",
             "core/skills/*.txt",
             "core/skills/*/*.txt",
             "core/skills/**/*.txt",
+            "remote/static/*",
         ]
     },
     install_requires=[
@@ -48,14 +42,20 @@ setup(
         # niche, and restart_aeon reinstalls the package on every self-modification —
         # keeping the base lean keeps restarts fast. Install with: pip install .[analysis]
         "analysis": ["numpy", "pandas", "h5py", "biopython", "PyMuPDF", "nbformat"],
-    },
-    # NOTE: fastapi / uvicorn / httpx / pydantic / patchright are intentionally
-    # absent — they belong to the browser service and the load-balancer, which run
-    # INSIDE their own Docker containers (the host never imports those modules).
-    entry_points={
-        "console_scripts": [
-            "aeon = aeon.main:cli",
+        "remote": [
+            "fastapi>=0.115",
+            "uvicorn[standard]>=0.30",
+            "argon2-cffi>=23.1",
+            "psutil>=5.9",
         ],
     },
-    python_requires='>=3.6',
+    # FastAPI/Uvicorn remain absent from the base install. They are opt-in through
+    # the remote extra; browser-service dependencies still stay in its container.
+    entry_points={
+        "console_scripts": [
+            "aeon = aeon.cli:main",
+            "aeon-remote = aeon.remote.cli:main",
+        ],
+    },
+    python_requires='>=3.10',
 )

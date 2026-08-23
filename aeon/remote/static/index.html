@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#090b10">
+  <title>Aeon Remote</title>
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css"
+        integrity="sha384-8Xk9wy/gzEDUKrXtrmCFa2bBuK3BpjpDuL/p0SeKQX19Khl/M+lHOgD/CyYf7efP"
+        crossorigin="anonymous">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script defer
+          src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"
+          integrity="sha384-M169f14mRZOXm3hD/v2Ti0ThIT/RnAQagXA9nlE15yHAtrW19gdePJh/HaTzUOe/"
+          crossorigin="anonymous"></script>
+  <script defer
+          src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"
+          integrity="sha384-iF+jqbuti4XlB64clWgFWYEscb+UnSRv3VgVikGYZu+otNFnSHr7y7NcKfBnGizn"
+          crossorigin="anonymous"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <main id="login-view" class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="brand-mark" aria-hidden="true">A</div>
+      <p class="eyebrow">Private control plane</p>
+      <h1 id="login-title">Aeon Remote</h1>
+      <p class="muted">Your persistent agents, wherever you are.</p>
+      <form id="login-form">
+        <label>Username<input id="login-username" autocomplete="username" required></label>
+        <label>Password<input id="login-password" type="password" autocomplete="current-password" required></label>
+        <label>Authenticator code <span class="muted">(if enabled)</span><input id="login-otp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}"></label>
+        <label class="check"><input id="login-remember" type="checkbox"> Remember this device</label>
+        <button class="primary wide" type="submit">Connect securely</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </section>
+  </main>
+
+  <main id="app-view" class="app-shell hidden">
+    <header class="topbar">
+      <div class="brand-row">
+        <div class="brand-mark small" aria-hidden="true">A</div>
+        <div><strong>Aeon Remote</strong><span id="connection-label">Connecting…</span></div>
+      </div>
+      <div class="top-actions">
+        <button id="resources-toggle" class="ghost mobile-only">Resources</button>
+        <button id="new-agent" class="primary">+ New terminal</button>
+        <button id="logout" class="icon-button" title="Sign out" aria-label="Sign out">↗</button>
+      </div>
+    </header>
+
+    <section id="resource-strip" class="resource-strip" aria-label="Host resources">
+      <div class="resource-card"><span>CPU</span><strong id="cpu-value">—</strong><small id="load-value">—</small></div>
+      <div class="resource-card"><span>Memory</span><strong id="memory-value">—</strong><small id="memory-detail">—</small></div>
+      <div class="resource-card"><span>Disk</span><strong id="disk-value">—</strong><small id="disk-detail">—</small></div>
+      <div id="gpu-cards" class="gpu-cards"></div>
+    </section>
+
+    <section class="workspace-shell">
+      <aside class="instance-sidebar">
+        <div class="aside-heading">
+          <span>Sessions</span><button id="refresh-instances" class="icon-button" aria-label="Refresh sessions">↻</button>
+        </div>
+        <div id="instance-list" class="instance-list"></div>
+      </aside>
+
+      <section class="terminal-column">
+        <div class="terminal-toolbar">
+          <div class="terminal-identity">
+            <strong id="terminal-name">No agent selected</strong>
+            <span id="terminal-status" class="status neutral">idle</span>
+            <small id="terminal-workspace"></small>
+          </div>
+          <div class="terminal-actions">
+            <button id="activate-aeon" class="primary hidden">Start Aeon here</button>
+            <button id="end-agent" class="ghost hidden">End agent</button>
+            <button id="resume-instance" class="ghost hidden">Resume</button>
+            <button id="stop-instance" class="ghost danger hidden">Stop</button>
+            <button id="force-instance" class="ghost danger hidden">Force stop</button>
+            <button id="delete-instance" class="ghost danger hidden">Delete</button>
+          </div>
+        </div>
+        <div id="terminal-empty" class="terminal-empty">
+          <div class="empty-orbit" aria-hidden="true"></div>
+          <h2>Open a persistent terminal</h2>
+          <p>Start Aeon in place when the shell is in the directory you want.</p>
+          <button id="empty-new-agent" class="primary">Create your first terminal</button>
+        </div>
+        <div id="terminal-wrap" class="terminal-wrap hidden">
+          <div id="terminal"></div>
+          <div id="terminal-disconnected" class="terminal-banner hidden">Terminal disconnected. The agent is still running.</div>
+        </div>
+        <div id="mobile-input" class="mobile-input hidden">
+          <div class="key-row">
+            <button data-key="ctrl-c">Ctrl-C</button>
+            <button data-key="escape">Esc</button>
+            <button data-key="tab">Tab</button>
+            <button data-key="up">↑</button>
+            <button data-key="down">↓</button>
+          </div>
+          <form id="command-form">
+            <textarea id="command-input" rows="1" placeholder="Type a command or instruction…" autocomplete="off"></textarea>
+            <button class="primary" type="submit">Send</button>
+          </form>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="new-dialog">
+    <form id="new-instance-form" class="dialog-card">
+      <div class="dialog-heading">
+        <div><p class="eyebrow">New session</p><h2>Open a terminal</h2></div>
+        <button type="button" class="icon-button close-dialog" aria-label="Close">×</button>
+      </div>
+      <label>Terminal name <span class="optional">optional</span><input id="instance-name" maxlength="64" placeholder="Terminal 1"></label>
+      <label>Workspace<select id="instance-workspace" required></select></label>
+      <details>
+        <summary>Create a new workspace</summary>
+        <div class="workspace-create">
+          <label>Root<select id="workspace-root"></select></label>
+          <label>Directory name<input id="workspace-name" maxlength="80" placeholder="new-project"></label>
+          <button id="create-workspace" type="button" class="ghost">Create directory</button>
+        </div>
+      </details>
+      <p id="new-error" class="error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="ghost close-dialog">Cancel</button>
+        <button type="submit" class="primary">Open terminal</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

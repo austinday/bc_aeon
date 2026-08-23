@@ -11,7 +11,7 @@ own:
   3. the model "sees" but MISREADS text          -> HTTP 200 with wrong content
 
 Case 3 is the dangerous one — a model that "sees" but garbles fine text, which
-no other startup check catches. We first suspected it on the abliterated Qwen3.6
+no other startup check catches. We first suspected it on an older abliterated Qwen
 FP8 build (a crisp 'RP9PCV' read back as 'R171'), but that turned out to be a
 LOW-RESOLUTION probe artifact: rendering the probe at the 1920 px the browser
 actually sends (see _render_probe) fixed it, and the FP8 build now passes
@@ -197,14 +197,15 @@ def _reads(answer: str, nonce: str) -> bool:
 
 
 # Failure hint for the case that actually bites: the model sees the image and
-# answers, but reads the text wrong. Reflects the real Qwen3.6-abliterated finding.
+# answers, but reads the text wrong. Reflects the original abliterated-Qwen finding.
 _MISREAD_HINT = (
     "The model SEES the image but cannot READ text reliably. The vision tower is "
     "fine (it produced coherent output); the damage is in the language layers' "
     "ability to interpret vision tokens — the hallmark of an abliteration that ran "
     "uniformly across all attention/MLP layers (AEON-7 lineage). Do NOT trust this "
-    "model for browsing. Use a vision-PRESERVING abliteration or the official "
-    "Qwen3.6 vision weights, or set multimodal=False for this entry in "
+    "model for browsing. Rebuild Qwen3.8 with a vision-preserving abliteration "
+    "that leaves the model's vision weights and vision-sensitive language layers intact, "
+    "or set multimodal=False for this entry in "
     "aeon/core/model_catalog.py. Inspect the saved probe images to confirm they are "
     "legible (they are crisp, normal-sized text)."
 )

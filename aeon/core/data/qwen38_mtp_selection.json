@@ -1,0 +1,149 @@
+{
+  "artifact": {
+    "build_manifest_sha256": "1a3ba1eb88d0507bdef3798a6db59830dc076199b7db7d111201f6997588220e",
+    "path_name": "Qwen3.8-27B-ARA-abliterated-NVFP4-MTP",
+    "sha256s_sha256": "e7eca7ebee03c4f27482d4fe421ca1fac9f1d9986663a51fd7614361010c1237"
+  },
+  "benchmark_script_sha256": "5ff91e92592e4b7d8718c8ea87f4cd0793cbb340862b87e0fd654db647056e98",
+  "candidates": [
+    {
+      "deterministic": true,
+      "disqualified_reason": "",
+      "k": 0,
+      "median_decode_tps": 59.11603787150182,
+      "median_total_tps": 58.5241571960496,
+      "p95_latency_seconds": 8.265367319982033,
+      "passed": true,
+      "probe_passed": true,
+      "report_sha256": "adc0e91c5d3d85996d46b1bcd91fded7b3430e4144cde4838874ad7b4ad78c90",
+      "request_count": 12,
+      "schema_valid": true,
+      "semantic_equivalent": true,
+      "speculative_metric_delta": {},
+      "successful_requests": 12
+    },
+    {
+      "deterministic": true,
+      "disqualified_reason": "",
+      "k": 1,
+      "median_decode_tps": 85.93724608489265,
+      "median_total_tps": 84.42261257690714,
+      "p95_latency_seconds": 5.72558150702389,
+      "passed": true,
+      "probe_passed": true,
+      "report_sha256": "5422fa7a9987c1dd80281530cec27f49b7e222db99a27e361339b1bada027a20",
+      "request_count": 12,
+      "schema_valid": true,
+      "semantic_equivalent": true,
+      "speculative_metric_delta": {
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"0\"}": 2106.0,
+        "vllm:spec_decode_num_accepted_tokens_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\"}": 2106.0,
+        "vllm:spec_decode_num_draft_tokens_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\"}": 2373.0
+      },
+      "successful_requests": 12
+    },
+    {
+      "deterministic": true,
+      "disqualified_reason": "",
+      "k": 2,
+      "median_decode_tps": 99.18023752278165,
+      "median_total_tps": 96.78741470751541,
+      "p95_latency_seconds": 4.452314267051406,
+      "passed": true,
+      "probe_passed": true,
+      "report_sha256": "222e4f6a6a7ffe9bfee6bd6d21c0601175fb5851edd2ab754aa5e5ddecf0a8dc",
+      "request_count": 12,
+      "schema_valid": true,
+      "semantic_equivalent": true,
+      "speculative_metric_delta": {
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"0\"}": 1530.0,
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"1\"}": 1236.0,
+        "vllm:spec_decode_num_accepted_tokens_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\"}": 2766.0,
+        "vllm:spec_decode_num_draft_tokens_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\"}": 3384.0
+      },
+      "successful_requests": 12
+    },
+    {
+      "deterministic": true,
+      "disqualified_reason": "",
+      "k": 3,
+      "median_decode_tps": 103.51395362209132,
+      "median_total_tps": 101.31746093105133,
+      "p95_latency_seconds": 4.7650671930168755,
+      "passed": true,
+      "probe_passed": true,
+      "report_sha256": "d9f36ce781c656a92c6454a67dcaf6fc3fd583a3c0429ead882b6e10154f64e0",
+      "request_count": 12,
+      "schema_valid": true,
+      "semantic_equivalent": true,
+      "speculative_metric_delta": {
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"0\"}": 1344.0,
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"1\"}": 1074.0,
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"2\"}": 855.0,
+        "vllm:spec_decode_num_accepted_tokens_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\"}": 3273.0,
+        "vllm:spec_decode_num_draft_tokens_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\"}": 4473.0
+      },
+      "successful_requests": 12
+    },
+    {
+      "deterministic": false,
+      "disqualified_reason": "probe did not complete all structured/correct requests; one or more responses chose the wrong Aeon action; tool/argument decisions varied across production-sampler seeds",
+      "k": 4,
+      "median_decode_tps": 101.48412617113266,
+      "median_total_tps": 98.72713782778528,
+      "p95_latency_seconds": 4.098193842975888,
+      "passed": false,
+      "probe_passed": false,
+      "report_sha256": "bb9411c4d0094ce194da4d2c6d130f814c6b984484ad4ecbb535088181f251b7",
+      "request_count": 12,
+      "schema_valid": false,
+      "semantic_equivalent": false,
+      "speculative_metric_delta": {
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"0\"}": 1086.0,
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"1\"}": 831.0,
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"2\"}": 648.0,
+        "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\",position=\"3\"}": 543.0,
+        "vllm:spec_decode_num_accepted_tokens_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\"}": 3108.0,
+        "vllm:spec_decode_num_draft_tokens_total{engine=\"0\",model_name=\"Qwen3.8-27B-ARA-NVFP4-MTP\"}": 4776.0
+      },
+      "successful_requests": 9
+    }
+  ],
+  "complete": true,
+  "completed_at": "2026-08-19T18:50:45.089635+00:00",
+  "entry_name": "Qwen3.8-27B-ARA-NVFP4-MTP",
+  "release_gate": {
+    "minimum_requests_per_k": 12,
+    "minimum_selected_decode_tps": 100.0
+  },
+  "runtime": {
+    "attention_backend": "TRITON_ATTN",
+    "image_id": "sha256:d57400972ab0ae46baac64d4bfcc49cb136c07d8b0c50a76c7e2d81bd8a9fe47",
+    "image_ref": "aeon_vllm:latest",
+    "kv_cache_dtype": "fp8_per_token_head",
+    "server_versions": {
+      "0": {
+        "version": "0.23.0"
+      },
+      "1": {
+        "version": "0.23.0"
+      },
+      "2": {
+        "version": "0.23.0"
+      },
+      "3": {
+        "version": "0.23.0"
+      },
+      "4": {
+        "version": "0.23.0"
+      }
+    }
+  },
+  "schema_version": "aeon-qwen38-mtp-selection-v2",
+  "selected_k": 3,
+  "selection_policy": "max_median_decode_tps_among_semantic_deterministic_prefer_lower_k_within_1pct",
+  "served_model": "Qwen3.8-27B-ARA-NVFP4-MTP",
+  "status": "validated",
+  "suite_sha256": "b5a95dc8deb63d4081d56e1d149c6ab796cad1a23427877bad1695f9a8dd41d7",
+  "suite_version": "aeon-agent-mtp-suite-v5-deterministic-control"
+}
