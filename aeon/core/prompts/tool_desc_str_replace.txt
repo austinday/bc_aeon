@@ -1,29 +1,17 @@
-Makes a small, targeted edit to a LARGE file using one or more SEARCH/REPLACE blocks.
+Applies a narrow atomic edit to an existing regular file.
 
-WHEN TO USE THIS vs write_file:
-- For files under ~400 lines: PREFER write_file to rewrite the whole file. It is far more reliable than str_replace.
-- Use str_replace ONLY for large files where rewriting everything would be wasteful, and only for a small, well-bounded change.
+Open the file first, copy a unique current SEARCH block, and pass its SHA-256
+receipt. Exact or uniquely whitespace-normalized matching is the default. Fuzzy
+matching is disabled unless explicitly requested; when enabled it still requires
+a unique >=92% match. Python/JSON/YAML parse failures are rejected before write.
 
-RELIABILITY NOTES:
-- The SEARCH text is matched using exact, whitespace-tolerant, and fuzzy matching, so minor whitespace differences are forgiven. Large mismatches still fail.
-- ALWAYS open_file the file immediately before editing and copy the SEARCH text verbatim from what you see. Do not reconstruct it from memory.
-- After 2 failed attempts on the same file, str_replace is automatically DISABLED for that file and you MUST switch to write_file. Do not keep retrying.
+Parameters:
+- file_path (str, required)
+- expected_sha256 (str, required): 64-hex receipt from the current file
+- Choose exactly one edit form:
+  - patch (str): one or more `<<<< SEARCH ... ==== ... >>>> REPLACE` blocks; omit old_str/new_str
+  - old_str (str): exact current text, with new_str (str, optional, default empty) as its replacement
+- allow_fuzzy (bool, optional): default false
 
-Schema:
-  file_path (str, required): Path to the file to edit.
-  patch (str, required): A string containing one or more SEARCH/REPLACE blocks, JSON-escaped (newlines as \n).
-Example: {"tool_name": "str_replace", "parameters": {"file_path": "src/big_module.py", "patch": "<<<< SEARCH\n    def calculate_metrics(self):\n        return sum(self.data)\n====\n    def calculate_metrics(self):\n        return sum(self.data) / len(self.data) if self.data else 0\n>>>> REPLACE"}}
-
-The patch string format (shown unescaped for clarity; you may include several SEARCH/REPLACE sections in one patch):
-<<<< SEARCH
-    def calculate_metrics(self):
-        return sum(self.data)
-====
-    def calculate_metrics(self):
-        return sum(self.data) / len(self.data) if self.data else 0
->>>> REPLACE
-
-RULES:
-1. The SEARCH block should match the existing code; copy it from a freshly opened file.
-2. Include enough surrounding context to make the SEARCH block unique.
-3. The "N: " line-number prefixes shown by open_file are stripped automatically, but it is cleaner to omit them.
+A failed match means re-open and diagnose current content. Never bypass it with a
+blind overwrite.

@@ -1,11 +1,3 @@
-Marks the current task as complete and terminates the agent loop. Use ONLY after the objective is fully achieved AND its result has been delivered.
-
-CRITICAL: If the objective was to produce information (analysis, research, brainstorm, plan, recommendations, or an answer), you MUST first present the FULL result to the user via say_to_user (or write_file for a long report). The `reason` field below is only a log summary — it is NOT shown to the user as the deliverable, and naming your findings in it does NOT deliver them. Deliver first, then complete (often in the same actions array).
-
-For code/implementation objectives, validate by running scripts and checking outputs before completing.
-
-For real-world state changes (account created, form submitted, message sent, file uploaded, purchase made), the objective is complete ONLY when your LATEST observation actually shows that end-state. Still sitting on a signup / verification / captcha / login / error screen means it is NOT done — do not call task_complete, and do NOT report credentials, IDs, or results you have not seen confirmed. If you are blocked and cannot finish, say so honestly via say_to_user and complete with a reason that states the block — never fabricate a success.
-
-Schema:
-  reason (str, optional, default="Task completed."): A brief summary of what was accomplished and how it was verified.
-Example: {"tool_name": "task_complete", "parameters": {"reason": "Delivered the 5-point analysis to the user via say_to_user; objective met."}}
+Legacy compatibility capability, hidden from the protocol-v2 model tool set.
+Use a `final` turn. The harness accepts completion only when request-scoped tool
+receipts prove any claimed mutation and a later receipt validates the end state.

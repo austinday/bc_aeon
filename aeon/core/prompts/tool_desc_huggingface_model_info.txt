@@ -1,0 +1,7 @@
+Read bounded, unsummarized PUBLIC Hugging Face metadata for one exact model repository, including repository identity/revision, dates, engagement, tags, selected architecture/config fields, safetensors/GGUF metadata, and file inventory.
+
+Use this as an early due-diligence step. It does not make the model "validated": inspect the actual README/license/config files and original upstream sources, identify existing derivatives using multiple searches, and calculate toolchain- and hardware-specific feasibility before promotion. A license tag alone does not establish derivative redistribution permission.
+
+Parameter: repo_id, such as Qwen/Qwen3-0.6B.
+
+Example: {"tool_name":"huggingface_model_info","parameters":{"repo_id":"Qwen/Qwen3-0.6B"}}

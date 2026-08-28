@@ -1,0 +1,7 @@
+Search Hugging Face's PUBLIC model API directly and return bounded, unsummarized repository metadata. Use this instead of a browser or generic web snippets when surveying models, formats, derivative competition, release activity, downloads, likes, tags, tasks, or authors.
+
+Parameters: query (optional model-id substring), filter_tag (optional Hub tag such as gguf or license:apache-2.0), author, pipeline_tag, sort (last_modified, trending_score, created_at, downloads, likes), direction (asc or desc), limit (1-50), and next_page_url. To continue a result set, pass only the exact next_page_url returned by the preceding call.
+
+IMPORTANT EVIDENCE RULES: zero matches prove only that this exact query/page returned zero matches. They do NOT prove that no derivative or competitor exists. Search name variants, base-model tags, format tags, authors, sorts, and additional pages, then inspect plausible repositories with huggingface_model_info. Model-card metadata is a claim by the repository, not independent validation.
+
+Example: {"tool_name":"huggingface_model_search","parameters":{"query":"SkyReels V3","filter_tag":"gguf","sort":"last_modified","direction":"desc","limit":20}}

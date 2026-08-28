@@ -1,16 +1,66 @@
 import os
 import sys
 import json
+import hashlib
 import uuid
 import time
 import signal
 import ctypes
+import re
+import stat
 import subprocess
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from aeon.tools.base import BaseTool
+from aeon.core.agent_protocol import SideEffect, ToolResult, ToolStatus
+from aeon.tools.command_fleet_guard import (
+    require_fleet_low_priority_wrapper,
+    scrubbed_fleet_command_environment,
+)
 from aeon.core import runtime_signals as rt
-from aeon.core.sub_agent_state import resolve, norm_status, group_kill
+from aeon.core.sub_agent_changes import (
+    MAX_CHANGED_PATHS,
+    MAX_PATCH_BYTES,
+    MUTABLE_CHANGE_RECEIPT,
+    MUTABLE_INTEGRATION_RECEIPT,
+    MUTABLE_PATCH_FILE,
+    MUTABLE_WORKSPACE_RECEIPT,
+    SUB_AGENT_REPORT_COLLECTION_RECEIPT,
+    SUB_AGENT_REPORT_PROGRESS_RECEIPT,
+    SubAgentChangeError,
+    read_owned_json,
+    validate_patch_file,
+    validate_relative_path,
+)
+from aeon.core.workspace_files import WorkspaceFileBoundary, WorkspacePathError
+from aeon.core.sub_agent_environment import bounded_sub_agent_environment
+from aeon.remote.mcp_capability import (
+    MCP_DELEGATION_ID_ENV,
+    MCP_DELEGATION_TOKEN_FILE_ENV,
+    MCP_URL_ENV,
+    mcp_action_endpoint,
+)
+from aeon.remote.self_settings import (
+    SELF_SETTINGS_TOKEN_FILE_ENV,
+    SelfSettingsCapabilityError,
+    read_self_settings_token,
+    validate_managed_instance_id,
+)
+from aeon.core.sub_agent_state import (
+    CPU_SANDBOX_SLICE_ENV,
+    ProcessIdentityError,
+    assert_sub_agent_systemd_units_available,
+    capture_sub_agent_process,
+    norm_status,
+    pid_alive,
+    resolve,
+    sub_agent_systemd_command,
+    sub_agent_systemd_units,
+    terminate_sub_agent,
+)
 
 
 def _resolve_agent_dir(base_dir, agent_id):
@@ -56,6 +106,311 @@ def _resolve_agent_dir(base_dir, agent_id):
     return None, f"Agent '{agent_id}' not found.{hint}"
 
 
+def _output_dir_for_worker(worker):
+    """Use request-scoped private state, with a legacy test/session fallback."""
+
+    resolver = getattr(worker, "sub_agent_output_dir", None)
+    if callable(resolver):
+        return resolver()
+    instance_id = getattr(worker, "instance_id", "default")
+    return Path(os.getcwd()) / "aeon_output" / instance_id / "sub_agents"
+
+
+def _run_git(workspace: Path, *arguments: str, timeout: int):
+    """Run fixed lifecycle-only Git without hooks or inherited Fleet authority."""
+
+    environment = scrubbed_fleet_command_environment()
+    for key in tuple(environment):
+        if key.startswith("GIT_"):
+            environment.pop(key, None)
+    return subprocess.run(
+        [
+            require_fleet_low_priority_wrapper(),
+            "/usr/bin/git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+            str(workspace),
+            *arguments,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=environment,
+    )
+
+
+def _git_failure_detail(result: subprocess.CompletedProcess) -> str:
+    detail = str(result.stderr or result.stdout or "").strip().splitlines()
+    return detail[-1][:500] if detail else "unknown git error"
+
+
+def _change_result(
+    status: ToolStatus,
+    summary: str,
+    *,
+    changed: bool = False,
+    error_code: str = "",
+    evidence: list[str] | None = None,
+    artifacts: list[str] | None = None,
+) -> ToolResult:
+    return ToolResult(
+        tool_name="integrate_sub_agent_changes",
+        status=status,
+        changed=changed,
+        summary=summary,
+        evidence=list(evidence or []),
+        artifacts=list(artifacts or []),
+        error_code=error_code,
+        retryable=False,
+        side_effect=SideEffect.LOCAL_MUTATION,
+    )
+
+
+def _admit_principal_change_paths(
+    worker,
+    repository: Path,
+    relative_workspace: str,
+    path_changes: list[dict],
+) -> list[str]:
+    """Apply the ordinary file-tool boundary to every receipt-owned path."""
+
+    boundary = WorkspaceFileBoundary.from_worker(worker)
+    expected_workspace = (
+        repository
+        if relative_workspace == "."
+        else repository / relative_workspace
+    ).resolve(strict=True)
+    if boundary.root != expected_workspace:
+        raise SubAgentChangeError(
+            "principal launch-workspace identity no longer matches the delegated workspace"
+        )
+    try:
+        from aeon.core.protected import guard as protected_guard
+    except Exception as exc:
+        raise SubAgentChangeError("protected-path policy is unavailable") from exc
+
+    artifacts = []
+    for item in path_changes:
+        target = repository / item["path"]
+        try:
+            bound = boundary.bind(str(target))
+        except WorkspacePathError as exc:
+            raise SubAgentChangeError(str(exc)) from exc
+        blocked = protected_guard(str(bound.absolute))
+        if blocked:
+            raise SubAgentChangeError(blocked)
+
+        # Reject every existing symlink/non-directory ancestor and every
+        # non-regular/multiply-linked leaf. Git's path checks are useful defense
+        # in depth, but they do not replace Aeon's descriptor-oriented boundary.
+        cursor = boundary.root
+        missing_parent = False
+        for component in bound.parts[:-1]:
+            cursor = cursor / component
+            if missing_parent:
+                continue
+            try:
+                metadata = cursor.lstat()
+            except FileNotFoundError:
+                missing_parent = True
+                continue
+            except OSError as exc:
+                raise SubAgentChangeError(
+                    f"cannot validate parent of integration path {item['path']}"
+                ) from exc
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise SubAgentChangeError(
+                    f"integration path has a symlink or non-directory ancestor: {item['path']}"
+                )
+        if not missing_parent:
+            try:
+                leaf = bound.absolute.lstat()
+            except FileNotFoundError:
+                leaf = None
+            except OSError as exc:
+                raise SubAgentChangeError(
+                    f"cannot validate integration path {item['path']}"
+                ) from exc
+            if leaf is not None and (
+                not stat.S_ISREG(leaf.st_mode)
+                or stat.S_ISLNK(leaf.st_mode)
+                or leaf.st_nlink != 1
+            ):
+                raise SubAgentChangeError(
+                    f"integration target is a symlink, linked file, or non-regular file: {item['path']}"
+                )
+        artifacts.append(str(bound.absolute))
+    return artifacts
+
+
+def _principal_paths_match_base(
+    repository: Path,
+    base_commit: str,
+    path_changes: list[dict],
+) -> str:
+    """Return a conflict reason if any affected principal path changed."""
+
+    new_paths = [
+        item["path"] for item in path_changes if item.get("old_mode") == "000000"
+    ]
+    for path in new_paths:
+        if os.path.lexists(repository / path):
+            return f"new child path already exists in the principal worktree: {path}"
+    tracked_paths = [
+        item["path"] for item in path_changes if item.get("old_mode") != "000000"
+    ]
+    for offset in range(0, len(tracked_paths), 128):
+        batch = tracked_paths[offset : offset + 128]
+        comparison = _run_git(
+            repository,
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+            base_commit,
+            "--",
+            *batch,
+            timeout=30,
+        )
+        if comparison.returncode == 1:
+            return "an affected principal path changed after the child was dispatched"
+        if comparison.returncode != 0:
+            return "Git could not prove affected principal paths still match the child base"
+    return ""
+
+
+def _final_change_receipt_matches(repository: Path, path_changes: list[dict]) -> bool:
+    """Verify the exact filesystem state described by the child snapshot."""
+
+    for item in path_changes:
+        target = repository / item["path"]
+        if item["status"] == "D":
+            if os.path.lexists(target):
+                return False
+            continue
+        try:
+            metadata = target.lstat()
+        except OSError:
+            return False
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return False
+        mode = "100755" if metadata.st_mode & 0o111 else "100644"
+        if (
+            mode != item["new_mode"]
+            or metadata.st_size != item["final_size"]
+        ):
+            return False
+        digest = hashlib.sha256()
+        try:
+            with target.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return False
+        if digest.hexdigest() != item["final_sha256"]:
+            return False
+    return True
+
+
+def _reap_sub_agent_launcher(process, agent_dir):
+    """Reap systemd-run and retire its exact leaf slice after natural exit.
+
+    The durable receipt remains the authority. If a nested command scope is
+    unexpectedly still populated, ``terminate_sub_agent`` gives the whole exact
+    slice the same 30-second cleanup grace before escalation. Ambiguity is
+    recorded for an operator and is never converted into a broader signal.
+    """
+
+    try:
+        process.wait()
+    except Exception:
+        return
+    try:
+        terminate_sub_agent(agent_dir)
+    except ProcessIdentityError as exc:
+        try:
+            rt.atomic_write_text(
+                Path(agent_dir) / "lifecycle_error.txt",
+                f"Exact sub-agent slice cleanup was refused: {str(exc)[:500]}",
+            )
+        except Exception:
+            pass
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+def _create_mcp_delegation(
+    *,
+    agent_id: str,
+    credential_ids: list[str],
+    expires_in: int,
+    agent_dir: Path,
+) -> tuple[str, Path]:
+    """Mint one expiring Nexus proxy capability without exposing OAuth secrets."""
+
+    try:
+        endpoint = mcp_action_endpoint(os.environ.get(MCP_URL_ENV, ""), "delegations")
+        parent_id = validate_managed_instance_id(
+            os.environ.get("AEON_REMOTE_INSTANCE_ID")
+        )
+        parent_token = read_self_settings_token(
+            os.environ.get(SELF_SETTINGS_TOKEN_FILE_ENV, "")
+        )
+    except SelfSettingsCapabilityError as exc:
+        raise RuntimeError(f"MCP delegation is unavailable: {exc}") from exc
+    request = urllib.request.Request(
+        endpoint,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {parent_token}",
+            "Content-Type": "application/json",
+            "X-Nexus-Agent-Instance": parent_id,
+        },
+        data=json.dumps(
+            {
+                "delegation_id": agent_id,
+                "credential_ids": credential_ids,
+                "expires_in": expires_in,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8"),
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirectHandler(),
+    )
+    try:
+        with opener.open(request, timeout=15) as response:
+            raw = response.read(16385)
+            if len(raw) > 16384:
+                raise RuntimeError("Nexus returned an oversized delegation response")
+            document = json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(8192)
+        try:
+            detail = json.loads(raw.decode("utf-8")).get("detail")
+        except (UnicodeError, json.JSONDecodeError, AttributeError):
+            detail = None
+        raise RuntimeError(detail or f"Nexus returned HTTP {exc.code}") from None
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Nexus MCP delegation failed: {exc}") from exc
+    if (
+        not isinstance(document, dict)
+        or document.get("delegation_id") != agent_id
+        or not isinstance(document.get("token"), str)
+    ):
+        raise RuntimeError("Nexus returned an invalid delegation capability")
+    token_path = agent_dir / "mcp-delegation.token"
+    rt.atomic_write_text(token_path, str(document["token"]))
+    os.chmod(token_path, 0o600)
+    return os.environ[MCP_URL_ENV], token_path
+
+
 def uncollected_sub_agents(base_dir, notified_set):
     """Return short ids of sub-agents that have a terminal result which was never
     surfaced to the principal (i.e. never gathered/reported). Used to stop the
@@ -89,27 +444,19 @@ class SpawnSubAgent(BaseTool):
         super().__init__(
             name="spawn_sub_agent",
             description=(
-                "Dispatch a background sub-agent (a graduate student) to work an INDEPENDENT thread in "
-                "parallel (a research avenue, a separate module, an isolated experiment). You are its "
-                "advisor: spawn the batch, then each turn watch the SUB-AGENTS section of your context, "
-                "steer the ones drifting (steer_sub_agent), relay useful cross-findings, and do your own "
-                "orthogonal work meanwhile -- never sit idle waiting. NEVER spawn a sub-agent for something "
-                "you can do yourself in 1-2 commands, and NEVER finish a task while a sub-agent you spawned "
-                "is still running or unread: collect its report (get_sub_agent_report), or kill it if you no "
-                "longer need its work, before task_complete.\n"
-                "Each sub-agent runs your model, shares the workspace, CANNOT spawn its own sub-agents, and "
-                "is GUARANTEED to reach a terminal state within its budget (an internal watchdog enforces "
-                "this). Its final report reaches you via get_sub_agent_report, so make the deliverable "
-                "explicit in the objective.\n"
-                "Schema:\n"
-                "  objective (str, required): a SELF-CONTAINED task with clear, explicitly-stated deliverables.\n"
-                "  time_budget_minutes (int, optional, default=40): wall-clock budget. Deep research: 60-90; "
-                "quick lookups: 10-15. Capped at 120.\n"
-                "  max_iterations (int, optional, default=20): planning-step cap.\n"
-                "  stall_timeout_seconds (int, optional, default=600): kill if it makes no progress this long.\n"
-                "Example: {\"tool_name\": \"spawn_sub_agent\", \"parameters\": {\"objective\": \"Map aeon/tools: "
-                "list every tool, its base class, and its upstream/downstream imports; report as a structured "
-                "summary with risks.\", \"time_budget_minutes\": 30}}"
+                "Dispatch one bounded sub-agent for a genuinely independent thread. Default read_only=true "
+                "shares the current workspace through an enforced read-only request mode. read_only=false "
+                "is allowed only for a clean Git repository and creates a detached isolated worktree; it "
+                "never permits concurrent edits in the principal's tree. A finished mutable child emits "
+                "an immutable patch receipt which the principal must review and apply with "
+                "integrate_sub_agent_changes. Sub-agents cannot recursively "
+                "delegate, resume the principal, or use principal-only Nexus capabilities. Give a complete "
+                "objective and expected report. Collect the terminal report before final completion.\n"
+                "Parameters: objective (str, required); time_budget_minutes (int, optional, default 40); "
+                "max_iterations (int, optional, default 20); stall_timeout_seconds (int, optional, default "
+                "600); read_only (bool, optional, default true)."
+                " allowed_credentials (list of exact credential IDs, optional) grants "
+                "only those accounts for this bounded run and defaults to none."
             ),
         )
         self.worker = worker
@@ -117,7 +464,7 @@ class SpawnSubAgent(BaseTool):
 
     @property
     def output_dir(self):
-        return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
+        return _output_dir_for_worker(self.worker)
 
     def _running_count(self):
         if not self.output_dir.exists():
@@ -147,7 +494,15 @@ class SpawnSubAgent(BaseTool):
                 return d.name[:8]
         return None
 
-    def execute(self, objective, time_budget_minutes=None, max_iterations=None, stall_timeout_seconds=None):
+    def execute(
+        self,
+        objective: str,
+        time_budget_minutes: int = None,
+        max_iterations: int = None,
+        stall_timeout_seconds: int = None,
+        read_only: bool = True,
+        allowed_credentials: list[str] | None = None,
+    ):
         if not self.worker:
             return "COMMAND FAILED: Worker context missing."
 
@@ -193,9 +548,34 @@ class SpawnSubAgent(BaseTool):
             iters = 20
         iters = max(1, min(iters, 100))
 
+        if not isinstance(read_only, bool):
+            return "COMMAND FAILED: read_only must be a JSON boolean."
+        if allowed_credentials is None:
+            allowed_credentials = []
+        if (
+            not isinstance(allowed_credentials, list)
+            or any(
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 128
+                for value in allowed_credentials
+            )
+        ):
+            return "COMMAND FAILED: allowed_credentials must be a list of credential IDs."
+        allowed_credentials = sorted({value.strip() for value in allowed_credentials})
+
         agent_id = str(uuid.uuid4())
+        try:
+            scope_unit, slice_unit = sub_agent_systemd_units(agent_id)
+            assert_sub_agent_systemd_units_available(agent_id)
+        except ProcessIdentityError as exc:
+            return f"COMMAND FAILED: could not reserve unique sub-agent units: {exc}"
         agent_dir = self.output_dir / agent_id
-        agent_dir.mkdir(parents=True, exist_ok=True)
+        agent_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            os.chmod(agent_dir, 0o700)
+        except OSError:
+            pass
         # Persist the objective so duplicate-spawn detection (and humans reading
         # the output dir) can see what each sub-agent was tasked with.
         try:
@@ -203,22 +583,139 @@ class SpawnSubAgent(BaseTool):
         except Exception:
             pass
 
-        workspace_path = Path(os.getcwd())
-        symlink_path = agent_dir / "workspace"
-        if symlink_path.exists() or symlink_path.is_symlink():
-            symlink_path.unlink()
-        symlink_path.symlink_to(workspace_path)
+        workspace_path = Path(os.getcwd()).resolve()
+        child_workspace = agent_dir / "workspace"
+        isolation_note = "read-only shared workspace"
+        mutable_repo_root = None
+        mutable_worktree_root = None
+
+        def rollback_unlaunched_worktree() -> str:
+            """Remove only this task-created, never-launched clean worktree."""
+
+            nonlocal mutable_worktree_root
+            if mutable_repo_root is None or mutable_worktree_root is None:
+                return ""
+            try:
+                removed = _run_git(
+                    mutable_repo_root,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(mutable_worktree_root),
+                    timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                return f" Exact task worktree cleanup also failed: {exc}"
+            if removed.returncode != 0:
+                return (
+                    " Exact task worktree cleanup also failed: "
+                    + _git_failure_detail(removed)
+                )
+            mutable_worktree_root = None
+            return ""
+
+        if read_only:
+            if child_workspace.exists() or child_workspace.is_symlink():
+                child_workspace.unlink()
+            child_workspace.symlink_to(workspace_path)
+        else:
+            # Mutable agents never share a writable tree. A detached worktree is
+            # created only from a clean Git snapshot so it cannot silently omit
+            # the principal's uncommitted work or race those edits.
+            try:
+                root_result = _run_git(
+                    workspace_path, "rev-parse", "--show-toplevel", timeout=10,
+                )
+                if root_result.returncode != 0:
+                    return (
+                        "COMMAND BLOCKED: mutable sub-agent requested, but the workspace is not "
+                        "inside a Git repository. Use read_only=true or prepare explicit isolation."
+                    )
+                repo_root = Path(root_result.stdout.strip()).resolve()
+                relative_workspace = workspace_path.relative_to(repo_root)
+                dirty = _run_git(
+                    repo_root,
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    timeout=15,
+                )
+                if dirty.returncode != 0 or dirty.stdout.strip():
+                    return (
+                        "COMMAND BLOCKED: mutable sub-agent isolation requires a clean Git worktree. "
+                        "Current tracked/untracked changes would be omitted from a detached snapshot. "
+                        "Use a read-only agent or let the principal finish the edits."
+                    )
+                head = _run_git(
+                    repo_root,
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                    timeout=10,
+                )
+                base_commit = str(head.stdout or "").strip().lower()
+                if head.returncode != 0 or not re.fullmatch(
+                    r"[0-9a-f]{40,64}", base_commit
+                ):
+                    return (
+                        "COMMAND BLOCKED: mutable sub-agent isolation could not bind "
+                        "the clean repository to an exact base commit."
+                    )
+                worktree_root = self.worker._request_state_dir() / "worktrees" / agent_id
+                worktree_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                add = _run_git(
+                    repo_root,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(worktree_root),
+                    "HEAD",
+                    timeout=60,
+                )
+                if add.returncode != 0:
+                    detail = (add.stderr or add.stdout).strip().splitlines()
+                    return "COMMAND FAILED: could not create isolated mutable worktree: " + (
+                        detail[-1][:500] if detail else "unknown git error"
+                    )
+                mutable_repo_root = repo_root
+                mutable_worktree_root = worktree_root
+                child_workspace = worktree_root / relative_workspace
+                if not child_workspace.is_dir():
+                    return (
+                        "COMMAND FAILED: isolated worktree does not contain the requested workspace path."
+                        + rollback_unlaunched_worktree()
+                    )
+                rt.atomic_write_json(
+                    agent_dir / MUTABLE_WORKSPACE_RECEIPT,
+                    {
+                        "schema": 1,
+                        "agent_id": agent_id,
+                        "read_only": False,
+                        "base_commit": base_commit,
+                        "parent_repository": str(repo_root),
+                        "worktree_repository": str(worktree_root.resolve()),
+                        "relative_workspace": relative_workspace.as_posix() or ".",
+                    },
+                )
+                os.chmod(agent_dir / MUTABLE_WORKSPACE_RECEIPT, 0o600)
+                isolation_note = f"isolated detached worktree at {worktree_root}"
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                return (
+                    f"COMMAND FAILED: mutable sub-agent isolation failed: {type(exc).__name__}: {exc}"
+                    + rollback_unlaunched_worktree()
+                )
 
         coordinated_objective = (
             f"{objective}\n\n"
-            f"[COORDINATION] You are one of several parallel sub-agents sharing this task. BEFORE starting "
-            f"a self-contained chunk of work, call blackboard_read to check whether a sibling already "
-            f"produced that result or already hit that dead end. When you produce something reusable, call "
-            f"blackboard_post.\n\n"
-            f"[REPORTING] Your final say_to_user message IS your report back to the principal agent and is "
-            f"the deliverable. Before you call task_complete, deliver your COMPLETE findings via say_to_user "
-            f"as a structured report (not a one-line summary, not just a log of what you opened). The "
-            f"principal cannot see your internal thoughts or your task_complete reason."
+            f"[CAPABILITY] This sub-agent is {'read-only' if read_only else 'mutable but isolated'}. "
+            f"Stay within that boundary. "
+            f"{'Do not commit, checkout, or change Git HEAD/refs; the terminal transfer accepts only uncommitted worktree edits.' if not read_only else ''}"
+            f"\n\n"
+            f"[COORDINATION] For a genuinely shared finding, check/post the run-scoped blackboard; "
+            f"do not duplicate a sibling's work.\n\n"
+            f"[REPORTING] End with one complete `final` report for the principal: findings, evidence, "
+            f"actions actually taken, artifacts, and any blocker. Do not claim completion from intent alone. "
+            f"For mutable work, the harness separately captures your exact repository patch."
         )
 
         cmd = [
@@ -226,14 +723,24 @@ class SpawnSubAgent(BaseTool):
             "--agent_id", agent_id,
             "--objective", coordinated_objective,
             "--model_config", json.dumps(model_cfg),
-            "--workspace", str(symlink_path),
+            "--workspace", str(child_workspace),
             "--output_dir", str(agent_dir),
             "--max_iterations", str(iters),
             "--stall_timeout", str(stall),
             "--max_wallclock", str(max_wallclock),
         ]
+        if read_only:
+            cmd.append("--read_only")
         if getattr(self.worker, "debug_mode", False):
             cmd.append("--debug")
+
+        try:
+            scoped_cmd = sub_agent_systemd_command(agent_id, cmd)
+        except ProcessIdentityError as exc:
+            return (
+                f"COMMAND FAILED: could not construct exact sub-agent scope: {exc}"
+                + rollback_unlaunched_worktree()
+            )
 
         def set_pdeathsig():
             try:
@@ -241,45 +748,563 @@ class SpawnSubAgent(BaseTool):
             except Exception:
                 pass
 
-        log_fd = open(agent_dir / "agent.log", "a")
+        request_id = str(getattr(self.worker, "request_id", "") or "unscoped")
+        blackboard_resolver = getattr(self.worker, "blackboard_path", None)
+        blackboard_path = (
+            blackboard_resolver()
+            if callable(blackboard_resolver)
+            else self.output_dir.parent / "blackboard.jsonl"
+        )
+        child_env = bounded_sub_agent_environment()
+        if allowed_credentials:
+            try:
+                mcp_url, delegation_token_path = _create_mcp_delegation(
+                    agent_id=agent_id,
+                    credential_ids=allowed_credentials,
+                    expires_in=max_wallclock,
+                    agent_dir=agent_dir,
+                )
+            except RuntimeError as exc:
+                return f"COMMAND FAILED: {exc}" + rollback_unlaunched_worktree()
+            child_env.update(
+                {
+                    MCP_URL_ENV: mcp_url,
+                    MCP_DELEGATION_ID_ENV: agent_id,
+                    MCP_DELEGATION_TOKEN_FILE_ENV: str(delegation_token_path),
+                }
+            )
+        child_env.update({
+            "AEON_PARENT_INSTANCE_ID": str(self.worker.instance_id),
+            "AEON_PARENT_REQUEST_ID": request_id,
+            "AEON_BLACKBOARD_PATH": str(blackboard_path),
+            "AEON_READ_ONLY": "1" if read_only else "0",
+            # Generated here only. Nested generic-shell scopes may inherit this
+            # exact leaf slice, but neither the model nor inherited state chooses
+            # or overrides the lifecycle boundary.
+            CPU_SANDBOX_SLICE_ENV: slice_unit,
+        })
+        try:
+            log_fd = open(agent_dir / "agent.log", "a")
+        except OSError as exc:
+            return (
+                f"COMMAND FAILED: could not open sub-agent log: {exc}"
+                + rollback_unlaunched_worktree()
+            )
         try:
             process = subprocess.Popen(
-                cmd,
+                scoped_cmd,
                 # Detach stdin: inheriting the principal's TTY makes the
                 # sub-agent's console reader contend with the principal's for
                 # the same terminal (background-session reads -> SIGTTIN).
                 stdin=subprocess.DEVNULL,
                 stdout=log_fd,
                 stderr=subprocess.STDOUT,
+                # A bounded child must not inherit the principal Project Manager's
+                # identity or owner-only Nexus mutation capabilities.
+                env=child_env,
                 preexec_fn=set_pdeathsig,
                 start_new_session=True,
             )
         except Exception as e:
-            return f"COMMAND FAILED: could not launch sub-agent process: {e}"
+            return (
+                f"COMMAND FAILED: could not launch sub-agent process: {e}"
+                + rollback_unlaunched_worktree()
+            )
         finally:
             # The child inherited the fd; keeping it open in the parent leaks one
             # fd per spawn for the life of the session.
             log_fd.close()
 
+        try:
+            process_ref = capture_sub_agent_process(
+                agent_dir,
+                process.pid,
+                scope_unit=scope_unit,
+                slice_unit=slice_unit,
+            )
+            rt.atomic_write_json(agent_dir / "process.json", process_ref)
+        except Exception as exc:
+            # Popen returned this exact systemd-run launcher. Kill only that
+            # pinned child; the wrapper's parent-death signal handles a scope we
+            # could not safely commit to a durable identity receipt.
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except Exception:
+                pass
+            return f"COMMAND FAILED: could not record sub-agent process identity: {exc}"
+
         rt.atomic_write_text(agent_dir / "pid.txt", str(process.pid))
         rt.atomic_write_text(agent_dir / "status.txt", "RUNNING")
+        threading.Thread(
+            target=_reap_sub_agent_launcher,
+            args=(process, agent_dir),
+            daemon=True,
+            name=f"aeon-subagent-reaper-{agent_id[:8]}",
+        ).start()
 
         short_id = agent_id[:8]
         msg = (f"Sub-agent spawned. Agent ID: {agent_id} (refer to it as '{short_id}' in steer/report/kill). "
                f"Budget: {max_wallclock // 60} min wall-clock, {stall}s stall, {iters} max iterations. "
-               f"It will now appear LIVE in the SUB-AGENTS section of your context every turn -- watch it "
-               f"there, steer_sub_agent if it drifts, and meanwhile advance your own orthogonal work. You "
-               f"must collect its report with get_sub_agent_report (or kill_sub_agent if you no longer need "
-               f"it) before you can task_complete.")
-        # `running` was counted BEFORE this spawn, so 0 means this is now your only
-        # student. A lone sub-agent buys no parallelism — push the principal to
-        # either fan out or get to work itself, NOT to sit and supervise one agent.
-        if running == 0:
-            msg += ("\nThis is your ONLY running sub-agent. A single student is no faster than doing the work "
-                    "yourself — it only pays off if you ALSO work a different thread in parallel. Right now: "
-                    "spawn more sub-agents for other independent sub-tasks you identified, or start your own "
-                    "orthogonal work this turn. Do not spend the next turns merely polling this one agent.")
+               f"Capability: {isolation_note}. It will appear in the run-scoped SUB-AGENTS section. "
+               f"A mutable child's edits remain isolated until integrate_sub_agent_changes succeeds. "
+               f"Collect its report before final completion, or stop it explicitly if no longer needed.")
         return msg
+
+
+class IntegrateSubAgentChanges(BaseTool):
+    """Apply one immutable detached-worktree patch after conflict checks."""
+
+    def __init__(self, worker=None, llm_client=None):
+        super().__init__(
+            name="integrate_sub_agent_changes",
+            description=(
+                "Integrate the exact patch produced by a finished mutable sub-agent into the "
+                "principal's Git worktree. The harness verifies the child/base/repository identity, "
+                "patch digest, bounded changed paths, exact unchanged base, and a no-write `git apply "
+                "--check` before applying. It never merges commits, changes refs, stages files, or "
+                "overwrites a conflicting principal edit. Read the terminal report first. "
+                "By default only a COMPLETED child can be integrated; set accept_partial=true only "
+                "after reviewing a BLOCKED/FAILED child's report and deliberately accepting its "
+                "partial patch. Validate the integrated result in a later action.\n"
+                "Parameters: agent_id (str, required); changeset_id (str, required, exact sha256 "
+                "shown by get_sub_agent_report); accept_partial (bool, optional, default false)."
+            ),
+        )
+        self.worker = worker
+        self.llm_client = llm_client
+
+    @property
+    def output_dir(self):
+        return _output_dir_for_worker(self.worker)
+
+    @staticmethod
+    def _blocked(message: str, code: str = "sub_agent_changes_blocked") -> ToolResult:
+        return _change_result(
+            ToolStatus.BLOCKED,
+            f"COMMAND BLOCKED: {message}",
+            error_code=code,
+        )
+
+    @staticmethod
+    def _failed(message: str) -> ToolResult:
+        return _change_result(
+            ToolStatus.FAILED,
+            f"COMMAND FAILED: {message}",
+            error_code="sub_agent_changes_failed",
+        )
+
+    def parameter_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "minLength": 4, "maxLength": 128},
+                "changeset_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                },
+                "accept_partial": {"type": "boolean"},
+            },
+            "required": ["agent_id", "changeset_id"],
+            "additionalProperties": False,
+        }
+
+    def execute(
+        self,
+        agent_id: str,
+        changeset_id: str,
+        accept_partial: bool = False,
+    ) -> ToolResult:
+        if not self.worker:
+            return self._failed("Worker context missing.")
+        if not isinstance(accept_partial, bool):
+            return self._failed("accept_partial must be a JSON boolean.")
+        changeset_id = str(changeset_id or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", changeset_id):
+            return self._failed("changeset_id must be the exact 64-character sha256 from the report.")
+        agent_dir, error = _resolve_agent_dir(self.output_dir, agent_id)
+        if error:
+            return self._failed(error)
+
+        terminal, status, terminal_report = resolve(agent_dir)
+        normalized_status = norm_status(status)
+        if not terminal:
+            return _change_result(
+                ToolStatus.PENDING,
+                f"Sub-agent {agent_dir.name[:8]} is still running; no patch was applied.",
+                error_code="sub_agent_running",
+            )
+        try:
+            collection = read_owned_json(
+                agent_dir / SUB_AGENT_REPORT_COLLECTION_RECEIPT
+            )
+            report_text = str(terminal_report or "N/A")
+            collected = bool(
+                collection.get("schema") == 1
+                and collection.get("agent_id") == agent_dir.name
+                and collection.get("status") == normalized_status
+                and collection.get("report_chars") == len(report_text)
+                and collection.get("report_sha256")
+                == hashlib.sha256(report_text.encode("utf-8")).hexdigest()
+            )
+        except SubAgentChangeError:
+            collected = False
+        if not collected:
+            return self._blocked(
+                f"read sub-agent {agent_dir.name[:8]}'s terminal report through EOF before "
+                "integrating its changes.",
+                "sub_agent_report_uncollected",
+            )
+        lifecycle = pid_alive(agent_dir)
+        if lifecycle is True:
+            return _change_result(
+                ToolStatus.PENDING,
+                f"Sub-agent {agent_dir.name[:8]} published a terminal report but its exact "
+                "process scope has not exited; no patch was applied.",
+                error_code="sub_agent_still_exiting",
+            )
+        if lifecycle is None:
+            return self._blocked(
+                "the exact sub-agent process/scope absence cannot be proven.",
+                "sub_agent_liveness_ambiguous",
+            )
+        if normalized_status != "COMPLETED" and not accept_partial:
+            return self._blocked(
+                f"sub-agent {agent_dir.name[:8]} ended {normalized_status}; read its report and "
+                "set accept_partial=true only if its incomplete changes are intentionally wanted.",
+                "partial_sub_agent_changes_require_acceptance",
+            )
+
+        try:
+            binding = read_owned_json(agent_dir / MUTABLE_WORKSPACE_RECEIPT)
+            changes = read_owned_json(agent_dir / MUTABLE_CHANGE_RECEIPT)
+            if (
+                binding.get("schema") != 1
+                or binding.get("agent_id") != agent_dir.name
+                or binding.get("read_only") is not False
+                or changes.get("schema") != 1
+                or changes.get("agent_id") != agent_dir.name
+            ):
+                raise SubAgentChangeError("mutable change receipt identity is invalid")
+
+            base_commit = str(changes.get("base_commit") or "").strip().lower()
+            if (
+                base_commit != str(binding.get("base_commit") or "").strip().lower()
+                or not re.fullmatch(r"[0-9a-f]{40,64}", base_commit)
+                or changes.get("child_head") != base_commit
+            ):
+                raise SubAgentChangeError("mutable change receipt base/child HEAD is invalid")
+            relative_workspace = validate_relative_path(
+                changes.get("relative_workspace") or "."
+            )
+            if relative_workspace != str(binding.get("relative_workspace") or "."):
+                raise SubAgentChangeError("mutable change receipt workspace changed")
+
+            patch_name = str(changes.get("patch_file") or "")
+            if patch_name != MUTABLE_PATCH_FILE:
+                raise SubAgentChangeError("mutable change receipt names an unexpected patch")
+            patch_size = changes.get("patch_bytes")
+            patch_sha256 = str(changes.get("patch_sha256") or "").strip().lower()
+            if (
+                not isinstance(patch_size, int)
+                or isinstance(patch_size, bool)
+                or patch_size < 0
+                or patch_size > MAX_PATCH_BYTES
+                or not re.fullmatch(r"[0-9a-f]{64}", patch_sha256)
+            ):
+                raise SubAgentChangeError("mutable patch metadata is invalid")
+            if changeset_id != patch_sha256:
+                raise SubAgentChangeError(
+                    "changeset_id does not match the child's exact immutable patch receipt"
+                )
+            raw_paths = changes.get("changed_paths")
+            raw_changes = changes.get("path_changes")
+            if (
+                not isinstance(raw_paths, list)
+                or not isinstance(raw_changes, list)
+                or len(raw_paths) > MAX_CHANGED_PATHS
+                or len(raw_changes) != len(raw_paths)
+            ):
+                raise SubAgentChangeError("mutable changed-path manifest is invalid")
+            changed_paths = [validate_relative_path(item) for item in raw_paths]
+            if len(set(changed_paths)) != len(changed_paths):
+                raise SubAgentChangeError("mutable changed-path manifest contains duplicates")
+            path_changes = []
+            for index, raw_change in enumerate(raw_changes):
+                if not isinstance(raw_change, dict):
+                    raise SubAgentChangeError("mutable path-change entry is invalid")
+                path = validate_relative_path(raw_change.get("path"))
+                status_code = str(raw_change.get("status") or "")
+                old_mode = str(raw_change.get("old_mode") or "")
+                new_mode = str(raw_change.get("new_mode") or "")
+                final_size = raw_change.get("final_size")
+                final_sha256 = str(raw_change.get("final_sha256") or "").lower()
+                if (
+                    path != changed_paths[index]
+                    or status_code not in {"A", "M", "D"}
+                    or old_mode not in {"000000", "100644", "100755"}
+                    or new_mode not in {"000000", "100644", "100755"}
+                    or not isinstance(final_size, int)
+                    or isinstance(final_size, bool)
+                    or final_size < 0
+                    or final_size > 1024 * 1024 * 1024
+                ):
+                    raise SubAgentChangeError("mutable path-change metadata is invalid")
+                expected_modes = {
+                    "A": old_mode == "000000" and new_mode in {"100644", "100755"},
+                    "M": old_mode in {"100644", "100755"} and new_mode in {"100644", "100755"},
+                    "D": old_mode in {"100644", "100755"} and new_mode == "000000",
+                }
+                if not expected_modes[status_code]:
+                    raise SubAgentChangeError("mutable path status/mode transition is invalid")
+                if status_code == "D":
+                    if final_size != 0 or final_sha256:
+                        raise SubAgentChangeError("deleted-path receipt has final content")
+                elif not re.fullmatch(r"[0-9a-f]{64}", final_sha256):
+                    raise SubAgentChangeError("mutable final file digest is invalid")
+                path_changes.append(
+                    {
+                        "path": path,
+                        "status": status_code,
+                        "old_mode": old_mode,
+                        "new_mode": new_mode,
+                        "final_size": final_size,
+                        "final_sha256": final_sha256,
+                    }
+                )
+            empty = changes.get("empty")
+            if (
+                not isinstance(empty, bool)
+                or empty != (patch_size == 0)
+                or empty != (not path_changes)
+            ):
+                raise SubAgentChangeError("mutable empty-patch receipt is inconsistent")
+
+            current_workspace = Path(os.getcwd()).resolve(strict=True)
+            root = _run_git(
+                current_workspace,
+                "rev-parse",
+                "--show-toplevel",
+                timeout=10,
+            )
+            if root.returncode != 0:
+                return self._blocked(
+                    "the principal workspace is no longer inside the bound Git repository.",
+                    "principal_repository_unavailable",
+                )
+            repository = Path(str(root.stdout or "").strip()).resolve(strict=True)
+            expected_repository = Path(
+                str(binding.get("parent_repository") or "")
+            ).resolve()
+            if repository != expected_repository:
+                raise SubAgentChangeError("principal repository identity changed")
+
+            principal_head = _run_git(
+                repository,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+                timeout=10,
+            )
+            if (
+                principal_head.returncode != 0
+                or str(principal_head.stdout or "").strip().lower() != base_commit
+            ):
+                return self._blocked(
+                    "the principal HEAD no longer equals the mutable child's exact base; "
+                    "inspect and port the report manually.",
+                    "sub_agent_base_diverged",
+                )
+
+            admitted_artifacts = _admit_principal_change_paths(
+                self.worker,
+                repository,
+                relative_workspace,
+                path_changes,
+            )
+            # Preserve the same request-relative identity used by ordinary file
+            # tools while also carrying canonical absolute receipts.
+            absolute_artifacts = changed_paths + admitted_artifacts
+            contract = getattr(self.worker, "request_contract", None)
+            invariant_check = getattr(contract, "invariant_mutation_error", None)
+            if callable(invariant_check):
+                invariant_error = invariant_check(
+                    self.policy,
+                    {
+                        "agent_id": agent_dir.name,
+                        "changeset_id": changeset_id,
+                        "accept_partial": accept_partial,
+                    },
+                    artifacts=absolute_artifacts,
+                )
+                if invariant_error:
+                    return self._blocked(
+                        invariant_error,
+                        "sub_agent_changes_violate_invariant",
+                    )
+            integration_path = agent_dir / MUTABLE_INTEGRATION_RECEIPT
+            if integration_path.exists():
+                integrated = read_owned_json(integration_path)
+                if (
+                    integrated.get("schema") == 1
+                    and integrated.get("agent_id") == agent_dir.name
+                    and integrated.get("patch_sha256") == patch_sha256
+                    and integrated.get("parent_repository") == str(repository)
+                ):
+                    journal_status = integrated.get("status")
+                    if journal_status == "PREPARED":
+                        if not _final_change_receipt_matches(repository, path_changes):
+                            return self._blocked(
+                                "a prior integration stopped after PREPARED and the principal "
+                                "files do not match the exact final receipt; refusing replay.",
+                                "sub_agent_integration_recovery_required",
+                            )
+                        integrated["status"] = "APPLIED"
+                        integrated["recovered"] = True
+                        rt.atomic_write_json(integration_path, integrated)
+                        os.chmod(integration_path, 0o600)
+                        return _change_result(
+                            ToolStatus.OK,
+                            f"Recovered sub-agent {agent_dir.name[:8]}'s exact completed "
+                            "integration journal. Validate the principal worktree.",
+                            changed=True,
+                            evidence=[f"sha256:{patch_sha256}", f"base:{base_commit}"],
+                            artifacts=absolute_artifacts,
+                        )
+                    if journal_status != "APPLIED":
+                        raise SubAgentChangeError("integration journal status is invalid")
+                    if not _final_change_receipt_matches(repository, path_changes):
+                        return self._blocked(
+                            "the already-integrated paths no longer match their exact receipt; "
+                            "inspect current principal changes instead of replaying the patch.",
+                            "integrated_sub_agent_state_changed",
+                        )
+                    return _change_result(
+                        ToolStatus.NO_CHANGE,
+                        f"NO CHANGE: sub-agent {agent_dir.name[:8]}'s exact patch already has an "
+                        "integration receipt. Validate the principal worktree instead of applying it twice.",
+                        error_code="already_integrated",
+                        artifacts=absolute_artifacts,
+                    )
+                raise SubAgentChangeError("an incompatible integration receipt already exists")
+
+            patch_path = agent_dir / MUTABLE_PATCH_FILE
+            validate_patch_file(
+                patch_path,
+                expected_size=patch_size,
+                expected_sha256=patch_sha256,
+            )
+            if empty:
+                rt.atomic_write_json(
+                    integration_path,
+                    {
+                        "schema": 1,
+                        "agent_id": agent_dir.name,
+                        "patch_sha256": patch_sha256,
+                        "parent_repository": str(repository),
+                        "status": "APPLIED",
+                        "changed": False,
+                    },
+                )
+                os.chmod(integration_path, 0o600)
+                return _change_result(
+                    ToolStatus.NO_CHANGE,
+                    f"NO CHANGE: mutable sub-agent {agent_dir.name[:8]} produced an empty patch.",
+                    error_code="empty_sub_agent_patch",
+                )
+
+            conflict = _principal_paths_match_base(
+                repository,
+                base_commit,
+                path_changes,
+            )
+            if conflict:
+                return self._blocked(conflict, "sub_agent_patch_conflict")
+
+            check = _run_git(
+                repository,
+                "apply",
+                "--check",
+                "--binary",
+                "--whitespace=nowarn",
+                str(patch_path),
+                timeout=60,
+            )
+            if check.returncode != 0:
+                return self._blocked(
+                    "the isolated patch conflicts with current principal files; no file was written. "
+                    f"Git check: {_git_failure_detail(check)}",
+                    "sub_agent_patch_conflict",
+                )
+
+            # Re-evaluate file boundaries immediately before the write, then
+            # journal PREPARED. A crash after apply is recovered by comparing
+            # exact final hashes; the patch is never blindly replayed.
+            _admit_principal_change_paths(
+                self.worker,
+                repository,
+                relative_workspace,
+                path_changes,
+            )
+            rt.atomic_write_json(
+                integration_path,
+                {
+                    "schema": 1,
+                    "agent_id": agent_dir.name,
+                    "patch_sha256": patch_sha256,
+                    "parent_repository": str(repository),
+                    "base_commit": base_commit,
+                    "status": "PREPARED",
+                    "changed_paths": changed_paths,
+                },
+            )
+            os.chmod(integration_path, 0o600)
+
+            applied = _run_git(
+                repository,
+                "apply",
+                "--binary",
+                "--whitespace=nowarn",
+                str(patch_path),
+                timeout=60,
+            )
+            if applied.returncode != 0:
+                return self._failed(
+                    "the patch changed between preflight and apply or Git refused it; "
+                    f"the PREPARED journal prevents unsafe replay. {_git_failure_detail(applied)}"
+                )
+
+            if not _final_change_receipt_matches(repository, path_changes):
+                return self._blocked(
+                    "Git returned success but the exact final file hashes/modes do not match "
+                    "the immutable changeset; the PREPARED journal prevents replay.",
+                    "sub_agent_post_apply_verification_failed",
+                )
+
+            rt.atomic_write_json(
+                integration_path,
+                {
+                    "schema": 1,
+                    "agent_id": agent_dir.name,
+                    "patch_sha256": patch_sha256,
+                    "parent_repository": str(repository),
+                    "base_commit": base_commit,
+                    "status": "APPLIED",
+                    "changed": True,
+                    "changed_paths": changed_paths,
+                },
+            )
+            os.chmod(integration_path, 0o600)
+            return _change_result(
+                ToolStatus.OK,
+                f"Integrated sub-agent {agent_dir.name[:8]}'s verified patch across "
+                f"{len(changed_paths)} path(s). Validate the result before completion.",
+                changed=True,
+                evidence=[f"sha256:{patch_sha256}", f"base:{base_commit}"],
+                artifacts=absolute_artifacts,
+            )
+        except (OSError, ValueError, SubAgentChangeError) as exc:
+            return self._blocked(str(exc), "invalid_sub_agent_change_receipt")
 
 
 class GatherSubAgents(BaseTool):
@@ -316,7 +1341,7 @@ class GatherSubAgents(BaseTool):
 
     @property
     def output_dir(self):
-        return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
+        return _output_dir_for_worker(self.worker)
 
     def _short_id(self, dir_name):
         return dir_name.split("-")[0]
@@ -384,7 +1409,6 @@ class GatherSubAgents(BaseTool):
             sid = self._short_id(d.name)
             if is_term:
                 base_status = norm_status(status)
-                self.worker.notified_sub_agents.add(f"{d.name}_{base_status}")
                 if base_status == "COMPLETED":
                     completed += 1
                     lines.append(f"[{sid}] COMPLETED\n  {(report or '')[:800]}\n"
@@ -454,6 +1478,7 @@ class GetSubAgentReport(BaseTool):
                 "Schema:\n"
                 "  agent_id (str, required): short id or full UUID.\n"
                 "  specific_question (str, optional): a targeted question about a running agent's progress.\n"
+                "  offset (int, optional): terminal-report character offset; follow next_offset until EOF.\n"
                 "Example: {\"tool_name\": \"get_sub_agent_report\", \"parameters\": {\"agent_id\": \"a44fa909\"}}"
             ),
             underlying_model=llm_client.model if llm_client else None,
@@ -463,9 +1488,9 @@ class GetSubAgentReport(BaseTool):
 
     @property
     def output_dir(self):
-        return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
+        return _output_dir_for_worker(self.worker)
 
-    def execute(self, agent_id, specific_question=None):
+    def execute(self, agent_id, specific_question=None, offset=0):
         agent_dir, err = _resolve_agent_dir(self.output_dir, agent_id)
         if err:
             return err
@@ -474,20 +1499,132 @@ class GetSubAgentReport(BaseTool):
         base_status = norm_status(status)
 
         if is_term:
-            self.worker.notified_sub_agents.add(f"{agent_dir.name}_{base_status}")
-            if base_status == "COMPLETED":
-                result = report or "N/A"
-                note = ""
-                if len(result) > self.MAX_RESULT_CHARS:
-                    # Keep BOTH ends: a structured report frames the work up top
-                    # and puts conclusions/deliverables at the bottom, so a
-                    # head-only cut would discard the most important part.
-                    from aeon.core.worker_utils import truncate_output
-                    result = truncate_output(result, max_chars=self.MAX_RESULT_CHARS)
-                    note = (f"\n\n[Report exceeded {self.MAX_RESULT_CHARS} chars; shown head+tail. "
-                            f"Full text in {agent_dir / 'output.json'}.]")
-                return f"Agent {agent_dir.name[:8]} Status: COMPLETED\n\n--- FINDINGS ---\n{result}{note}"
-            return f"Agent {agent_dir.name[:8]} Status: {status}\n\n{report or ''}"
+            try:
+                start = int(offset)
+            except (TypeError, ValueError):
+                return "COMMAND FAILED: offset must be a non-negative integer."
+            if start < 0:
+                return "COMMAND FAILED: offset must be a non-negative integer."
+            result = report or "N/A"
+            if start > len(result):
+                return (
+                    f"COMMAND FAILED: offset {start} exceeds terminal report length "
+                    f"{len(result)}."
+                )
+            report_sha256 = hashlib.sha256(result.encode("utf-8")).hexdigest()
+            already_collected = False
+            try:
+                collection = read_owned_json(
+                    agent_dir / SUB_AGENT_REPORT_COLLECTION_RECEIPT
+                )
+                already_collected = bool(
+                    collection.get("schema") == 1
+                    and collection.get("agent_id") == agent_dir.name
+                    and collection.get("status") == base_status
+                    and collection.get("report_chars") == len(result)
+                    and collection.get("report_sha256") == report_sha256
+                )
+            except SubAgentChangeError:
+                pass
+            if not already_collected:
+                expected_offset = 0
+                try:
+                    progress = read_owned_json(
+                        agent_dir / SUB_AGENT_REPORT_PROGRESS_RECEIPT
+                    )
+                    if (
+                        progress.get("schema") == 1
+                        and progress.get("agent_id") == agent_dir.name
+                        and progress.get("status") == base_status
+                        and progress.get("report_chars") == len(result)
+                        and progress.get("report_sha256") == report_sha256
+                        and isinstance(progress.get("next_offset"), int)
+                    ):
+                        expected_offset = max(
+                            0,
+                            min(len(result), progress["next_offset"]),
+                        )
+                except SubAgentChangeError:
+                    pass
+                if start != expected_offset:
+                    return (
+                        f"COMMAND FAILED: terminal report pages must be consumed in order; "
+                        f"expected offset {expected_offset}, received {start}."
+                    )
+            end = min(len(result), start + self.MAX_RESULT_CHARS)
+            chunk = result[start:end]
+            eof = end >= len(result)
+            if not already_collected:
+                rt.atomic_write_json(
+                    agent_dir / SUB_AGENT_REPORT_PROGRESS_RECEIPT,
+                    {
+                        "schema": 1,
+                        "agent_id": agent_dir.name,
+                        "status": base_status,
+                        "report_chars": len(result),
+                        "report_sha256": report_sha256,
+                        "next_offset": end,
+                    },
+                )
+                os.chmod(
+                    agent_dir / SUB_AGENT_REPORT_PROGRESS_RECEIPT,
+                    0o600,
+                )
+            if eof:
+                # A terminal child is resolved only after the principal has
+                # consumed every bounded page; a status preview is insufficient.
+                self.worker.notified_sub_agents.add(
+                    f"{agent_dir.name}_{base_status}"
+                )
+                rt.atomic_write_json(
+                    agent_dir / SUB_AGENT_REPORT_COLLECTION_RECEIPT,
+                    {
+                        "schema": 1,
+                        "agent_id": agent_dir.name,
+                        "status": base_status,
+                        "report_chars": len(result),
+                        "report_sha256": report_sha256,
+                    },
+                )
+                os.chmod(
+                    agent_dir / SUB_AGENT_REPORT_COLLECTION_RECEIPT,
+                    0o600,
+                )
+            page = (
+                f"report_chars={start}:{end}/{len(result)} · "
+                + ("EOF (report collected)" if eof else f"next_offset={end}")
+            )
+            heading = "--- FINDINGS ---\n" if base_status == "COMPLETED" else ""
+            change_note = ""
+            if (agent_dir / MUTABLE_WORKSPACE_RECEIPT).exists():
+                try:
+                    changes = read_owned_json(agent_dir / MUTABLE_CHANGE_RECEIPT)
+                    paths = changes.get("changed_paths")
+                    if not isinstance(paths, list):
+                        raise SubAgentChangeError("changed-path manifest is invalid")
+                    digest = str(changes.get("patch_sha256") or "")
+                    if changes.get("empty") is True:
+                        change_note = (
+                            "\n[MUTABLE WORKTREE] The exact terminal patch is empty; there are no "
+                            "isolated edits to integrate.\n"
+                        )
+                    else:
+                        change_note = (
+                            f"\n[MUTABLE WORKTREE] Verified patch receipt: {len(paths)} path(s), "
+                            f"changeset_id={digest}. After reviewing this report, apply it with "
+                            "integrate_sub_agent_changes("
+                            f"agent_id='{agent_dir.name[:8]}', changeset_id='{digest}') and then "
+                            "validate the principal worktree.\n"
+                        )
+                except SubAgentChangeError as exc:
+                    change_note = (
+                        "\n[MUTABLE WORKTREE] No valid transferable patch receipt is available "
+                        f"({exc}). Do not claim these isolated edits were integrated.\n"
+                    )
+            return (
+                f"Agent {agent_dir.name[:8]} Status: {status}\n{page}\n\n"
+                f"{change_note}{heading}{chunk}"
+            )
 
         report_str = f"Agent {agent_dir.name[:8]} Status: RUNNING"
         log_path = agent_dir / "agent.log"
@@ -549,7 +1686,7 @@ class KillSubAgent(BaseTool):
 
     @property
     def output_dir(self):
-        return Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents"
+        return _output_dir_for_worker(self.worker)
 
     def execute(self, agent_id):
         agent_dir, err = _resolve_agent_dir(self.output_dir, agent_id)
@@ -557,13 +1694,19 @@ class KillSubAgent(BaseTool):
             return err
 
         # Already terminal? Do NOT overwrite output.json — that would destroy a
-        # completed agent's findings. Mark it collected and point at the report.
+        # completed agent's findings. A status check is not report collection;
+        # leave the completion guard armed and point at the report tool.
         is_term, status, _ = resolve(agent_dir)
         if is_term:
             base_status = norm_status(status)
-            self.worker.notified_sub_agents.add(f"{agent_dir.name}_{base_status}")
             return (f"Sub-agent {agent_dir.name[:8]} already finished ({base_status}); nothing to kill. "
                     f"Its report is preserved — read it with get_sub_agent_report(agent_id='{agent_dir.name[:8]}').")
+
+        try:
+            signalled = terminate_sub_agent(agent_dir)
+        except ProcessIdentityError as exc:
+            return (f"REFUSED: could not prove that the recorded PID still belongs to sub-agent "
+                    f"{agent_dir.name[:8]} ({exc}). Its state was not overwritten.")
 
         rt.atomic_write_json(agent_dir / "output.json", {
             "agent_id": agent_dir.name,
@@ -572,13 +1715,5 @@ class KillSubAgent(BaseTool):
         })
         rt.atomic_write_text(agent_dir / "status.txt", "KILLED")
         self.worker.notified_sub_agents.add(f"{agent_dir.name}_KILLED")
-
-        pid_path = agent_dir / "pid.txt"
-        if not pid_path.exists():
-            return f"Sub-agent {agent_dir.name[:8]} marked KILLED (no PID file; process may have already exited)."
-        try:
-            pid = int(pid_path.read_text().strip())
-        except Exception:
-            return f"Sub-agent {agent_dir.name[:8]} marked KILLED (PID file unreadable)."
-        group_kill(pid)
-        return f"Sub-agent {agent_dir.name[:8]} (PID {pid}) terminated (process group killed) and marked KILLED."
+        outcome = "terminated" if signalled else "had already exited"
+        return f"Sub-agent {agent_dir.name[:8]} {outcome} and was marked KILLED."

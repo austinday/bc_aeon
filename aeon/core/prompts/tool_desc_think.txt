@@ -1,4 +1,4 @@
-Internal reasoning loop. Use sparingly and only when necessary. Use only when the query you are asking is something that is non-obvious, and requires complex, multi-step reasoning. 
+Primary strong-model reasoning call at xhigh effort. Use sparingly and only when the query is non-obvious and requires complex, multi-step reasoning. For a genuinely complex task, use this before consequential action to formulate or review the concise execution checklist; return reasoning to the agent, which must publish only the checklist steps through `updated_plan`.
 Schema:
   query (str, required): The question or topic to reason about.
 Example: {"tool_name": "think", "parameters": {"query": "What are the possible root causes of this import error?"}}

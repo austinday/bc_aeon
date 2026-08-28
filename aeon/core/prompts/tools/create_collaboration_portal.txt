@@ -1,0 +1,2 @@
+- This only pins an owner-approval proposal. Never claim a portal, credential, collaborator sibling, or public URL exists until Nexus reports owner approval through a later trusted channel.
+- Include only a project brief the owner explicitly authorized for external sharing.

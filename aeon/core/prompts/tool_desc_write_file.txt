@@ -1,14 +1,9 @@
-Writes or overwrites an ENTIRE file from scratch. Creates parent directories automatically. Writes are atomic (written to a temp file then swapped in), so a file is never left half-written, even on a crash.
+Atomically creates a new regular file or deliberately replaces an existing one.
+For an existing file, `expected_sha256` is mandatory and must match the current
+open_file receipt; otherwise the write is blocked. Prefer str_replace for narrow
+edits. Python/JSON/YAML parse failures are rejected before replacement.
 
-THIS IS THE PREFERRED, MOST RELIABLE WAY TO CREATE OR EDIT FILES.
-- Use write_file to CREATE new files.
-- Use write_file to EDIT any file under ~400 lines: just provide the full, corrected content. This is far more reliable than str_replace and avoids all text-matching failures.
-- Reserve str_replace for small edits to very large files only.
-- Whenever str_replace fails to match, immediately switch to write_file and supply the full file content.
-
-Schema:
-  file_path (str, required): Path to the file. Created if it does not exist; fully overwritten if it does.
-  content (str, required): The COMPLETE file content. Prefix with "base64:" for binary content.
-Example: {"tool_name": "write_file", "parameters": {"file_path": "src/main.py", "content": "import os\n\ndef main():\n    print(\"hello\")\n"}}
-
-Multi-line content goes directly in the "content" string with standard JSON escaping: newline as \n, double quote as \", backslash as \\.
+Parameters:
+- file_path (str, required)
+- content (str, required): complete text, or `base64:` followed by binary data
+- expected_sha256 (str, required only when the file already exists)

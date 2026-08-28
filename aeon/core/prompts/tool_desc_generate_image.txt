@@ -1,5 +1,5 @@
 CRITICAL: MUST USE THIS TOOL for ANY image generation request. Whenever the user asks you to make, generate, draw, or create an image, you MUST call this tool. Do NOT write your own Python scripts, do NOT use curl, and do NOT try to interact with the ComfyUI API manually.
-Generates a high-quality image using a local, UNCENSORED FLUX.2-klein model via ComfyUI and saves it to a file. The model has no content restrictions; fulfil the user's described image directly. Pairs with generate_video: create character sheets, scene stills, and storyboard frames here, then animate them (see the video_director skill).
+Generates a high-quality image using the configured local FLUX.2-klein service via ComfyUI and saves it to a file. Follow the user's request and applicable policy. It can create character sheets, scene stills, and storyboard frames for later use with generate_video.
 Schema:
   prompt (str, required): The detailed visual description of the image to generate. Make this highly descriptive.
   output_dir (str, REQUIRED): The DIRECTORY to save the image in; the file is auto-named for you and its full path is returned. A relative dir resolves against the current workspace (the directory you are working in); an absolute dir is honored as-is. Use '.' for the current workspace. Do NOT include a filename — pass a directory.

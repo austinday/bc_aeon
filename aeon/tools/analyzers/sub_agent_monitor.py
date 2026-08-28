@@ -5,18 +5,25 @@ from aeon.tools.base import BaseTool
 from aeon.core.logger import get_logger
 
 class SubAgentMonitor(BaseTool):
+    """Legacy analyzer retained for compatibility, never a model-facing tool.
+
+    ``get_sub_agent_status`` and ``get_sub_agent_report`` own the reviewed,
+    receipt-aware lifecycle surface. Keep this older path explicitly internal
+    so a future recursive loader cannot expose its unreviewed directory reader.
+    """
+
     def __init__(self, worker=None, llm_client=None):
         super().__init__(
             name="sub_agent_monitor",
             description="Monitors the progress of a running sub-agent by reading its telemetry and logs."
         )
+        self.is_internal = True
         self.worker = worker
         self.llm_client = llm_client
 
     def execute(self, agent_id: str) -> str:
         logger = get_logger()
-        # Path aligned with spawn_sub_agent.py
-        agent_path = Path(os.getcwd()) / "aeon_output" / self.worker.instance_id / "sub_agents" / agent_id
+        agent_path = self.worker.sub_agent_output_dir() / agent_id
         telemetry_file = agent_path / "telemetry.json"
         log_file = agent_path / "agent.log"
         status_file = agent_path / "status.txt"

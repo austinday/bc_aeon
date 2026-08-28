@@ -123,6 +123,12 @@ def enhance_prompt(llm_client, raw: str, media_type: str = "image",
     # Classify intent deterministically, then pick ONE unambiguous system prompt:
     # clean-steer for neutral requests (brand-safe), faithful/uncensored for adult.
     system = _system_for(media_type, wants_adult(raw))
+    limiter = getattr(llm_client, "support_request_kwargs", None)
+    support_limits = (
+        limiter(requested_tokens=2048, phase="media prompt enhancement")
+        if callable(limiter)
+        else {"max_tokens": 2048, "timeout": 45.0}
+    )
     resp = llm_client.client.chat.completions.create(
         # Send the served model id (api_model), the same id the main agent loop
         # uses -- the display name ('model') 404s against vLLM's served name.
@@ -130,6 +136,7 @@ def enhance_prompt(llm_client, raw: str, media_type: str = "image",
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": raw}],
         temperature=0.7,
+        **support_limits,
     )
     out = (resp.choices[0].message.content or "").strip()
     # Strip accidental wrapping quotes the model may add.

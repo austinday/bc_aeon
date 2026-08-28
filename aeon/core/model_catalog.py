@@ -102,6 +102,8 @@ MIN_CTX = 65536  # never deploy below 64k context
 QWEN38_MODEL_NAME = "Qwen3.8-27B-ARA-NVFP4-MTP"
 QWEN38_SERVED_NAME = "Qwen3.8-27B-ARA-NVFP4-MTP"
 VISION_MODEL_NAME = QWEN38_SERVED_NAME
+FLASH_NEXT_SERVED_NAME = "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP"
+VISION_MODEL_NAMES = frozenset({VISION_MODEL_NAME, FLASH_NEXT_SERVED_NAME})
 
 # Port allocation (lb = the port the agent connects to; node0/node1 = dual-copy backends).
 CATALOG: List[CatalogEntry] = [
@@ -110,10 +112,12 @@ CATALOG: List[CatalogEntry] = [
         # abliteration and local W4A4 NVFP4 compression. The language head,
         # recurrent convolutions, full vision tower, and all 15 native MTP tensors
         # remain BF16. A source-guarded vLLM structured-output backport fixes the
-        # upstream MTP/reasoning boundary bug. The bound K=0..4 release sweep uses
-        # real Aeon turn schemas plus text, vision, tool, and system-diagnosis
-        # cases; it selects K=3 only when every action is semantically exact and
-        # deterministic and measured decode throughput remains >=100 tok/s.
+        # upstream MTP/reasoning boundary bug. The bound historical v5 K=0..4
+        # release sweep uses real Aeon turn schemas plus text, vision, tool, and
+        # system-diagnosis cases; it selects K=3 only when every action is
+        # semantically exact and deterministic and measured decode throughput
+        # remains >=100 tok/s. Newer single-K regression evidence is kept
+        # separate and cannot silently rewrite that full-sweep selection.
         #
         # This is intentionally local-only: it is the exact checksum-validated
         # artifact built by aeon/scripts/build_qwen38_abliterated_nvfp4.py, not a
@@ -134,8 +138,9 @@ CATALOG: List[CatalogEntry] = [
         local_model_dir="Qwen3.8-27B-ARA-abliterated-NVFP4-MTP",
         served_name=QWEN38_SERVED_NAME,
         # n_max is not a guessed architecture default: it must match the
-        # versioned K=0..4 benchmark artifact below, which the launcher
-        # revalidates against the model and Docker image on every start.
+        # versioned historical K=0..4 benchmark artifact below, whose exact
+        # suite/script provenance the launcher revalidates alongside the model
+        # and Docker image on every start.
         mtp=Mtp(
             method="mtp",
             n_max=3,

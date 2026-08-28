@@ -1,4 +1,6 @@
-Restarts the Aeon agent process to apply code changes made to the agent's own source code. This tool saves your current memories, action history, plan, and objective, reinstalls the agent package from source, and relaunches. You will resume with the same objective and all persistent context preserved.
+Restarts the Aeon agent process to apply code changes made to the agent's own canonical source code. This tool saves your current memories, action history, plan, and objective, then relaunches with the canonical source tree first on PYTHONPATH. It does not execute package build/install hooks. You will resume with the same objective and all persistent context preserved.
+
+CURRENT SAFETY LATCH: restart is fail-closed on this host until modified-source imports can run inside an actively-probed masked-home sandbox. If the tool reports this blocker, do not retry or attempt a manual re-exec; report that the operator isolation boundary is required.
 
 WHEN TO USE:
 - After modifying any file under the Aeon source directory (adding a tool, changing a prompt, editing core logic, etc.).
@@ -6,11 +8,11 @@ WHEN TO USE:
 
 CRITICAL RULES:
 1. Save ALL important context to persistent memory (memorize) BEFORE calling this tool. Open files will NOT be preserved across restart.
-2. aeon_code_dir is OPTIONAL. Omit it and the agent auto-derives its own source root (the directory containing setup.py) from the installed package — you do NOT need to know or type the path. Only pass it to point at a different source tree on purpose.
+2. aeon_code_dir is OPTIONAL. Omit it and the agent auto-derives its own canonical source root (the directory containing setup.py). Alternate trees are refused; dependency, console-script, and entry-point changes require the explicit operator upgrade workflow.
 3. After restart, you will resume with the same objective. You MUST now perform a live test by actually calling the modified tool or triggering the modified logic to prove it works in the agent's operational context. This is the only acceptable final validation for self-modifications.
 4. Do NOT call this tool unless you have actually changed files in the Aeon source tree. It is pointless otherwise.
 
 Schema:
-  aeon_code_dir (str, optional): Absolute path to the Aeon source code directory (must contain setup.py). Omit to auto-derive it from the installed package.
+  aeon_code_dir (str, optional): Compatibility field; when present it must resolve to the exact canonical Aeon source tree. Omit it normally.
   reason (str, optional, default="Applying code changes"): Brief description of what changes are being applied.
 Example (typical): {"tool_name": "restart_aeon", "parameters": {"reason": "Added new calculator tool and prompt"}}

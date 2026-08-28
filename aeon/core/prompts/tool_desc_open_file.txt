@@ -1,4 +1,6 @@
-Opens a file and loads its FULL content into working memory so it can be read and edited. Use this to read, examine, or edit files. File contents stay up to date until closed. No need to re-open files already in working memory.
-Schema:
-  file_path (str, required): Path to the file to open. Relative or absolute.
-Example: {"tool_name": "open_file", "parameters": {"file_path": "src/main.py"}}
+Reads one current file into working memory and returns a SHA-256 receipt. Use
+the receipt as `expected_sha256` for a later edit. Files already open stay synced;
+do not reopen them unless a tool reports that the on-disk version changed.
+
+Parameters:
+- file_path (str, required): relative or absolute path to a specific file.

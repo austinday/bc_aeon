@@ -1,4 +1,3 @@
-Pauses execution and prompts the user for input. Use when you need clarification, a decision, credentials, confirmation, or just need to wait for the user to give you something before proceeding. Common to use after using "say_to_user".
-Schema:
-  prompt (str, optional, default="Please provide input:"): The question or prompt to display to the user.
-Example: {"tool_name": "get_user_input", "parameters": {"prompt": "Which database should I connect to: postgres or sqlite?"}}
+Legacy compatibility capability, hidden from the protocol-v2 model tool set.
+Use an `ask_user` turn with one focused question. The harness yields immediately
+and resumes only when the next exact role=user message arrives.

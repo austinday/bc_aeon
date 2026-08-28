@@ -14,6 +14,14 @@ def _load(filename: str) -> str:
         raise FileNotFoundError(f"Prompt file not found: {filepath}")
     return filepath.read_text(encoding='utf-8').rstrip()
 
+
+def load_prompt(filename: str) -> str:
+    """Reload one canonical prompt body after validating its local filename."""
+
+    if not filename or Path(filename).name != filename or not filename.endswith('.txt'):
+        raise ValueError("Prompt filename is invalid")
+    return _load(filename)
+
 # =============================================================================
 # CORE DIRECTIVES
 # =============================================================================
@@ -25,6 +33,9 @@ IMPORTANT_REMINDERS = _load('important_reminders.txt')
 # AGENT INSTRUCTIONS
 # =============================================================================
 PRIMARY_AGENT_INSTRUCTIONS = _load('primary_agent_instructions.txt')
+FLEET_SAFETY_INSTRUCTIONS = _load('fleet_safety_instructions.txt')
+MAIN_ORCHESTRATOR_INSTRUCTIONS = _load('main_orchestrator_instructions.txt')
+DEFAULT_JOB_ROLE = _load('default_job_role.txt')
 
 # =============================================================================
 # LLM PROMPT TEMPLATES (for llm.py)
@@ -50,6 +61,9 @@ TOOL_DESC_CLOSE_FILE = _load('tool_desc_close_file.txt')
 TOOL_DESC_WRITE_FILE = _load('tool_desc_write_file.txt')
 TOOL_DESC_STR_REPLACE = _load('tool_desc_str_replace.txt')
 TOOL_DESC_SEARCH_WEB = _load('tool_desc_search_web.txt')
+TOOL_DESC_HUGGINGFACE_MODEL_SEARCH = _load('tool_desc_huggingface_model_search.txt')
+TOOL_DESC_HUGGINGFACE_MODEL_INFO = _load('tool_desc_huggingface_model_info.txt')
+TOOL_DESC_HUGGINGFACE_REPO_FILE = _load('tool_desc_huggingface_repo_file.txt')
 TOOL_DESC_RUN_COMMAND = _load('tool_desc_run_command.txt')
 TOOL_DESC_TASK_COMPLETE = _load('tool_desc_task_complete.txt')
 TOOL_DESC_GET_USER_INPUT = _load('tool_desc_get_user_input.txt')

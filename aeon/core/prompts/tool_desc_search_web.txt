@@ -2,7 +2,7 @@ Searches the web via a LOCAL SearXNG metasearch engine and returns a concise, su
 
 USE search_web FOR shallow, public, easily-looked-up information: documentation, API references, current facts, definitions, "what is X / how do I Y", error-message lookups, package versions, and general research where a summary plus a few links is enough.
 
-DO NOT use search_web for deep work. If you need to actually READ a full page, gather a dataset, extract structured data, log into or navigate a site, or explore content a search snippet won't surface, expand the `web_browser` category and use the browser tools to act like a human (navigate, click, scroll, read). Good pattern: use search_web to FIND the right page, then the browser to DIG INTO it.
+DO NOT use search_web for deep work. If you need to read a full page, gather a dataset, extract structured data, log into or navigate a site, or explore content a search snippet will not surface, use the top-level browser tools. Search can locate a page; browser_navigate/browser_read can inspect it. Browser interactions that change external state still require explicit authority.
 
 Schema:
   query (str, required): The search query. Be specific and concise for best results.

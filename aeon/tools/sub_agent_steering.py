@@ -6,14 +6,13 @@ from pathlib import Path
 from aeon.tools.base import BaseTool
 from aeon.core.logger import get_logger
 from aeon.core.sub_agent_state import resolve
-from aeon.tools.sub_agent import _resolve_agent_dir
+from aeon.tools.sub_agent import _output_dir_for_worker, _resolve_agent_dir
 
 logger = get_logger()
 
 
 def _sub_agents_base(worker):
-    instance_id = getattr(worker, "instance_id", "default")
-    return Path(os.getcwd()) / "aeon_output" / instance_id / "sub_agents"
+    return _output_dir_for_worker(worker)
 
 
 class SubAgentSteering(BaseTool):

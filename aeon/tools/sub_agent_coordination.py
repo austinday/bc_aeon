@@ -11,15 +11,9 @@ logger = get_logger()
 # =============================================================================
 # Task-scoped shared blackboard
 # =============================================================================
-# Lives at the WORKSPACE ROOT (cwd), NOT under any per-process instance_id.
-#
-# Why not instance_id: every sub-agent process builds its own Worker with its
-# own random instance_id (Worker.__init__ -> uuid4). Siblings therefore do not
-# share an instance_id, so it is unusable as a coordination key. The workspace
-# directory IS the natural task scope: SpawnSubAgent symlinks each sub-agent's
-# workspace to the main cwd, and the wrapper chdir's into it, so os.getcwd()
-# resolves to the SAME physical directory for the primary agent and every
-# sub-agent. A single file there is genuinely shared by all of them.
+# The parent assigns one owner-private, request-scoped path to every child via
+# AEON_BLACKBOARD_PATH. This prevents findings from unrelated tasks or parallel
+# Nexus tabs from leaking into each other and keeps runtime state out of source.
 #
 # Concurrency: append-only writes guarded by an advisory flock (the same
 # fcntl pattern used throughout this codebase). Reads parse line-by-line and
@@ -32,10 +26,21 @@ MAX_FINDING_LEN = 4000
 MAX_READ_ENTRIES = 50
 
 
-def _blackboard_path() -> Path:
-    base = Path(os.getcwd()) / "aeon_output"
-    base.mkdir(parents=True, exist_ok=True)
-    return base / "blackboard.jsonl"
+def _blackboard_path(worker=None) -> Path:
+    if worker is not None and callable(getattr(worker, "blackboard_path", None)):
+        path = worker.blackboard_path()
+    else:
+        configured = os.environ.get("AEON_BLACKBOARD_PATH", "").strip()
+        if not configured:
+            raise RuntimeError("No request-scoped blackboard path is configured")
+        path = Path(configured)
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    return path
 
 
 class BlackboardPost(BaseTool):
@@ -63,6 +68,12 @@ class BlackboardPost(BaseTool):
 
         author = getattr(getattr(self, "worker", None), "instance_id", "unknown")
         finding = str(finding)
+        from aeon.tools.memory import MemorizeTool
+        if MemorizeTool.secret_error(str(topic), finding, "blackboard"):
+            return (
+                "COMMAND BLOCKED: secret-like content cannot be posted to the agent "
+                "blackboard. Use an opaque Nexus credential handle instead."
+            )
         if len(finding) > MAX_FINDING_LEN:
             finding = finding[:MAX_FINDING_LEN] + " ...[truncated]"
 
@@ -74,14 +85,18 @@ class BlackboardPost(BaseTool):
         }
 
         try:
-            path = _blackboard_path()
+            path = _blackboard_path(self.worker)
             with open(path, "a", encoding="utf-8") as f:
                 fcntl.flock(f, fcntl.LOCK_EX)
                 try:
                     f.write(json.dumps(entry) + "\n")
                 finally:
                     fcntl.flock(f, fcntl.LOCK_UN)
-            return f"Posted to the shared blackboard under topic '{topic}'."
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            return f"Posted to the request-scoped blackboard under topic '{topic}'."
         except Exception as e:
             logger.error(f"blackboard_post failed: {e}")
             return f"Error posting to blackboard: {e}"
@@ -105,7 +120,10 @@ class BlackboardRead(BaseTool):
         self.llm_client = llm_client
 
     def execute(self, topic: str = None) -> str:
-        path = _blackboard_path()
+        try:
+            path = _blackboard_path(self.worker)
+        except Exception as e:
+            return f"Error reading blackboard: {e}"
         if not path.exists():
             return "The shared blackboard is empty. No findings have been posted yet."
 

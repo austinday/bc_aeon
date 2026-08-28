@@ -58,6 +58,24 @@ class SayToUserTool(BaseTool):
         # PREVIOUS turn's output — the deliverable used to be lost entirely).
         if self.worker is not None:
             self.worker.last_say_to_user = message
+            try:
+                from aeon.core.chat_transcript import (
+                    append_assistant_message_from_environment,
+                )
+
+                append_assistant_message_from_environment(
+                    message,
+                    performance=getattr(
+                        self.worker.llm_client,
+                        "last_generation_performance",
+                        None,
+                    ),
+                )
+            except Exception:
+                # Chat history is a presentation aid. A transient private-state
+                # write failure must not turn a delivered agent response into a
+                # failed objective or cause the model to repeat the message.
+                pass
         # Return only a concise confirmation, NOT the full message: the message
         # text is already in this action's parameters, so echoing it back would
         # duplicate a potentially long report into the agent's context every turn.

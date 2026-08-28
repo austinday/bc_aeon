@@ -1,9 +1,13 @@
 Executes a shell command on the HOST machine (World A).
-CRITICAL: This tool CANNOT see inside Docker containers.
-- To check files inside a Container: `docker run --rm image_name ls -la /container/path`
+CRITICAL: This tool never enters, starts, inspects, or controls containers. Docker, Podman, Kubernetes, and low-level container-runtime clients are refused because their daemon/control plane is outside the command service and may own renter work.
+- Commands run as expendable owner work through `/home/aday/bin/fleet-low-priority`, without shell startup files, inside a cryptographically unique, gated user-systemd service. The requested shell cannot start until external readback proves the exact unit/MainPID/cgroup/InvocationID, hardened properties, optional parent CPU slice, and a durable receipt. Accelerator/Fleet authority is scrubbed. Landlock denies non-standard devices, coordinator/control/credential paths, and writes outside the trusted grant; seccomp denies every socket family, including DNS, loopback, public Internet, and AF_UNIX. Use the browser/search/provider tools for reviewed network access.
+- Aeon's source tree and fixed Fleet/delegation/Comfy/self-modification guardrails are read-only. In a source-tree cwd, only the private `$AEON_COMMAND_SCRATCH_DIR`/`$TMPDIR` is writable and it is removed when the service is collected; make durable source changes with `write_file`/`str_replace`. An ordinary external cwd with no protected overlap is writable.
+- This is NOT a GPU allocator. Recognized direct GPU/coordinator/device/lease access, container/runtime clients, privilege/scope/namespace launchers, remote execution, service/scheduler mutation, generic process signaling, untracked shell backgrounding, and GPU/distributed launch forms are deterministically rejected before execution. Opaque descendants remain inside the exact service cgroup and the active Landlock/seccomp boundary. Use `run_command_async` for tracked CPU background work. Submit GPU work through an enabled Fleet Compute service/profile or reviewed batch adapter; never invoke `gpu_coord.py` directly.
+- A refusal saying the command-sandbox source changed is non-transient for this process: do not retry it. Record that the running agent needs an exact Nexus restart so its in-memory controller and on-disk bootstrap use one protocol, then continue with a different safe tool or task lane.
 - NEVER try to run commands using paths that only exist inside the container (like /app, /workspace) directly with this tool.
 - WARNING: NEVER run `grep -r` on data directories. Always use `grep -rnI` to ignore binaries, or limit `find` to specific extensions to prevent system hangs.
 Schema:
   command (str, required): The shell command to execute (run via bash).
   timeout (int, optional, default=300): Max seconds before the command is killed.
-Example: {"tool_name": "run_command", "parameters": {"command": "docker build -t myapp .", "timeout": 600}}
+  cwd (str, optional): Exact existing project directory beneath this agent's launch workspace. Use this instead of guessing paths or relying on a broad `/home/aday` cwd. Protected credential/control paths and paths outside the launch workspace are refused.
+Example: {"tool_name": "run_command", "parameters": {"command": "python -m pytest -q", "timeout": 600, "cwd": "/home/aday/NexusAgentDashboard/bc_aeon"}}

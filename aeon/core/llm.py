@@ -2,7 +2,9 @@ import os
 import io
 import base64
 import time
+import math
 import openai
+import httpx
 import pathlib
 import sys
 import json
@@ -10,12 +12,13 @@ import re
 import subprocess
 import requests
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 sys.setrecursionlimit(2000)
 from .system_info import get_runtime_info
 from .logger import get_logger
 from .utils import estimate_tokens
-from .model_catalog import VISION_MODEL_NAME
+from .model_catalog import VISION_MODEL_NAME, VISION_MODEL_NAMES
+from .fleet_backend import FleetBackendError, validate_loopback_endpoint
 from .sampling import (
     QWEN_CONTROL_TEMPERATURE,
     QWEN_CONTROL_TOP_K,
@@ -33,6 +36,154 @@ from .prompts import (
 C_YELLOW = '\033[93m'
 C_RESET = '\033[0m'
 
+
+def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(parsed, maximum))
+
+
+def _bounded_float(value, *, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return max(minimum, min(parsed, maximum))
+
+
+class DecisionGenerationBudgetExceeded(RuntimeError):
+    """One primary-agent decision exhausted its local generation allowance."""
+
+
+class _GenerationReservation:
+    """One already-counted completion request within a decision budget."""
+
+    def __init__(
+        self,
+        budget: "DecisionGenerationBudget",
+        *,
+        phase: str,
+        max_tokens: int,
+        timeout_seconds: float,
+    ):
+        self._budget = budget
+        self.phase = phase
+        self.max_tokens = max_tokens
+        self.timeout_seconds = timeout_seconds
+        self._finished = False
+
+    def finish(self, reported_tokens: object = None) -> None:
+        """Charge exact server usage, or the full reservation when it is unknown."""
+
+        if self._finished:
+            return
+        self._finished = True
+        if (
+            isinstance(reported_tokens, int)
+            and not isinstance(reported_tokens, bool)
+            and 0 <= reported_tokens <= self.max_tokens
+        ):
+            charged = reported_tokens
+        else:
+            # A dropped/truncated stream may have generated all requested tokens
+            # even when its final usage chunk never reached us. Fail closed.
+            charged = self.max_tokens
+        self._budget.completion_tokens_charged += charged
+
+
+class DecisionGenerationBudget:
+    """Strict aggregate model-call, output-token, and wall budget for one turn.
+
+    Requests are sequential today, so a reservation may return unused token
+    allowance after the server reports exact completion usage. Missing usage is
+    charged pessimistically at the request's full ``max_tokens`` value.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_model_calls: int,
+        max_completion_tokens: int,
+        max_wall_seconds: float,
+    ):
+        self.max_model_calls = max(1, int(max_model_calls))
+        self.max_completion_tokens = max(1, int(max_completion_tokens))
+        self.max_wall_seconds = max(0.1, float(max_wall_seconds))
+        self.model_calls_started = 0
+        self.completion_tokens_charged = 0
+        self.started_at = time.monotonic()
+
+    @property
+    def remaining_completion_tokens(self) -> int:
+        return max(0, self.max_completion_tokens - self.completion_tokens_charged)
+
+    @property
+    def remaining_wall_seconds(self) -> float:
+        elapsed = max(0.0, time.monotonic() - self.started_at)
+        return max(0.0, self.max_wall_seconds - elapsed)
+
+    def _error(self, reason: str, phase: str) -> DecisionGenerationBudgetExceeded:
+        return DecisionGenerationBudgetExceeded(
+            "Primary-agent decision generation budget exhausted "
+            f"during {phase}: {reason}; calls={self.model_calls_started}/"
+            f"{self.max_model_calls}, completion_tokens="
+            f"{self.completion_tokens_charged}/{self.max_completion_tokens}, "
+            f"wall_seconds={self.max_wall_seconds - self.remaining_wall_seconds:.2f}/"
+            f"{self.max_wall_seconds:.2f}."
+        )
+
+    def check_wall(self, phase: str) -> None:
+        if self.remaining_wall_seconds <= 0:
+            raise self._error("wall deadline reached", phase)
+
+    def reserve(
+        self,
+        *,
+        phase: str,
+        requested_tokens: int,
+        minimum_useful_tokens: int = 1,
+    ) -> _GenerationReservation:
+        self.check_wall(phase)
+        if self.model_calls_started >= self.max_model_calls:
+            raise self._error("model-call limit reached", phase)
+        remaining = self.remaining_completion_tokens
+        minimum = max(1, int(minimum_useful_tokens))
+        if remaining < minimum:
+            raise self._error(
+                f"only {remaining} completion tokens remain (need at least {minimum})",
+                phase,
+            )
+        granted = min(max(1, int(requested_tokens)), remaining)
+        if granted < minimum:
+            raise self._error(
+                f"only {granted} completion tokens can be granted (need at least {minimum})",
+                phase,
+            )
+        self.model_calls_started += 1
+        # The OpenAI SDK applies a per-request timeout to both response setup and
+        # streamed reads. Leave a tiny positive value for SDK validation.
+        timeout = max(0.1, self.remaining_wall_seconds)
+        return _GenerationReservation(
+            self,
+            phase=phase,
+            max_tokens=granted,
+            timeout_seconds=timeout,
+        )
+
+    def bounded_sleep(self, seconds: float, phase: str) -> None:
+        self.check_wall(phase)
+        remaining = self.remaining_wall_seconds
+        requested = max(0.0, float(seconds))
+        if requested >= remaining:
+            raise self._error("recovery delay would cross the wall deadline", phase)
+        if requested:
+            time.sleep(requested)
+        self.check_wall(phase)
+
 class LLMClient:
     """A client for interacting with Aeon's local Qwen3.8 model.
 
@@ -44,26 +195,125 @@ class LLMClient:
     There is no cloud/API or alternate-model fallback; failures remain visible
     rather than silently degrading to another model.
     """
-    def __init__(self, config: dict):
+    def __init__(
+        self,
+        config: dict,
+        *,
+        before_local_request: Optional[Callable[[], None]] = None,
+    ):
         self.logger = get_logger()
         self.debug_path: Optional[pathlib.Path] = None
         self.current_iteration = 0
+        if before_local_request is not None and not callable(before_local_request):
+            raise ValueError("before_local_request must be callable")
+        self._before_local_request = before_local_request
 
         if config is None:
             raise ValueError("config is required. Select a model at startup or provide --model.")
 
         configured_api_model = config.get('api_model') or config.get('model')
-        if configured_api_model != VISION_MODEL_NAME or config.get('provider') != 'vllm':
+        if configured_api_model not in VISION_MODEL_NAMES or config.get('provider') != 'vllm':
             raise ValueError(
                 f"Aeon is configured for Qwen3.8-only vLLM inference; refusing "
                 f"provider/model '{config.get('provider')}/{configured_api_model}'. "
-                f"Expected 'vllm/{VISION_MODEL_NAME}'.")
+                f"Expected one reviewed vLLM wire model: {sorted(VISION_MODEL_NAMES)}.")
 
         self.provider = config['provider']
         self.client = self._create_client(config)
         self.model = config['model']            # catalog/display name: logging, llama.cpp self-heal lookup
         self.api_model = configured_api_model  # id sent to the server (vLLM served name)
         self.context_limit = config.get('context_limit', 128000)
+        # An agent decision should be a concise action envelope, not a second
+        # long-form document.  The previous 16K ceiling let one confused turn
+        # occupy the local model for minutes and multiplied that cost during
+        # candidate search.  Keep an operator escape hatch for unusually large
+        # file-write envelopes, but use a safer production default.
+        self.max_turn_tokens = _bounded_int(
+            config.get("max_turn_tokens", os.environ.get("AEON_MAX_TURN_TOKENS")),
+            default=8192,
+            minimum=2048,
+            maximum=16384,
+        )
+        self.max_verifier_tokens = _bounded_int(
+            config.get(
+                "max_verifier_tokens",
+                os.environ.get("AEON_MAX_VERIFIER_TOKENS"),
+            ),
+            default=2048,
+            minimum=512,
+            maximum=8192,
+        )
+        # These three limits are shared by every completion involved in one
+        # primary-agent decision. Selective local search therefore cannot turn
+        # ``candidate_count * retries + verifier`` into an unbounded latency
+        # multiplier. Ordinary single-response decisions are additionally
+        # limited to one initial request plus one recovery request below.
+        self.max_decision_model_calls = _bounded_int(
+            config.get(
+                "max_decision_model_calls",
+                os.environ.get("AEON_MAX_DECISION_MODEL_CALLS"),
+            ),
+            # Up to two zero-token compatibility rejections plus three
+            # candidates and one verifier. Successful generation attempts are
+            # capped separately (one plus one recovery for ordinary decisions,
+            # one per selective-search candidate).
+            default=6,
+            minimum=2,
+            maximum=8,
+        )
+        self.max_decision_completion_tokens = _bounded_int(
+            config.get(
+                "max_decision_completion_tokens",
+                os.environ.get("AEON_MAX_DECISION_COMPLETION_TOKENS"),
+            ),
+            default=12288,
+            minimum=4096,
+            maximum=32768,
+        )
+        self.max_decision_wall_seconds = _bounded_float(
+            config.get(
+                "max_decision_wall_seconds",
+                os.environ.get("AEON_MAX_DECISION_WALL_SECONDS"),
+            ),
+            default=90.0,
+            minimum=15.0,
+            maximum=180.0,
+        )
+        # Non-decision model calls are production work too: ThinkTool, web
+        # summaries, skill routing, state integration and media prompt
+        # enhancement must never inherit the transport's effectively open-ended
+        # lifecycle. These limits are shared within one worker decision epoch.
+        self.max_support_model_calls = _bounded_int(
+            config.get(
+                "max_support_model_calls",
+                os.environ.get("AEON_MAX_SUPPORT_MODEL_CALLS"),
+            ),
+            default=2,
+            minimum=1,
+            maximum=4,
+        )
+        self.max_support_completion_tokens = _bounded_int(
+            config.get(
+                "max_support_completion_tokens",
+                os.environ.get("AEON_MAX_SUPPORT_COMPLETION_TOKENS"),
+            ),
+            default=4096,
+            minimum=512,
+            maximum=8192,
+        )
+        self.max_support_wall_seconds = _bounded_float(
+            config.get(
+                "max_support_wall_seconds",
+                os.environ.get("AEON_MAX_SUPPORT_WALL_SECONDS"),
+            ),
+            default=30.0,
+            minimum=5.0,
+            maximum=60.0,
+        )
+        self._support_budget_epoch: int | None = None
+        self._support_budget_started_at: float | None = None
+        self._support_model_calls = 0
+        self._support_completion_tokens_reserved = 0
 
         # Support tasks (skill routing, JSON repair/recovery, summarization,
         # log/memory compression, interruption analysis, prompt enhancement) run
@@ -91,24 +341,200 @@ class LLMClient:
         # as an action or user-visible answer.
         self.last_reasoning_content = ""
         self.last_reasoning_effort = ""
+        self.last_generation_performance: Optional[Dict[str, float | int | str]] = None
         # Populated only when the worker deliberately enables selective local
         # search for a difficult turn.  It is compact operator telemetry (candidate
         # count, selected index, grounded verifier reason), never a hidden chain of
         # thought and never sent to an external service.
         self.last_local_search: Dict = {}
 
+    def _new_decision_generation_budget(
+        self,
+        *,
+        max_model_calls: Optional[int] = None,
+        max_completion_tokens: Optional[int] = None,
+    ) -> DecisionGenerationBudget:
+        return DecisionGenerationBudget(
+            max_model_calls=(
+                max_model_calls
+                if max_model_calls is not None
+                else getattr(self, "max_decision_model_calls", 6)
+            ),
+            max_completion_tokens=(
+                max_completion_tokens
+                if max_completion_tokens is not None
+                else getattr(self, "max_decision_completion_tokens", 12288)
+            ),
+            max_wall_seconds=getattr(self, "max_decision_wall_seconds", 90.0),
+        )
+
+    @staticmethod
+    def _reported_completion_tokens(response: object) -> Optional[int]:
+        usage = getattr(response, "usage", None)
+        value = getattr(usage, "completion_tokens", None) if usage is not None else None
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
+
     def _create_client(self, config: dict):
         """Create the OpenAI-compatible client for local Qwen3.8 on vLLM."""
         provider = config['provider']
         if provider == 'vllm':
-            return openai.OpenAI(base_url=config['base_url'], api_key='no-key-needed')
+            generation = getattr(self, "_transport_generation", 0) + 1
+            self._transport_generation = generation
+            endpoint = validate_loopback_endpoint(config['base_url'])
+            parsed_endpoint = httpx.URL(endpoint)
+            self._expected_local_origin = (
+                parsed_endpoint.scheme,
+                parsed_endpoint.host,
+                parsed_endpoint.port,
+            )
+            base_path = parsed_endpoint.path.rstrip("/")
+            self._expected_local_path_prefix = f"{base_path}/" if base_path else "/"
+            return openai.OpenAI(
+                base_url=endpoint,
+                api_key='no-key-needed',
+                http_client=httpx.Client(
+                    trust_env=False,
+                    follow_redirects=False,
+                    timeout=120.0,
+                    event_hooks={
+                        "request": [
+                            lambda request, bound_generation=generation: (
+                                self._guard_local_http_request(
+                                    request, bound_generation=bound_generation
+                                )
+                            )
+                        ]
+                    },
+                ),
+                max_retries=0,
+            )
         raise ValueError(
             f"Unsupported provider '{provider}'. Aeon permits only its local "
             "Qwen3.8 vLLM service."
         )
 
+    def _guard_local_http_request(
+        self,
+        request: httpx.Request,
+        *,
+        bound_generation: int | None = None,
+    ) -> None:
+        """Revalidate the Fleet ticket immediately before every model request.
+
+        Worker-level checks remain useful at turn/tool boundaries, but support
+        calls and streamed retries can happen later.  Binding the guard to the
+        actual HTTP transport makes a preempted or promoted runtime fail closed
+        at the last possible point and prevents a rebound client from reaching a
+        different origin or path.
+        """
+
+        expected_origin = getattr(self, "_expected_local_origin", None)
+        actual_origin = (request.url.scheme, request.url.host, request.url.port)
+        expected_prefix = getattr(self, "_expected_local_path_prefix", None)
+        if (
+            expected_origin is None
+            or actual_origin != expected_origin
+            or not isinstance(expected_prefix, str)
+            or not request.url.path.startswith(expected_prefix)
+            or request.url.userinfo
+            or request.url.query
+            or request.url.fragment
+        ):
+            raise FleetBackendError(
+                "local model transport changed outside its Fleet-issued endpoint"
+            )
+        guard = getattr(self, "_before_local_request", None)
+        if not callable(guard):
+            raise FleetBackendError(
+                "local model request has no immediate Fleet ticket guard"
+            )
+        guard()
+        # ``ensure_ready`` may promote the logical service and invoke Aeon's
+        # rebind callback.  The request object being hooked still belongs to the
+        # old client, so never let it continue to a just-retired endpoint; the
+        # caller retries through the newly bound client instead.
+        if (
+            actual_origin != getattr(self, "_expected_local_origin", None)
+            or not request.url.path.startswith(
+                getattr(self, "_expected_local_path_prefix", "")
+            )
+            or (
+                bound_generation is not None
+                and bound_generation
+                != getattr(self, "_transport_generation", None)
+            )
+        ):
+            raise FleetBackendError(
+                "Fleet promoted the local model binding; retry on the rebound client"
+            )
+
+    def rebind_base_url(self, base_url: str, *, api_model: str | None = None) -> None:
+        """Atomically bind future requests to a promoted Fleet endpoint."""
+
+        rebound_model = api_model or getattr(self, "api_model", VISION_MODEL_NAME)
+        if rebound_model not in VISION_MODEL_NAMES:
+            raise FleetBackendError("Fleet promotion advertised an unreviewed model token")
+
+        replacement = self._create_client({
+            "provider": self.provider,
+            "base_url": base_url,
+        })
+        self.client = replacement
+        self.utility_client = replacement
+        self.api_model = rebound_model
+        self.utility_model = rebound_model
+        self._structured_mode = None
+
     def set_debug_path(self, path: pathlib.Path):
         self.debug_path = path
+
+    @staticmethod
+    def _finite_metric(source: object, key: str) -> Optional[float]:
+        """Read one non-negative finite timing metric from an SDK object/dict.
+
+        Newer vLLM releases put opt-in per-request metrics in the final stream
+        chunk.  The OpenAI SDK preserves unknown response fields either as
+        attributes or below ``model_extra`` depending on its version, so keep
+        this compatibility reader deliberately small and reject malformed data.
+        """
+
+        if isinstance(source, dict):
+            value = source.get(key)
+        else:
+            value = getattr(source, key, None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        rendered = float(value)
+        if not math.isfinite(rendered) or rendered < 0:
+            return None
+        return rendered
+
+    @classmethod
+    def _stream_chunk_metrics(cls, chunk: object) -> Optional[Dict[str, float]]:
+        """Return only allowlisted vLLM per-request timing measurements."""
+
+        metrics = getattr(chunk, "metrics", None)
+        if metrics is None:
+            model_extra = getattr(chunk, "model_extra", None)
+            if isinstance(model_extra, dict):
+                metrics = model_extra.get("metrics")
+        if metrics is None:
+            return None
+        normalized = {}
+        for key in (
+            "time_to_first_token_ms",
+            "generation_time_ms",
+            "queue_time_ms",
+            "mean_itl_ms",
+            "tokens_per_second",
+        ):
+            value = cls._finite_metric(metrics, key)
+            maximum = 100_000.0 if key == "tokens_per_second" else 86_400_000.0
+            if value is not None and value < maximum:
+                normalized[key] = value
+        return normalized or None
 
     def set_action_schema(self, schema: Optional[Dict]):
         """Install (or clear) the turn schema used for grammar-constrained
@@ -221,6 +647,54 @@ class LLMClient:
     def set_iteration(self, iteration: int):
         self.current_iteration = iteration
 
+    def support_request_kwargs(
+        self, *, requested_tokens: int, phase: str
+    ) -> dict[str, int | float]:
+        """Reserve one bounded support-model call in the current decision epoch."""
+
+        epoch = int(getattr(self, "current_iteration", 0) or 0)
+        if getattr(self, "_support_budget_epoch", None) != epoch:
+            self._support_budget_epoch = epoch
+            self._support_budget_started_at = None
+            self._support_model_calls = 0
+            self._support_completion_tokens_reserved = 0
+        now = time.monotonic()
+        if getattr(self, "_support_budget_started_at", None) is None:
+            self._support_budget_started_at = now
+        elapsed = now - self._support_budget_started_at
+        remaining_wall = float(
+            getattr(self, "max_support_wall_seconds", 30.0)
+        ) - elapsed
+        remaining_tokens = int(
+            getattr(self, "max_support_completion_tokens", 4096)
+        ) - int(
+            getattr(self, "_support_completion_tokens_reserved", 0)
+        )
+        if remaining_wall <= 0:
+            raise DecisionGenerationBudgetExceeded(
+                f"support-model wall deadline exhausted during {phase}"
+            )
+        if getattr(self, "_support_model_calls", 0) >= int(
+            getattr(self, "max_support_model_calls", 2)
+        ):
+            raise DecisionGenerationBudgetExceeded(
+                f"support-model call budget exhausted during {phase}"
+            )
+        requested = max(1, int(requested_tokens))
+        reserved = min(requested, remaining_tokens)
+        if reserved < 1:
+            raise DecisionGenerationBudgetExceeded(
+                f"support-model completion-token budget exhausted during {phase}"
+            )
+        self._support_model_calls = getattr(self, "_support_model_calls", 0) + 1
+        self._support_completion_tokens_reserved = (
+            getattr(self, "_support_completion_tokens_reserved", 0) + reserved
+        )
+        return {
+            "max_tokens": reserved,
+            "timeout": max(0.1, remaining_wall),
+        }
+
     def _log_to_debug(self, m_type, m_name, prompt, resp):
         """Legacy debug logger - removed to prevent log flooding."""
         pass
@@ -237,25 +711,35 @@ class LLMClient:
         try:
             from aeon.core.skills.manager import SkillsManager
             sm = SkillsManager()
-            try:
-                # Real skill categories only (skip __pycache__ / dot / empty dirs;
-                # skills/ is also a Python package).
-                categories = [d.name for d in sm.base_dir.iterdir()
-                              if d.is_dir() and not d.name.startswith(('__', '.'))
-                              and any(d.glob("*.txt"))]
-            except Exception:
-                return ""
-
             catalog = []
-            for cat in sorted(categories):
-                for skill in sorted(sm.get_skills_in_category(cat)):
-                    content = sm.get_skill_content(cat, skill) or ""
-                    # The first 1-2 comment lines of each protocol describe when it applies.
-                    desc_lines = [ln.lstrip("# ").strip()
-                                  for ln in content.splitlines()[:4]
-                                  if ln.strip().startswith("#")]
-                    desc = " ".join(desc_lines)[:240] if desc_lines else "(no description)"
-                    catalog.append(f"- {cat}/{skill}: {desc}")
+            try:
+                records = sm.list_effective_skills()
+            except AttributeError:
+                # Compatibility for small embedders/test doubles implementing
+                # the original read-only manager surface.
+                records = [
+                    {
+                        "skill_path": f"{category}/{skill}",
+                        "content": sm.get_skill_content(category, skill) or "",
+                        "scope": "shared",
+                    }
+                    for category in sorted(sm.list_categories())
+                    for skill in sorted(sm.get_skills_in_category(category))
+                ]
+            for record in records:
+                if record.get("scope") == "private":
+                    lifecycle = record.get("lifecycle") or {}
+                    if lifecycle.get("status") != "ready" or lifecycle.get("metadata_stale"):
+                        continue
+                content = str(record.get("content") or "")
+                match = re.search(
+                    r"(?ims)^#{1,6}\s+when to use\s*$\s*(.+?)(?=^#{1,6}\s+|\Z)",
+                    content,
+                )
+                desc = re.sub(r"\s+", " ", match.group(1)).strip()[:240] if match else ""
+                catalog.append(
+                    f"- {record['skill_path']}: {desc or '(read before deciding)'}"
+                )
 
             if not catalog:
                 return ""
@@ -277,6 +761,9 @@ class LLMClient:
                 temperature=QWEN_CONTROL_TEMPERATURE,
                 top_p=QWEN_CONTROL_TOP_P,
                 presence_penalty=0.0,
+                **self.support_request_kwargs(
+                    requested_tokens=512, phase="skill routing"
+                ),
                 **self._reasoning_request_kwargs("low"),
             )
             content = resp.choices[0].message.content or ""
@@ -295,9 +782,11 @@ class LLMClient:
             else:
                 return ""
 
-            return (f"[SKILL ROUTING] This task strongly matches the '{skill}' skill protocol "
-                    f"({reason}). You should activate it with activate_skill('{skill}') as your first "
-                    f"action, then follow its steps, unless it is clearly wrong for the actual task.")
+            return (
+                f"[SKILL ROUTING] Prior experience may be relevant: '{skill}' ({reason}). "
+                f"Read it, compare its preconditions with live state, and activate it only if it "
+                "actually fits. Working without it is valid."
+            )
         except Exception as e:
             self.logger.warning(f"Skill routing failed (continuing without it): {e}")
             return ""
@@ -537,7 +1026,14 @@ class LLMClient:
             return obj
         return obj
 
-    def _recover_missing_block(self, missing_key: str, parsed_json: dict, original_prompt: str) -> Optional[str]:
+    def _recover_missing_block(
+        self,
+        missing_key: str,
+        parsed_json: dict,
+        original_prompt: str,
+        *,
+        _decision_budget: Optional[DecisionGenerationBudget] = None,
+    ) -> Optional[str]:
         """Deploy a surgical LLM call to recover a specific missing code block."""
         intent = parsed_json.get('intent', 'Unknown intent')
         
@@ -552,15 +1048,31 @@ class LLMClient:
             f"Output ONLY the content that should replace the {missing_key} placeholder."
         )
         
+        budget = _decision_budget or self._new_decision_generation_budget(
+            max_model_calls=1,
+            max_completion_tokens=4096,
+        )
+        reservation = None
         try:
+            reservation = budget.reserve(
+                phase=f"missing-block recovery ({missing_key})",
+                requested_tokens=min(getattr(self, "max_turn_tokens", 8192), 4096),
+                minimum_useful_tokens=256,
+            )
             resp = self.utility_client.chat.completions.create(
                 model=self.utility_model,
                 messages=[{"role": "user", "content": recovery_prompt}],
                 temperature=QWEN_CONTROL_TEMPERATURE,
                 top_p=QWEN_CONTROL_TOP_P,
                 presence_penalty=0.0,
+                max_tokens=reservation.max_tokens,
+                timeout=reservation.timeout_seconds,
                 **self._reasoning_request_kwargs("xhigh"),
             )
+            reservation.finish(self._reported_completion_tokens(resp))
+            budget.check_wall(f"missing-block recovery ({missing_key})")
+            if getattr(resp.choices[0], "finish_reason", None) == "length":
+                return None
             content = resp.choices[0].message.content.strip()
             
             if content.startswith("```") and content.endswith("```"):
@@ -572,7 +1084,13 @@ class LLMClient:
                     
             self._log_to_debug("BLOCK_RECOVERY", self.utility_model, recovery_prompt, content)
             return content
+        except DecisionGenerationBudgetExceeded:
+            if reservation is not None:
+                reservation.finish()
+            return None
         except Exception as e:
+            if reservation is not None:
+                reservation.finish()
             self.logger.warning(f"Block recovery failed for {missing_key}: {e}")
             return None
 
@@ -648,7 +1166,13 @@ class LLMClient:
         except (json.JSONDecodeError, ValueError):
             return None
 
-    def _repair_json(self, raw_string: str, error_msg: str) -> Optional[str]:
+    def _repair_json(
+        self,
+        raw_string: str,
+        error_msg: str,
+        *,
+        _decision_budget: Optional[DecisionGenerationBudget] = None,
+    ) -> Optional[str]:
         """Attempt to use the isolated utility model to fix malformed JSON."""
         prompt = (
             "You are a strict JSON repair parsing system. Your only job is to take a malformed JSON string and output valid JSON.\n"
@@ -662,6 +1186,15 @@ class LLMClient:
             f"{raw_string}"
         )
         
+        budget = _decision_budget or self._new_decision_generation_budget(
+            max_model_calls=1,
+            max_completion_tokens=2048,
+        )
+        reservation = budget.reserve(
+            phase="JSON repair",
+            requested_tokens=min(getattr(self, "max_verifier_tokens", 2048), 2048),
+            minimum_useful_tokens=256,
+        )
         try:
             resp = self.utility_client.chat.completions.create(
                 model=self.utility_model,
@@ -669,18 +1202,58 @@ class LLMClient:
                 temperature=QWEN_CONTROL_TEMPERATURE,
                 top_p=QWEN_CONTROL_TOP_P,
                 presence_penalty=0.0,
+                max_tokens=reservation.max_tokens,
+                timeout=reservation.timeout_seconds,
                 **self._reasoning_request_kwargs("xhigh"),
             )
+            reservation.finish(self._reported_completion_tokens(resp))
+            budget.check_wall("JSON repair")
+            if getattr(resp.choices[0], "finish_reason", None) == "length":
+                return None
             content = resp.choices[0].message.content
             self._log_to_debug("JSON_REPAIR", self.utility_model, prompt, content)
             return self._clean_json_response(content)
+        except DecisionGenerationBudgetExceeded:
+            reservation.finish()
+            raise
         except Exception as e:
+            reservation.finish()
             self.logger.warning(f"JSON repair failed: {e}")
             return None
 
-    def _handle_connection_error(self, error):
+    def _handle_connection_error(
+        self,
+        error,
+        *,
+        _decision_budget: Optional[DecisionGenerationBudget] = None,
+    ):
         """Handle API connection errors with exponential backoff and GPU recovery check."""
         self.logger.warning(f"Connection error detected: {error}. Entering recovery mode...")
+
+        if _decision_budget is not None:
+            # A primary decision must never disappear into the historical
+            # ten-minute self-heal loop. Fleet owns runtime recovery; this path
+            # permits only two bounded reachability checks, then returns control
+            # to the caller while the same decision deadline is still active.
+            for probe_delay in (0.25, 1.0):
+                _decision_budget.bounded_sleep(
+                    probe_delay,
+                    "local-model connection recovery",
+                )
+                try:
+                    self.client.models.list(
+                        timeout=max(0.1, _decision_budget.remaining_wall_seconds)
+                    )
+                    _decision_budget.check_wall("local-model connection recovery")
+                    self.logger.info(
+                        "Server is reachable again (bounded transient recovery)."
+                    )
+                    return True
+                except DecisionGenerationBudgetExceeded:
+                    raise
+                except Exception:
+                    pass
+            return False
 
         start_time = time.time()
 
@@ -829,10 +1402,50 @@ class LLMClient:
                                if isinstance(p, dict) and p.get("type") == "text")
         else:
             content = str(c)
+        tool_bits = []
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+            tool_bits.append(
+                f"{call.get('id', '')}:{fn.get('name', '')}:{fn.get('arguments', '')}"
+            )
+        if message.get("tool_call_id"):
+            tool_bits.append(str(message.get("tool_call_id")))
+        if tool_bits:
+            content = content + "\n" + "\n".join(tool_bits)
         reasoning = message.get("reasoning_content")
         if reasoning is None:
             reasoning = message.get("reasoning")
         return (str(reasoning) + "\n" + content) if reasoning else content
+
+    @classmethod
+    def _coalesce_system_messages(cls, messages: List[Dict]) -> List[Dict]:
+        """Return a Qwen-compatible typed conversation.
+
+        Qwen's chat template accepts one system message, and it must be the first
+        message.  Aeon's stable directives, restored-history marker, live state,
+        local-search directive, and retry guidance are all genuinely system
+        context, so retain that role while combining their content in encounter
+        order.  Filtering only system messages leaves every user/assistant/tool
+        message in its original order, including assistant tool-call/receipt
+        protocol units.
+        """
+
+        system_parts: List[str] = []
+        conversation: List[Dict] = []
+        for source in messages:
+            message = dict(source)
+            if message.get("role") == "system":
+                system_parts.append(cls._msg_text(message))
+            else:
+                conversation.append(message)
+        if system_parts:
+            conversation.insert(0, {
+                "role": "system",
+                "content": "\n\n".join(system_parts),
+            })
+        return conversation
 
     def _build_user_content(self, text: str, images: Optional[List[str]]):
         """Encode image FILE PATHS and build the user content (encodes each path).
@@ -846,7 +1459,10 @@ class LLMClient:
                                    images: Optional[List[str]] = None,
                                    messages: Optional[List[Dict]] = None,
                                    reasoning_effort: str = "medium",
-                                   candidate_directive: Optional[str] = None) -> str:
+                                   candidate_directive: Optional[str] = None,
+                                   *,
+                                   _decision_budget: Optional[DecisionGenerationBudget] = None,
+                                   _max_output_tokens: Optional[int] = None) -> str:
         """Get combined reasoning and action from the Primary Agent (Strong Model).
 
         When ``images`` (file paths) are supplied — e.g. the current browser
@@ -855,41 +1471,68 @@ class LLMClient:
         it. Image payloads are accepted only by Aeon's canonical Qwen3.8 vision
         model; other primaries fail closed instead of receiving image data.
 
-        When ``messages`` is given (message-history mode) it is used as the chat
-        message list: the LAST message is the current-turn user message (images and
-        any retry note attach to it), and the earlier messages (system + prior
-        turns) form the stable, cache-friendly prefix. Otherwise a single user
-        message is built from ``prompt`` (the compatibility path used when
-        message history is explicitly disabled)."""
-        if images and self.api_model != VISION_MODEL_NAME:
+        When ``messages`` is given, non-system roles are preserved exactly. This
+        matters to the harness: user text remains a real user message and tool
+        receipts remain tool messages. Qwen requires all system context at the
+        beginning, so stable directives, volatile harness state, and any
+        candidate/retry guidance are coalesced into one leading system message.
+        Images attach to the most recent user message. Otherwise a single user
+        message is built from ``prompt`` for compatibility callers."""
+        if images and self.api_model not in VISION_MODEL_NAMES:
             raise RuntimeError(
                 f"Refusing to send image data to '{self.api_model}'. Aeon's only "
                 f"approved vision model is '{VISION_MODEL_NAME}'.")
 
-        # Stable prefix (system + history) vs the current-turn user text. A retry
-        # note is applied to the user text only, so the prefix stays byte-identical
-        # across attempts (and across turns — that is the whole point of caching).
+        owns_decision_budget = _decision_budget is None
+        decision_budget = _decision_budget or self._new_decision_generation_budget()
+        try:
+            requested_attempts = max(1, int(max_retries))
+        except (TypeError, ValueError):
+            requested_attempts = 1
+        generation_attempt_limit = (
+            min(requested_attempts, 2)
+            if owns_decision_budget
+            else requested_attempts
+        )
+        # Compatibility negotiation (response_format -> guided_json -> legacy,
+        # or one reasoning/image downgrade) uses zero-token rejected requests.
+        # Give it room inside the same aggregate model-call cap without letting
+        # it consume the one-generation(+one-recovery) semantic limit.
+        transport_attempt_limit = max(
+            1,
+            decision_budget.max_model_calls - decision_budget.model_calls_started,
+        )
+        requested_output_tokens = (
+            int(_max_output_tokens)
+            if isinstance(_max_output_tokens, int)
+            and not isinstance(_max_output_tokens, bool)
+            and _max_output_tokens > 0
+            else getattr(self, "max_turn_tokens", 8192)
+        )
+
+        # Preserve the caller's typed conversation. Candidate and retry guidance
+        # remain system context; _coalesce_system_messages moves every such block
+        # into Qwen's one permitted leading system message immediately before the
+        # request is sent.
         if messages:
-            prefix_messages = [dict(m) for m in messages[:-1]]
-            _last = messages[-1]
-            base_user_text = _last.get("content", "") if isinstance(_last.get("content"), str) else (prompt or "")
+            base_messages = [dict(message) for message in messages]
         else:
-            prefix_messages = []
-            base_user_text = prompt or ""
+            base_messages = [{"role": "user", "content": prompt or ""}]
         if candidate_directive:
-            # This suffix changes only the volatile current-turn message, so the
-            # stable system/history prefix remains eligible for vLLM prefix-cache
-            # reuse across independent local-search candidates.
-            base_user_text += (
-                "\n\n**SELECTIVE LOCAL SEARCH (proposal only; nothing has executed yet)**\n"
-                + str(candidate_directive).strip()
-            )
+            base_messages.append({
+                "role": "system",
+                "content": (
+                    "SELECTIVE LOCAL SEARCH: this is a proposal only; nothing has "
+                    "executed yet.\n" + str(candidate_directive).strip()
+                ),
+            })
         retry_suffix = ""
-        full_prompt_text = base_user_text
+        full_prompt_text = "\n".join(self._msg_text(m) for m in base_messages)
         last_error = None
         requested_effort = self._normalize_reasoning_effort(reasoning_effort)
         self.last_reasoning_content = ""
         self.last_reasoning_effort = ""
+        self.last_generation_performance = None
         # Encode attached screenshots ONCE, not once per retry attempt. If this
         # model has already told us it can't accept images (a text-only build),
         # don't even try — degrade to text-only instead of failing every turn.
@@ -899,16 +1542,32 @@ class LLMClient:
         else:
             image_urls = []
 
-        for attempt in range(max_retries):
+        completed_generation_attempts = 0
+        for attempt in range(transport_attempt_limit):
             try:
-                start_time = time.time()
+                # Durations must use a monotonic clock. Wall-clock adjustments
+                # otherwise make the dashboard's TTFT and throughput claims
+                # disagree with vLLM's own request histograms.
+                start_time = time.perf_counter()
 
-                # Assemble this attempt's messages: stable prefix + the current user
-                # message (base text + optional retry note + images). full_prompt_text
-                # is the concatenation used for token calibration and debug logging.
-                user_text = base_user_text + retry_suffix
-                req_messages = prefix_messages + [
-                    {"role": "user", "content": self._content_with_images(user_text, image_urls)}]
+                # Assemble this attempt without flattening non-system roles.
+                # Attach vision to the exact latest user turn and keep parser
+                # guidance as system context.
+                req_messages = [dict(message) for message in base_messages]
+                if image_urls:
+                    user_index = next(
+                        (index for index in range(len(req_messages) - 1, -1, -1)
+                         if req_messages[index].get("role") == "user"),
+                        None,
+                    )
+                    if user_index is not None:
+                        user_text = self._msg_text(req_messages[user_index])
+                        req_messages[user_index]["content"] = self._content_with_images(
+                            user_text, image_urls
+                        )
+                if retry_suffix:
+                    req_messages.append({"role": "system", "content": retry_suffix.strip()})
+                req_messages = self._coalesce_system_messages(req_messages)
                 full_prompt_text = "\n".join(self._msg_text(m) for m in req_messages)
 
                 # Grammar-constrained decoding: when the worker installed a turn
@@ -922,7 +1581,9 @@ class LLMClient:
                 # maximum reasoning even if the original simple turn was low or
                 # medium.  This avoids saving milliseconds only to repeat a bad
                 # plan several times.
-                attempt_effort = "xhigh" if attempt > 0 else requested_effort
+                attempt_effort = (
+                    "xhigh" if completed_generation_attempts > 0 else requested_effort
+                )
                 sampling_kwargs = self._merge_reasoning_kwargs(
                     structured_kwargs or {"extra_body": {}}, attempt_effort)
                 # NOTE: no frequency_penalty here, deliberately. It accumulates on
@@ -935,71 +1596,108 @@ class LLMClient:
                 # baseline without compounding structural damage; max_tokens is
                 # the hard backstop.
 
-                # Stream the response to accurately measure TTFT vs pure generation time
-                resp_stream = self.client.chat.completions.create(
-                    model=self.api_model,
-                    messages=req_messages,
-                    # Deterministic control-plane sampling: repeated production
-                    # trials showed stochastic thinking could change a grounded
-                    # tool decision on identical evidence. Greedy decoding also
-                    # maximizes native-MTP acceptance and throughput.
-                    temperature=QWEN_CONTROL_TEMPERATURE,
-                    top_p=QWEN_CONTROL_TOP_P,
-                    presence_penalty=0.0,
-                    stream=True,
-                    # Hard ceiling on one turn's output. Without this a model
-                    # that hits a confusing input (e.g. an unparseable CAPTCHA frame)
-                    # can enter a repetition loop and emit tens of thousands of tokens
-                    # — a real incident here was 85k tokens / 11 min in a single turn.
-                    # A normal turn (thought + actions, or a file write inside a JSON
-                    # string) is well under this; the cap only bites a runaway.
-                    max_tokens=16384,
-                    # Ask the server for a final usage chunk so we can report the
-                    # model's REAL generated-token count, not a tiktoken estimate
-                    # (cl100k mis-counts Qwen tokens, making t/s look far too low).
-                    stream_options={"include_usage": True},
-                    **sampling_kwargs,
+                generation_reservation = decision_budget.reserve(
+                    phase=f"primary generation attempt {attempt + 1}",
+                    requested_tokens=requested_output_tokens,
+                    minimum_useful_tokens=256,
                 )
-
+                resp_stream = None
                 first_token_time = None
                 raw_chunks =[]
                 reasoning_chunks = []
                 server_completion_tokens = None
                 server_prompt_tokens = None
                 server_cached_tokens = None
+                server_request_metrics = None
+                served_model = None
                 finish_reason = None
+                try:
+                    # Stream the response to accurately measure TTFT vs pure
+                    # generation time. Both max_tokens and timeout are derived
+                    # from the shared decision budget, never caller multiplication.
+                    resp_stream = self.client.chat.completions.create(
+                        model=self.api_model,
+                        messages=req_messages,
+                        temperature=QWEN_CONTROL_TEMPERATURE,
+                        top_p=QWEN_CONTROL_TOP_P,
+                        presence_penalty=0.0,
+                        stream=True,
+                        max_tokens=generation_reservation.max_tokens,
+                        timeout=generation_reservation.timeout_seconds,
+                        stream_options={"include_usage": True},
+                        **sampling_kwargs,
+                    )
 
-                for chunk in resp_stream:
-                    # The final usage-only chunk has empty choices; don't let it set TTFT.
-                    if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
-                        if first_token_time is None:
-                            first_token_time = time.time()
-                        choice = chunk.choices[0]
-                        delta = choice.delta
-                        reasoning_delta = getattr(delta, 'reasoning_content', None)
-                        if reasoning_delta is None:
-                            reasoning_delta = getattr(delta, 'reasoning', None)
-                        if reasoning_delta:
-                            reasoning_chunks.append(str(reasoning_delta))
-                        if hasattr(delta, 'content') and delta.content:
-                            raw_chunks.append(delta.content)
-                        if getattr(choice, 'finish_reason', None):
-                            finish_reason = choice.finish_reason
-                    usage = getattr(chunk, 'usage', None)
-                    if usage is not None and getattr(usage, 'completion_tokens', None):
-                        server_completion_tokens = usage.completion_tokens
-                    if usage is not None and getattr(usage, 'prompt_tokens', None):
-                        server_prompt_tokens = usage.prompt_tokens
-                    # Prefix-cache hit count (vLLM reports it in prompt_tokens_details
-                    # when --enable-prefix-caching is on). Surfaced below so the
-                    # cache-friendly prompt ordering is visible per turn.
-                    if usage is not None:
-                        ptd = getattr(usage, 'prompt_tokens_details', None)
-                        cached = getattr(ptd, 'cached_tokens', None) if ptd is not None else None
-                        if cached is None and isinstance(ptd, dict):
-                            cached = ptd.get('cached_tokens')
-                        if cached is not None:
-                            server_cached_tokens = cached
+                    for chunk in resp_stream:
+                        decision_budget.check_wall(
+                            f"primary generation attempt {attempt + 1} stream"
+                        )
+                        chunk_model = getattr(chunk, "model", None)
+                        if isinstance(chunk_model, str) and chunk_model.strip():
+                            served_model = chunk_model.strip()
+                        # A role-only or finish-only choice is not a generated token.
+                        # Start decode timing only when reasoning/content bytes arrive,
+                        # matching the release benchmark's definition of TTFT.
+                        if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                            choice = chunk.choices[0]
+                            delta = choice.delta
+                            reasoning_delta = getattr(delta, 'reasoning_content', None)
+                            if reasoning_delta is None:
+                                reasoning_delta = getattr(delta, 'reasoning', None)
+                            content_delta = (
+                                delta.content
+                                if hasattr(delta, 'content') and delta.content
+                                else None
+                            )
+                            if first_token_time is None and (reasoning_delta or content_delta):
+                                first_token_time = time.perf_counter()
+                            if reasoning_delta:
+                                reasoning_chunks.append(str(reasoning_delta))
+                            if content_delta:
+                                raw_chunks.append(content_delta)
+                            if getattr(choice, 'finish_reason', None):
+                                finish_reason = choice.finish_reason
+                        usage = getattr(chunk, 'usage', None)
+                        if usage is not None and getattr(usage, 'completion_tokens', None):
+                            server_completion_tokens = usage.completion_tokens
+                        if usage is not None and getattr(usage, 'prompt_tokens', None):
+                            server_prompt_tokens = usage.prompt_tokens
+                        # Prefix-cache hit count (vLLM reports it in prompt_tokens_details
+                        # when --enable-prefix-caching is on). Surfaced below so the
+                        # cache-friendly prompt ordering is visible per turn.
+                        if usage is not None:
+                            ptd = getattr(usage, 'prompt_tokens_details', None)
+                            cached = getattr(ptd, 'cached_tokens', None) if ptd is not None else None
+                            if cached is None and isinstance(ptd, dict):
+                                cached = ptd.get('cached_tokens')
+                            if cached is not None:
+                                server_cached_tokens = cached
+                        # Newer vLLM servers can attach exact per-request engine
+                        # timings to the final usage chunk. Do not query aggregate
+                        # /metrics counters: they cannot be attributed safely under
+                        # concurrency. Unknown fields and identifiers are discarded.
+                        chunk_metrics = self._stream_chunk_metrics(chunk)
+                        if chunk_metrics is not None:
+                            server_request_metrics = chunk_metrics
+                except openai.BadRequestError:
+                    # A request rejected before decoding consumed no completion
+                    # tokens, though it still counts toward the model-call cap.
+                    generation_reservation.finish(0)
+                    raise
+                except Exception:
+                    generation_reservation.finish()
+                    if resp_stream is not None and hasattr(resp_stream, "close"):
+                        try:
+                            resp_stream.close()
+                        except Exception:
+                            pass
+                    raise
+
+                generation_reservation.finish(server_completion_tokens)
+                decision_budget.check_wall(
+                    f"primary generation attempt {attempt + 1} completion"
+                )
+                completed_generation_attempts += 1
 
                 # Calibrate estimate_tokens against the server's REAL prompt token
                 # count (free — it's already in the usage chunk), so the worker's
@@ -1012,18 +1710,122 @@ class LLMClient:
                     except Exception:
                         pass
 
-                end_time = time.time()
+                end_time = time.perf_counter()
                 raw = "".join(raw_chunks)
                 # Store only the most recent attempt. The worker commits it to
                 # history only after the corresponding action turn succeeds.
                 self.last_reasoning_content = "".join(reasoning_chunks)
                 self.last_reasoning_effort = attempt_effort
-                ttft = (first_token_time - start_time) if first_token_time else 0
-                gen_time = (end_time - first_token_time) if first_token_time else 0
-                # Prefer the server's real token count; fall back to the estimate.
-                comp_tokens = server_completion_tokens or estimate_tokens(raw)
+                client_ttft = (
+                    (first_token_time - start_time) if first_token_time else 0
+                )
+                client_gen_time = (
+                    (end_time - first_token_time) if first_token_time else 0
+                )
+                has_server_tokens = (
+                    isinstance(server_completion_tokens, int)
+                    and not isinstance(server_completion_tokens, bool)
+                    and server_completion_tokens > 0
+                )
+                # The fallback is console diagnostics only. It includes hidden
+                # reasoning as well as the action JSON, but it is never published
+                # to Nexus as authoritative model throughput.
+                comp_tokens = (
+                    server_completion_tokens
+                    if has_server_tokens
+                    else estimate_tokens(self.last_reasoning_content + raw)
+                )
+
+                server_ttft = None
+                server_gen_time = None
+                server_queue_time = None
+                server_mean_itl = None
+                server_inference_tps = None
+                if server_request_metrics:
+                    if "time_to_first_token_ms" in server_request_metrics:
+                        server_ttft = (
+                            server_request_metrics["time_to_first_token_ms"] / 1000.0
+                        )
+                    if server_request_metrics.get("generation_time_ms", 0) > 0:
+                        server_gen_time = (
+                            server_request_metrics["generation_time_ms"] / 1000.0
+                        )
+                    if "queue_time_ms" in server_request_metrics:
+                        server_queue_time = (
+                            server_request_metrics["queue_time_ms"] / 1000.0
+                        )
+                    if "mean_itl_ms" in server_request_metrics:
+                        server_mean_itl = (
+                            server_request_metrics["mean_itl_ms"] / 1000.0
+                        )
+                    if server_request_metrics.get("tokens_per_second", 0) > 0:
+                        server_inference_tps = server_request_metrics["tokens_per_second"]
+
+                # Prefer vLLM's request-scoped timing set when both primary
+                # engine phases are attributable. A partial/malformed set is not
+                # sufficient to claim vLLM per-request timing in the UI.
+                # Its own tokens_per_second field includes prefill, so it must
+                # never be mislabeled as decode throughput.
+                use_server_timing = (
+                    server_ttft is not None and server_gen_time is not None
+                )
+                # Preserve the existing field as the user's client-observed
+                # first-token wait. Server TTFT excludes queue and transport, so
+                # publish it separately as the prefill/first-token engine phase.
+                ttft = client_ttft
+                gen_time = server_gen_time if use_server_timing else client_gen_time
 
                 tps = comp_tokens / gen_time if gen_time > 0 else 0
+                end_to_end_time = max(0.0, end_time - start_time)
+                end_to_end_tps = (
+                    comp_tokens / end_to_end_time if end_to_end_time > 0 else 0
+                )
+                if has_server_tokens and tps > 0:
+                    measurement = (
+                        "vllm_per_request_metrics"
+                        if use_server_timing
+                        else "server_tokens_over_client_stream_time"
+                    )
+                    performance = {
+                        # Keep the legacy field as the release-comparable decode
+                        # rate while exposing every denominator explicitly.
+                        "tokens_per_second": round(float(tps), 2),
+                        "decode_tokens_per_second": round(float(tps), 2),
+                        "end_to_end_tokens_per_second": round(float(end_to_end_tps), 2),
+                        "completion_tokens": int(comp_tokens),
+                        "prompt_tokens": int(server_prompt_tokens or 0),
+                        "cached_prompt_tokens": int(server_cached_tokens or 0),
+                        "time_to_first_token_seconds": round(float(ttft), 3),
+                        "decode_seconds": round(float(gen_time), 3),
+                        "end_to_end_seconds": round(float(end_to_end_time), 3),
+                        "reasoning_effort": attempt_effort,
+                        "served_model": str(served_model or self.api_model)[:160],
+                        "measurement": measurement,
+                        # This client is fail-closed to the one release-validated
+                        # Qwen3.8 service, whose launcher independently verifies
+                        # native MTP K=3 before publishing readiness.
+                        "speculative_method": "mtp",
+                        "speculative_tokens": 3,
+                    }
+                    if use_server_timing and server_queue_time is not None:
+                        performance["queue_seconds"] = round(
+                            float(server_queue_time), 3
+                        )
+                    if use_server_timing:
+                        performance["prefill_time_to_first_token_seconds"] = round(
+                            float(server_ttft), 3
+                        )
+                    if use_server_timing and server_mean_itl is not None:
+                        performance["mean_inter_token_seconds"] = round(
+                            float(server_mean_itl), 4
+                        )
+                    if use_server_timing and server_inference_tps is not None:
+                        performance["inference_tokens_per_second"] = round(
+                            float(server_inference_tps), 2
+                        )
+                    self.last_generation_performance = performance
+                else:
+                    self.last_generation_performance = None
                 # Prompt / prefix-cache readout: high 'cached' across turns means the
                 # static prompt prefix is being reused (low TTFT). A low value turn
                 # after turn signals the ordering is being busted by volatile content.
@@ -1035,7 +1837,18 @@ class LLMClient:
                         prompt_str = f" | prompt {server_prompt_tokens}"
                 else:
                     prompt_str = ""
-                print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s (TTFT: {ttft:.2f}s | {comp_tokens} tokens in {gen_time:.2f}s{prompt_str})\033[0m")
+                timing_source = (
+                    "vLLM request metrics"
+                    if use_server_timing
+                    else "client stream"
+                )
+                token_source = "server tokens" if has_server_tokens else "estimated tokens"
+                prefill_str = (
+                    f" | prefill/TTFT {server_ttft:.2f}s"
+                    if use_server_timing
+                    else ""
+                )
+                print(f"\033[96m[Performance] {self.model} speed: {tps:.2f} t/s ({timing_source}, {token_source}; observed first token: {ttft:.2f}s{prefill_str} | {comp_tokens} tokens in {gen_time:.2f}s{prompt_str})\033[0m")
 
                 if self.debug_path:
                     print(f"{C_YELLOW}[LLM RAW - PRIMARY AGENT]\n{raw}{C_RESET}")
@@ -1049,8 +1862,11 @@ class LLMClient:
                     last_error = ("Response truncated at the max_tokens ceiling "
                                   "(finish_reason=length) — incomplete JSON.")
                     self.logger.warning(
-                        f"Primary Agent attempt {attempt + 1}/{max_retries}: {last_error}")
-                    if attempt < max_retries - 1:
+                        "Primary Agent generation attempt "
+                        f"{completed_generation_attempts}/{generation_attempt_limit}: "
+                        f"{last_error}"
+                    )
+                    if completed_generation_attempts < generation_attempt_limit:
                         retry_suffix = (
                             "\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS CUT OFF (too long) **\n"
                             "Your response exceeded the output limit and was truncated. Be BRIEF: "
@@ -1058,7 +1874,10 @@ class LLMClient:
                             "file, write a smaller piece of it this turn (or split the work across "
                             "multiple str_replace/write_file turns).")
                         continue
-                    break
+                    raise decision_budget._error(
+                        "response ended with finish_reason=length and no recovery call remains",
+                        f"primary generation attempt {attempt + 1}",
+                    )
 
                 # --- STRUCTURED FAST PATH ---
                 # Grammar-constrained output IS the JSON object — parse directly.
@@ -1122,7 +1941,12 @@ class LLMClient:
                             print(f"{C_YELLOW}[LLM] Missing blocks detected: {missing_blocks}. Initiating recovery...{C_RESET}")
                         
                         for mb in missing_blocks:
-                            recovered_text = self._recover_missing_block(mb, parsed, full_prompt_text)
+                            recovered_text = self._recover_missing_block(
+                                mb,
+                                parsed,
+                                full_prompt_text,
+                                _decision_budget=decision_budget,
+                            )
                             if recovered_text:
                                 blocks[mb] = recovered_text
                             else:
@@ -1140,7 +1964,11 @@ class LLMClient:
                     return json.dumps(parsed)
                 except (json.JSONDecodeError, ValueError) as e:
                     last_error = f"JSON validation error: {str(e)}"
-                    self.logger.warning(f"Primary Agent attempt {attempt + 1}/{max_retries} failed: {last_error}")
+                    self.logger.warning(
+                        "Primary Agent generation attempt "
+                        f"{completed_generation_attempts}/{generation_attempt_limit} "
+                        f"failed: {last_error}"
+                    )
 
                     # --- ISOLATED FIXER AGENT INJECTION ---
                     is_decode_error = isinstance(e, json.JSONDecodeError) or "Expecting" in str(e) or "Unterminated" in str(e)
@@ -1165,7 +1993,11 @@ class LLMClient:
                         if self.debug_path:
                             print(f"{C_YELLOW}[LLM] Malformed JSON detected. Routing to Fixer Agent ({self.model})...{C_RESET}")
 
-                        repaired_json_str = self._repair_json(json_str, str(e))
+                        repaired_json_str = self._repair_json(
+                            json_str,
+                            str(e),
+                            _decision_budget=decision_budget,
+                        )
                         if repaired_json_str:
                             try:
                                 parsed = json.loads(repaired_json_str)
@@ -1186,12 +2018,27 @@ class LLMClient:
                         print(f"{C_YELLOW}{diagnostic_str}{C_RESET}")
                         print(f"{C_YELLOW}------------------------------{C_RESET}\n")
 
-                    if attempt < max_retries - 1:
-                        retry_suffix = f"\n\n** RETRY - YOUR PREVIOUS RESPONSE WAS INVALID **\nError: {last_error}\nRaw output started with: {raw[:300]}...\n\nYou MUST output exactly ONE valid JSON object containing 'thought' and 'actions', and nothing else.\nCRITICAL: JSON values must be static strings with standard JSON escaping — newlines as \\n, quotes as \\\", backslashes as \\\\. No Python operations (like '+' or '*'), no markdown fences, no text before or after the JSON."
+                    if completed_generation_attempts < generation_attempt_limit:
+                        retry_suffix = f"RETRY: the previous response was invalid.\nError: {last_error}\nRaw output started with: {raw[:300]}...\nReturn exactly one schema-valid turn object with kind, intent, message, and actions; no markdown or surrounding prose."
+                    else:
+                        raise decision_budget._error(
+                            "completed-generation recovery limit reached after invalid JSON",
+                            "primary JSON validation",
+                        )
 
+            except DecisionGenerationBudgetExceeded:
+                raise
             except (openai.APIConnectionError, openai.InternalServerError, requests.exceptions.ConnectionError) as e:
-                if self._handle_connection_error(e):
+                if self._handle_connection_error(
+                    e,
+                    _decision_budget=decision_budget,
+                ):
                     continue # Recovery successful, retry the request
+                if decision_budget.model_calls_started >= decision_budget.max_model_calls:
+                    raise decision_budget._error(
+                        "model-call limit reached during connection recovery",
+                        "primary connection recovery",
+                    ) from e
                 raise
             except openai.BadRequestError as e:
                 # The server rejected the request. First: if the rejection names
@@ -1220,20 +2067,36 @@ class LLMClient:
                 self._log_to_debug("PRIMARY_AGENT_ERR", self.model, full_prompt_text, str(e))
                 self.logger.error(f"Primary Agent bad request: {e}")
                 last_error = f"API Error: {str(e)}"
-                if attempt < max_retries - 1:
-                    time.sleep(1)
+                if decision_budget.model_calls_started < decision_budget.max_model_calls:
+                    decision_budget.bounded_sleep(1, "primary bad-request recovery")
                     continue
-                raise
+                raise decision_budget._error(
+                    "model-call limit reached after repeated bad requests",
+                    "primary bad-request recovery",
+                ) from e
             except Exception as e:
                 self._log_to_debug("PRIMARY_AGENT_ERR", self.model, full_prompt_text, str(e))
                 self.logger.error(f"Primary Agent LLM call failed: {e}")
                 last_error = f"API Error: {str(e)}"
-                if attempt < max_retries - 1:
-                    time.sleep(2)
+                if decision_budget.model_calls_started < decision_budget.max_model_calls:
+                    decision_budget.bounded_sleep(2, "primary error recovery")
                     continue
-                raise
+                raise decision_budget._error(
+                    "model-call limit reached after repeated request failures",
+                    "primary error recovery",
+                ) from e
 
-        error_msg = f"Primary Agent failed after {max_retries} attempts. Last error: {last_error}"
+        if decision_budget.model_calls_started >= decision_budget.max_model_calls:
+            raise decision_budget._error(
+                "model-call limit reached before a valid turn was produced",
+                "primary compatibility/recovery loop",
+            )
+        error_msg = (
+            "Primary Agent failed within its bounded decision generation window "
+            f"after {decision_budget.model_calls_started} model calls and "
+            f"{completed_generation_attempts} completed generations. "
+            f"Last error: {last_error}"
+        )
         self.logger.error(error_msg)
         raise RuntimeError(error_msg)
 
@@ -1275,7 +2138,9 @@ class LLMClient:
                                    prompt: Optional[str] = None,
                                    messages: Optional[List[Dict]] = None,
                                    images: Optional[List[str]] = None,
-                                   evidence_hint: str = "") -> tuple[int, str]:
+                                   evidence_hint: str = "",
+                                   _decision_budget: Optional[DecisionGenerationBudget] = None,
+                                   _max_output_tokens: Optional[int] = None) -> tuple[int, str]:
         """Have the same local model select one *unexecuted* candidate by evidence.
 
         The verifier receives the same current state and screenshots as the
@@ -1300,14 +2165,14 @@ class LLMClient:
             + json.dumps(review_candidates, ensure_ascii=False, separators=(",", ":"))
         )
 
-        if messages:
-            verifier_messages = [dict(m) for m in messages[:-1]]
-            last = messages[-1]
-            last_text = (last.get("content", "") if isinstance(last.get("content"), str)
-                         else (prompt or self._msg_text(last)))
-        else:
-            verifier_messages = []
-            last_text = prompt or ""
+        # Preserve the complete typed conversation. In particular, the worker's
+        # state projection ends in an assistant tool_call plus its matching tool
+        # receipt. Dropping the final receipt creates an invalid message sequence
+        # on strict endpoints and, worse, re-labels harness/tool data as a user
+        # instruction. Verifier guidance is a new user message; existing roles
+        # and authority boundaries remain intact.
+        verifier_messages = [dict(message) for message in (messages or [])]
+        verifier_text = review_prompt if messages else (prompt or "") + review_prompt
 
         image_urls = []
         if getattr(self, "_vision_supported", True):
@@ -1315,8 +2180,9 @@ class LLMClient:
             image_urls = [url for url in image_urls if url]
         verifier_messages.append({
             "role": "user",
-            "content": self._content_with_images(last_text + review_prompt, image_urls),
+            "content": self._content_with_images(verifier_text, image_urls),
         })
+        verifier_messages = self._coalesce_system_messages(verifier_messages)
 
         selection_schema = {
             "type": "object",
@@ -1336,7 +2202,24 @@ class LLMClient:
             },
             "extra_body": {},
         }, "xhigh")
+        budget = _decision_budget or self._new_decision_generation_budget(
+            max_model_calls=1,
+            max_completion_tokens=getattr(self, "max_verifier_tokens", 2048),
+        )
+        verifier_cap = (
+            _max_output_tokens
+            if isinstance(_max_output_tokens, int)
+            and not isinstance(_max_output_tokens, bool)
+            and _max_output_tokens > 0
+            else getattr(self, "max_verifier_tokens", 2048)
+        )
+        reservation = None
         try:
+            reservation = budget.reserve(
+                phase="local candidate verifier",
+                requested_tokens=verifier_cap,
+                minimum_useful_tokens=256,
+            )
             response = self.client.chat.completions.create(
                 model=self.api_model,
                 messages=verifier_messages,
@@ -1347,9 +2230,17 @@ class LLMClient:
                 # reasoning stream before the tiny constrained decision object.
                 # Leave enough room to reach </think>; truncation safely falls
                 # back to candidate zero, but should not be the normal path.
-                max_tokens=8192,
+                max_tokens=reservation.max_tokens,
+                timeout=reservation.timeout_seconds,
                 **request_kwargs,
             )
+            reservation.finish(self._reported_completion_tokens(response))
+            budget.check_wall("local candidate verifier")
+            if getattr(response.choices[0], "finish_reason", None) == "length":
+                raise budget._error(
+                    "verifier response ended with finish_reason=length",
+                    "local candidate verifier",
+                )
             content = response.choices[0].message.content or ""
             decision = json.loads(content)
             selected = decision.get("selected_index")
@@ -1357,7 +2248,17 @@ class LLMClient:
                 raise ValueError(f"invalid selected_index {selected!r}")
             reason = str(decision.get("reason") or decision.get("evidence_used") or "")[:600]
             return selected, reason or "selected by the local evidence verifier"
+        except DecisionGenerationBudgetExceeded:
+            if reservation is not None:
+                reservation.finish()
+            self.logger.warning(
+                "Local candidate verifier exhausted its bounded generation budget; "
+                "using the first valid proposal."
+            )
+            return 0, "verifier budget exhausted; deterministic first-valid fallback"
         except Exception as exc:
+            if reservation is not None:
+                reservation.finish()
             self.logger.warning(
                 "Local candidate verifier failed; using the first valid candidate: %s", exc)
             return 0, f"verifier unavailable; deterministic fallback ({type(exc).__name__})"
@@ -1381,12 +2282,41 @@ class LLMClient:
             count = max(1, min(3, int(candidate_count)))
         except (TypeError, ValueError):
             count = 2
+        requested_count = count
+        decision_budget = self._new_decision_generation_budget()
+        # Keep one call available for evidence selection whenever there are
+        # multiple proposals. An operator tightening the aggregate call limit
+        # therefore reduces candidate breadth instead of silently dropping the
+        # verifier.
+        count = min(count, max(1, decision_budget.max_model_calls - 1))
         if count == 1:
             self.last_local_search = {}
             return self.get_primary_agent_response(
-                prompt=prompt, max_retries=max_retries,
+                prompt=prompt,
+                max_retries=_bounded_int(
+                    max_retries, default=1, minimum=1, maximum=2
+                ),
                 diagnostic_str=diagnostic_str, images=images, messages=messages,
-                reasoning_effort=reasoning_effort)
+                reasoning_effort=reasoning_effort,
+                _decision_budget=decision_budget)
+
+        verifier_reserve = min(
+            getattr(self, "max_verifier_tokens", 2048),
+            max(256, decision_budget.max_completion_tokens // 6),
+        )
+        candidate_pool = max(
+            0,
+            decision_budget.max_completion_tokens - verifier_reserve,
+        )
+        candidate_token_cap = min(
+            getattr(self, "max_turn_tokens", 8192),
+            candidate_pool // count,
+        )
+        if candidate_token_cap < 256:
+            raise decision_budget._error(
+                "not enough completion tokens for candidates plus verifier",
+                "selective local search setup",
+            )
 
         strategies = (
             "Candidate 1: take an evidence-first, conservative next step; verify the key assumption before a risky mutation.",
@@ -1399,7 +2329,9 @@ class LLMClient:
             try:
                 raw = self.get_primary_agent_response(
                     prompt=prompt,
-                    max_retries=max_retries,
+                    # Each proposal is single-shot. The old code multiplied the
+                    # caller's retry loop by candidate_count before verification.
+                    max_retries=1,
                     diagnostic_str=diagnostic_str,
                     images=images,
                     messages=messages,
@@ -1408,6 +2340,8 @@ class LLMClient:
                         f"Produce independent proposal {index + 1} of {count}. {strategies[index]} "
                         "Return the normal turn JSON. Do not claim the proposed actions already ran."
                     ),
+                    _decision_budget=decision_budget,
+                    _max_output_tokens=candidate_token_cap,
                 )
                 parsed = json.loads(raw)
                 if not isinstance(parsed, dict) or not isinstance(parsed.get("actions"), list):
@@ -1417,8 +2351,23 @@ class LLMClient:
                     "parsed": parsed,
                     "reasoning": self.last_reasoning_content,
                     "effort": self.last_reasoning_effort,
+                    "performance": (
+                        dict(getattr(self, "last_generation_performance", {}))
+                        if isinstance(
+                            getattr(self, "last_generation_performance", None), dict
+                        )
+                        else None
+                    ),
                     "proposal_index": index,
                 })
+            except DecisionGenerationBudgetExceeded as exc:
+                if not valid:
+                    raise
+                failures.append(
+                    f"candidate {index + 1}: budget exhausted after a valid proposal: {exc}"
+                )
+                self.logger.warning("Selective local-search %s", failures[-1])
+                break
             except Exception as exc:
                 failures.append(f"candidate {index + 1}: {type(exc).__name__}: {exc}")
                 self.logger.warning("Selective local-search %s", failures[-1])
@@ -1429,18 +2378,30 @@ class LLMClient:
 
         selected, reason = self._verify_primary_candidates(
             [item["parsed"] for item in valid], prompt=prompt, messages=messages,
-            images=images, evidence_hint=evidence_hint)
+            images=images, evidence_hint=evidence_hint,
+            _decision_budget=decision_budget,
+            _max_output_tokens=verifier_reserve)
         chosen = valid[selected]
         # Candidate and verifier calls overwrite these fields as they run. Restore
         # the trace belonging to the action that will actually execute/history-log.
         self.last_reasoning_content = chosen["reasoning"]
         self.last_reasoning_effort = chosen["effort"]
+        self.last_generation_performance = chosen["performance"]
         self.last_local_search = {
-            "requested": count,
+            "requested": requested_count,
+            "generated": count,
             "valid": len(valid),
             "selected_candidate": chosen["proposal_index"] + 1,
             "reason": reason,
             "failures": failures,
+            "generation_budget": {
+                "model_calls": decision_budget.model_calls_started,
+                "completion_tokens_charged": (
+                    decision_budget.completion_tokens_charged
+                ),
+                "max_model_calls": decision_budget.max_model_calls,
+                "max_completion_tokens": decision_budget.max_completion_tokens,
+            },
         }
         return chosen["raw"]
 
@@ -1460,6 +2421,9 @@ class LLMClient:
                 temperature=QWEN_CONTROL_TEMPERATURE,
                 top_p=QWEN_CONTROL_TOP_P,
                 presence_penalty=0.0,
+                **self.support_request_kwargs(
+                    requested_tokens=2048, phase="action-log compression"
+                ),
                 **self._reasoning_request_kwargs("low"),
             )
             content = resp.choices[0].message.content
@@ -1471,7 +2435,14 @@ class LLMClient:
 
     def compress_memories(self, memories_text: str) -> Dict:
         """Compresses the persistent memories using the utility model and returns a dictionary."""
-        prompt = COMPRESS_MEMORIES_PROMPT.format(memories=memories_text)
+        try:
+            prompt = COMPRESS_MEMORIES_PROMPT.format(memories=memories_text)
+        except (KeyError, ValueError):
+            # Older prompt revisions contained illustrative JSON braces which
+            # were not escaped for ``str.format``. Memory is independently
+            # versioned; keep the behavior harness compatible without editing
+            # or taking ownership of that subsystem's prompt.
+            prompt = COMPRESS_MEMORIES_PROMPT.replace("{memories}", memories_text)
         try:
             resp = self.utility_client.chat.completions.create(
                 model=self.utility_model,
@@ -1480,6 +2451,9 @@ class LLMClient:
                 temperature=QWEN_CONTROL_TEMPERATURE,
                 top_p=QWEN_CONTROL_TOP_P,
                 presence_penalty=0.0,
+                **self.support_request_kwargs(
+                    requested_tokens=2048, phase="memory compression"
+                ),
                 **self._reasoning_request_kwargs("low"),
             )
             content = resp.choices[0].message.content
@@ -1506,6 +2480,9 @@ class LLMClient:
                 temperature=QWEN_CONTROL_TEMPERATURE,
                 top_p=QWEN_CONTROL_TOP_P,
                 presence_penalty=0.0,
+                **self.support_request_kwargs(
+                    requested_tokens=2048, phase="interruption integration"
+                ),
                 **self._reasoning_request_kwargs("xhigh"),
             )
             content = resp.choices[0].message.content
@@ -1539,6 +2516,9 @@ class LLMClient:
                 temperature=QWEN_CONTROL_TEMPERATURE,
                 top_p=QWEN_CONTROL_TOP_P,
                 presence_penalty=0.0,
+                **self.support_request_kwargs(
+                    requested_tokens=2048, phase="resume integration"
+                ),
                 **self._reasoning_request_kwargs("xhigh"),
             )
             content = resp.choices[0].message.content
@@ -1561,6 +2541,9 @@ class LLMClient:
                 temperature=QWEN_CONTROL_TEMPERATURE,
                 top_p=QWEN_CONTROL_TOP_P,
                 presence_penalty=0.0,
+                **self.support_request_kwargs(
+                    requested_tokens=2048, phase="think tool"
+                ),
                 **self._reasoning_request_kwargs("xhigh"),
             )
             content = resp.choices[0].message.content
@@ -1607,7 +2590,9 @@ class LLMClient:
                 # reasoning depth is xhigh, but sampling variance is deliberately
                 # disabled for the disclosure boundary.
                 temperature=QWEN_CONTROL_TEMPERATURE,
-                max_tokens=256,
+                **self.support_request_kwargs(
+                    requested_tokens=256, phase="external disclosure review"
+                ),
                 response_format={"type": "json_object"},
                 **self._reasoning_request_kwargs("xhigh"),
             )
@@ -1640,6 +2625,9 @@ class LLMClient:
                 temperature=QWEN_CONTROL_TEMPERATURE,
                 top_p=QWEN_CONTROL_TOP_P,
                 presence_penalty=0.0,
+                **self.support_request_kwargs(
+                    requested_tokens=1536, phase="web summary"
+                ),
                 **self._reasoning_request_kwargs("low"),
             )
             content = resp.choices[0].message.content

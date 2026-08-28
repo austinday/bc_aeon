@@ -3,7 +3,6 @@ import re
 import time
 import base64
 import requests
-import subprocess
 import json
 import fcntl
 import hashlib
@@ -22,11 +21,27 @@ from ..core.prompts import (
     TOOL_DESC_BROWSER_CAPTURE_MEDIA,
 )
 from ..core.paths import resolve_output_dir
-from ..core.model_catalog import VISION_MODEL_NAME
+from ..core.model_catalog import VISION_MODEL_NAME, VISION_MODEL_NAMES
+from ..scripts.browser_service import (
+    SERVICE_RECEIPT_PATH as BROWSER_SERVICE_RECEIPT,
+    source_digest as browser_service_source_digest,
+)
 from ..services.browser.browser_util import read_auth_token
 
-BROWSER_API_URL = "http://localhost:8030"
+BROWSER_API_URL = "http://127.0.0.1:8030"
 BROWSER_API_VERSION = "human_v6"
+_BROWSER_SERVICE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_BROWSER_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_BROWSER_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_BROWSER_SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_BROWSER_CAPTURE_FILENAME_RE = re.compile(
+    r"^capture_(?:img|vid)_[1-9][0-9]*_[0-9a-f]{32}\.[a-z0-9]{1,8}$"
+)
+_BROWSER_AUTH_VERSION = "required-v1"
+_LOCAL_HTTP_KWARGS = {
+    "allow_redirects": False,
+    "proxies": {"http": "", "https": ""},
+}
 
 # Cap the structured element list so a huge page can't flood context. The agent
 # can scroll to reveal more; function is primary but context still must survive.
@@ -144,10 +159,66 @@ def browser_auth_headers():
     return {"Authorization": f"Bearer {token}"}
 
 
+def _browser_service_identity() -> str:
+    """Return the exact operator-created browser service identity.
+
+    A bearer-protected response on the expected port is not ownership proof by
+    itself. Bind every model-facing call to the private receipt written by the
+    browser operator helper and to the same identity returned by health.
+    """
+
+    receipt = BROWSER_SERVICE_RECEIPT
+    metadata = receipt.lstat()
+    parent = receipt.parent.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or parent.st_mode & 0o077
+        or metadata.st_size > 32 * 1024
+    ):
+        raise RuntimeError("the local browser ownership receipt is unsafe")
+    document = json.loads(receipt.read_text(encoding="utf-8"))
+    service_id = str(document.get("service_id", "")) if isinstance(document, dict) else ""
+    receipt_source_sha256 = (
+        str(document.get("source_sha256", "")) if isinstance(document, dict) else ""
+    )
+    if (
+        not isinstance(document, dict)
+        or document.get("schema") != 1
+        or _BROWSER_SERVICE_ID_RE.fullmatch(service_id) is None
+        or _BROWSER_CONTAINER_ID_RE.fullmatch(
+            str(document.get("container_id", ""))
+        )
+        is None
+        or _BROWSER_IMAGE_ID_RE.fullmatch(str(document.get("image_id", "")))
+        is None
+        or _BROWSER_SOURCE_SHA_RE.fullmatch(receipt_source_sha256) is None
+        or document.get("container_name") != f"aeon-browser-{service_id}"
+        or document.get("auth_version") != _BROWSER_AUTH_VERSION
+        or document.get("api_version") != BROWSER_API_VERSION
+    ):
+        raise RuntimeError("the local browser ownership receipt is invalid")
+    try:
+        current_source_sha256 = browser_service_source_digest()
+    except Exception as exc:
+        raise RuntimeError(
+            "the current browser service source identity is unavailable"
+        ) from exc
+    if receipt_source_sha256 != current_source_sha256:
+        raise RuntimeError(
+            "the local browser ownership receipt is stale for the current source"
+        )
+    return service_id
+
+
 def _worker_uses_qwen38_vision(worker):
     """True only when browser screenshots would reach the approved Qwen3.8 ID."""
     return (getattr(getattr(worker, "llm_client", None), "api_model", None)
-            == VISION_MODEL_NAME)
+            in VISION_MODEL_NAMES)
 
 
 def _page_signature(data):
@@ -515,49 +586,23 @@ def _log_browser_diag(data, action_desc, session_id, tab_id, clean_bytes=None):
         pass  # never let diagnostics break a browser action
 
 
-def _manage_browser_registry(action='register'):
-    """Manage the current agent PID as an active user of the browser service."""
-    registry_path = "/tmp/aeon_browser_registry.json"
-    lock_path = "/tmp/aeon_browser_registry.lock"
-    pid = os.getpid()
-
-    with open(lock_path, 'w') as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            active_pids = []
-            if os.path.exists(registry_path):
-                with open(registry_path, 'r') as f:
-                    active_pids = json.load(f)
-        except (json.JSONDecodeError, EOFError):
-            active_pids = []
-
-        cleaned_pids = []
-        for p in active_pids:
-            try:
-                os.kill(p, 0)
-                cleaned_pids.append(p)
-            except OSError:
-                pass
-
-        if action == 'register':
-            if pid not in cleaned_pids:
-                cleaned_pids.append(pid)
-        elif action == 'unregister':
-            if pid in cleaned_pids:
-                cleaned_pids.remove(pid)
-
-        with open(registry_path, 'w') as f:
-            json.dump(cleaned_pids, f)
-
-        return len(cleaned_pids)
-
-
 def _browser_healthy():
     try:
+        service_id = _browser_service_identity()
         response = requests.get(
-            f"{BROWSER_API_URL}/health", headers=browser_auth_headers(), timeout=2
+            f"{BROWSER_API_URL}/health",
+            headers=browser_auth_headers(),
+            timeout=2,
+            **_LOCAL_HTTP_KWARGS,
         )
         if response.status_code != 200:
+            return False
+        if (
+            len(response.content) > 8192
+            or not response.headers.get("content-type", "").startswith(
+                "application/json"
+            )
+        ):
             return False
         body = response.json()
         # Do not treat the legacy unauthenticated server as healthy merely
@@ -566,6 +611,7 @@ def _browser_healthy():
             body.get("status") == "ok"
             and body.get("auth_required") is True
             and body.get("api_version") == BROWSER_API_VERSION
+            and body.get("service_id") == service_id
         )
     except Exception:
         return False
@@ -575,63 +621,30 @@ _pruned_stale_output = False
 
 
 def _prune_stale_output_dirs():
-    """Remove ~/.aeon/temp/browser_output_<pid>_<tab> dirs left by agent processes
-    that are no longer alive, so screenshots don't accumulate on disk across runs.
-    Runs once per process and only ever deletes dirs whose owning PID is dead."""
+    """Deliberately leave prior browser output for exact operator cleanup.
+
+    A PID embedded in a directory name is not an ownership receipt: PIDs can be
+    reused and a matching directory may be pre-existing or uniquely valuable.
+    Fleet storage policy therefore forbids the browser tool from discovering and
+    recursively deleting old directories merely because their apparent process
+    is gone.  Current-invocation temporary uploads are still removed through
+    their exact paths by the code that created them.
+    """
     global _pruned_stale_output
     if _pruned_stale_output:
         return
     _pruned_stale_output = True
-    base = os.path.expanduser("~/.aeon/temp")
-    try:
-        if not os.path.isdir(base):
-            return
-        my_pid = os.getpid()
-        for name in os.listdir(base):
-            if not name.startswith("browser_output_"):
-                continue
-            parts = name.split("_")  # browser, output, <pid>, <tab...>
-            if len(parts) < 4 or not parts[2].isdigit():
-                continue
-            pid = int(parts[2])
-            if pid == my_pid:
-                continue
-            try:
-                os.kill(pid, 0)          # exists (alive, or ours) -> keep
-            except ProcessLookupError:
-                shutil.rmtree(os.path.join(base, name), ignore_errors=True)
-            except OSError:
-                pass                     # exists but not signalable -> keep
-    except Exception:
-        pass
 
 
 def ensure_browser_running():
-    _manage_browser_registry('register')
     _prune_stale_output_dirs()
     if _browser_healthy():
         return True
-
-    # Serialize startup ACROSS agent processes: without this, the principal and
-    # its sub-agents can each fire `docker run` at once and collide on the
-    # container name. Hold an exclusive lock, re-check health inside it (another
-    # process may have just started the service), then start exactly once.
-    script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "start_browser.sh"))
-    with open("/tmp/aeon_browser_start.lock", "w") as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        if _browser_healthy():
-            return True
-        # Bound the start: `docker run -d` returns fast, but a stuck docker
-        # daemon must not hang the agent loop. Capture output so a failed start
-        # yields a diagnostic instead of a bare CalledProcessError.
-        try:
-            subprocess.run(["bash", script_path], check=True,
-                           capture_output=True, text=True, timeout=180)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Timed out (180s) starting the browser service (docker may be stuck).")
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to start the browser service: {(e.stderr or e.stdout or '').strip()[:400]}")
-    return True
+    raise RuntimeError(
+        "The authenticated Aeon browser service is unavailable. Browser tools "
+        "do not inspect, start, replace, or stop host containers; restore the "
+        "reviewed CPU-only browser service through the operator workflow, then retry."
+    )
 
 
 def _session_id():
@@ -1073,6 +1086,7 @@ def _post(endpoint, payload, action_desc, tab_id, timeout=90,
             resp = requests.post(
                 f"{BROWSER_API_URL}/{endpoint}", json=payload,
                 headers=browser_auth_headers(), timeout=timeout,
+                **_LOCAL_HTTP_KWARGS,
             )
         if resp.status_code != 200:
             # The server returns a helpful 'detail' for 4xx (e.g. expected_text mismatch).
@@ -1124,7 +1138,11 @@ class BrowserInteractTool(BaseTool):
                 visual: str = "overlay", compare: bool = False,
                 x: float = None, y: float = None, to_x: float = None,
                 to_y: float = None, dialog_action: str = None,
-                dialog_text: str = None, **kwargs) -> str:
+                dialog_text: str = None, authority_target: str = None,
+                authority_targets: list[str] = None,
+                authority_operation: str = None,
+                source_files: list[str] = None, **kwargs) -> str:
+        del source_files
         if not action:
             return "Error: 'action' is required."
         tab_id = _resolve_tab(self.worker, tab_id)
@@ -1275,7 +1293,8 @@ class BrowserCloseTabTool(BaseTool):
                 resp = requests.post(f"{BROWSER_API_URL}/close_tab",
                                      json={"session_id": _session_id(), "tab_id": tab_id,
                                            "profile": profile},
-                                     headers=browser_auth_headers(), timeout=15)
+                                     headers=browser_auth_headers(), timeout=15,
+                                     **_LOCAL_HTTP_KWARGS)
             if resp.status_code != 200:
                 return f"HTTP Error {resp.status_code} from browser API: {resp.text}"
             data = resp.json()
@@ -1286,11 +1305,10 @@ class BrowserCloseTabTool(BaseTool):
                 self.worker._last_browser_tab = None
             remaining = data.get("remaining_tabs", 0)
             if remaining == 0:
-                rem_browser = _manage_browser_registry('unregister')
-                if rem_browser == 0:
-                    subprocess.run(['docker', 'rm', '-f', 'aeon_browser'],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return f"Closed tab '{tab_id}'. No tabs left; released the browser resource."
+                return (
+                    f"Closed tab '{tab_id}'. No tabs remain in this session; "
+                    "the operator-managed browser service remains available."
+                )
             return f"Closed tab '{tab_id}'. {remaining} tab(s) still open."
         except Exception as e:
             return self.format_error_message(e, f"closing tab {tab_id}")
@@ -1330,6 +1348,7 @@ class BrowserCaptureMediaTool(BaseTool):
                 resp = requests.post(
                     f"{BROWSER_API_URL}/capture_media", json=payload,
                     headers=browser_auth_headers(), timeout=300,
+                    **_LOCAL_HTTP_KWARGS,
                 )
             if resp.status_code != 200:
                 try:
@@ -1351,6 +1370,11 @@ class BrowserCaptureMediaTool(BaseTool):
             return ("Error: 'output_dir' is required to save the media — the directory to write the "
                     "file into (e.g. '.' for the current workspace).")
         filename = data.get("filename")
+        if (
+            not isinstance(filename, str)
+            or _BROWSER_CAPTURE_FILENAME_RE.fullmatch(filename) is None
+        ):
+            return "Browser capture returned an invalid output identity."
         src = os.path.join(_host_download_dir(), filename)
         for _ in range(15):  # bind-mount flush can lag the service's write
             if os.path.exists(src):
@@ -1359,14 +1383,31 @@ class BrowserCaptureMediaTool(BaseTool):
         if not os.path.exists(src):
             return (f"Capture reported success ({data.get('method')}) but the file did not appear "
                     f"at {src}. The browser service may be running without the shared profile mount.")
+        try:
+            source_metadata = os.lstat(src)
+            maximum = (
+                512 * 1024 * 1024
+                if data.get("tag") == "video"
+                else 64 * 1024 * 1024
+            )
+            if (
+                not stat.S_ISREG(source_metadata.st_mode)
+                or source_metadata.st_uid != os.geteuid()
+                or source_metadata.st_nlink != 1
+                or not 0 < source_metadata.st_size <= maximum
+            ):
+                return "Browser capture output failed owner/size identity checks."
+        except OSError as exc:
+            return f"Browser capture output identity is unavailable: {exc}"
         dest = str(resolve_output_dir(output_dir, filename))
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         try:
             shutil.copy2(src, dest)
         except Exception as e:
             return f"Captured to {src} but could not copy it into {output_dir}: {e}"
-        # The service writes as root (docker), so we may not be able to delete the
-        # source — best-effort cleanup; the copy above is what matters.
+        # Remove only the exact unguessable service-created source after its copy
+        # has settled. A failed cleanup leaves it for the operator; it never
+        # triggers discovery or recursive deletion.
         try:
             os.remove(src)
         except Exception:

@@ -17,13 +17,24 @@ Structure:
 TOP_LEVEL_TOOLS = {
     'think', 'say_to_user', 'get_user_input',
     'open_file', 'close_file', 'write_file', 'str_replace',
-    'search_web', 'run_command', 'task_complete',
+    'search_web', 'huggingface_model_search', 'huggingface_model_info',
+    'huggingface_repo_file', 'run_command', 'task_complete',
+    'inspect_tool_result',
     'run_command_async', 'job_output', 'kill_job',
     'memorize', 'forget',
     'verify_self_modification', 'restart_aeon', 'revert_aeon', 'run_self_benchmark',
     'resume_previous_session',
+    'set_job_role',
+    'create_collaboration_portal', 'send_collaborator_handoff',
+    'connect_mcp_account', 'list_mcp_credentials', 'list_provider_credentials',
+    'list_payment_addresses',
+    'list_mcp_tools', 'call_mcp_tool',
+    'github_repositories', 'github_status', 'github_commit',
+    'github_push', 'github_verify_remote',
     'expand_tool_category', 'collapse_tool_category',
     'activate_skill', 'deactivate_skill', 'create_skill', 'read_skill', 'delete_skill',
+    'remember_skill_knowledge', 'list_skill_knowledge', 'read_skill_knowledge',
+    'search_skill_knowledge', 'delete_skill_knowledge',
     # Browser tools are TOP-LEVEL (always visible with full descriptions). They are
     # a core capability; hiding them in a collapsed category left the model unable
     # to see HOW to use them, so it improvised (curl to "navigate", a hallucinated
@@ -48,8 +59,7 @@ TOOL_CATEGORIES = {
     },
     'video_tools': {
         'description': 'AI video creation & editing (LTX-2.3 via ComfyUI): text/image-to-video, '
-                       'storyboard keyframes, extend, and restyle. See the video_director skill for '
-                       'orchestrating multi-shot, character-consistent sequences from any assets.',
+                       'storyboard keyframes, extend, restyle, and multi-shot sequence assembly.',
         'tools': [
             'generate_video',
         ],

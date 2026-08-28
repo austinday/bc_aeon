@@ -12,7 +12,7 @@ def _skill_category_names():
     try:
         from aeon.core.skills.manager import SkillsManager
         sm = SkillsManager()
-        return [d.name for d in sm.base_dir.iterdir() if d.is_dir() and not d.name.startswith('__')]
+        return sm.list_categories()
     except Exception:
         return []
 

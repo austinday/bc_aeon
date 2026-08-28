@@ -1,0 +1,1 @@
+Prefer a focused literal query over paging. Read another bounded page only when the prior page proves it is necessary.

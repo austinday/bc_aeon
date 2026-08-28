@@ -1,5 +1,7 @@
 Use the indexed elements and grounded visible text from the most recent browser observation. Element ids are observation-local and may be reassigned after any DOM change, so pass expected_text for every consequential element action and re-read or browser_find when state may be stale.
 
+For an owner-requested external effect (send/post/publish/purchase/schedule/etc.), repeat the harness-owned scope on every browser_interact call with authority_target (for example recipient:alice, site:example.com, or platform:x) and authority_operation (for example send or publish). If the owner bound more than one destination dimension, use authority_targets as a list (for example recipient:alice plus account:work). These declarations do not grant authority; the harness checks them exactly against the owner's request and rejects substitutions. Omit them for ordinary read-only navigation.
+
 Canonical actions:
 - click, double_click, right_click, hover: element_id; expected_text for clicks.
 - type: element_id + text; optional clear_first and then_enter.

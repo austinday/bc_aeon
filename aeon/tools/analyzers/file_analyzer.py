@@ -1,5 +1,6 @@
 import os
 import re
+import stat
 from typing import Dict, Any
 
 from .handlers.archive import summarize_archive
@@ -29,6 +30,7 @@ from .handlers.utility import (
     summarize_opaque,
     is_likely_binary,
 )
+from .limits import ResourceLimitError, limit_error, read_bounded_bytes
 
 class FileAnalyzer:
     """
@@ -45,6 +47,7 @@ class FileAnalyzer:
     PDF_EXTENSIONS = {'.pdf'}
     STRUCTURED_RECORD_EXTENSIONS = {'.sdf', '.pdb', '.cif', '.mol2', '.gro', '.mmcif', '.pdbqt', '.ent'}
     SEQUENCE_EXTENSIONS = {'.fasta', '.fa', '.fna', '.faa', '.smi', '.fastq', '.fq', '.gb', '.gbk', '.seq', '.embl'}
+    GENBANK_EXTENSIONS = {'.gb', '.gbk'}
     LOG_EXTENSIONS = {'.log'}
     JSONL_EXTENSIONS = {'.jsonl', '.jsonlines'}
     ARCHIVE_EXTENSIONS = {'.zip', '.tar', '.gz', '.bz2', '.rar', '.7z', '.tgz'}
@@ -67,13 +70,64 @@ class FileAnalyzer:
     MAX_FASTA_SAMPLE_BYTES = 1 * 1024 * 1024  # 1MB
     HIDDEN_FILE_TAIL_LINES = 50
 
-    def __init__(self, file_path: str):
+    # In-process parsing contracts.  Handlers may return bounded partial
+    # metadata, but must never exceed these ceilings to obtain it.
+    MAX_FULL_CONTENT_BYTES = 256 * 1024
+    MAX_TEXT_PREFIX_BYTES = 64 * 1024
+    MAX_TEXT_LINE_BYTES = 256 * 1024
+    MAX_HIDDEN_SCAN_BYTES = 4 * 1024 * 1024
+    MAX_HIDDEN_TAIL_BYTES = 64 * 1024
+    MAX_JSON_PARSE_BYTES = 2 * 1024 * 1024
+    MAX_NOTEBOOK_PARSE_BYTES = 8 * 1024 * 1024
+    MAX_NOTEBOOK_CELLS = 2_000
+    MAX_NOTEBOOK_CODE_CHARS = 250_000
+    MAX_PDF_INPUT_BYTES = 64 * 1024 * 1024
+    MAX_PDF_PAGES = 400
+    MAX_PDF_PAGE_TEXT_CHARS = 100_000
+    MAX_PDF_TEXT_CHARS = 250_000
+    MAX_ARCHIVE_INPUT_BYTES = 64 * 1024 * 1024
+    MAX_ARCHIVE_CENTRAL_DIRECTORY_BYTES = 8 * 1024 * 1024
+    MAX_ARCHIVE_MEMBERS = 10_000
+    MAX_ARCHIVE_EXPANDED_BYTES = 512 * 1024 * 1024
+    MAX_ARCHIVE_EXPANSION_RATIO = 1_000
+    MAX_ARCHIVE_STREAM_BYTES = 512 * 1024 * 1024
+    MAX_ARCHIVE_NAME_BYTES = 4 * 1024
+    MAX_NPY_HEADER_BYTES = 64 * 1024
+    MAX_NUMPY_MEMBERS = 500
+    MAX_GENBANK_INPUT_BYTES = 32 * 1024 * 1024
+    MAX_GENBANK_RECORDS = 10_000
+    MAX_HDF5_OBJECTS = 2_000
+    MAX_HDF5_DEPTH = 16
+    MAX_RECORD_SCAN_BYTES = 32 * 1024 * 1024
+    MAX_RECORD_SCAN_ROWS = 500_000
+    MAX_TABULAR_SAMPLE_BYTES = 2 * 1024 * 1024
+    MAX_TABULAR_SAMPLE_ROWS = 50
+    MAX_TABULAR_SCAN_BYTES = 64 * 1024 * 1024
+    MAX_TABULAR_SCAN_ROWS = 1_000_000
+    MAX_TABULAR_COLUMNS = 2_000
+    MAX_JSONL_FIRST_ROW_BYTES = 1024 * 1024
+    MAX_LOG_SCAN_BYTES = 64 * 1024 * 1024
+    MAX_LOG_SCAN_ROWS = 1_000_000
+    MAX_LOG_UNIQUE_ERRORS = 500
+    MAX_LOG_SAMPLE_LINE_CHARS = 2_000
+
+    def __init__(self, file_path: str, *, display_path: str | None = None):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
+        file_stat = os.stat(file_path)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("File analyzer inputs must be regular files")
         self.file_path = file_path
-        self.file_size = os.path.getsize(file_path)
-        self.file_extension = os.path.splitext(file_path)[1].lower()
-        self.file_name_lower = os.path.basename(file_path).lower()
+        self.display_path = display_path or file_path
+        self.file_size = int(file_stat.st_size)
+        self.file_identity = (
+            int(file_stat.st_dev),
+            int(file_stat.st_ino),
+            int(file_stat.st_size),
+            int(file_stat.st_mtime_ns),
+        )
+        self.file_extension = os.path.splitext(self.display_path)[1].lower()
+        self.file_name_lower = os.path.basename(self.display_path).lower()
 
         # Dispatch mapping from extension to handler function
         self.handler_map = {
@@ -86,6 +140,7 @@ class FileAnalyzer:
             **{ext: summarize_pdf for ext in self.PDF_EXTENSIONS},
             **{ext: summarize_record_based_data for ext in self.STRUCTURED_RECORD_EXTENSIONS},
             **{ext: summarize_sequence_file for ext in self.SEQUENCE_EXTENSIONS},
+            **{ext: summarize_genbank for ext in self.GENBANK_EXTENSIONS},
             **{ext: summarize_log_file for ext in self.LOG_EXTENSIONS},
             **{ext: summarize_jsonl_file for ext in self.JSONL_EXTENSIONS},
             **{ext: summarize_archive for ext in self.ARCHIVE_EXTENSIONS},
@@ -93,25 +148,61 @@ class FileAnalyzer:
             **{ext: summarize_hdf5 for ext in self.BIO_HDF5_EXTENSIONS},
         }
 
+    def identity_is_current(self) -> bool:
+        try:
+            current = os.stat(self.file_path)
+        except OSError:
+            return False
+        return self.file_identity == (
+            int(current.st_dev),
+            int(current.st_ino),
+            int(current.st_size),
+            int(current.st_mtime_ns),
+        )
+
     def _summarize_hidden_file(self) -> Dict[str, Any]:
         """Special summarizer for hidden files: provide only the last 50 lines for text files."""
         if is_likely_binary(self):
             return summarize_opaque(self)
         
         try:
-            with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
-            
-            num_lines = len(lines)
-            tail_lines = lines[-self.HIDDEN_FILE_TAIL_LINES:] if len(lines) > self.HIDDEN_FILE_TAIL_LINES else lines
-            content_tail = ''.join(tail_lines)
-            
+            if self.file_size <= self.MAX_HIDDEN_SCAN_BYTES:
+                raw = read_bounded_bytes(
+                    self.file_path,
+                    self.MAX_HIDDEN_SCAN_BYTES,
+                    label="hidden text file",
+                )
+                lines = raw.decode("utf-8", errors="replace").splitlines(keepends=True)
+                num_lines: int | str = len(lines)
+                tail_lines = lines[-self.HIDDEN_FILE_TAIL_LINES:]
+                content_tail = ''.join(tail_lines)
+                line_description = f"{num_lines} total lines"
+            else:
+                # A reverse byte window is enough for a useful tail and avoids a
+                # full-file line count.  Drop the first fragment when the window
+                # starts in the middle of a line.
+                with open(self.file_path, "rb") as handle:
+                    handle.seek(-self.MAX_HIDDEN_TAIL_BYTES, os.SEEK_END)
+                    raw = handle.read(self.MAX_HIDDEN_TAIL_BYTES)
+                text = raw.decode("utf-8", errors="replace")
+                first_break = text.find("\n")
+                if first_break >= 0:
+                    text = text[first_break + 1:]
+                tail_lines = text.splitlines(keepends=True)[-self.HIDDEN_FILE_TAIL_LINES:]
+                content_tail = ''.join(tail_lines)
+                num_lines = "not counted (scan limit)"
+                line_description = "total line count omitted by scan limit"
+
             return {
                 "summary_type": "hidden_file_tail",
                 "file_format": self.file_extension.lstrip('.') or 'hidden',
                 "content": content_tail,
                 "total_lines": num_lines,
-                "description": f"Hidden file ({os.path.basename(self.file_path)}). Full content omitted; only last {min(self.HIDDEN_FILE_TAIL_LINES, num_lines)} lines provided ({num_lines} total lines)."
+                "description": (
+                    f"Hidden file ({os.path.basename(self.display_path)}). Full content omitted; "
+                    f"only the last {len(tail_lines)} bounded lines are provided "
+                    f"({line_description})."
+                ),
             }
         except Exception as e:
             return {"summary_type": "error", "error_message": f"Could not read hidden file: {e}"}
@@ -143,11 +234,14 @@ class FileAnalyzer:
                     if summary.get("summary_type") == "_structured_text_internal":
                         try:
                             summary = summarize_structured_text(self, is_likely_structured=summary["is_likely_structured"])
-                        except ValueError: 
-                            summary = summarize_unrecognized_text(self)
+                        except ValueError:
+                            try:
+                                summary = summarize_unrecognized_text(self)
+                            except ResourceLimitError as exc:
+                                summary = limit_error(exc)
 
         base_info = {
-            "file_name": os.path.basename(self.file_path),
+            "file_name": os.path.basename(self.display_path),
             "file_size_bytes": self.file_size
         }
         return {**base_info, **summary}

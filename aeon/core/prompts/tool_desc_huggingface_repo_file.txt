@@ -1,0 +1,7 @@
+Fetch a bounded PUBLIC UTF-8 text file from an exact Hugging Face model repository revision without using browser state or local Hugging Face credentials. Use it for README.md, LICENSE, config.json, tokenizer_config.json, or other small evidence files listed by huggingface_model_info. Binary/oversized files are refused.
+
+Parameters: repo_id, path, revision (default main; prefer the exact SHA returned by model info for stable evidence), and max_chars (1-400000).
+
+Reading and hashing a file proves what bytes were returned for that revision, not that factual claims inside are true. License review must include referenced upstream licenses, acceptable-use terms, and derivative/redistribution conditions.
+
+Example: {"tool_name":"huggingface_repo_file","parameters":{"repo_id":"Qwen/Qwen3-0.6B","path":"LICENSE","revision":"<exact model SHA>"}}

@@ -1,41 +1,41 @@
-CRITICAL: You MUST use this tool for ANY video creation or manipulation request — making a video, animating an image, telling a visual story, putting a character into a scene, extending a clip, or restyling/editing a video. Do NOT write Python, use curl, or call the ComfyUI API yourself.
+CRITICAL: use this tool for every requested video creation, continuation, edit, or final assembly. Do not call ComfyUI or ffmpeg yourself.
 
-Generates or edits high-quality video with the LTX-2.3 22B model via local ComfyUI, saving an .mp4. ComfyUI is auto-started; this works from any directory.
+Generates verified H.264 MP4 video locally and returns it to Nexus as a playable chat attachment. The default `auto` renderer uses uncensored MiniMax H3 / 10Eros-Max NVFP4 with native synchronized stereo audio for ordinary generation, and the mature LTX-2.3 / 10Eros 1.5 Q8 specialist for explicit motion, arbitrary storyboard anchors, continuation, and editing.
 
-Schema:
-  mode (str, required): one of:
-     'text_to_video'  — animate a text prompt from scratch.
-     'image_to_video' — animate a single starting image (init_image) per the prompt.
-     'keyframes'      — STORYBOARD: pin images at chosen frame positions; the model
-                        interpolates/sequences between them. Use for "start as A, end
-                        as B", multi-shot beats, or anchoring a consistent subject.
-     'extend_video'   — continue an existing clip (init_video); seeds from its last frame.
-     'edit_video'     — restyle/edit an existing clip (init_video) at `denoise` strength.
-  prompt (str, required for most modes): detailed visual description; richer is better.
-  output_dir (str, REQUIRED): the DIRECTORY to save the .mp4 in; the file is auto-named for you and its full path is returned. A relative dir resolves against the current workspace; an absolute dir is honored as-is. Use '.' for the current workspace. Do NOT include a filename — pass a directory.
-  init_image (str): path to the start image — for image_to_video.
-  init_video (str): path to the source video — for extend_video / edit_video.
-  keyframes (list): for 'keyframes' mode, a list of {"image": path, "at_frame": int,
-                    "strength": 0..1}. Place anchors across the timeline (frame 0 = start;
-                    use frames up to ~ frames-1). strength 1.0 locks the frame hard.
-  denoise (float, default 0.6): for edit_video — lower keeps more of the original (0.3
-                    light restyle), higher changes more (0.8 heavy).
-  negative_prompt (str): things to avoid.
-  width (int, default 768) / height (int, default 512): auto-rounded to /32.
-  frames (int, default 97): ~4s at 24fps; auto-coerced to 8n+1 (max ~121 per call —
-                    for longer/multi-shot sequences, chain with extend_video).
-  seed (int, default 42).
+Parameters:
+  mode (str, required):
+    - `text_to_video`: create from text.
+    - `image_to_video`: animate `init_image` as the first frame.
+    - `keyframes`: animate ordered image anchors. H3 supports first/last boundaries; LTX supports interior anchors.
+    - `extend_video`: continue from the last frame of `init_video` (LTX).
+    - `edit_video`: restyle/re-render `init_video` at `denoise` strength (LTX).
+    - `concatenate`: assemble 2-20 ordered `input_videos`; no GPU or prompt needed.
+  output_dir (str, required): destination DIRECTORY. Relative paths resolve from the current workspace; the tool chooses a collision-safe filename.
+  prompt (str): the directed scene or H3 audiovisual IR.
+  renderer (str, default `auto`): `auto`, `h3`, or `ltx`. Keep `auto` unless deliberately choosing a tradeoff.
+  init_image (str): source path for `image_to_video`.
+  init_video (str): source path for `extend_video` or `edit_video`.
+  input_videos (list[str]): ordered compatible MP4 clips for `concatenate`.
+  keyframes (list[object]): `{"image": path, "at_frame": int, "strength": 0..1}`. Use frame 0 and `frames-1` for H3 first/last conditioning.
+  denoise (float, default 0.6): LTX edit strength; about 0.3 light, 0.6 balanced, 0.8 heavy.
+  negative_prompt (str): visible failures/exclusions to avoid.
+  width / height (int, default 864x480): divisible by 32. H3 supports up to 1344x768 or 768x1344; LTX is capped to a safe 768x512-area canvas.
+  frames (int, default 124): H3 snaps upward to `17n+5`, 56-362 frames (about 2.3-15.1s). LTX snaps to `8n+1` and caps at 121 (about 5s). Both are 24fps.
+  seed (int, default 42): keep fixed while revising one take.
+  enhance (bool): true forces local model-native prompt compilation, false preserves the exact prompt, omitted compiles terse/unstructured prompts.
 
-Composition guidance (you are the director — chain calls and assets freely):
-  - Consistent character: create or obtain a character image, then reuse that SAME image
-    as a frame-0 keyframe (or init_image) in each shot; or use edit_image to place the
-    character in new scenes, then animate those. Use extend_video to continue across shots.
-  - Storyboard a scene by passing several keyframes; render shot-by-shot and stitch.
-  - For motion that follows a reference, animate from a strong init_image/keyframe.
+For H3, direct one sequence up to 15 seconds with this exact field order:
+  `integrated_multimodal_description: [Shot 1] ...`
+  `overall_soundscape: ...`
+  `non_diegetic_music: ...`
+Write later cuts as `[Shot N] At 00:SS.mmm, the camera cuts to...`; keep times inside the target duration. Describe composition, stable identity, visible action over time, camera motion, synchronized physical sound, and the final state. Format exact dialogue as `<d>[English] words</d>` and keep a stable speaker ID such as `(S1)`. The tool inserts required first/last-frame alignment instructions. A plain prompt still works, but the full IR gives better control.
+
+For LTX, use one continuous untimestamped shot: initial composition, visible motion, performance/environment micro-motion, one camera move, final state, and continuity constraints. This fallback currently produces silent video.
+
+For work over 15 seconds, render complete sequence clips and make `concatenate` the final video call. Reuse literal image anchors for identity. Trust only the successful typed receipt and inspect substantive final work with `analyze_video`.
 
 Examples:
-  Text:      {"tool_name":"generate_video","parameters":{"mode":"text_to_video","prompt":"a neon city at night, flying cars, dynamic camera","output_dir":".","frames":97}}
-  Image:     {"tool_name":"generate_video","parameters":{"mode":"image_to_video","prompt":"the dog sprints across the field","init_image":"dog.png","output_dir":"clips"}}
-  Storyboard:{"tool_name":"generate_video","parameters":{"mode":"keyframes","prompt":"smooth cinematic motion between the moments","keyframes":[{"image":"hero_calm.png","at_frame":0},{"image":"hero_leaping.png","at_frame":96}],"frames":97,"output_dir":"."}}
-  Extend:    {"tool_name":"generate_video","parameters":{"mode":"extend_video","prompt":"the car drives off into the sunset","init_video":"car.mp4","output_dir":"clips"}}
-  Restyle:   {"tool_name":"generate_video","parameters":{"mode":"edit_video","prompt":"same scene in vibrant watercolor","init_video":"clip.mp4","denoise":0.5,"output_dir":"."}}
+  {"tool_name":"generate_video","parameters":{"mode":"text_to_video","prompt":"integrated_multimodal_description: [Shot 1] Live-action medium-wide shot of a courier running through a rain-soaked neon alley while the camera tracks backward; coat and puddles move naturally, ending as she stops beneath a red sign.\n\noverall_soundscape: Fast footsteps splash through puddles beneath steady rain and distant traffic.\n\nnon_diegetic_music: A low electronic pulse accelerates, then stops on the final beat.","output_dir":".","frames":124}}
+  {"tool_name":"generate_video","parameters":{"mode":"image_to_video","prompt":"The dog lowers its shoulders, accelerates across the field, and the camera pans smoothly to follow.","init_image":"dog.png","output_dir":"shots"}}
+  {"tool_name":"generate_video","parameters":{"mode":"keyframes","prompt":"One continuous physically coherent movement from the first pose to the exact final pose, preserving identity, clothing, background, and light.","keyframes":[{"image":"start.png","at_frame":0,"strength":1.0},{"image":"end.png","at_frame":123,"strength":1.0}],"frames":124,"output_dir":"shots"}}
+  {"tool_name":"generate_video","parameters":{"mode":"concatenate","input_videos":["shots/01.mp4","shots/02.mp4"],"output_dir":"."}}

@@ -1,0 +1,2 @@
+- Send only material project input, preserve uncertainty, and do not duplicate a previously accepted handoff.
+- A queued receipt is not proof that the working agent received or acted on the input.

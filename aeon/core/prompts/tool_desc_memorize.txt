@@ -1,10 +1,13 @@
-Saves a key-value pair to your persistent memory. Use this to remember important details, intermediate instructions, summaries of key findings, and long-term plans across your session. 
+Stores a concise non-secret fact with explicit lifetime. Use only when the
+fact will be useful after raw turn history is trimmed.
 
-Organize memories using categories (e.g., 'plan', 'credentials', 'summary', 'context') to keep your memory structured and easy to prune.
+Never store passwords, tokens, cookies, private keys, recovery codes, raw account
+credentials, or secret-bearing text. Nexus credential storage owns those values;
+memory may contain only an opaque credential handle or “integration X is configured.”
 
-Schema:
-key (str, required): A unique identifier for the memory.
-value (str, required): The information to save.
-category (str, optional): The category for this memory. Defaults to 'general'.
-
-Example: {"tool_name": "memorize", "parameters": {"key": "current_step", "value": "Implementing prompt updates", "category": "plan"}}
+Parameters:
+- key (str, required): concise unique name.
+- value (str, required): non-secret factual content.
+- category (str, optional): descriptive grouping; default `general`.
+- scope (str, optional): `task`, `project`, or `preference`; default `task`.
+- ttl_hours (int, optional): 1–8760; omit when no expiry is appropriate.

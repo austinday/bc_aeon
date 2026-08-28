@@ -1,55 +1,87 @@
-import json
 from typing import Dict, Any
 from collections import Counter
-import re
+
+from ..limits import (
+    ResourceLimitError,
+    bounded_binary_readline,
+    limit_error,
+    read_text_prefix,
+    regular_file_stat,
+)
+
+
+def _visit_bounded_lines(analyzer, visitor, *, max_rows=None, max_bytes=None):
+    row_limit = max_rows or analyzer.MAX_RECORD_SCAN_ROWS
+    byte_limit = max_bytes or analyzer.MAX_RECORD_SCAN_BYTES
+    file_size = regular_file_stat(analyzer.file_path).st_size
+    rows = 0
+    scanned = 0
+    with open(analyzer.file_path, "rb") as handle:
+        while rows < row_limit and scanned < byte_limit:
+            remaining = byte_limit - scanned
+            if remaining < analyzer.MAX_TEXT_LINE_BYTES:
+                raw = handle.readline(remaining + 1)
+                if len(raw) > remaining:
+                    break
+            else:
+                raw = bounded_binary_readline(handle, analyzer.MAX_TEXT_LINE_BYTES)
+            if not raw:
+                break
+            if not raw.endswith((b"\n", b"\r")) and handle.tell() < file_size:
+                break
+            rows += 1
+            scanned += len(raw)
+            visitor(raw.decode("utf-8", errors="replace"))
+        truncated = handle.tell() < file_size
+    return rows, scanned, truncated
 
 def summarize_record_based_data(analyzer) -> Dict[str, Any]:
     delimiters = {'.sdf': '$$$$', '.pdb': 'ENDMDL'}
-    # For new protein structure formats, use generic line-based counting or known delimiters if available
-    # .cif uses 'data_' sections, but for simplicity, count lines as approximate records
-    # Omit content_sample for all structure files to avoid including complex data
-    protein_structure_extensions = {'.sdf', '.pdb', '.cif', '.mol2', '.gro', '.mmcif', '.pdbqt', '.ent'}
     try:
-        # Prevent OOM on massive files by returning a basic summary
-        if analyzer.file_size > 50 * 1024 * 1024:  # 50 MB limit
-            return {
-                "summary_type": "structured_record_summary", "file_format": analyzer.file_extension.lstrip('.'),
-                "record_count": "Unknown (File too large)", "record_delimiter": delimiters.get(analyzer.file_extension, 'N/A'),
-                "description": f"Large {analyzer.file_extension.lstrip('.')} file ({analyzer.file_size / 1024 / 1024:.1f} MB). Content omitted to save memory."
-            }
+        record_count = 0
+        content_since_delimiter = False
 
-        with open(analyzer.file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        if analyzer.file_extension in protein_structure_extensions:
-            if analyzer.file_extension in delimiters:
-                delimiter = delimiters[analyzer.file_extension]
-                records = [r for r in content.split(delimiter) if r.strip()]
-                record_count = len(records)
-            else:
-                # Generic counting for .cif, .mol2, etc. (e.g., lines or sections)
-                if analyzer.file_extension == '.cif':
-                    # Approximate records by counting 'data_' or '_atom_site' lines
-                    record_count = len(re.findall(r'^data_|^_atom_site', content, re.MULTILINE))
+        def visit(line):
+            nonlocal record_count, content_since_delimiter
+            stripped = line.strip()
+            if not stripped:
+                return
+            if analyzer.file_extension == ".sdf":
+                if stripped == "$$$$":
+                    record_count += 1
+                    content_since_delimiter = False
                 else:
-                    # Fallback: approximate by non-empty lines or fixed estimate
-                    record_count = sum(1 for line in content.splitlines() if line.strip())
-            return {
-                "summary_type": "structured_record_summary", "file_format": analyzer.file_extension.lstrip('.'),
-                "record_count": record_count, "record_delimiter": delimiters.get(analyzer.file_extension, 'N/A'),
-                "description": f"Complex protein structure file ({analyzer.file_extension.lstrip('.')}). Content omitted to save context space; only metadata provided."
-            }
-        else:
-            # Original logic for non-structure record files
-            delimiter = delimiters.get(analyzer.file_extension, '$$$$')
-            records = [r for r in content.split(delimiter) if r.strip()]
-            sample_content = delimiter.join(records[:2])
-            if len(records) > 2:
-                sample_content += f'\n{delimiter} ...and more'
-            return {
-                "summary_type": "structured_record_summary", "file_format": analyzer.file_extension.lstrip('.'),
-                "record_count": len(records), "record_delimiter": delimiter, "content_sample": sample_content,
-                "description": f"File with record-based data. A sample of the first 2 records is provided."
-            }
+                    content_since_delimiter = True
+            elif analyzer.file_extension == ".pdb":
+                if stripped.startswith("ENDMDL"):
+                    record_count += 1
+                    content_since_delimiter = False
+                else:
+                    content_since_delimiter = True
+            elif analyzer.file_extension in {".cif", ".mmcif"}:
+                if stripped.startswith(("data_", "_atom_site")):
+                    record_count += 1
+            else:
+                record_count += 1
+
+        _rows, scanned, truncated = _visit_bounded_lines(analyzer, visit)
+        if content_since_delimiter and not truncated:
+            record_count += 1
+        record_value = f">={record_count:,}" if truncated else record_count
+        return {
+            "summary_type": "structured_record_summary",
+            "file_format": analyzer.file_extension.lstrip('.'),
+            "record_count": record_value,
+            "record_delimiter": delimiters.get(analyzer.file_extension, 'N/A'),
+            "scan_truncated": truncated,
+            "bytes_scanned": scanned,
+            "description": (
+                f"Bounded metadata summary for a {analyzer.file_extension.lstrip('.')} "
+                "structure file; content omitted."
+            ),
+        }
+    except ResourceLimitError as e:
+        return limit_error(e)
     except Exception as e:
         return {"summary_type": "error", "error_message": str(e)}
 
@@ -57,9 +89,10 @@ def summarize_sequence_file(analyzer) -> Dict[str, Any]:
     """Summarizes FASTA/FASTQ-like files by reading a small chunk from the beginning."""
     headers = []
     try:
-        with open(analyzer.file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            # Read a sample chunk to avoid processing huge files with single long lines
-            sample_content = f.read(analyzer.MAX_FASTA_SAMPLE_BYTES)
+        # Read a byte-bounded prefix to avoid processing huge single-line data.
+        sample_content, omitted = read_text_prefix(
+            analyzer.file_path, analyzer.MAX_FASTA_SAMPLE_BYTES
+        )
         
         lines = sample_content.splitlines()
         
@@ -79,6 +112,7 @@ def summarize_sequence_file(analyzer) -> Dict[str, Any]:
                 "file_format": analyzer.file_extension.lstrip('.'),
                 "records_in_sample": non_empty_lines,
                 "header_sample": [],
+                "sample_truncated": omitted,
                 "description": description
             }
 
@@ -87,6 +121,7 @@ def summarize_sequence_file(analyzer) -> Dict[str, Any]:
             "file_format": analyzer.file_extension.lstrip('.'),
             "sequences_in_sample": sequence_count_in_sample,
             "header_sample": headers,
+            "sample_truncated": omitted,
             "description": f"A summary of the first {analyzer.MAX_FASTA_SAMPLE_BYTES:,} bytes of the file. A sample of headers is provided for FASTA/FASTQ-like files."
         }
     except Exception as e:
@@ -97,22 +132,25 @@ def summarize_gene_annotation(analyzer) -> Dict[str, Any]:
     try:
         comments, data_sample = [], []
         feature_counts = Counter()
-        with open(analyzer.file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            for i, line in enumerate(f):
-                if i >= analyzer.MAX_GENE_ANNOTATION_SAMPLE_LINES:
-                    break
-                if line.startswith('##'):
-                    if len(comments) < 20:
-                        comments.append(line.strip())
-                    continue
-                if line.startswith('#') or not line.strip():
-                    continue
-                if len(data_sample) < 5:
-                    data_sample.append(line.strip())
-                
-                parts = line.strip().split('\t')
-                if len(parts) > 2:
-                    feature_counts[parts[2]] += 1
+
+        def visit(line):
+            if line.startswith('##'):
+                if len(comments) < 20:
+                    comments.append(line.strip())
+                return
+            if line.startswith('#') or not line.strip():
+                return
+            if len(data_sample) < 5:
+                data_sample.append(line.strip())
+            parts = line.strip().split('\t')
+            if len(parts) > 2:
+                feature_counts[parts[2]] += 1
+
+        rows, scanned, truncated = _visit_bounded_lines(
+            analyzer,
+            visit,
+            max_rows=analyzer.MAX_GENE_ANNOTATION_SAMPLE_LINES,
+        )
 
         return {
             "summary_type": "gene_annotation_summary",
@@ -120,7 +158,12 @@ def summarize_gene_annotation(analyzer) -> Dict[str, Any]:
             "header_comments": comments,
             "feature_counts": dict(feature_counts.most_common(20)),
             "data_sample": "\n".join(data_sample),
+            "rows_scanned": rows,
+            "bytes_scanned": scanned,
+            "scan_truncated": truncated,
             "description": f"Summary of the first {analyzer.MAX_GENE_ANNOTATION_SAMPLE_LINES:,} lines of a gene annotation file, showing feature counts."
         }
+    except ResourceLimitError as e:
+        return limit_error(e)
     except Exception as e:
         return {"summary_type": "error", "error_message": str(e)}

@@ -8,10 +8,13 @@ problem summary supplied to this tool and has no tools or execution authority.
 from __future__ import annotations
 
 import fcntl
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -21,8 +24,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import openai
+import httpx
 
 from .base import BaseTool
+from .command_fleet_guard import (
+    require_fleet_low_priority_wrapper,
+    scrubbed_fleet_command_environment,
+)
 
 
 _ENV_SECRET_RE = re.compile(r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.I)
@@ -149,7 +157,7 @@ class ExternalExpertConfig:
             return f"{model} ({self.reasoning_effort})"
         return model
 
-    def problem(self) -> str | None:
+    def problem(self, *, require_executable_identity: bool = True) -> str | None:
         if not self.enabled:
             return "external expert access is disabled"
         if self.backend not in {"api", "codex", "claude", "gemini"}:
@@ -168,14 +176,64 @@ class ExternalExpertConfig:
             executable = self.executable or shutil.which(self.backend)
             if not executable:
                 return f"the official {self.backend} CLI is not installed"
+            if require_executable_identity:
+                try:
+                    requested = Path(executable).expanduser()
+                    resolved = requested.resolve(strict=True)
+                    metadata = resolved.stat()
+                except (OSError, RuntimeError):
+                    return f"the official {self.backend} CLI identity is unavailable"
+                if (
+                    requested.name != self.backend
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid not in {0, os.geteuid()}
+                    or metadata.st_mode & 0o022
+                    or not os.access(resolved, os.X_OK)
+                ):
+                    return f"the official {self.backend} CLI identity is unsafe"
             return None
         if not self.model:
             return "AEON_EXTERNAL_EXPERT_MODEL is not configured"
         parsed = urlparse(self.base_url)
-        if not self.base_url or not parsed.hostname:
+        if (
+            not self.base_url
+            or not self.base_url.isascii()
+            or any(ord(character) < 33 for character in self.base_url)
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
             return "AEON_EXTERNAL_EXPERT_BASE_URL is not a valid URL"
-        if parsed.scheme != "https" and not self.allow_insecure_http:
+        try:
+            endpoint_port = parsed.port
+        except ValueError:
+            return "AEON_EXTERNAL_EXPERT_BASE_URL is not a valid URL"
+        if parsed.scheme != "https" or endpoint_port not in {None, 443}:
             return "the external expert endpoint must use HTTPS"
+        hostname = parsed.hostname.lower()
+        try:
+            literal = ipaddress.ip_address(hostname)
+        except ValueError:
+            labels = hostname.split(".")
+            if (
+                len(labels) < 2
+                or hostname.endswith((".local", ".localhost", ".internal"))
+                or any(
+                    not label
+                    or len(label) > 63
+                    or not re.fullmatch(
+                        r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label
+                    )
+                    for label in labels
+                )
+            ):
+                return "the external expert endpoint must be a public DNS origin"
+        else:
+            if not literal.is_global:
+                return "the external expert endpoint must not use a local/private address"
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", self.api_key_env):
             return "AEON_EXTERNAL_EXPERT_API_KEY_ENV is not a valid environment name"
         if not os.environ.get(self.api_key_env):
@@ -319,6 +377,7 @@ class ConsultExternalExpertTool(BaseTool):
     ):
         self.worker = worker
         self.config = config or ExternalExpertConfig.from_env()
+        self._uses_default_client = client_factory is None
         self.client_factory = client_factory or self._client
         self.command_runner = command_runner or subprocess.run
         self.local_reviewer = local_reviewer
@@ -346,7 +405,36 @@ class ConsultExternalExpertTool(BaseTool):
             base_url=base_url,
             timeout=timeout,
             max_retries=0,
+            http_client=httpx.Client(
+                trust_env=False,
+                follow_redirects=False,
+                timeout=timeout,
+            ),
         )
+
+    def _resolved_endpoint_problem(self) -> str | None:
+        """Reject production API DNS that resolves into owner/local networks."""
+
+        parsed = urlparse(self.config.base_url)
+        try:
+            answers = socket.getaddrinfo(
+                parsed.hostname,
+                443,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )
+        except (OSError, TypeError, ValueError):
+            return "the external expert endpoint DNS identity is unavailable"
+        addresses = set()
+        for answer in answers:
+            try:
+                addresses.add(ipaddress.ip_address(answer[4][0]))
+            except (IndexError, TypeError, ValueError):
+                return "the external expert endpoint DNS response is invalid"
+        if not addresses or any(not address.is_global for address in addresses):
+            return "the external expert endpoint DNS includes a local/private address"
+        return None
 
     def _worker_is_stuck(self) -> bool:
         if not self.worker:
@@ -380,12 +468,25 @@ class ConsultExternalExpertTool(BaseTool):
         return True, reason
 
     def _cli_environment(self) -> dict:
-        """Drop unrelated secrets before starting a subscription-backed CLI."""
+        """Drop unrelated secrets and all inherited local-compute authority."""
         environment = {}
-        for key, value in os.environ.items():
+        # Subscription-backed advisers are an external-provider route.  They must
+        # not inherit the principal's Fleet ticket/claim selectors or accelerator
+        # visibility simply because the CLI happens to be launched as its child.
+        # This is defense in depth around the CLIs' own no-tool/read-only modes.
+        source = scrubbed_fleet_command_environment(os.environ)
+        for key, value in source.items():
             if _ENV_SECRET_RE.search(key):
                 continue
             environment[key] = value
+        for key in (
+            "DBUS_SESSION_BUS_ADDRESS",
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "PYTHONHOME",
+            "PYTHONPATH",
+        ):
+            environment.pop(key, None)
         # Claude's official long-lived subscription token is allowed only for
         # Claude, whose tool set is explicitly empty below.
         oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
@@ -499,13 +600,20 @@ class ConsultExternalExpertTool(BaseTool):
             stdin_text = user_prompt
         elif backend == "gemini":
             args = [
-                executable, "--prompt", prompt, "--output-format", "json",
+                executable, "--prompt", "", "--output-format", "json",
                 "--approval-mode", "plan",
             ]
             if self.config.model:
                 args.extend(["--model", self.config.model])
+            # Gemini combines piped stdin with --prompt. Keep the disclosure out
+            # of argv/process listings just like the Codex and Claude adapters.
+            stdin_text = prompt
         else:
             raise RuntimeError(f"unsupported CLI backend: {backend}")
+
+        # Subscription CLIs are still owner work. Keep them expendable to Vast
+        # renters and ensure the child never inherits local Fleet/GPU authority.
+        args = [require_fleet_low_priority_wrapper(), *args]
 
         try:
             runner_kwargs = {
@@ -576,7 +684,12 @@ class ConsultExternalExpertTool(BaseTool):
         question: str,
         sensitivity: str = "public",
     ) -> str:
-        config_problem = self.config.problem()
+        # Test doubles deliberately use synthetic executable paths. Production
+        # calls must prove the configured official CLI's on-disk identity before
+        # any prompt or budget state is touched.
+        config_problem = self.config.problem(
+            require_executable_identity=self.command_runner is subprocess.run
+        )
         if config_problem:
             return f"Error: External expert unavailable: {config_problem}."
         if not self.config.allow_early and not self._worker_is_stuck():
@@ -624,6 +737,10 @@ class ConsultExternalExpertTool(BaseTool):
                 "budget was consumed. Continue troubleshooting with the local "
                 "uncensored model."
             )
+        if self.config.backend == "api" and self._uses_default_client:
+            endpoint_problem = self._resolved_endpoint_problem()
+            if endpoint_problem:
+                return f"Error: External expert unavailable: {endpoint_problem}."
         estimated_tokens = (len(user_prompt) + 3) // 4 + self.config.max_output_tokens
         try:
             call_id = self.budget.reserve(estimated_tokens)

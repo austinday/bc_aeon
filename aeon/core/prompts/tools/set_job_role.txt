@@ -1,0 +1,1 @@
+Use set_job_role only after the user explicitly requests a Job Role change for the current Nexus session. Never use it to weaken higher-priority instructions or safety policy. Pass job_role for a session-only override, or use_default=true without job_role to restore the shared default. The changed role is loaded on the next model turn.

@@ -1,4 +1,3 @@
-Sends a message to the user. Use for conversational responses, progress updates, asking clarifying questions, or reporting results. If you expect a response, you MUST include the "get_user_input" action immediately after "say_to_user" in the SAME actions array. If your message fully resolves the objective, include "task_complete" immediately after. Do not leave the agent hanging without a terminal action. 
-Schema:
-  message (str, required): The message text to display to the user.
-Example: {"tool_name": "say_to_user", "parameters": {"message": "Analysis complete. Found 3 issues."}}
+Legacy compatibility capability, hidden from the protocol-v2 model tool set.
+Visible responses use the turn envelope directly: `final` for a terminal response
+or `ask_user` for one question followed by a yield.
