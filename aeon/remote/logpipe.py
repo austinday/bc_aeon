@@ -10,10 +10,14 @@ from pathlib import Path
 
 def stream_to_log(path: Path, max_bytes: int = 50 * 1024 * 1024) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    input_fd = sys.stdin.buffer.fileno()
     output = None
     try:
         while True:
-            chunk = sys.stdin.buffer.read(65536)
+            # BufferedReader.read(size) may wait for ``size`` bytes while tmux's
+            # pipe remains open.  Read the pipe descriptor directly so even a
+            # small burst becomes visible in the live terminal log immediately.
+            chunk = os.read(input_fd, 65536)
             if not chunk:
                 break
             if output is None:

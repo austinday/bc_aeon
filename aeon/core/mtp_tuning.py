@@ -6,6 +6,11 @@ runtime profile. Candidates must produce the intended Aeon tool call under the
 real turn schema, remain deterministic across repeated requests, and complete a
 large enough sample. The selected candidate must also clear Aeon's measured
 single-stream decode-throughput floor.
+
+The packaged selection is the immutable, complete v5 sweep. Later single-depth
+regression reports may confirm that its selected K still passes a newer harness,
+but they are separate release evidence and cannot be represented as a new
+K=0..4 selection.
 """
 from __future__ import annotations
 
@@ -21,6 +26,18 @@ SELECTION_POLICY = "max_median_decode_tps_among_semantic_deterministic_prefer_lo
 MAX_RELEASE_K = 4
 MIN_RELEASE_REQUESTS_PER_K = 12
 MIN_SELECTED_DECODE_TPS = 100.0
+
+# Provenance of the complete K=0..4 sweep packaged in
+# ``data/qwen38_mtp_selection.json``.  The current benchmark source may advance
+# independently for single-depth release regressions; replacing these values
+# requires a new complete sweep, not merely a fresh K=3 report.
+PACKAGED_SELECTION_SUITE_VERSION = "aeon-agent-mtp-suite-v5-deterministic-control"
+PACKAGED_SELECTION_SUITE_SHA256 = (
+    "b5a95dc8deb63d4081d56e1d149c6ab796cad1a23427877bad1695f9a8dd41d7"
+)
+PACKAGED_SELECTION_BENCHMARK_SCRIPT_SHA256 = (
+    "5ff91e92592e4b7d8718c8ea87f4cd0793cbb340862b87e0fd654db647056e98"
+)
 
 
 class MtpSelectionError(ValueError):
@@ -80,6 +97,9 @@ def validate_selection_manifest(data: Dict, *, expected_entry: str,
                                 expected_image_id: Optional[str] = None,
                                 expected_attention_backend: Optional[str] = None,
                                 expected_kv_cache_dtype: Optional[str] = None,
+                                expected_suite_version: Optional[str] = None,
+                                expected_suite_sha256: Optional[str] = None,
+                                expected_benchmark_script_sha256: Optional[str] = None,
                                 max_k: int = MAX_RELEASE_K) -> int:
     """Validate and return selected K, raising ``MtpSelectionError`` on doubt."""
     if not isinstance(data, dict):
@@ -92,6 +112,31 @@ def validate_selection_manifest(data: Dict, *, expected_entry: str,
         raise MtpSelectionError("MTP selection is for a different catalog entry")
     if data.get("selection_policy") != SELECTION_POLICY:
         raise MtpSelectionError("unexpected MTP selection policy")
+
+    suite_version = data.get("suite_version")
+    suite_sha256 = data.get("suite_sha256")
+    benchmark_script_sha256 = data.get("benchmark_script_sha256")
+    if not isinstance(suite_version, str) or not suite_version:
+        raise MtpSelectionError("MTP selection has no benchmark-suite version")
+    for value, label in (
+        (suite_sha256, "benchmark-suite"),
+        (benchmark_script_sha256, "benchmark-script"),
+    ):
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise MtpSelectionError(f"MTP selection has no valid {label} SHA-256")
+    if expected_suite_version and suite_version != expected_suite_version:
+        raise MtpSelectionError("MTP selection used a different benchmark suite")
+    if expected_suite_sha256 and suite_sha256 != expected_suite_sha256:
+        raise MtpSelectionError("MTP selection benchmark-suite identity changed")
+    if (
+        expected_benchmark_script_sha256
+        and benchmark_script_sha256 != expected_benchmark_script_sha256
+    ):
+        raise MtpSelectionError("MTP selection benchmark-script identity changed")
 
     artifact = data.get("artifact") or {}
     if expected_model_build_sha256 and (

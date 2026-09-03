@@ -23,13 +23,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+from .prompts import FLEET_SAFETY_INSTRUCTIONS, load_prompt
+
 
 RUNTIME_INSTRUCTIONS_ENV = "AEON_INSTANCE_INSTRUCTIONS_FILE"
 RUNTIME_INSTRUCTIONS_FILENAME = "runtime-instructions.json"
 PROVIDER_INSTRUCTIONS_FILENAME = "provider-instructions.txt"
 GROK_AGENT_PROFILE_FILENAME = "grok-agent-profile.md"
 RUNTIME_INSTRUCTIONS_SCHEMA = 1
-MAX_INSTRUCTION_LAYER_BYTES = 64 * 1024
+MAX_INSTRUCTION_LAYER_BYTES = 512 * 1024
 # JSON may expand permitted control characters to six-byte ``\uXXXX`` escapes.
 MAX_RUNTIME_INSTRUCTIONS_BYTES = MAX_INSTRUCTION_LAYER_BYTES * 12 + 32 * 1024
 MAX_PROVIDER_INSTRUCTIONS_BYTES = MAX_INSTRUCTION_LAYER_BYTES * 2 + 4 * 1024
@@ -39,7 +41,6 @@ _AGENT_KINDS = frozenset({"aeon", "codex", "claude", "grok"})
 _PROVIDER_KINDS = frozenset({"codex", "claude", "grok"})
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-
 
 class RuntimeInstructionError(RuntimeError):
     """A private instruction snapshot could not be safely written or read."""
@@ -457,7 +458,14 @@ def format_runtime_instruction_layers(layers: RuntimeInstructionLayers) -> str:
     """Render exact bodies as provider-neutral, truthfully labelled sections."""
 
     validated = _revalidate_layers(layers)
-    sections: list[str] = []
+    sections: list[str] = [load_prompt("fleet_safety_instructions.txt")]
+    default_job_role = load_prompt("default_job_role.txt").strip()
+    if default_job_role:
+        sections.append(
+            "**NEXUS DEFAULT JOB ROLE**\n"
+            "This is the shared default role for managed agents.\n"
+            f"{default_job_role}"
+        )
     if validated.profile_content:
         sections.append(
             "**NEXUS LOCALLY KNOWN INSTRUCTION PROFILE**\n"

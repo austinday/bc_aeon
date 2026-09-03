@@ -1,0 +1,25 @@
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -177,6 +177,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+ 
+         # Alias for better readability
+         self.draft_runner = self.draft_worker.model_runner
++        self.init_token_map()
++        self.init_lm_head()
++        self._lm_head_shared = True
+         self._init_dsa_index_share_state()
+         # Eager draft-extend seed buffer (graph paths use their own static ones).
+         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
+@@ -202,8 +205,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+             req_to_token_pool=req_to_token_pool,
+             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+         )
+-        self.init_token_map()
+-        self.init_lm_head()
++        if not getattr(self, "_lm_head_shared", False):
++            self.init_token_map()
++            self.init_lm_head()
+ 
+         if get_spec().speculative_use_rejection_sampling:
+             target_vocab_size = self.target_worker.model_config.vocab_size

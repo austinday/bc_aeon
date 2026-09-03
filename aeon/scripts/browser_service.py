@@ -882,6 +882,57 @@ def retire_stopped_service() -> dict:
         os.close(descriptor)
 
 
+def replace_current_service() -> tuple[dict, dict]:
+    """Replace only the exact receipted service with the current image release.
+
+    The prior container is stopped and retained. This operation never lists,
+    discovers, removes, or adopts a container; both the stop and retirement are
+    bound to the immutable service receipt under the normal lifecycle lock.
+    """
+
+    token = _prepare_service_state()
+    _secure_directory(RETIRED_SERVICE_ROOT)
+    release = _load_current_image_release()
+    descriptor = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if CREATE_INTENT_PATH.exists() or PENDING_CID_PATH.exists():
+            raise BrowserServiceError(
+                "cannot replace a browser service with an unsettled create transaction"
+            )
+        receipt = _load_service_receipt()
+        if receipt is None:
+            raise BrowserServiceError("no current browser service receipt exists")
+        if (
+            receipt["image_id"] == release["image_id"]
+            and receipt["source_sha256"] == release["source_sha256"]
+        ):
+            raise BrowserServiceError(
+                "browser service already uses the current image release"
+            )
+        document = _inspect_container(receipt["container_id"])
+        running = _validate_container(document, receipt)
+        if running:
+            result = _docker(
+                ["container", "stop", "--time", "30", receipt["container_id"]],
+                timeout=60,
+            )
+            if result.returncode != 0:
+                raise BrowserServiceError(
+                    "Docker refused to stop the exact browser container"
+                )
+            document = _inspect_container(receipt["container_id"])
+        _validate_retirement_identity(document, receipt)
+        retired = _retire_stopped_service_locked()
+        replacement = _ensure_service_locked(token)
+        if replacement["container_id"] == retired["container_id"]:
+            raise BrowserServiceError("browser replacement reused the retired container")
+        return retired, replacement
+    finally:
+        os.close(descriptor)
+
+
 def _healthy(service_id: str, token: str) -> bool:
     if SERVICE_ID_RE.fullmatch(service_id) is None:
         return False
@@ -1034,6 +1085,10 @@ def _parser() -> argparse.ArgumentParser:
         help="archive an exact stopped service receipt without deleting its container",
     )
     subparsers.add_parser(
+        "replace-current",
+        help="replace the exact receipted service with the current image release",
+    )
+    subparsers.add_parser(
         "migrate-legacy-cuda-sentinel",
         help="replace only the exact running legacy CUDA -1 service",
     )
@@ -1060,6 +1115,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "Stopped browser service receipt retired: "
                 f"service={receipt['service_id']}"
+            )
+        elif command == "replace-current":
+            retired, replacement = replace_current_service()
+            print(
+                "Browser service replaced: "
+                f"retired={retired['service_id']} "
+                f"replacement={replacement['service_id']}"
             )
         elif command == "migrate-legacy-cuda-sentinel":
             retired, replacement = migrate_legacy_cuda_sentinel()

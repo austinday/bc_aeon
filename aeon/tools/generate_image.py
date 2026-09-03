@@ -1,27 +1,60 @@
 import os
-import json
+import re
 import time
 import random
+import uuid
+from collections.abc import Mapping
+from numbers import Real
+from urllib.parse import urlparse
+
 import requests
-import subprocess
 from .base import BaseTool
-from ..core.prompts import TOOL_DESC_GENERATE_IMAGE, TOOL_DESC_EDIT_IMAGE
-from ..core.gpu_queue import (
-    current_lease,
-    heartbeat_vram,
-    release_vram,
-    wait_for_vram,
+from ..core.fleet_backend import (
+    DEFAULT_BROKER_SOCKET,
+    FleetBackendError,
+    FleetBrokerClient,
 )
+from ..core.prompts import TOOL_DESC_GENERATE_IMAGE, TOOL_DESC_EDIT_IMAGE
 from ..core.prompt_enhancer import enhance_prompt
 from ..core.paths import resolve_output_dir
 
-FLEET_LOW_PRIORITY = "/home/aday/bin/fleet-low-priority"
+_COMFY_SERVICE_ID = "aeon-comfyui"
+_COMFY_TICKET_ID = re.compile(r"^fd-[0-9a-f]{32}$")
+_COMFY_TICKET_TTL_SECONDS = 900
+_COMFY_WAIT_TIMEOUT_SECONDS = 1800
+_COMFY_RENEW_INTERVAL_SECONDS = 300
+_LOCAL_HTTP_KWARGS = {
+    "allow_redirects": False,
+    "proxies": {"http": "", "https": ""},
+}
 
 class ComfyUITool(BaseTool):
-    """Base class for tools using ComfyUI to handle VRAM and registry management."""
+    """Base class for one-call, broker-owned ComfyUI service sessions."""
+    COMFY_SERVICE_ID = _COMFY_SERVICE_ID
+    COMFY_TICKET_TTL_SECONDS = _COMFY_TICKET_TTL_SECONDS
+    COMFY_WAIT_TIMEOUT_SECONDS = _COMFY_WAIT_TIMEOUT_SECONDS
+    COMFY_RENEW_INTERVAL_SECONDS = _COMFY_RENEW_INTERVAL_SECONDS
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.comfy_url = "http://localhost:8188"
+        self.comfy_url = "http://127.0.0.1:8188"
+        self._fleet_ticket_id = None
+        self._fleet_consumer_id = None
+
+    @staticmethod
+    def _new_fleet_consumer() -> str:
+        """Return an invocation-unique consumer identity for one media demand."""
+
+        return f"aeon/tool/comfy/{os.getpid()}/{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _fleet_client() -> FleetBrokerClient:
+        """Use Aeon's ACL-validating client for the owner-only Fleet socket."""
+
+        socket_path = os.environ.get(
+            "AEON_FLEET_SOCKET", str(DEFAULT_BROKER_SOCKET)
+        )
+        return FleetBrokerClient(socket_path, timeout=15)
 
     @staticmethod
     def _norm_dim(value, default=1024, lo=256, hi=2048, multiple=16):
@@ -47,189 +80,257 @@ class ComfyUITool(BaseTool):
 
     def _check_comfyui_health(self):
         try:
-            res = requests.get(f"{self.comfy_url}/system_stats", timeout=2)
-            return res.status_code == 200
-        except requests.exceptions.RequestException:
+            response = requests.get(
+                f"{self.comfy_url}/system_stats",
+                timeout=(2, 10),
+                **_LOCAL_HTTP_KWARGS,
+            )
+            if response.status_code != 200 or len(response.content) > 2 * 1024 * 1024:
+                return False
+            return isinstance(response.json(), dict)
+        except (ValueError, requests.exceptions.RequestException):
             return False
 
-    def _manage_registry(self, action: str):
-        """Manage active users and reap only Aeon's exact labeled container."""
-        import fcntl
-        registry_path = "/tmp/aeon_comfyui_registry.json"
-        lock_path = "/tmp/aeon_comfyui_registry.lock"
-        pid = os.getpid()
-        
-        with open(lock_path, 'w') as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            try:
-                if os.path.exists(registry_path):
-                    with open(registry_path, 'r') as f:
-                        state = json.load(f)
-                else:
-                    state = {"pids": []}
-            except (json.JSONDecodeError, EOFError):
-                state = {"pids": []}
-                
-            # Clean up dead PIDs
-            cleaned_pids = []
-            for p in state.get("pids", []):
-                try:
-                    os.kill(p, 0)
-                    cleaned_pids.append(p)
-                except OSError:
-                    pass
-            state["pids"] = cleaned_pids
-                    
-            if action == 'register':
-                if pid not in state["pids"]:
-                    state["pids"].append(pid)
-            elif action == 'unregister':
-                if pid in state["pids"]:
-                    state["pids"].remove(pid)
-            elif action == 'reap_if_idle':
-                # Atomic under the registry lock: if NO comfy op is in flight
-                # (across every agent/tool), free the shared container's VRAM.
-                # Registering happens under this same lock, so a starting op
-                # either bumps the count before we check (we skip) or starts a
-                # fresh container after our teardown (clean) — no half-dead race.
-                if not state["pids"]:
-                    label = subprocess.run(
-                        ["docker", "inspect", "-f",
-                         "{{ index .Config.Labels \"com.bc_aeon.component\" }}",
-                         "aeon_comfyui"], capture_output=True, text=True)
-                    if label.returncode == 0 and label.stdout.strip() != "comfyui":
-                        raise RuntimeError(
-                            "Refusing to remove an aeon_comfyui container without "
-                            "the bc_aeon ownership label."
-                        )
-                    if label.returncode == 0:
-                        stopped = subprocess.run(
-                            ["docker", "rm", "-f", "aeon_comfyui"],
-                            capture_output=True, text=True)
-                        if stopped.returncode != 0:
-                            raise RuntimeError(stopped.stderr.strip() or "Could not stop ComfyUI")
-                    remains = subprocess.run(
-                        ["docker", "inspect", "aeon_comfyui"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    state["reaped"] = remains.returncode != 0
-                else:
-                    state["reaped"] = False
+    @staticmethod
+    def _validate_comfy_endpoint(value) -> str:
+        """Accept only a credential-free loopback HTTP origin for ComfyUI."""
 
-            reaped = state.pop("reaped", False)
-            with open(registry_path, 'w') as f:
-                json.dump(state, f)
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 512
+            or any(
+                character.isspace()
+                or ord(character) < 0x20
+                or ord(character) == 0x7F
+                for character in value
+            )
+        ):
+            raise RuntimeError("Fleet returned an invalid ComfyUI endpoint")
+        parsed = urlparse(value)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise RuntimeError("Fleet returned an invalid ComfyUI endpoint") from exc
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "::1"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.params
+            or parsed.path.rstrip("/") != ""
+            or port is None
+            or port < 1024
+            or port > 65535
+        ):
+            raise RuntimeError("Fleet returned a non-loopback ComfyUI endpoint")
+        canonical = (
+            f"http://[::1]:{port}"
+            if parsed.hostname == "::1"
+            else f"http://127.0.0.1:{port}"
+        )
+        if value not in {canonical, canonical + "/"}:
+            raise RuntimeError("Fleet returned a non-canonical ComfyUI endpoint")
+        return canonical
 
-            count = len(state["pids"])
-            if action == 'reap_if_idle':
-                return count, reaped
-            return count, None
+    @classmethod
+    def _validate_active_ticket(
+        cls, value, *, expected_ticket_id=None, expected_consumer=None
+    ):
+        """Validate the complete sanitized proof for one active demand ticket."""
+
+        if not isinstance(value, Mapping):
+            raise RuntimeError("Fleet returned a malformed ComfyUI ticket")
+        ticket_id = value.get("ticket_id")
+        if not isinstance(ticket_id, str) or _COMFY_TICKET_ID.fullmatch(ticket_id) is None:
+            raise RuntimeError("Fleet returned an invalid ComfyUI ticket ID")
+        if expected_ticket_id is not None and ticket_id != expected_ticket_id:
+            raise RuntimeError("Fleet returned status for a different ComfyUI ticket")
+        if expected_consumer is not None and value.get("consumer") != expected_consumer:
+            raise RuntimeError("Fleet changed the ComfyUI demand consumer identity")
+        if (
+            value.get("profile_id") != cls.COMFY_SERVICE_ID
+            or value.get("service_id") != cls.COMFY_SERVICE_ID
+            or value.get("state") != "active"
+        ):
+            raise RuntimeError("Fleet returned an inconsistent ComfyUI demand")
+        compute_state = value.get("compute_state")
+        endpoint = value.get("endpoint")
+        if compute_state == "waiting_for_compute":
+            if endpoint is not None:
+                raise RuntimeError("Fleet exposed an endpoint before ComfyUI was ready")
+            return ticket_id, compute_state, None
+        if compute_state == "ready":
+            return ticket_id, compute_state, cls._validate_comfy_endpoint(endpoint)
+        raise RuntimeError("Fleet returned an unknown ComfyUI compute state")
+
+    @classmethod
+    def _validate_release_proof(
+        cls, value, *, expected_ticket_id: str, expected_consumer: str
+    ):
+        if (
+            not isinstance(value, Mapping)
+            or value.get("ticket_id") != expected_ticket_id
+            or value.get("profile_id") != cls.COMFY_SERVICE_ID
+            or value.get("service_id") != cls.COMFY_SERVICE_ID
+            or value.get("consumer") != expected_consumer
+            or value.get("state") != "released"
+            or value.get("compute_state") != "inactive"
+            or value.get("endpoint") is not None
+        ):
+            raise RuntimeError("Fleet did not prove exact ComfyUI ticket release")
+        return {"state": "released", "compute_state": "inactive"}
 
     def _finish_comfy_session(self):
-        """Drop our slot, then stop and release only after the last caller exits."""
-        import fcntl
-        with open("/tmp/aeon_comfyui_start.lock", 'w') as start_fd:
-            fcntl.flock(start_fd, fcntl.LOCK_EX)
-            self._manage_registry('unregister')
-            _, reaped = self._manage_registry('reap_if_idle')
-            if reaped and current_lease():
-                release_vram("Aeon ComfyUI container stopped after final tool call")
-                print(f"{self.C_CYAN}ComfyUI stopped and its coordinator lease was released."
-                      f"{self.C_RESET}")
-
-    def _reap_if_idle(self):
-        """Tear down the shared container iff no Comfy operation is in flight."""
-        try:
-            _, reaped = self._manage_registry('reap_if_idle')
-            if reaped and current_lease():
-                release_vram("Aeon ComfyUI container stopped while idle")
-        except Exception:
-            pass
-
-    @staticmethod
-    def _container_pid():
-        result = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Pid}}", "aeon_comfyui"],
-            capture_output=True, text=True)
-        if result.returncode != 0:
+        """Release this call's opaque ticket and require exact terminal proof."""
+        ticket_id = self._fleet_ticket_id
+        if not ticket_id:
+            # No ticket was ever bound, so any provisional consumer belongs to a
+            # rejected/cross-wired acquisition and carries no release authority.
+            self._fleet_consumer_id = None
             return None
+        consumer = self._fleet_consumer_id
+        if not isinstance(consumer, str) or not consumer:
+            raise RuntimeError("ComfyUI Fleet consumer identity is unavailable")
         try:
-            return int(result.stdout.strip())
-        except ValueError:
-            return None
+            response = self._fleet_client().release_service(ticket_id)
+        except FleetBackendError as exc:
+            # Keep the exact ID so a later cleanup attempt cannot acquire a new
+            # ticket while ownership of this one is unresolved.
+            raise RuntimeError("Fleet could not release the ComfyUI ticket") from exc
+        proof = self._validate_release_proof(
+            response,
+            expected_ticket_id=ticket_id,
+            expected_consumer=consumer,
+        )
+        self._fleet_ticket_id = None
+        self._fleet_consumer_id = None
+        self.comfy_url = "http://127.0.0.1:8188"
+        return proof
+
+    def _bind_acquired_comfy_ticket(self, value, *, consumer: str) -> str:
+        """Retain only an acquisition proven to belong to this consumer/service."""
+
+        if not isinstance(value, Mapping):
+            raise RuntimeError("Fleet returned a malformed ComfyUI ticket")
+        ticket_id = value.get("ticket_id")
+        if (
+            not isinstance(ticket_id, str)
+            or _COMFY_TICKET_ID.fullmatch(ticket_id) is None
+        ):
+            raise RuntimeError("Fleet returned an invalid ComfyUI ticket ID")
+        if value.get("consumer") != consumer:
+            raise RuntimeError("Fleet returned an unowned ComfyUI demand consumer")
+        if (
+            value.get("profile_id") != self.COMFY_SERVICE_ID
+            or value.get("service_id") != self.COMFY_SERVICE_ID
+        ):
+            raise RuntimeError("Fleet returned an unowned ComfyUI service identity")
+        self._fleet_ticket_id = ticket_id
+        return ticket_id
+
+    def _renew_comfy_ticket(self, *, require_ready: bool = False):
+        if not self._fleet_ticket_id:
+            raise RuntimeError("ComfyUI Fleet ticket is unavailable")
+        ticket_id = self._fleet_ticket_id
+        consumer = self._fleet_consumer_id
+        if not isinstance(consumer, str) or not consumer:
+            raise RuntimeError("ComfyUI Fleet consumer identity is unavailable")
+        response = self._fleet_client().renew_service(
+            ticket_id, ttl_seconds=self.COMFY_TICKET_TTL_SECONDS
+        )
+        _, compute_state, endpoint = self._validate_active_ticket(
+            response,
+            expected_ticket_id=ticket_id,
+            expected_consumer=consumer,
+        )
+        if require_ready:
+            if compute_state != "ready":
+                raise RuntimeError("Fleet-managed ComfyUI capacity is no longer ready")
+            if endpoint != self.comfy_url:
+                raise RuntimeError("Fleet changed the ComfyUI endpoint during an active job")
+        return response
 
     def _ensure_comfyui_running(self, required_vram: float = 20.0):
-        """Ensure the SHARED ComfyUI is up, safely under concurrent agents.
-
-        Concurrency rules that keep multiple agents from crashing each other:
-          - If it's already healthy, USE IT AS-IS. Never restart a running server
-            (that would kill other agents' in-flight jobs) and never reserve VRAM
-            again (its memory is already accounted for by the live container).
-          - If it needs starting, do so under a cross-process START lock so only
-            ONE agent runs start_comfyui.sh; the rest block, then find it healthy.
-        """
-        self._manage_registry('register')
-
-        # Fast path: reuse only when its live coordinator lease can be refreshed.
-        if self._check_comfyui_health():
-            heartbeat_vram(self._container_pid(), "Aeon reused healthy ComfyUI")
-            return True
-
-        import fcntl
-        with open("/tmp/aeon_comfyui_start.lock", 'w') as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)  # serialize starts across all agents
-            # Someone may have started it while we waited for the lock.
-            if self._check_comfyui_health():
-                heartbeat_vram(self._container_pid(), "Aeon reused healthy ComfyUI")
-                return True
-
-            print(f"{self.C_CYAN}Requesting a coordinator-approved, hard-capped "
-                  f"{required_vram:g}GB ComfyUI lease on .177...{self.C_RESET}")
-            if not os.path.isfile(FLEET_LOW_PRIORITY) or not os.access(
-                FLEET_LOW_PRIORITY, os.X_OK
-            ):
-                raise RuntimeError(
-                    f"Renter-yielding launcher is unavailable: {FLEET_LOW_PRIORITY}"
-                )
-            lease = wait_for_vram(required_vram)
-
-            placement = ("shared with Qwen under independent hard caps"
-                         if lease.get("shared_with_qwen") else "separate tool placement")
-            print(f"{self.C_CYAN}Starting ComfyUI on leased UUID {lease['gpu_uuid']} "
-                  f"({placement})...{self.C_RESET}")
-            script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "start_comfyui.sh"))
-            env = os.environ.copy()
-            env["AEON_HOME"] = os.environ.get("AEON_HOME", os.path.expanduser("~/.aeon"))
-            env["GPU_AGENT_CLAIM_ID"] = lease["claim_id"]
-            env["CUDA_VISIBLE_DEVICES"] = lease["gpu_uuid"]
-            env["GPU_MEM_LIMIT_GB"] = f"{lease['vram_budget_gb']:g}"
-            env["GPU_RESERVE_GB"] = "6"
-            res = subprocess.run(
-                [FLEET_LOW_PRIORITY, "bash", script_path],
-                capture_output=True,
-                text=True,
-                env=env,
+        """Acquire the broker-managed ComfyUI service and wait durably for compute."""
+        if (
+            isinstance(required_vram, bool)
+            or not isinstance(required_vram, Real)
+            or not 0 < float(required_vram) <= 40
+        ):
+            raise RuntimeError("requested ComfyUI workload exceeds the reviewed 40 GB profile")
+        if self._fleet_ticket_id is not None or self._fleet_consumer_id is not None:
+            raise RuntimeError("a previous ComfyUI Fleet ticket is still unresolved")
+        try:
+            consumer = self._new_fleet_consumer()
+            self._fleet_consumer_id = consumer
+            response = self._fleet_client().acquire_service(
+                profile=self.COMFY_SERVICE_ID,
+                consumer=consumer,
+                idempotency_key=f"{self.COMFY_SERVICE_ID}/{uuid.uuid4().hex}",
+                ttl_seconds=self.COMFY_TICKET_TTL_SECONDS,
             )
-            if res.returncode != 0:
-                release_vram("ComfyUI launch failed before a GPU process started")
-                raise RuntimeError(f"Error starting ComfyUI: {res.stderr}")
+            # A valid-looking ID is not ownership proof. Bind only after the
+            # exact consumer and reviewed service identities match; an ambiguous
+            # cross-wired ID is left to its bounded Fleet TTL.
+            raw_ticket_id = self._bind_acquired_comfy_ticket(
+                response, consumer=consumer
+            )
+            self._validate_active_ticket(
+                response,
+                expected_ticket_id=raw_ticket_id,
+                expected_consumer=consumer,
+            )
 
-            print(f"{self.C_CYAN}Waiting for ComfyUI to become healthy...{self.C_RESET}")
-            for _ in range(90):  # up to ~180s for a cold container + first boot
-                if self._check_comfyui_health():
-                    heartbeat_vram(self._container_pid(), "Aeon ComfyUI started and is healthy")
-                    return True
+            print(
+                f"{self.C_CYAN}Waiting for Fleet-managed ComfyUI capacity "
+                f"({float(required_vram):g}GB operation)...{self.C_RESET}"
+            )
+            deadline = time.monotonic() + self.COMFY_WAIT_TIMEOUT_SECONDS
+            next_renewal = time.monotonic() + self.COMFY_RENEW_INTERVAL_SECONDS
+            while time.monotonic() < deadline:
+                status = self._fleet_client().service_status(raw_ticket_id)
+                _, compute_state, endpoint = self._validate_active_ticket(
+                    status,
+                    expected_ticket_id=raw_ticket_id,
+                    expected_consumer=consumer,
+                )
+                if compute_state == "ready":
+                    self.comfy_url = endpoint
+                    if self._check_comfyui_health():
+                        return True
+                if time.monotonic() >= next_renewal:
+                    self._renew_comfy_ticket()
+                    next_renewal = time.monotonic() + self.COMFY_RENEW_INTERVAL_SECONDS
                 time.sleep(2)
-            subprocess.run(["docker", "rm", "-f", "aeon_comfyui"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            release_vram("ComfyUI failed its startup health check and was stopped")
-            raise RuntimeError("Error: ComfyUI failed to become healthy after starting.")
+            raise RuntimeError(
+                "Fleet did not provide safe ComfyUI capacity within 30 minutes"
+            )
+        except BaseException:
+            if self._fleet_ticket_id is not None:
+                try:
+                    self._finish_comfy_session()
+                except BaseException as release_error:
+                    raise RuntimeError(
+                        "ComfyUI acquisition failed and Fleet did not prove exact ticket release"
+                    ) from release_error
+            else:
+                # The response never proved that a ticket belonged to this
+                # invocation. Leave any cross-wired ID to broker TTL, but clear
+                # the provisional local identity so a future call can proceed.
+                self._fleet_consumer_id = None
+            raise
 
     def _prompt_in_queue(self, prompt_id: str) -> bool:
         """Is our prompt still running or pending in ComfyUI's queue? Used to tell
         'legitimately waiting behind another agent's job' from 'lost'. On a
         transient error we assume still-queued (patience over a false failure)."""
         try:
-            q = requests.get(f"{self.comfy_url}/queue", timeout=10).json()
+            q = requests.get(
+                f"{self.comfy_url}/queue", timeout=10, **_LOCAL_HTTP_KWARGS
+            ).json()
         except requests.RequestException:
             return True
         for key in ("queue_running", "queue_pending"):
@@ -249,10 +350,14 @@ class ComfyUITool(BaseTool):
         missing = 0
         while time.time() - start < hard_timeout:
             if time.time() >= next_heartbeat:
-                heartbeat_vram(self._container_pid(), f"Aeon ComfyUI job {prompt_id} is active")
+                self._renew_comfy_ticket(require_ready=True)
                 next_heartbeat = time.time() + 300
             try:
-                hist = requests.get(f"{self.comfy_url}/history/{prompt_id}", timeout=10).json()
+                hist = requests.get(
+                    f"{self.comfy_url}/history/{prompt_id}",
+                    timeout=10,
+                    **_LOCAL_HTTP_KWARGS,
+                ).json()
             except requests.RequestException:
                 time.sleep(2)
                 continue
@@ -275,7 +380,12 @@ class ComfyUITool(BaseTool):
     def _upload_image(self, abs_path: str) -> str:
         """Upload a local image to ComfyUI and return the server-side filename."""
         with open(abs_path, "rb") as f:
-            r = requests.post(f"{self.comfy_url}/upload/image", files={"image": f}, timeout=30)
+            r = requests.post(
+                f"{self.comfy_url}/upload/image",
+                files={"image": f},
+                timeout=30,
+                **_LOCAL_HTTP_KWARGS,
+            )
         if r.status_code != 200:
             raise RuntimeError(f"Failed to upload image to ComfyUI: {r.text[:200]}")
         return r.json()["name"]
@@ -287,7 +397,7 @@ class ComfyUITool(BaseTool):
             "filename": info["filename"],
             "subfolder": info.get("subfolder", ""),
             "type": info.get("type", "output"),
-        }, timeout=timeout)
+        }, timeout=timeout, **_LOCAL_HTTP_KWARGS)
         if r.status_code != 200:
             raise RuntimeError(f"Failed to download output from ComfyUI (HTTP {r.status_code}).")
         with open(dest, "wb") as f:
@@ -386,8 +496,6 @@ class GenerateImageTool(ComfyUITool):
         os.makedirs(os.path.dirname(abs_output_path) or ".", exist_ok=True)
 
         try:
-            # Register this agent as an active user and ensure server is running on allocated VRAM
-            self._manage_registry('register')
             self._ensure_comfyui_running(required_vram=24.0)
 
             seed = random.randint(1, 0xffffffffffffffff)
@@ -418,7 +526,12 @@ class GenerateImageTool(ComfyUITool):
                     prompt=prompt, guidance=3.5, seed=seed)
 
             print(f"{self.C_CYAN}Submitting image generation workflow to ComfyUI...{self.C_RESET}")
-            req = requests.post(f"{self.comfy_url}/prompt", json={"prompt": workflow}, timeout=5)
+            req = requests.post(
+                f"{self.comfy_url}/prompt",
+                json={"prompt": workflow},
+                timeout=5,
+                **_LOCAL_HTTP_KWARGS,
+            )
             if req.status_code != 200:
                 return f"Error submitting workflow to ComfyUI: {req.text}"
             
@@ -433,10 +546,8 @@ class GenerateImageTool(ComfyUITool):
             return self.format_error_message(e, "generating image via ComfyUI", "checking if ComfyUI is running correctly")
         
         finally:
-            # Keep ComfyUI warm across a burst of ops, reap it once idle (see
-            # _finish_comfy_session). Fixes the per-call teardown that cold-started
-            # the ~20GB model on every image, while still freeing VRAM for other
-            # tools when image work stops.
+            # Release only this invocation's opaque demand. Fleet decides whether
+            # the shared service remains warm for other callers.
             self._finish_comfy_session()
 
 
@@ -487,8 +598,6 @@ class EditImageTool(ComfyUITool):
         os.makedirs(os.path.dirname(abs_output_path) or ".", exist_ok=True)
 
         try:
-            # Register this agent as an active user and ensure server is running on allocated VRAM
-            self._manage_registry('register')
             self._ensure_comfyui_running(required_vram=40.0)
 
             n_imgs = 1 + len(extra_paths)
@@ -543,7 +652,12 @@ class EditImageTool(ComfyUITool):
                 workflow[nid] = {"class_type": "LoadImage", "inputs": {"image": nm}}
 
             print(f"{self.C_CYAN}Submitting image edit workflow to ComfyUI...{self.C_RESET}")
-            req = requests.post(f"{self.comfy_url}/prompt", json={"prompt": workflow}, timeout=5)
+            req = requests.post(
+                f"{self.comfy_url}/prompt",
+                json={"prompt": workflow},
+                timeout=5,
+                **_LOCAL_HTTP_KWARGS,
+            )
             if req.status_code != 200:
                 return f"Error submitting workflow to ComfyUI: {req.text}"
             
@@ -558,7 +672,6 @@ class EditImageTool(ComfyUITool):
             return self.format_error_message(e, "editing image via ComfyUI", "checking if ComfyUI is running correctly")
         
         finally:
-            # Warm across bursts, reap when idle (see _finish_comfy_session): the
-            # per-call teardown cold-started the model on every edit and caused the
-            # same "server unreachable" timeout loop.
+            # Release only this invocation's opaque demand. Fleet owns runtime
+            # warmth, teardown, and all coordinator claims.
             self._finish_comfy_session()

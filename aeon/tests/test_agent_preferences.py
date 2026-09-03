@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sqlite3
 import tempfile
 import time
@@ -16,7 +17,12 @@ from unittest.mock import patch
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 
-from aeon.core.model_catalog import QWEN38_MODEL_NAME
+from aeon.core.model_identity import AEON_DEFAULT_MODEL_NAME
+from aeon.harnesses.catalog import (
+    DEFAULT_HARNESS_ID,
+    LEGACY_AEON_HARNESS_ID,
+    OPENCODE_HARNESS_ID,
+)
 from aeon.remote.app import create_app
 from aeon.remote.instances import InstanceError, InstanceLaunchError, InstanceManager
 from aeon.remote.instruction_profiles import InstructionProfileService
@@ -46,6 +52,49 @@ class AgentPreferenceFixture(RemoteFixture):
 
 
 class TestAgentPreferenceStore(AgentPreferenceFixture):
+    def test_harness_defaults_and_applied_snapshot_are_independent(self):
+        terminal = self.terminal("Harness settings")
+        initial = self.store.get_harness_setting(terminal["id"])
+        self.assertEqual(initial["desired_harness"], DEFAULT_HARNESS_ID)
+        self.assertIsNone(initial["applied_harness"])
+        with self.store._connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM instance_harness_settings "
+                    "WHERE instance_id=?",
+                    (terminal["id"],),
+                ).fetchone()[0],
+                0,
+            )
+
+        historical = self.store.mark_harness_setting_applied(
+            terminal["id"], LEGACY_AEON_HARNESS_ID
+        )
+        self.assertEqual(historical["desired_harness"], DEFAULT_HARNESS_ID)
+        self.assertEqual(
+            historical["applied_harness"], LEGACY_AEON_HARNESS_ID
+        )
+        self.store.put_harness_setting(
+            terminal["id"], LEGACY_AEON_HARNESS_ID
+        )
+        changed = self.store.put_harness_setting(
+            terminal["id"], OPENCODE_HARNESS_ID
+        )
+        self.assertEqual(changed["desired_harness"], OPENCODE_HARNESS_ID)
+        self.assertEqual(
+            changed["applied_harness"], LEGACY_AEON_HARNESS_ID
+        )
+
+        with self.assertRaises(ValueError):
+            self.store.put_harness_setting(terminal["id"], "arbitrary-harness")
+        self.store.delete_instance(terminal["id"])
+        with self.store._connect() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM instance_harness_settings WHERE instance_id=?",
+                (terminal["id"],),
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_desired_and_applied_are_independent_and_delete_cascades(self):
         terminal = self.terminal()
         initial = self.store.get_agent_setting(terminal["id"], "codex")
@@ -152,6 +201,9 @@ class TestAgentPreferenceStore(AgentPreferenceFixture):
             self.assertEqual(value["desired_model"], "sonnet")
             self.assertEqual(value["desired_effort"], "high")
             self.assertIsNone(value["applied_model"])
+            harness = restarted.get_harness_setting("legacy-terminal")
+            self.assertEqual(harness["desired_harness"], OPENCODE_HARNESS_ID)
+            self.assertIsNone(harness["applied_harness"])
 
     def test_all_missing_rows_have_reviewed_defaults_without_read_side_effects(self):
         terminal = self.terminal()
@@ -159,7 +211,15 @@ class TestAgentPreferenceStore(AgentPreferenceFixture):
         self.assertEqual(set(payload["settings"]), {"aeon", "codex", "claude", "grok"})
         self.assertEqual(
             payload["settings"]["aeon"]["desired"]["model"],
-            QWEN38_MODEL_NAME,
+            AEON_DEFAULT_MODEL_NAME,
+        )
+        self.assertEqual(
+            payload["settings"]["aeon"]["desired"]["harness"],
+            OPENCODE_HARNESS_ID,
+        )
+        self.assertEqual(
+            {item["id"] for item in payload["settings"]["aeon"]["catalog"]["harnesses"]},
+            {OPENCODE_HARNESS_ID, LEGACY_AEON_HARNESS_ID},
         )
         self.assertFalse(payload["settings"]["aeon"]["model_editable"])
         self.assertTrue(payload["settings"]["aeon"]["pending"])
@@ -169,6 +229,12 @@ class TestAgentPreferenceStore(AgentPreferenceFixture):
         with self.store._connect() as conn:
             count = conn.execute(
                 "SELECT COUNT(*) FROM instance_agent_settings WHERE instance_id=?",
+                (terminal["id"],),
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+        with self.store._connect() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM instance_harness_settings WHERE instance_id=?",
                 (terminal["id"],),
             ).fetchone()[0]
         self.assertEqual(count, 0)
@@ -210,7 +276,65 @@ class TestAgentPreferenceAPI(AgentPreferenceFixture):
             body = initial.json()
             self.assertEqual(body["selected_kind"], "aeon")
             self.assertIn("catalog", body["settings"]["codex"])
+            self.assertEqual(
+                body["settings"]["aeon"]["desired"]["harness"],
+                OPENCODE_HARNESS_ID,
+            )
+            self.assertIsNone(body["settings"]["aeon"]["applied"])
+            self.assertIn("harnesses", body["settings"]["aeon"]["catalog"])
             self.assertNotIn("argv", json.dumps(body))
+
+            aeon_update = client.put(
+                route,
+                headers={
+                    "Origin": "http://testserver",
+                    "X-CSRF-Token": csrf,
+                },
+                json={
+                    "kind": "aeon",
+                    "model": AEON_DEFAULT_MODEL_NAME,
+                    "effort": "",
+                    "harness": LEGACY_AEON_HARNESS_ID,
+                },
+            )
+            self.assertEqual(aeon_update.status_code, 200, aeon_update.text)
+            self.assertEqual(
+                aeon_update.json()["settings"]["aeon"]["desired"]["harness"],
+                LEGACY_AEON_HARNESS_ID,
+            )
+
+            omitted_harness = client.put(
+                route,
+                headers={
+                    "Origin": "http://testserver",
+                    "X-CSRF-Token": csrf,
+                },
+                json={
+                    "kind": "aeon",
+                    "model": AEON_DEFAULT_MODEL_NAME,
+                    "effort": "",
+                },
+            )
+            self.assertEqual(omitted_harness.status_code, 200)
+            self.assertEqual(
+                omitted_harness.json()["settings"]["aeon"]["desired"]["harness"],
+                LEGACY_AEON_HARNESS_ID,
+            )
+
+            invalid_harness = client.put(
+                route,
+                headers={
+                    "Origin": "http://testserver",
+                    "X-CSRF-Token": csrf,
+                },
+                json={
+                    "kind": "aeon",
+                    "model": AEON_DEFAULT_MODEL_NAME,
+                    "effort": "",
+                    "harness": "unreviewed-harness",
+                },
+            )
+            self.assertEqual(invalid_harness.status_code, 400)
 
             mutation = {
                 "kind": "codex",
@@ -252,6 +376,21 @@ class TestAgentPreferenceAPI(AgentPreferenceFixture):
             )
             self.assertEqual(rejected.status_code, 400)
 
+            wrong_kind_harness = client.put(
+                route,
+                headers={
+                    "Origin": "http://testserver",
+                    "X-CSRF-Token": csrf,
+                },
+                json={
+                    "kind": "codex",
+                    "model": "gpt-5.6-terra",
+                    "effort": "high",
+                    "harness": LEGACY_AEON_HARNESS_ID,
+                },
+            )
+            self.assertEqual(wrong_kind_harness.status_code, 400)
+
         audit = self.store.recent_audit(1)[0]
         self.assertEqual(audit["action"], "agent_settings_updated")
         self.assertEqual(
@@ -259,6 +398,68 @@ class TestAgentPreferenceAPI(AgentPreferenceFixture):
             {"kind", "changed", "apply_mode"},
         )
         self.assertNotIn("gpt-5.6", audit["details_json"])
+
+    def test_continuous_mode_api_is_authenticated_csrf_guarded_and_validated(self):
+        app = create_app(
+            self.config,
+            store=self.store,
+            manager=self.manager,
+            auth=self.auth,
+        )
+        route = f"/api/instances/{self.terminal_record['id']}/continuous-mode"
+        with TestClient(app) as client:
+            self.assertEqual(client.get(route).status_code, 401)
+            login = client.post(
+                "/api/login",
+                headers={"Origin": "http://testserver"},
+                json={"username": "admin", "password": self.password},
+            )
+            csrf = login.json()["csrf_token"]
+            initial = client.get(route)
+            self.assertEqual(initial.status_code, 200)
+            self.assertFalse(initial.json()["enabled"])
+
+            missing_csrf = client.put(
+                route,
+                headers={"Origin": "http://testserver"},
+                json={"enabled": True, "goal": "keep improving this project"},
+            )
+            self.assertEqual(missing_csrf.status_code, 403)
+            rejected = client.put(
+                route,
+                headers={
+                    "Origin": "http://testserver",
+                    "X-CSRF-Token": csrf,
+                },
+                json={"enabled": True, "goal": "two words"},
+            )
+            self.assertEqual(rejected.status_code, 400)
+            updated = client.put(
+                route,
+                headers={
+                    "Origin": "http://testserver",
+                    "X-CSRF-Token": csrf,
+                },
+                json={"enabled": True, "goal": "keep improving this project"},
+            )
+            self.assertEqual(updated.status_code, 200, updated.text)
+            self.assertTrue(updated.json()["enabled"])
+            self.assertEqual(updated.json()["goal"], "keep improving this project")
+
+        audit = self.store.recent_audit(1)[0]
+        self.assertEqual(audit["action"], "continuous_mode_updated")
+        details = json.loads(audit["details_json"])
+        self.assertEqual(
+            set(details),
+            {
+                "enabled",
+                "goal_present",
+                "live_wake",
+                "turn_stop_acknowledged",
+                "idle_restart",
+            },
+        )
+        self.assertNotIn("keep improving", audit["details_json"])
 
 
 class TestAgentPreferenceLaunch(AgentPreferenceFixture):
@@ -560,9 +761,46 @@ class TestAgentPreferenceLaunch(AgentPreferenceFixture):
         agent = self.manager.activate_agent(
             terminal["id"], kind="aeon", actor="admin"
         )
-        self.assertIn(f"--model {QWEN38_MODEL_NAME}", self.fake.loaded_payloads[-1])
-        self.assertEqual(agent["applied_agent_model"], QWEN38_MODEL_NAME)
+        self.assertIn(
+            f"--model {shlex.quote(AEON_DEFAULT_MODEL_NAME)}",
+            self.fake.loaded_payloads[-1],
+        )
+        self.assertIn(
+            "aeon.harnesses.opencode_runtime", self.fake.loaded_payloads[-1]
+        )
+        self.assertEqual(agent["applied_agent_model"], AEON_DEFAULT_MODEL_NAME)
+        self.assertEqual(agent["agent_harness"], OPENCODE_HARNESS_ID)
+        self.assertEqual(agent["applied_agent_harness"], OPENCODE_HARNESS_ID)
         self.assertFalse(agent["agent_settings_pending"])
+
+    def test_legacy_harness_preference_controls_launch_and_applied_truth(self):
+        terminal = self.terminal("Legacy Aeon harness")
+        self.manager.update_agent_settings(
+            terminal["id"],
+            kind="aeon",
+            model=AEON_DEFAULT_MODEL_NAME,
+            effort="",
+            harness=LEGACY_AEON_HARNESS_ID,
+            actor="admin",
+        )
+        agent = self.manager.activate_agent(
+            terminal["id"], kind="aeon", actor="admin"
+        )
+        command = self.fake.loaded_payloads[-1]
+        self.assertIn("aeon.main", command)
+        self.assertNotIn("aeon.harnesses.opencode_runtime", command)
+        setting = self.manager.get_agent_settings(terminal["id"])["settings"][
+            "aeon"
+        ]
+        self.assertEqual(
+            setting["desired"]["harness"], LEGACY_AEON_HARNESS_ID
+        )
+        self.assertEqual(
+            setting["applied"]["harness"], LEGACY_AEON_HARNESS_ID
+        )
+        self.assertTrue(setting["current_process_verified"])
+        self.assertFalse(setting["pending"])
+        self.assertEqual(agent["applied_agent_harness"], LEGACY_AEON_HARNESS_ID)
 
     def test_failed_start_preserves_previous_applied_and_instruction_binding(self):
         instruction_service = InstructionProfileService(
@@ -692,6 +930,34 @@ class TestAgentPreferenceLaunch(AgentPreferenceFixture):
         self.assertEqual(setting["applied_scope"], "current_process")
         self.assertEqual(setting["apply_mode"], "current_start")
 
+    def test_aeon_harness_receipt_recovers_after_registry_interruption(self):
+        terminal = self.terminal("Harness receipt recovery")
+        with patch.object(
+            self.store,
+            "mark_harness_setting_applied",
+            side_effect=RuntimeError("simulated harness registry interruption"),
+        ):
+            with self.assertRaises(InstanceLaunchError) as raised:
+                self.manager.activate_agent(
+                    terminal["id"], kind="aeon", actor="admin"
+                )
+        self.assertTrue(raised.exception.launched)
+        pending = (
+            self.config.instance_state_dir
+            / terminal["id"]
+            / "managed-agent.pending.json"
+        )
+        self.assertTrue(pending.is_file())
+
+        recovered = self.manager.get_instance(terminal["id"])
+        self.assertEqual(recovered["applied_agent_harness"], OPENCODE_HARNESS_ID)
+        self.assertFalse(recovered["agent_settings_pending"])
+        self.assertEqual(recovered["last_error"], "")
+        self.assertFalse(pending.exists())
+        setting = self.manager.get_agent_settings(terminal["id"])["settings"]["aeon"]
+        self.assertEqual(setting["applied"]["harness"], OPENCODE_HARNESS_ID)
+        self.assertTrue(setting["current_process_verified"])
+
     def test_stored_applied_snapshot_becomes_historical_outside_verified_process(self):
         terminal = self.terminal("Historical settings")
         active = self.manager.activate_agent(
@@ -710,6 +976,25 @@ class TestAgentPreferenceLaunch(AgentPreferenceFixture):
         self.assertEqual(historical["applied_scope"], "historical")
         self.assertEqual(historical["apply_mode"], "last_verified")
         self.assertIsNotNone(historical["applied"])
+
+    def test_running_preference_without_harness_receipt_stays_historical(self):
+        terminal = self.terminal("Pre-harness running Aeon")
+        active = self.manager.activate_agent(
+            terminal["id"], kind="aeon", actor="admin"
+        )
+        with self.store._connect() as conn:
+            conn.execute(
+                "DELETE FROM instance_harness_settings WHERE instance_id=?",
+                (active["id"],),
+            )
+
+        setting = self.manager.get_agent_settings(active["id"])["settings"]["aeon"]
+        self.assertEqual(setting["desired"]["harness"], OPENCODE_HARNESS_ID)
+        self.assertEqual(setting["applied"]["harness"], None)
+        self.assertFalse(setting["current_process_verified"])
+        self.assertEqual(setting["applied_scope"], "historical")
+        self.assertEqual(setting["apply_mode"], "last_verified")
+        self.assertTrue(setting["pending"])
 
     def test_live_agent_reports_next_start_after_desired_setting_changes(self):
         terminal = self.terminal("Pending next start")
@@ -765,7 +1050,7 @@ class TestAgentPreferenceLaunch(AgentPreferenceFixture):
         self.store.mark_agent_setting_applied(
             active["id"],
             "aeon",
-            model=QWEN38_MODEL_NAME,
+            model=AEON_DEFAULT_MODEL_NAME,
             effort="",
         )
         with self.store._connect() as conn:

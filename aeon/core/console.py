@@ -226,6 +226,12 @@ class ConsoleInput:
                         _thread.interrupt_main()
                     continue
                 except Exception:
+                    # A broken prompt-toolkit terminal or closed input stream
+                    # can fail persistently. Fall back to the simpler reader and
+                    # back off so the daemon thread cannot hot-loop at 100% CPU
+                    # while delivering no user input.
+                    self._use_pt = False
+                    time.sleep(0.2)
                     continue
                 finally:
                     with self._cond:

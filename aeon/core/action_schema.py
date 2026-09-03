@@ -55,7 +55,7 @@ def _action_schema(entries: list[tuple[str, dict]]) -> Dict:
                 "parameters": {"type": "object", "additionalProperties": True},
                 "goal_refs": goal_refs,
             },
-            "required": ["tool_name", "parameters", "goal_refs"],
+            "required": ["tool_name", "parameters"],
             "additionalProperties": False,
         }
     branches = []
@@ -68,7 +68,10 @@ def _action_schema(entries: list[tuple[str, dict]]) -> Dict:
                     "parameters": parameters,
                     "goal_refs": deepcopy(goal_refs),
                 },
-                "required": ["tool_name", "parameters", "goal_refs"],
+                # Goal IDs are an optional precision hint.  Evidence ownership is
+                # inferred from the typed tool receipt when they are omitted, so
+                # the model does not have to operate harness bookkeeping.
+                "required": ["tool_name", "parameters"],
                 "additionalProperties": False,
             }
         )

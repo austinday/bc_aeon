@@ -39,12 +39,8 @@ fi
 
 echo "Starting ComfyUI container..."
 if docker inspect aeon_comfyui >/dev/null 2>&1; then
-    existing_label="$(docker inspect -f '{{ index .Config.Labels "com.bc_aeon.component" }}' aeon_comfyui)"
-    if [ "$existing_label" != "comfyui" ]; then
-        echo "ERROR: refusing to replace an aeon_comfyui container not labeled as bc_aeon-owned." >&2
-        exit 3
-    fi
-    docker rm -f aeon_comfyui >/dev/null
+    echo "ERROR: refusing to replace an existing container; Fleet must reconcile its exact runtime identity." >&2
+    exit 3
 fi
 
 echo "Using leased GPU UUID: ${CUDA_VISIBLE_DEVICES} (cap ${GPU_MEM_LIMIT_GB}GB)"

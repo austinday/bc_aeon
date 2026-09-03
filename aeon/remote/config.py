@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
 
-from aeon.core.model_catalog import QWEN38_MODEL_NAME
+from aeon.core.model_identity import AEON_DEFAULT_MODEL_NAME
 
 
 _DIRECTORY_OPEN_FLAGS = (
@@ -161,7 +161,7 @@ class RemoteConfig:
     # its single-screen password/OIDC flow in the task-owned service unit.
     require_totp: bool = True
     allow_insecure_http: bool = False
-    default_model: str = QWEN38_MODEL_NAME
+    default_model: str = AEON_DEFAULT_MODEL_NAME
     coordinator_path: Path = Path("/home/aday/website_hosting/gpu_coord.py")
     coordinator_cwd: Path = Path("/home/aday/website_hosting/ads")
     expected_coordinator_host: str = "DAY2RTX6000PRO"
@@ -232,8 +232,10 @@ class RemoteConfig:
             ),
             require_totp=not _truthy(os.environ.get("AEON_REMOTE_DISABLE_TOTP")),
             allow_insecure_http=_truthy(os.environ.get("AEON_REMOTE_INSECURE_HTTP")),
-            default_model=os.environ.get("AEON_REMOTE_MODEL", QWEN38_MODEL_NAME).strip()
-            or QWEN38_MODEL_NAME,
+            default_model=os.environ.get(
+                "AEON_REMOTE_MODEL", AEON_DEFAULT_MODEL_NAME
+            ).strip()
+            or AEON_DEFAULT_MODEL_NAME,
             coordinator_path=Path(
                 os.environ.get(
                     "AEON_REMOTE_GPU_COORD", "/home/aday/website_hosting/gpu_coord.py"

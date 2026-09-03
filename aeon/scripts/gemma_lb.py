@@ -16,8 +16,8 @@ CONTEXT_LIMIT_NODE1 = 89984
 CHAR_PER_TOKEN = 4
 HEALTH_CHECK_INTERVAL = 30  # seconds
 IDLE_SHUTDOWN_TIMEOUT = 300  # 5 minutes of no requests -> shutdown nodes
-START_SCRIPT_NODE0 = "/home/aday/bc_aeon/scripts/debug/start_gemma_node0.sh"
-START_SCRIPT_NODE1 = "/home/aday/bc_aeon/scripts/debug/start_gemma_node1.sh"
+START_SCRIPT_NODE0 = "/home/aday/NexusAgentDashboard/bc_aeon/scripts/debug/start_gemma_node0.sh"
+START_SCRIPT_NODE1 = "/home/aday/NexusAgentDashboard/bc_aeon/scripts/debug/start_gemma_node1.sh"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("gemma-lb")
@@ -26,7 +26,9 @@ app = FastAPI()
 client = httpx.AsyncClient(
     timeout=None,
     limits=httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=30.0),
-    http2=False
+    http2=False,
+    trust_env=False,
+    follow_redirects=False,
 )
 
 active_requests = {NODE0_URL: 0, NODE1_URL: 0}

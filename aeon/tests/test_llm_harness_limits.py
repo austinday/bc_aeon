@@ -79,11 +79,11 @@ def test_llm_client_installs_concise_production_token_budgets():
     with patch.object(LLMClient, "_create_client", return_value=object()):
         client = LLMClient(config)
 
-    assert client.max_turn_tokens == 8192
+    assert client.max_turn_tokens == 32768
     assert client.max_verifier_tokens == 2048
     assert client.max_decision_model_calls == 6
-    assert client.max_decision_completion_tokens == 12288
-    assert client.max_decision_wall_seconds == 90.0
+    assert client.max_decision_completion_tokens == 65536
+    assert client.max_decision_wall_seconds == 1800.0
     assert client.max_support_model_calls == 2
     assert client.max_support_completion_tokens == 4096
     assert client.max_support_wall_seconds == 30.0
@@ -176,6 +176,38 @@ def test_primary_forwards_remaining_token_and_wall_caps():
     assert 0 < requests[0]["timeout"] <= 30.0
 
 
+def test_compact_primary_disables_hidden_thinking_in_request():
+    requests = []
+    good = json.dumps({"intent": "compact", "actions": []})
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return _stream(good, completion_tokens=12)
+
+    client = _client_with_fake_create(create)
+    budget = client._new_decision_generation_budget(
+        max_model_calls=6,
+        max_completion_tokens=8192,
+        max_wall_seconds=180,
+    )
+
+    result = client.get_primary_agent_response(
+        "state",
+        max_retries=1,
+        reasoning_effort="low",
+        _decision_budget=budget,
+        _max_output_tokens=8192,
+        _disable_thinking=True,
+    )
+
+    assert json.loads(result)["intent"] == "compact"
+    template = requests[0]["extra_body"]["chat_template_kwargs"]
+    assert requests[0]["reasoning_effort"] == "low"
+    assert template == {"enable_thinking": False, "preserve_thinking": False}
+    assert requests[0]["max_tokens"] == 8192
+    assert requests[0]["timeout"] <= 180
+
+
 def test_length_truncation_uses_only_remaining_shared_tokens_for_one_recovery():
     requests = []
     good = json.dumps({"intent": "brief", "actions": []})
@@ -198,6 +230,7 @@ def test_length_truncation_uses_only_remaining_shared_tokens_for_one_recovery():
 
     assert json.loads(result)["intent"] == "brief"
     assert [request["max_tokens"] for request in requests] == [4096, 2048]
+    assert requests[1]["reasoning_effort"] == "medium"
     assert "CUT OFF" in requests[1]["messages"][0]["content"]
 
 
@@ -393,6 +426,35 @@ def test_candidate_budget_exhaustion_without_any_valid_proposal_is_typed():
     client.get_primary_agent_response = fail
     with pytest.raises(DecisionGenerationBudgetExceeded, match="no candidate budget"):
         client.get_verified_primary_agent_response(prompt="state", candidate_count=2)
+
+
+def test_length_exhausted_first_candidate_still_tries_independent_fallback():
+    requests = []
+    good = json.dumps({"intent": "fallback", "actions": []})
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        stream_number = sum(1 for request in requests if request.get("stream"))
+        if stream_number == 1:
+            return _stream(
+                "{",
+                finish_reason="length",
+                completion_tokens=kwargs["max_tokens"],
+            )
+        if kwargs.get("stream"):
+            return _stream(good, completion_tokens=32)
+        raise AssertionError("the exhausted aggregate verifier reserve must fall back")
+
+    client = _client_with_fake_create(create)
+    result = client.get_verified_primary_agent_response(
+        prompt="state",
+        candidate_count=2,
+    )
+
+    assert json.loads(result)["intent"] == "fallback"
+    assert len([request for request in requests if request.get("stream")]) == 2
+    assert client.last_local_search["selected_candidate"] == 2
+    assert "generation budget exhausted" in client.last_local_search["failures"][0]
 
 
 def test_preexhausted_verifier_budget_uses_deterministic_first_valid_fallback():

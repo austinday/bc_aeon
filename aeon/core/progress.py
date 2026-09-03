@@ -168,38 +168,26 @@ class ProgressController:
                 self._recovery_attempts.add(action)
 
     def recovery_directive(self) -> str:
-        """Return a concise event-triggered meta-reasoning checkpoint."""
+        """Return a compact, action-oriented recovery constraint."""
 
         if not self.recovery_required:
             return ""
         level = self.recovery_level
         if level == 1:
-            level_action = (
-                "Name the failed assumption, then choose the cheapest safe action "
-                "that can falsify it or establish a missing precondition."
-            )
+            level_action = "Check one missing precondition or use a different action."
         elif level == 2:
-            level_action = (
-                "Generate at least two independent method families. Do not vary only "
-                "parameters or wording; choose one that bypasses the failed mechanism."
-            )
+            level_action = "Use a different tool or mechanism from the failed family."
         else:
-            level_action = (
-                "Reconstruct the parent objective and done criteria. Ask how to satisfy "
-                "them if the narrow subproblem is impossible, then choose a different route."
-            )
+            level_action = "Choose a different route to an unmet owner outcome."
         barred = (
             f" {len(self._barred_actions)} exact action(s) are harness-barred."
             if self._barred_actions
             else ""
         )
         return (
-            f"STRATEGIC RECOVERY — LEVEL {level} (harness required)\n"
-            f"Typed task state did not advance: {self._recovery_reason}.{barred}\n"
-            "Treat activity, repeated reads, and status narration as zero progress. "
-            f"{level_action} Update the checklist around observable outcomes, then take "
-            "the highest-information action. Report a blocker only if a verified invariant "
-            "prevents the parent goal or materially different safe strategies are exhausted."
+            f"RECOVERY REQUIRED (level {level}): {self._recovery_reason}.{barred}\n"
+            f"{level_action} Do not narrate recovery, restate the goal, or update the "
+            "plan unless it changed. Take one evidence-producing action."
         )
 
     def to_state_dict(self) -> dict[str, object]:

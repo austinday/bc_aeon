@@ -49,7 +49,7 @@ class WorkspaceInstructionTests(unittest.TestCase):
             with self.assertRaises(WorkspaceInstructionError):
                 discover_workspace_instructions(home, home=home)
 
-    def test_worker_prompt_appends_workspace_layer(self):
+    def test_worker_prompt_places_instance_overrides_after_workspace_layer(self):
         from aeon.core import worker as worker_module
 
         with patch.object(
@@ -58,7 +58,7 @@ class WorkspaceInstructionTests(unittest.TestCase):
             worker_module, "format_aeon_runtime_instructions", return_value="\nprivate-marker"
         ), patch.object(worker_module, "load_runtime_instructions", return_value=object()):
             rendered = worker_module.Worker._runtime_instruction_section()
-        self.assertEqual(rendered, "\nprivate-marker\nworkspace-marker")
+        self.assertEqual(rendered, "\nworkspace-marker\nprivate-marker")
 
 
 if __name__ == "__main__":

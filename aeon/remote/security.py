@@ -218,6 +218,27 @@ class AuthService:
             return None
         return self.store.get_web_session(token_digest(raw_token))
 
+    def refresh_session(self, raw_token: str | None, *, lifetime_seconds: int) -> bool:
+        """Slide an active remembered session without reviving expired/logout state."""
+
+        if (
+            not raw_token
+            or isinstance(lifetime_seconds, bool)
+            or not 86400 <= lifetime_seconds <= 365 * 86400
+        ):
+            return False
+        session = self.session(raw_token)
+        if not session:
+            return False
+        now = time.time()
+        # One write per day of device activity is enough to preserve the rolling
+        # lifetime without turning every API poll into a database mutation.
+        if float(session["expires_at"]) >= now + lifetime_seconds - 86400:
+            return False
+        return self.store.extend_web_session(
+            token_digest(raw_token), now + lifetime_seconds
+        )
+
     def logout(self, raw_token: str | None, *, client_ip: str = "") -> None:
         if not raw_token:
             return

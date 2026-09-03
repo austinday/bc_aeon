@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from aeon.core.agent_protocol import RequestContract, RequestMode
 from aeon.core.llm import LLMClient
 from aeon.core.worker import Worker
 from aeon.main import select_model
@@ -134,6 +135,61 @@ class TestExternalExpert(unittest.TestCase):
             state_dir=Path(self.temp.name),
         )
         self.assertTrue(self.tool(config=disabled).is_internal)
+
+    def test_api_endpoint_must_be_public_https(self):
+        for endpoint in (
+            "http://expert.example/v1",
+            "https://127.0.0.1/v1",
+            "https://10.42.0.9/v1",
+            "https://[::1]/v1",
+            "https://localhost/v1",
+            "https://service.internal/v1",
+            "https://user@example.com/v1",
+            "https://expert.example:8443/v1",
+            "https://expert.example:not-a-port/v1",
+        ):
+            with self.subTest(endpoint=endpoint):
+                config = ExternalExpertConfig(
+                    enabled=True,
+                    model="strong-test-model",
+                    base_url=endpoint,
+                    api_key_env="TEST_EXPERT_API_KEY",
+                    state_dir=Path(self.temp.name),
+                    allow_insecure_http=True,
+                )
+                self.assertIsNotNone(config.problem())
+
+        self.assertIsNone(self.config.problem())
+
+    def test_production_cli_requires_a_safe_official_executable_identity(self):
+        executable = Path(self.temp.name) / "codex"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o777)
+        config = ExternalExpertConfig(
+            enabled=True,
+            model="gpt-5.6-sol",
+            base_url="",
+            api_key_env="UNUSED",
+            state_dir=Path(self.temp.name),
+            backend="codex",
+            executable=str(executable),
+            reasoning_effort="high",
+        )
+        self.assertIn("identity is unsafe", config.problem())
+        executable.chmod(0o700)
+        self.assertIsNone(config.problem())
+
+    def test_production_api_dns_must_resolve_only_to_public_addresses(self):
+        tool = ConsultExternalExpertTool(worker=self.worker, config=self.config)
+        private_answer = [
+            (2, 1, 6, "", ("127.0.0.1", 443)),
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+        ]
+        with patch("aeon.tools.external_expert.socket.getaddrinfo", return_value=private_answer):
+            self.assertIn("local/private", tool._resolved_endpoint_problem())
+        public_answer = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with patch("aeon.tools.external_expert.socket.getaddrinfo", return_value=public_answer):
+            self.assertIsNone(tool._resolved_endpoint_problem())
 
     def test_loader_exposes_tool_only_after_explicit_enablement(self):
         with patch.dict(os.environ, {"AEON_EXTERNAL_EXPERT_ENABLED": "0"}):
@@ -337,7 +393,8 @@ class TestExternalExpert(unittest.TestCase):
         result = tool.execute("hard problem", "three failures", "what assumption?")
         self.assertIn("Advisory answer", result)
         args, kwargs = runner.calls[0]
-        self.assertEqual(args[:2], ["/test/codex", "exec"])
+        self.assertEqual(args[0], "/home/aday/bin/fleet-low-priority")
+        self.assertEqual(args[1:3], ["/test/codex", "exec"])
         self.assertIn("--ephemeral", args)
         self.assertIn("--ignore-user-config", args)
         self.assertIn("read-only", args)
@@ -350,6 +407,50 @@ class TestExternalExpert(unittest.TestCase):
         self.assertGreaterEqual(args.count("--disable"), 7)
         self.assertNotIn(self.secret, kwargs["env"].values())
         self.assertTrue(Path(kwargs["cwd"]).is_dir())
+
+    def test_subscription_cli_cannot_inherit_local_compute_authority(self):
+        config = ExternalExpertConfig(
+            enabled=True,
+            model="gpt-5.6-sol",
+            base_url="",
+            api_key_env="UNUSED",
+            state_dir=Path(self.temp.name),
+            backend="codex",
+            executable="/test/codex",
+            reasoning_effort="high",
+            max_output_tokens=1000,
+        )
+        runner = FakeCommandRunner()
+        with patch.dict(
+            os.environ,
+            {
+                "CUDA_VISIBLE_DEVICES": "GPU-principal",
+                "NVIDIA_VISIBLE_DEVICES": "all",
+                "GPU_AGENT_CLAIM_ID": "claim-principal",
+                "GPU_MEM_LIMIT_GB": "48",
+                "AEON_FLEET_TICKET": "fd-secret",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+                "LD_PRELOAD": "/tmp/untrusted.so",
+                "PYTHONPATH": "/tmp/untrusted-python",
+            },
+            clear=False,
+        ):
+            ConsultExternalExpertTool(
+                worker=self.worker, config=config, command_runner=runner
+            ).execute("hard problem", "three failures", "what assumption?")
+
+        environment = runner.calls[0][1]["env"]
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "void")
+        self.assertEqual(environment["NVIDIA_VISIBLE_DEVICES"], "void")
+        for key in (
+            "GPU_AGENT_CLAIM_ID",
+            "GPU_MEM_LIMIT_GB",
+            "AEON_FLEET_TICKET",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "LD_PRELOAD",
+            "PYTHONPATH",
+        ):
+            self.assertNotIn(key, environment)
 
     def test_codex_uses_final_message_file_and_jsonl_usage(self):
         config = ExternalExpertConfig(
@@ -389,7 +490,7 @@ class TestExternalExpert(unittest.TestCase):
         usage = json.loads(config.usage_path.read_text(encoding="utf-8"))
         self.assertEqual(usage[0]["tokens"], 150)
 
-    def test_worker_auto_consults_after_two_failures_with_replan_context(self):
+    def test_worker_consults_only_after_explicit_auto_opt_in_and_authority(self):
         class RecordingExpert:
             name = "consult_external_expert"
 
@@ -402,29 +503,47 @@ class TestExternalExpert(unittest.TestCase):
 
         expert = RecordingExpert()
         worker = Worker(
-            SimpleNamespace(context_limit=131072),
+            SimpleNamespace(context_limit=131072, provider="vllm"),
             tools=[expert],
             print_func=lambda _message: None,
         )
+        worker.model_config = {"provider": "vllm"}
+        worker.compute_guard = lambda: None
         worker.current_plan = "Reproduce, isolate, then repair."
         worker.action_log = [
             "[Iter 1]\n- Intent: reproduce\n- Actions: run_command\n"
             "- Result: ERROR — first failure"
         ]
-        worker._failures_since_external_consult = 1
+        worker.request_contract = RequestContract.from_request(
+            "Consult the configured external expert about this failure.",
+            forced_mode=RequestMode.EXTERNAL_ACTION,
+        )
+
+        # External disclosure/spend is never an invisible default recovery step.
+        worker._failures_since_external_consult = 2
         self.assertEqual(worker._maybe_auto_consult_external(
             objective="Fix the failing service",
             intent="Retry the health check",
             actions=["run_command(health check)"],
             latest_result="Error: connection refused",
         ), "")
-        worker._failures_since_external_consult = 2
-        result = worker._maybe_auto_consult_external(
-            objective="Fix the failing service",
-            intent="Retry the health check",
-            actions=["run_command(health check)"],
-            latest_result="Error: connection refused",
-        )
+        self.assertEqual(expert.calls, [])
+
+        worker._failures_since_external_consult = 1
+        with patch.dict(os.environ, {"AEON_AUTO_EXTERNAL_CONSULT": "1"}):
+            self.assertEqual(worker._maybe_auto_consult_external(
+                objective="Fix the failing service",
+                intent="Retry the health check",
+                actions=["run_command(health check)"],
+                latest_result="Error: connection refused",
+            ), "")
+            worker._failures_since_external_consult = 2
+            result = worker._maybe_auto_consult_external(
+                objective="Fix the failing service",
+                intent="Retry the health check",
+                actions=["run_command(health check)"],
+                latest_result="Error: connection refused",
+            )
         self.assertIn("Try a different invariant", result)
         self.assertEqual(len(expert.calls), 1)
         call = expert.calls[0]
@@ -577,10 +696,13 @@ class TestExternalExpert(unittest.TestCase):
         )
         result = tool.execute("hard problem", "three failures", "what assumption?")
         self.assertIn("Gemini advice", result)
-        args, _kwargs = runner.calls[0]
-        self.assertEqual(args[0], "/test/gemini")
+        args, kwargs = runner.calls[0]
+        self.assertEqual(args[1], "/test/gemini")
         self.assertEqual(args[args.index("--approval-mode") + 1], "plan")
         self.assertEqual(args[args.index("--output-format") + 1], "json")
+        self.assertEqual(args[args.index("--prompt") + 1], "")
+        self.assertIn("PROBLEM\nhard problem", kwargs["input"])
+        self.assertNotIn("hard problem", "\x00".join(args))
 
     def test_subscription_advice_is_bounded_before_entering_context(self):
         config = ExternalExpertConfig(

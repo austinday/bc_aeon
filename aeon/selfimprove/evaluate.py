@@ -18,30 +18,82 @@ from pathlib import Path
 from . import benchmark, scorer
 from .runtask import RESULT_PREFIX
 
-# Directories never worth copying into a sandbox (heavy, regenerated, or noise).
-_IGNORE = shutil.ignore_patterns(
+
+class CandidateEvaluationBoundaryUnavailable(RuntimeError):
+    """Modified source cannot be imported under the required OS boundary."""
+
+
+def _candidate_evaluation_boundary_available() -> bool:
+    """Loaded-code latch for the not-yet-proven masked-home sandbox."""
+
+    return False
+
+
+_TREE_IGNORE = shutil.ignore_patterns(
     ".git", "aeon_output", "build", "dist", "__pycache__", ".ipynb_checkpoints",
     "*.egg-info", ".venv", "venv", ".mypy_cache", ".pytest_cache", "node_modules",
-    "aeon_models", "data",
+    "aeon_models",
 )
+
+
+def _candidate_copy_ignore(root: Path):
+    """Ignore root-only data without dropping nested package data directories."""
+
+    canonical_root = root.resolve()
+
+    def ignore(directory, names):
+        ignored = set(_TREE_IGNORE(directory, names))
+        if Path(directory).resolve() == canonical_root and "data" in names:
+            ignored.add("data")
+        return ignored
+
+    return ignore
 
 
 def _make_sandbox(root: Path):
     """Return (sandbox_dir, cleanup_fn): an isolated copy of the candidate source.
 
-    Falls back to running in place (no isolation) only if the copy fails, so an
-    evaluation never silently does nothing.
+    Copy failure is fatal. Running modified code in place would turn a failed
+    isolation step into full principal authority.
     """
+    root = root.resolve(strict=True)
+    for directory, subdirs, files in os.walk(root, followlinks=False):
+        for name in [*subdirs, *files]:
+            candidate = Path(directory) / name
+            if not candidate.is_symlink():
+                continue
+            try:
+                candidate.resolve(strict=True).relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise CandidateEvaluationBoundaryUnavailable(
+                    f"candidate tree contains an escaping/unresolved symlink: {candidate}"
+                ) from exc
+    tmp = tempfile.mkdtemp(prefix="aeon_eval_")
     try:
-        tmp = tempfile.mkdtemp(prefix="aeon_eval_")
         dest = os.path.join(tmp, "src")
-        shutil.copytree(root, dest, ignore=_IGNORE, symlinks=True)
+        shutil.copytree(
+            root,
+            dest,
+            ignore=_candidate_copy_ignore(root),
+            symlinks=True,
+        )
         return Path(dest), (lambda: shutil.rmtree(tmp, ignore_errors=True))
     except Exception:
-        return Path(root), (lambda: None)
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
 
 
 def _run_one(base: Path, task_id: str, timeout: int = 120) -> dict:
+    if not _candidate_evaluation_boundary_available():
+        return {
+            "task": task_id,
+            "passed": False,
+            "detail": (
+                "candidate evaluation blocked: an actively-probed masked-home "
+                "dependency sandbox is not installed"
+            ),
+            "metric": None,
+        }
     env = dict(os.environ)
     # Prepend the sandbox so its aeon package shadows any pip-installed one, and
     # repoint AEON_PROJECT_ROOT at the sandbox — otherwise an inherited value pins
@@ -69,6 +121,11 @@ def _run_one(base: Path, task_id: str, timeout: int = 120) -> dict:
 def evaluate(root=None, task_ids=None, timeout: int = 120) -> dict:
     """Run the deterministic benchmark against the candidate at ``root`` in an
     isolated sandbox and return a scorecard (see :func:`scorer.build_scorecard`)."""
+    if not _candidate_evaluation_boundary_available():
+        raise CandidateEvaluationBoundaryUnavailable(
+            "candidate benchmark is blocked until an actively-probed masked-home "
+            "dependency sandbox is installed; no candidate code was executed"
+        )
     if root is None:
         from ..core.paths import PROJECT_ROOT
         root = PROJECT_ROOT

@@ -8,7 +8,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/aday/bc_aeon
+WorkingDirectory=/home/aday/NexusAgentDashboard/bc_aeon
 Environment=AEON_REMOTE_ORIGINS=https://aeon.example.com
 Environment=AEON_REMOTE_HOSTS=aeon.example.com
 Environment=AEON_REMOTE_ALLOWED_ROOTS=/home/aday/aeon_workspaces:/home/aday/website_hosting

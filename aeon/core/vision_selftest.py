@@ -32,11 +32,15 @@ from __future__ import annotations
 import io
 import os
 import base64
+import json
 import logging
 import secrets
 import tempfile
+from typing import Callable
 
 import requests
+
+from .fleet_backend import FleetBackendError, validate_loopback_endpoint
 
 logger = logging.getLogger("aeon")
 
@@ -48,6 +52,7 @@ _NONCE_LEN = 6
 # healthy model passes on the first two calls; a broken one gets all N tries.
 _SAMPLES = 3
 _PASS_NEED = 2
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 _SAVE_DIR = os.path.join(tempfile.gettempdir(), "aeon_vision_selftest")
 
@@ -133,6 +138,26 @@ def _save_probe(jpeg: bytes, idx: int, nonce: str) -> str:
         return "<unsaved>"
 
 
+def _bounded_response_body(response: requests.Response) -> bytes:
+    """Read one local inference response without permitting an unbounded body."""
+
+    advertised = response.headers.get("content-length")
+    if advertised is not None:
+        try:
+            if int(advertised) < 0 or int(advertised) > _MAX_RESPONSE_BYTES:
+                raise VisionSelfTestError("vision endpoint response exceeded its size bound")
+        except ValueError as exc:
+            raise VisionSelfTestError(
+                "vision endpoint returned an invalid Content-Length"
+            ) from exc
+    payload = bytearray()
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        payload.extend(chunk)
+        if len(payload) > _MAX_RESPONSE_BYTES:
+            raise VisionSelfTestError("vision endpoint response exceeded its size bound")
+    return bytes(payload)
+
+
 def _ask_vision(url: str, model: str, jpeg: bytes, timeout: int):
     """POST one image, return (answer_text, None) or (None, VisionSelfTestError).
 
@@ -161,15 +186,34 @@ def _ask_vision(url: str, model: str, jpeg: bytes, timeout: int):
         "temperature": 0.0,
     }
     try:
-        resp = requests.post(url, json=payload, timeout=timeout)
+        resp = requests.post(
+            url,
+            json=payload,
+            timeout=timeout,
+            allow_redirects=False,
+            proxies={"http": "", "https": ""},
+            stream=True,
+        )
     except requests.exceptions.RequestException as e:
         return None, VisionSelfTestError(
             f"vision endpoint unreachable at {url}: {type(e).__name__}: {e}",
             hint=("The multimodal model is not serving on its chat endpoint. "
                   "Check that the model launched and that this vLLM build "
                   "supports the checkpoint's vision architecture."))
+    try:
+        raw_body = _bounded_response_body(resp)
+    except VisionSelfTestError as exc:
+        return None, exc
+    except requests.exceptions.RequestException as exc:
+        return None, VisionSelfTestError(
+            f"vision endpoint response failed: {type(exc).__name__}: {exc}",
+            hint="The local multimodal endpoint did not return a complete bounded response.",
+        )
+    finally:
+        resp.close()
+    body_text = raw_body.decode("utf-8", errors="replace")
     if resp.status_code != 200:
-        body = (resp.text or "")[:600]
+        body = body_text[:600]
         low = body.lower()
         if resp.status_code == 400 and ("image" in low or "multimodal" in low or "vision" in low):
             return None, VisionSelfTestError(
@@ -183,11 +227,12 @@ def _ask_vision(url: str, model: str, jpeg: bytes, timeout: int):
             f"vision endpoint returned HTTP {resp.status_code}: {body}",
             hint="The model errored on an image request; inspect the server log above.")
     try:
-        answer = resp.json()["choices"][0]["message"]["content"] or ""
-    except (KeyError, IndexError, ValueError) as e:
+        decoded = json.loads(raw_body.decode("utf-8"))
+        answer = decoded["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, UnicodeDecodeError, ValueError) as e:
         return None, VisionSelfTestError(
             f"unexpected response format from vision endpoint: {type(e).__name__}: {e}; "
-            f"raw={resp.text[:400]}",
+            f"raw={body_text[:400]}",
             hint="The endpoint answered but not in OpenAI chat format; check the server.")
     return answer, None
 
@@ -211,12 +256,26 @@ _MISREAD_HINT = (
 )
 
 
-def run_vision_self_test(base_url: str, model: str, timeout: int = 120) -> str:
+def run_vision_self_test(
+    base_url: str,
+    model: str,
+    timeout: int = 120,
+    *,
+    compute_guard: Callable[[], None],
+) -> str:
     """Prove the served model can READ an image, or raise VisionSelfTestError.
 
     Returns the last correctly-read nonce on success, or "" if the probe itself
     could not run (our bug, not the model's — logged and skipped, never aborts).
     """
+    try:
+        base_url = validate_loopback_endpoint(base_url)
+    except FleetBackendError as exc:
+        raise VisionSelfTestError(
+            "vision self-test endpoint is not an exact Fleet loopback API"
+        ) from exc
+    if not callable(compute_guard):
+        raise VisionSelfTestError("vision self-test has no Fleet ticket guard")
     url = base_url.rstrip("/") + "/chat/completions"
     passes = 0
     records = []   # (nonce, answer, ok)
@@ -235,6 +294,15 @@ def run_vision_self_test(base_url: str, model: str, timeout: int = 120) -> str:
             return ""
 
         images.append(_save_probe(jpeg, i, nonce))
+        try:
+            # Revalidate the exact primary demand immediately beside every
+            # request.  A ticket renewal failure or pending endpoint promotion
+            # aborts this startup gate instead of probing stale compute.
+            compute_guard()
+        except Exception as exc:
+            raise VisionSelfTestError(
+                "Fleet compute changed before the vision self-test request"
+            ) from exc
         answer, err = _ask_vision(url, model, jpeg, timeout)
         if err is not None:
             err.images = images

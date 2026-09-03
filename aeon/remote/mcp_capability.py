@@ -29,6 +29,9 @@ MCP_ACTIONS = frozenset(
         "github-commit",
         "github-push",
         "github-verify",
+        "huggingface-account",
+        "huggingface-publish",
+        "huggingface-verify",
     }
 )
 

@@ -30,6 +30,7 @@ from unittest.mock import patch
 
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
+from PIL import Image
 from starlette.websockets import WebSocketDisconnect
 
 from aeon.remote.app import _websocket_session, create_app
@@ -58,6 +59,15 @@ from aeon.remote.terminal import (
     _resize_attached_client,
     bridge_terminal,
 )
+import aeon.core.chat_transcript as chat_transcript
+from aeon.core.chat_transcript import (
+    ChatTranscriptError,
+    append_chat_message,
+    build_chat_delivery_envelope,
+)
+from aeon.tools.command_fleet_guard import FleetCommandGuardError
+from aeon.core.skills.knowledge import SkillKnowledgeStore
+from aeon.core.skills.manager import SkillsManager
 
 
 _FAKE_TMUX_PANE_FIELD_SEPARATOR = "__AEON_REMOTE_PANE_FIELD_6B1E__"
@@ -89,7 +99,10 @@ class FakeTmux:
         end = min(separators)
         command = pending[:end]
         item["pending"] = pending[end + 1 :]
-        if "aeon.main" in command:
+        if (
+            "aeon.main" in command
+            or "aeon.harnesses.opencode_runtime" in command
+        ):
             item["command"] = "python3"
             item["agent_mode"] = True
             item["managed_agent"] = True
@@ -263,6 +276,19 @@ class FakeTmux:
 class RemoteFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.low_priority_wrapper = "/verified/fleet-low-priority"
+        self.low_priority_patcher = patch(
+            "aeon.remote.instances.require_fleet_low_priority_wrapper",
+            return_value=self.low_priority_wrapper,
+        )
+        self.low_priority_patcher.start()
+        self.addCleanup(self.low_priority_patcher.stop)
+        self.chat_delivery_ack_patcher = patch(
+            "aeon.remote.instances.wait_for_chat_delivery_consumed",
+            return_value=True,
+        )
+        self.chat_delivery_ack_patcher.start()
+        self.addCleanup(self.chat_delivery_ack_patcher.stop)
         base = Path(self.temp.name)
         self.root = base / "workspaces"
         self.root.mkdir()
@@ -447,6 +473,37 @@ class TestRemoteSecurity(RemoteFixture):
             stored = conn.execute("SELECT token_hash FROM web_sessions").fetchone()[0]
         self.assertEqual(stored, token_digest(raw))
         self.assertNotEqual(stored, raw)
+
+    def test_remembered_session_slides_but_logout_cannot_be_revived(self):
+        result = self.auth.authenticate_password(
+            "admin",
+            self.password,
+            client_ip="127.0.0.2",
+            user_agent="phone",
+            remember=True,
+        )
+        digest = token_digest(result.token)
+        with sqlite3.connect(self.config.database_path) as conn:
+            conn.execute(
+                "UPDATE web_sessions SET expires_at=? WHERE token_hash=?",
+                (time.time() + 3600, digest),
+            )
+        self.assertTrue(
+            self.auth.refresh_session(
+                result.token,
+                lifetime_seconds=30 * 86400,
+            )
+        )
+        refreshed = self.auth.session(result.token)
+        self.assertGreater(refreshed["expires_at"], time.time() + 29 * 86400)
+
+        self.auth.logout(result.token)
+        self.assertFalse(
+            self.auth.refresh_session(
+                result.token,
+                lifetime_seconds=30 * 86400,
+            )
+        )
 
     def test_standalone_totp_mode_keeps_strict_cookie(self):
         self.assertEqual(replace(self.config, require_totp=True).cookie_samesite, "strict")
@@ -683,6 +740,61 @@ class TestRemoteSecurity(RemoteFixture):
         self.assertEqual(stopped.json()["instance"]["status"], "stopped")
         self.assertFalse(
             stopped.json()["instance"]["force_stop_required"]
+        )
+
+    def test_kill_route_is_csrf_protected_and_removes_only_after_exact_confirmation(self):
+        csrf = self.login().json()["csrf_token"]
+        headers = {
+            "Origin": "http://testserver",
+            "X-CSRF-Token": csrf,
+        }
+        terminal = self.manager.create_terminal(
+            name="Disposable child",
+            workspace=str(self.workspace),
+            actor="admin",
+        )
+        record = self.store.get_instance(terminal["id"])
+        calls_before = len(self.fake.calls)
+
+        missing_csrf = self.client.post(
+            f"/api/instances/{terminal['id']}/kill",
+            headers={"Origin": "http://testserver"},
+            json={"confirmation": terminal["name"]},
+        )
+        self.assertEqual(missing_csrf.status_code, 403, missing_csrf.text)
+        self.assertIsNotNone(self.store.get_instance(terminal["id"]))
+        self.assertEqual(len(self.fake.calls), calls_before)
+
+        wrong_name = self.client.post(
+            f"/api/instances/{terminal['id']}/kill",
+            headers=headers,
+            json={"confirmation": "not the visible name"},
+        )
+        self.assertEqual(wrong_name.status_code, 400, wrong_name.text)
+        self.assertIsNotNone(self.store.get_instance(terminal["id"]))
+        self.assertIn(record["tmux_name"], self.fake.sessions)
+
+        killed = self.client.post(
+            f"/api/instances/{terminal['id']}/kill",
+            headers=headers,
+            json={"confirmation": terminal["name"]},
+        )
+        self.assertEqual(killed.status_code, 200, killed.text)
+        self.assertEqual(killed.json(), {"deleted": True})
+        self.assertIsNone(self.store.get_instance(terminal["id"]))
+        self.assertNotIn(record["tmux_name"], self.fake.sessions)
+        listed_ids = {
+            item["id"] for item in self.client.get("/api/instances").json()["instances"]
+        }
+        self.assertNotIn(terminal["id"], listed_ids)
+        lifecycle_audits = [
+            row["action"]
+            for row in reversed(self.store.recent_audit(limit=20))
+            if row["instance_id"] == terminal["id"]
+        ]
+        self.assertEqual(
+            lifecycle_audits[-2:],
+            ["instance_force_stopped", "instance_deleted"],
         )
 
     def test_security_headers_and_no_public_api_without_login(self):
@@ -1242,6 +1354,26 @@ class TestRemoteStateAndStoreSafety(unittest.TestCase):
             finally:
                 writer.close()
 
+    def test_writable_store_tolerates_sqlite_unlinking_sidecar_during_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            database = state / "remote.sqlite3"
+            store = RemoteStore(database)
+            sidecar = Path(f"{database}-wal")
+            sidecar.write_bytes(b"transient sqlite sidecar")
+            sidecar.chmod(0o600)
+            real_stat = os.stat
+
+            def unlink_before_identity(path, *args, **kwargs):
+                if path == sidecar.name and kwargs.get("dir_fd") is not None:
+                    sidecar.unlink(missing_ok=True)
+                    raise FileNotFoundError(2, "No such file or directory", path)
+                return real_stat(path, *args, **kwargs)
+
+            with patch("aeon.remote.store.os.stat", side_effect=unlink_before_identity):
+                self.assertEqual(store.admin_count(), 0)
+            self.assertFalse(sidecar.exists())
+
     def test_store_rejects_database_and_parent_replacement_after_open(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -1469,6 +1601,8 @@ class TestRemoteStoreMigration(unittest.TestCase):
             self.assertEqual(
                 columns.count("transport_process_create_time"), 1
             )
+            self.assertEqual(columns.count("awaiting_objective"), 1)
+            self.assertEqual(columns.count("deferred_message_id"), 1)
 
     def test_legacy_login_attempt_table_adds_attempt_id_before_index(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1552,6 +1686,8 @@ class TestRemoteStoreMigration(unittest.TestCase):
             self.assertIsNone(
                 store.get_instance("web-id")["transport_process_create_time"]
             )
+            self.assertEqual(store.get_instance("web-id")["awaiting_objective"], 0)
+            self.assertIsNone(store.get_instance("web-id")["deferred_message_id"])
             with sqlite3.connect(database) as conn:
                 columns = {
                     row[1]: row for row in conn.execute("PRAGMA table_info(instances)")
@@ -1564,6 +1700,9 @@ class TestRemoteStoreMigration(unittest.TestCase):
             self.assertIn("last_agent_kind", columns)
             self.assertIn("transport_pid", columns)
             self.assertIn("transport_process_create_time", columns)
+            self.assertEqual(columns["awaiting_objective"][3], 1)
+            self.assertEqual(columns["awaiting_objective"][4], "0")
+            self.assertIn("deferred_message_id", columns)
 
     def test_existing_terminal_rows_migrate_to_shell_backed_tabs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1794,6 +1933,322 @@ class TestInstanceManager(RemoteFixture):
         with self.assertRaises(InstanceError):
             self.manager.validate_workspace(self.root / "escape")
 
+    def test_agent_project_binding_is_exact_and_inferred_from_active_root(self):
+        now = time.time()
+        project_id = "pr-" + "a" * 32
+        self.store.create_project(
+            {
+                "id": project_id,
+                "name": "Exact project",
+                "root": str(self.workspace.resolve()),
+                "description": "fixture",
+                "default_agent_kind": "aeon",
+                "status": "active",
+                "created_at": now,
+                "updated_at": now,
+                "created_by": "admin",
+            }
+        )
+
+        inferred = self.manager.create_instance(
+            name="Inferred project agent",
+            workspace=str(self.workspace),
+            objective="",
+            max_iterations=None,
+            actor="admin",
+            defer_until_message=True,
+        )
+        self.assertEqual(inferred["project_id"], project_id)
+        self.assertEqual(
+            self.store.get_instance(inferred["id"])["project_id"], project_id
+        )
+
+        explicit = self.manager.create_instance(
+            name="Explicit project agent",
+            workspace=str(self.workspace),
+            objective="",
+            max_iterations=None,
+            actor="admin",
+            defer_until_message=True,
+            project_id=project_id,
+        )
+        self.assertEqual(explicit["project_id"], project_id)
+
+        other = self.root / "other"
+        other.mkdir()
+        with self.assertRaisesRegex(InstanceError, "must match its project root"):
+            self.manager.create_instance(
+                name="Mismatched project agent",
+                workspace=str(other),
+                objective="",
+                max_iterations=None,
+                actor="admin",
+                defer_until_message=True,
+                project_id=project_id,
+            )
+        with self.assertRaisesRegex(InstanceError, "Project identity is invalid"):
+            self.manager.create_instance(
+                name="Malformed project agent",
+                workspace=str(self.workspace),
+                objective="",
+                max_iterations=None,
+                actor="admin",
+                defer_until_message=True,
+                project_id="../../not-a-project",
+            )
+
+    def test_agent_created_skills_are_private_listed_and_revision_checked(self):
+        instance = self.manager.create_instance(
+            name="Skill agent", workspace=str(self.workspace), objective="Build useful things",
+            max_iterations=None, actor="admin",
+        )
+        skill_dir = self.config.instance_state_dir / instance["id"] / "skills" / "research"
+        skill_dir.mkdir(parents=True, mode=0o700)
+        os.chmod(skill_dir.parent, 0o700)
+        os.chmod(skill_dir, 0o700)
+        skill_file = skill_dir / "useful_versions.txt"
+        skill_file.write_text("1. Find gaps.\n", encoding="utf-8")
+        os.chmod(skill_file, 0o600)
+
+        listed = self.manager.get_private_skills(instance["id"])
+        self.assertTrue(listed["supported"])
+        self.assertEqual([item["skill_path"] for item in listed["skills"]], ["research/useful_versions"])
+        revision = listed["skills"][0]["revision"]
+        updated = self.manager.update_private_skill(
+            instance["id"], category="research", skill_name="useful_versions",
+            content="1. Find verified gaps.\n", expected_revision=revision, actor="admin",
+        )
+        self.assertEqual(updated["skills"][0]["content"], "1. Find verified gaps.\n")
+        self.assertEqual(stat.S_IMODE(skill_file.stat().st_mode), 0o600)
+        with self.assertRaisesRegex(InstanceError, "changed since it was loaded"):
+            self.manager.update_private_skill(
+                instance["id"], category="research", skill_name="useful_versions",
+                content="stale overwrite", expected_revision=revision, actor="admin",
+            )
+
+    def test_fresh_context_restarts_legacy_direct_agent_and_preserves_skills(self):
+        instance = self.manager.create_instance(
+            name="Legacy direct agent", workspace=str(self.workspace),
+            objective="Research useful contributions", max_iterations=None,
+            actor="admin",
+        )
+        self.assertFalse(instance["shell_backed"])
+        instance_state = self.config.instance_state_dir / instance["id"]
+        skill_dir = instance_state / "skills" / "research"
+        skill_dir.mkdir(parents=True, mode=0o700)
+        os.chmod(skill_dir.parent, 0o700)
+        os.chmod(skill_dir, 0o700)
+        skill = skill_dir / "validated_search.txt"
+        skill.write_text("1. Verify exact metadata.\n", encoding="utf-8")
+        os.chmod(skill, 0o600)
+
+        worker_state_root = Path(self.temp.name) / "worker-state"
+        with patch.dict(
+            os.environ, {"AEON_STATE_DIR": str(worker_state_root)}, clear=False
+        ):
+            worker_session = self.manager._worker_session_directory(
+                self.store.get_instance(instance["id"])
+            )
+            worker_session.mkdir(mode=0o700, parents=True)
+            state_file = worker_session / "session_state.json"
+            state_file.write_text(
+                json.dumps({"memories": {"old": "conversation"}}),
+                encoding="utf-8",
+            )
+            state_file.chmod(0o600)
+            restarted = self.manager.fresh_restart_agent(
+                instance["id"], actor="admin"
+            )
+
+        self.assertEqual(restarted["mode"], "agent")
+        self.assertEqual(restarted["status"], "running")
+        self.assertFalse(restarted["shell_backed"])
+        self.assertEqual(restarted["objective"], "")
+        self.assertEqual(json.loads(state_file.read_text(encoding="utf-8")), {})
+        self.assertEqual(skill.read_text(encoding="utf-8"), "1. Verify exact metadata.\n")
+        lifecycle_calls = [call[1] for call in self.fake.calls]
+        self.assertIn("send-keys", lifecycle_calls)
+        self.assertIn("kill-session", lifecycle_calls)
+        self.assertGreaterEqual(lifecycle_calls.count("new-session"), 2)
+        launches = [call for call in self.fake.calls if call[1] == "new-session"]
+        self.assertNotIn("--start", launches[-1])
+        self.assertNotIn("--resume-unfinished", launches[-1])
+        self.assertNotIn("Research useful contributions", launches[-1])
+
+    def test_private_skills_and_related_wiki_transfer_without_overwrite(self):
+        source = self.manager.create_instance(
+            name="Source specialist", workspace=str(self.workspace),
+            objective="Learn a repeatable workflow", max_iterations=None, actor="admin",
+        )
+        target = self.manager.create_instance(
+            name="Target specialist", workspace=str(self.workspace),
+            objective="Reuse a proven workflow", max_iterations=None, actor="admin",
+        )
+        source_state = self.config.instance_state_dir / source["id"]
+        category = source_state / "skills" / "conversion"
+        category.mkdir(parents=True, mode=0o700)
+        os.chmod(category.parent, 0o700)
+        os.chmod(category, 0o700)
+        source_file = category / "verified_export.txt"
+        source_file.write_text("1. Validate identity.\n2. Export.", encoding="utf-8")
+        os.chmod(source_file, 0o600)
+        source_note = SkillKnowledgeStore(source_state / "skill-wiki").save_note(
+            title="Export evidence",
+            content="The second attempt passed an exact round-trip comparison.",
+            related_skill_paths=["conversion/verified_export"],
+            learning={
+                "candidate_skill_path": "conversion/verified_export",
+                "procedure": "Validate the source identity, then export it.",
+                "verification": "The second attempt matched byte-for-byte.",
+                "procedure_stable": True,
+                "uncertainty": "low",
+            },
+            experience={
+                "request_id": "transfer-fixture",
+                "attempt_count": 2,
+                "failure_count": 1,
+                "success_count": 1,
+                "recovered_after_failure": True,
+                "receipts": [
+                    {
+                        "tool": "run_command",
+                        "status": "failed",
+                        "error_code": "mismatch",
+                        "summary_sha256": "a" * 64,
+                    },
+                    {
+                        "tool": "run_command",
+                        "status": "ok",
+                        "error_code": "",
+                        "summary_sha256": "b" * 64,
+                    },
+                ],
+            },
+        )
+        self.assertTrue(source_note["skill_evidence_eligible"])
+
+        source_payload = self.manager.get_private_skills(source["id"])
+        revision = next(
+            item["revision"] for item in source_payload["effective_skills"]
+            if item["skill_path"] == "conversion/verified_export"
+        )
+        self.assertEqual(source_payload["maximum_skills"], 16)
+        target_root = self.config.instance_state_dir / target["id"] / "skills"
+        target_root.mkdir(parents=True, mode=0o700)
+        os.chmod(target_root, 0o700)
+        SkillsManager(instance_dir=target_root).learned_store().save_protocol(
+            category="conversion",
+            skill_name="verified_export",
+            content_revision=revision,
+            evidence=[{"note_id": "note-" + "c" * 32, "revision": "d" * 64}],
+        )
+        target_payload = self.manager.get_private_skills(target["id"])
+        self.assertIn(
+            source["id"], {item["id"] for item in target_payload["transfer_sources"]}
+        )
+
+        transferred = self.manager.transfer_private_skills(
+            target["id"], source_instance_id=source["id"],
+            selections=[{
+                "skill_path": "conversion/verified_export",
+                "revision": revision,
+            }],
+            include_knowledge=False, actor="admin",
+        )
+        self.assertEqual(transferred["transfer"]["copied"], ["conversion/verified_export"])
+        self.assertEqual(transferred["transfer"]["knowledge_notes_copied"], 0)
+        copied = next(
+            item for item in transferred["skills"]
+            if item["skill_path"] == "conversion/verified_export"
+        )
+        self.assertEqual(copied["content"], "1. Validate identity.\n2. Export.")
+        self.assertEqual(copied["revision"], revision)
+        copied_effective = next(
+            item for item in transferred["effective_skills"]
+            if item["skill_path"] == "conversion/verified_export"
+        )
+        self.assertEqual(copied_effective["lifecycle"]["status"], "needs_review")
+        self.assertTrue(copied_effective["lifecycle"]["evidence_stale"])
+        self.assertEqual(transferred["knowledge_notes"], [])
+
+        repeated = self.manager.transfer_private_skills(
+            target["id"], source_instance_id=source["id"],
+            selections=[{
+                "skill_path": "conversion/verified_export",
+                "revision": revision,
+            }],
+            include_knowledge=True, actor="admin",
+        )
+        self.assertEqual(repeated["transfer"]["copied"], [])
+        self.assertEqual(
+            repeated["transfer"]["already_known"], ["conversion/verified_export"]
+        )
+        self.assertEqual(repeated["transfer"]["knowledge_notes_copied"], 1)
+        self.assertEqual(len(repeated["knowledge_notes"]), 1)
+        transferred_note = repeated["knowledge_notes"][0]
+        self.assertEqual(
+            transferred_note["origin"]["source_instance_id"], source["id"]
+        )
+        self.assertEqual(transferred_note["origin"]["locally_earned"], "false")
+        self.assertEqual(
+            transferred_note["origin"]["source_origin_kind"], "agent-authored"
+        )
+        self.assertEqual(transferred_note["learning"], source_note["learning"])
+        self.assertEqual(transferred_note["experience"], source_note["experience"])
+        self.assertFalse(transferred_note["skill_evidence_eligible"])
+
+        idempotent = self.manager.transfer_private_skills(
+            target["id"], source_instance_id=source["id"],
+            selections=[{
+                "skill_path": "conversion/verified_export",
+                "revision": revision,
+            }],
+            include_knowledge=True, actor="admin",
+        )
+        self.assertEqual(idempotent["transfer"]["knowledge_notes_copied"], 0)
+        self.assertEqual(len(idempotent["knowledge_notes"]), 1)
+
+        with self.assertRaisesRegex(InstanceError, "changed; refresh"):
+            self.manager.transfer_private_skills(
+                target["id"], source_instance_id=source["id"],
+                selections=[{
+                    "skill_path": "conversion/verified_export",
+                    "revision": "0" * 64,
+                }],
+                include_knowledge=False, actor="admin",
+            )
+
+        deleted = self.manager.delete_private_skill(
+            target["id"], category="conversion", skill_name="verified_export",
+            expected_revision=copied["revision"],
+            confirmation="delete conversion/verified_export", actor="admin",
+        )
+        self.assertNotIn(
+            "conversion/verified_export",
+            {item["skill_path"] for item in deleted["skills"]},
+        )
+
+    def test_private_skill_delete_requires_exact_confirmation(self):
+        instance = self.manager.create_instance(
+            name="Delete guard", workspace=str(self.workspace), objective="Maintain skills",
+            max_iterations=None, actor="admin",
+        )
+        category = self.config.instance_state_dir / instance["id"] / "skills" / "review"
+        category.mkdir(parents=True, mode=0o700)
+        os.chmod(category.parent, 0o700)
+        os.chmod(category, 0o700)
+        skill = category / "obsolete.txt"
+        skill.write_text("Old protocol.\n", encoding="utf-8")
+        os.chmod(skill, 0o600)
+        revision = self.manager.get_private_skills(instance["id"])["skills"][0]["revision"]
+
+        with self.assertRaisesRegex(InstanceError, "Type 'delete review/obsolete'"):
+            self.manager.delete_private_skill(
+                instance["id"], category="review", skill_name="obsolete",
+                expected_revision=revision, confirmation="yes", actor="admin",
+            )
+        self.assertTrue(skill.exists())
+
     def test_launch_is_direct_argv_not_shell_and_uses_exact_tmux_targets(self):
         objective = "Inspect the project; do not delete anything"
         instance = self.manager.create_instance(
@@ -1807,7 +2262,9 @@ class TestInstanceManager(RemoteFixture):
         self.assertNotIn("sh", launch)
         self.assertNotIn("-c", launch[launch.index("/usr/bin/python3") :])
         self.assertIn("/usr/bin/python3", launch)
-        self.assertIn("aeon.main", launch)
+        self.assertIn("aeon.harnesses.opencode_runtime", launch)
+        python_at = launch.index("/usr/bin/python3")
+        self.assertEqual(launch[python_at - 1], self.low_priority_wrapper)
         self.assertIn("--model", launch)
         self.assertIn(self.config.default_model, launch)
         self.assertIn(objective, launch)
@@ -1820,11 +2277,342 @@ class TestInstanceManager(RemoteFixture):
         self.assertEqual(instance["status"], "running")
         self.assertEqual(instance["kind"], "aeon")
 
+    def test_iteration_limit_is_validated_for_the_selected_harness(self):
+        before = len(self.store.list_instances())
+        with self.assertRaisesRegex(InstanceError, "between 1 and 32 for OpenCode"):
+            self.manager.create_instance(
+                name="Too many OpenCode steps",
+                workspace=str(self.workspace),
+                objective="",
+                max_iterations=33,
+                actor="admin",
+                defer_until_message=True,
+            )
+        self.assertEqual(len(self.store.list_instances()), before)
+
+        legacy = self.manager.create_instance(
+            name="Long legacy run",
+            workspace=str(self.workspace),
+            objective="",
+            max_iterations=10_000,
+            actor="admin",
+            defer_until_message=True,
+            harness="legacy-aeon",
+        )
+        setting = self.store.get_agent_setting(legacy["id"], "aeon")
+        self.assertEqual(setting["desired_harness"], "legacy-aeon")
+        with self.assertRaisesRegex(InstanceError, "between 1 and 32 for OpenCode"):
+            self.manager.update_agent_settings(
+                legacy["id"],
+                kind="aeon",
+                model=self.config.default_model,
+                effort="",
+                harness="opencode",
+                actor="admin",
+            )
+        unchanged = self.store.get_agent_setting(legacy["id"], "aeon")
+        self.assertEqual(unchanged["desired_harness"], "legacy-aeon")
+
+        # Revalidate at launch to protect migrated or externally persisted rows.
+        self.store.put_harness_setting(legacy["id"], "opencode")
+        calls_before = len(self.fake.calls)
+        with self.assertRaisesRegex(InstanceError, "between 1 and 32 for OpenCode"):
+            self.manager._launch_record(self.store.get_instance(legacy["id"]))
+        self.assertEqual(len(self.fake.calls), calls_before)
+
+    def test_managed_agent_launch_fails_closed_when_priority_wrapper_drifts(self):
+        for error in (
+            FleetCommandGuardError("unsafe wrapper identity"),
+            RuntimeError("wrapper verifier unavailable"),
+        ):
+            calls_before = len(self.fake.calls)
+            with self.subTest(error=type(error).__name__), patch(
+                "aeon.remote.instances.require_fleet_low_priority_wrapper",
+                side_effect=error,
+            ), self.assertRaisesRegex(
+                InstanceError, "low-priority agent launcher"
+            ):
+                self.manager.create_instance(
+                    name=f"Blocked agent {type(error).__name__}",
+                    workspace=str(self.workspace),
+                    objective="",
+                    max_iterations=None,
+                    actor="admin",
+                )
+            self.assertFalse(
+                any(
+                    call[1] == "new-session"
+                    for call in self.fake.calls[calls_before:]
+                )
+            )
+
+    def test_deferred_aeon_waits_for_exact_first_chat_message(self):
+        deferred = self.manager.create_instance(
+            name="Idle project agent",
+            workspace=str(self.workspace),
+            objective="",
+            max_iterations=None,
+            actor="project-manager",
+            defer_until_message=True,
+        )
+
+        self.assertEqual(deferred["status"], "idle")
+        self.assertEqual(deferred["desired_state"], "stopped")
+        self.assertTrue(deferred["awaiting_objective"])
+        self.assertEqual(deferred["objective"], "")
+        self.assertIsNone(deferred["last_started_at"])
+        self.assertEqual(self.manager.read_agent_chat(deferred["id"]), [])
+        self.assertFalse(any(call[1] == "new-session" for call in self.fake.calls))
+
+        # Resume is not an objective and cannot turn an idle registration into
+        # an empty Aeon/model launch.
+        resumed = self.manager.resume_instance(deferred["id"], actor="admin")
+        self.assertEqual(resumed["status"], "idle")
+        self.assertTrue(resumed["awaiting_objective"])
+        self.assertFalse(any(call[1] == "new-session" for call in self.fake.calls))
+
+        message_id = "msg-" + "d" * 32
+        objective = "First inspect the repository and report what you find."
+        first = self.manager.send_agent_chat_message(
+            deferred["id"],
+            objective,
+            actor="admin",
+            message_id=message_id,
+        )
+        launches = [call for call in self.fake.calls if call[1] == "new-session"]
+        self.assertEqual(len(launches), 1)
+        self.assertIn("--start", launches[0])
+        self.assertEqual(launches[0][launches[0].index("--start") + 1], objective)
+        self.assertEqual(launches[0].count(objective), 1)
+        self.assertNotIn(objective, self.fake.loaded_payloads)
+        self.assertEqual(first["id"], message_id)
+        self.assertEqual(self.manager.read_agent_chat(deferred["id"]), [first])
+        running = self.manager.get_instance(deferred["id"])
+        self.assertFalse(running["awaiting_objective"])
+        self.assertEqual(running["status"], "running")
+
+        deliveries_before_retry = len(self.fake.loaded_payloads)
+        retry = self.manager.send_agent_chat_message(
+            deferred["id"],
+            objective,
+            actor="admin",
+            message_id=message_id,
+        )
+        self.assertEqual(retry, first)
+        self.assertEqual(
+            len([call for call in self.fake.calls if call[1] == "new-session"]),
+            1,
+        )
+        self.assertEqual(len(self.fake.loaded_payloads), deliveries_before_retry)
+
+        # Model a lost success response after tmux launch but before the durable
+        # awaiting flag was cleared. Retrying recovers state without a new launch
+        # or a second PTY delivery.
+        self.store.update_instance(
+            deferred["id"],
+            awaiting_objective=1,
+        )
+        recovered = self.manager.send_agent_chat_message(
+            deferred["id"],
+            objective,
+            actor="admin",
+            message_id=message_id,
+        )
+        self.assertEqual(recovered, first)
+        self.assertFalse(
+            self.store.get_instance(deferred["id"])["awaiting_objective"]
+        )
+        self.assertEqual(
+            len([call for call in self.fake.calls if call[1] == "new-session"]),
+            1,
+        )
+        self.assertEqual(len(self.fake.loaded_payloads), deliveries_before_retry)
+
+        second = self.manager.send_agent_chat_message(
+            deferred["id"],
+            "Now summarize the test suite.",
+            actor="admin",
+        )
+        self.assertEqual(second["content"], "Now summarize the test suite.")
+        self.assertEqual(
+            self.fake.loaded_payloads[-1],
+            "\x1b[200~"
+            + build_chat_delivery_envelope(second["id"], second["content"])
+            + "\x1b[201~\r",
+        )
+
+    def test_deferred_creation_requires_an_empty_aeon_objective(self):
+        with self.assertRaisesRegex(InstanceError, "without an objective"):
+            self.manager.create_instance(
+                name="Premature Aeon",
+                workspace=str(self.workspace),
+                objective="Start doing work",
+                max_iterations=None,
+                actor="admin",
+                defer_until_message=True,
+            )
+        with self.assertRaisesRegex(InstanceError, "Only Aeon"):
+            self.manager.create_instance(
+                kind="codex",
+                name="Deferred Codex",
+                workspace=str(self.workspace),
+                objective="",
+                max_iterations=None,
+                actor="admin",
+                defer_until_message=True,
+            )
+
+    def test_chat_fork_clones_exact_prefix_and_restores_independent_state(self):
+        source = self.manager.create_instance(
+            name="Main investigation",
+            workspace=str(self.workspace),
+            objective="",
+            max_iterations=32,
+            actor="admin",
+            defer_until_message=True,
+        )
+        user = self.manager.send_agent_chat_message(
+            source["id"],
+            "Inspect the implementation.",
+            actor="admin",
+            message_id="msg-" + "a" * 32,
+        )
+        transcript = self.manager._agent_chat_path(source["id"])
+        plan = append_chat_message(
+            transcript,
+            role="plan",
+            content="- [x] Inspect\n- [ ] Explain",
+            message_id="msg-" + "b" * 32,
+        )
+        assistant = append_chat_message(
+            transcript,
+            role="assistant",
+            content="The implementation has two relevant layers.",
+            message_id="msg-" + "c" * 32,
+            performance={
+                "tokens_per_second": 101.2,
+                "decode_tokens_per_second": 101.2,
+                "end_to_end_tokens_per_second": 35.4,
+                "completion_tokens": 24,
+                "time_to_first_token_seconds": 0.42,
+                "served_model": "Qwen3-Coder-Next-FP8",
+            },
+        )
+        worker_state_root = Path(self.temp.name) / "worker-state"
+        environment = {"AEON_STATE_DIR": str(worker_state_root)}
+        with patch.dict(os.environ, environment, clear=False):
+            checkpoint_directory = (
+                self.manager._worker_session_directory(source) / "fork-checkpoints"
+            )
+            checkpoint_directory.mkdir(parents=True)
+            checkpoint_directory.chmod(0o700)
+            checkpoint = checkpoint_directory / f"{assistant['id']}.json.gz"
+            import gzip
+
+            with gzip.open(checkpoint, "wt", encoding="utf-8") as stream:
+                json.dump(
+                    {
+                        "fork_checkpoint_schema": 1,
+                        "fork_checkpoint_message_id": assistant["id"],
+                        "memories": {"shared-fact": "retained"},
+                        "action_log": ["inspected exact source"],
+                        "history_messages": [
+                            {"role": "user", "content": user["content"]},
+                            {"role": "assistant", "content": assistant["content"]},
+                        ],
+                        "current_plan": plan["content"],
+                    },
+                    stream,
+                )
+            checkpoint.chmod(0o600)
+
+            fork = self.manager.fork_agent_chat(
+                source["id"], assistant["id"], actor="admin"
+            )
+
+            self.assertTrue(fork["temporary_fork"])
+            self.assertEqual(fork["fork_parent_id"], source["id"])
+            self.assertEqual(fork["fork_root_id"], source["id"])
+            self.assertEqual(fork["fork_point_message_id"], assistant["id"])
+            self.assertEqual(fork["fork_state_quality"], "checkpoint")
+            self.assertTrue(fork["awaiting_objective"])
+            self.assertEqual(
+                [item["id"] for item in self.manager.read_agent_chat(fork["id"])],
+                [user["id"], plan["id"], assistant["id"]],
+            )
+            self.assertEqual(
+                self.manager.read_agent_chat(fork["id"])[-1]["performance"],
+                assistant["performance"],
+            )
+            fork_state_path = (
+                self.manager._worker_session_directory(fork) / "session_state.json"
+            )
+            fork_state = json.loads(fork_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(fork_state["memories"], {"shared-fact": "retained"})
+            self.assertEqual(
+                fork_state["fork_restore"]["source_instance_id"], source["id"]
+            )
+
+            branch_message = self.manager.send_agent_chat_message(
+                fork["id"], "Explain only the second layer.", actor="admin"
+            )
+            self.assertEqual(branch_message["content"], "Explain only the second layer.")
+            self.assertEqual(
+                self.manager.read_agent_chat(source["id"]), [user, plan, assistant]
+            )
+            self.manager.close_agent_chat_fork(fork["id"], actor="admin")
+            self.assertIsNone(self.store.get_instance(fork["id"]))
+            self.assertIsNotNone(self.store.get_instance(source["id"]))
+    def test_deferred_first_message_replaces_only_a_dead_same_tab_session(self):
+        deferred = self.manager.create_instance(
+            name="Dead-session retry",
+            workspace=str(self.workspace),
+            objective="",
+            max_iterations=None,
+            actor="project-manager",
+            defer_until_message=True,
+        )
+        tmux_name = self.store.get_instance(deferred["id"])["tmux_name"]
+        self.fake.sessions[tmux_name] = {
+            "dead": True,
+            "pid": 987000,
+            "exit": 1,
+            "cwd": str(self.workspace),
+            "command": "python3",
+            "pending": "",
+            "agent_mode": False,
+            "managed_agent": False,
+            "at_prompt": False,
+            "interrupt_returns_prompt": True,
+            "delayed_browser_input": "",
+        }
+
+        saved = self.manager.send_agent_chat_message(
+            deferred["id"],
+            "Inspect the failure and report only.",
+            actor="admin",
+            message_id="msg-" + "e" * 32,
+        )
+
+        self.assertEqual(saved["content"], "Inspect the failure and report only.")
+        self.assertFalse(self.fake.sessions[tmux_name]["dead"])
+        self.assertFalse(self.manager.get_instance(deferred["id"])["awaiting_objective"])
+        self.assertEqual(
+            len([call for call in self.fake.calls if call[1] == "new-session"]),
+            1,
+        )
+
     def test_legacy_direct_aeon_uses_clean_environment_without_service_secrets(self):
         sentinels = {
             "NEXUS_OIDC_CLIENT_SECRET": "oidc-secret-sentinel",
             "CLOUDFLARE_API_TOKEN": "cloudflare-secret-sentinel",
             "OPENAI_API_KEY": "openai-secret-sentinel",
+            "AEON_FLEET_SOCKET": "/tmp/forged-fleet-socket",
+            "FLEET_TICKET": "forged-fleet-ticket",
+            "GPU_AGENT_CLAIM_ID": "forged-gpu-claim",
+            "GPU_MEM_LIMIT_GB": "forged-gpu-memory-limit",
+            "CUDA_VISIBLE_DEVICES": "forged-cuda-selector",
+            "DOCKER_HOST": "unix:///tmp/forged-docker.sock",
         }
         with patch.dict(os.environ, sentinels, clear=False):
             self.manager.create_instance(
@@ -1839,6 +2627,9 @@ class TestInstanceManager(RemoteFixture):
         python_at = launch.index("/usr/bin/python3")
         self.assertEqual(launch[env_at : env_at + 2], ["/usr/bin/env", "-i"])
         self.assertLess(env_at, python_at)
+        self.assertEqual(launch[python_at - 1], self.low_priority_wrapper)
+        self.assertIn("CUDA_VISIBLE_DEVICES=void", launch)
+        self.assertIn("NVIDIA_VISIBLE_DEVICES=void", launch)
         rendered = "\x00".join(launch)
         for secret in sentinels.values():
             self.assertNotIn(secret, rendered)
@@ -1859,6 +2650,7 @@ class TestInstanceManager(RemoteFixture):
             launches[-1][bash_at : bash_at + 3],
             ["/bin/bash", "--noprofile", "--rcfile"],
         )
+        self.assertNotIn(self.low_priority_wrapper, launches[-1])
         self.assertTrue(launches[-1][bash_at + 3].endswith("/managed-shell.rc"))
         self.assertEqual(launches[-1][bash_at + 4], "-i")
         environment_args = launches[-1][launches[-1].index("-i") + 1 : bash_at]
@@ -1979,7 +2771,17 @@ class TestInstanceManager(RemoteFixture):
         activation_calls = self.fake.calls[calls_before:]
         self.assertFalse(any(call[1] == "new-session" for call in activation_calls))
         command = self.fake.loaded_payloads[-1]
-        self.assertIn("aeon.main", command)
+        self.assertIn("aeon.harnesses.opencode_runtime", command)
+        self.assertIn(
+            f"{self.low_priority_wrapper} /usr/bin/python3 "
+            "-m aeon.harnesses.opencode_runtime",
+            command,
+        )
+        self.assertIn(
+            "AEON_INSTANCE_SKILLS_DIR="
+            f"{self.config.instance_state_dir / terminal['id'] / 'skills'}",
+            command,
+        )
         self.assertNotIn("--start", command)
         self.assertTrue(command.endswith("\r"))
         self.assertFalse(
@@ -2032,7 +2834,9 @@ class TestInstanceManager(RemoteFixture):
         self.assertEqual(agent["workspace"], str(nested.resolve()))
         command = self.fake.loaded_payloads[-1]
         self.assertIn("/usr/bin/env -i", command)
-        self.assertIn("/safe/codex --no-alt-screen", command)
+        self.assertIn(
+            f"{self.low_priority_wrapper} /safe/codex --no-alt-screen", command
+        )
         self.assertIn("HOME=/home/aday", command)
         self.assertNotIn(secret, command)
         self.assertFalse(any(call[1] == "new-session" for call in self.fake.calls[-6:]))
@@ -2289,8 +3093,32 @@ class TestInstanceManager(RemoteFixture):
         self.assertEqual(unchanged["mode"], "terminal")
         self.assertEqual(unchanged["status"], "running")
 
+    def test_disconnected_direct_provider_is_rejected_before_registry_mutation(self):
+        before = self.store.list_instances()
+        calls_before = len(self.fake.calls)
+        with patch(
+            "aeon.remote.instances.provider_status",
+            return_value={"installed": True, "connected": False},
+        ):
+            with self.assertRaisesRegex(InstanceError, "Connect codex"):
+                self.manager.create_instance(
+                    kind="codex",
+                    name="Unconnected direct Codex",
+                    workspace=str(self.workspace),
+                    objective="",
+                    max_iterations=None,
+                    actor="project-manager",
+                )
+
+        self.assertEqual(self.store.list_instances(), before)
+        self.assertEqual(len(self.fake.calls), calls_before)
+
     def test_legacy_direct_provider_resume_requires_fresh_connection(self):
         with (
+            patch(
+                "aeon.remote.instances.provider_status",
+                return_value={"installed": True, "connected": True},
+            ),
             patch(
                 "aeon.remote.instances.provider_agent_command",
                 return_value=SimpleNamespace(argv=("/safe/codex",)),
@@ -2588,6 +3416,63 @@ class TestInstanceManager(RemoteFixture):
         self.assertTrue(sent)
         self.assertTrue(all("-l" not in call for call in sent))
         self.assertFalse(any("exit" in call for call in sent))
+
+    def test_agent_end_allows_verified_shell_handoff_to_finish_prompt(self):
+        terminal = self.manager.create_terminal(
+            workspace=str(self.workspace), actor="admin"
+        )
+        agent = self.manager.activate_agent(
+            terminal["id"], kind="aeon", actor="admin"
+        )
+
+        with (
+            patch.object(
+                self.manager,
+                "_pane_at_base_prompt",
+                side_effect=[False, False, True],
+            ),
+            patch.object(
+                self.manager,
+                "_managed_agent_is_foreground",
+                side_effect=[True, False],
+            ),
+            patch.object(
+                self.manager, "_base_shell_has_foreground_control", return_value=True
+            ),
+        ):
+            returned = self.manager.end_agent(agent["id"], actor="admin")
+
+        self.assertEqual(returned["kind"], "terminal")
+        self.assertEqual(returned["status"], "running")
+        self.assertFalse(returned["force_stop_required"])
+
+    def test_exact_prompt_repairs_stale_force_stop_error(self):
+        terminal = self.manager.create_terminal(
+            workspace=str(self.workspace), actor="admin"
+        )
+        agent = self.manager.activate_agent(
+            terminal["id"], kind="aeon", actor="admin"
+        )
+        record = self.store.get_instance(agent["id"])
+        self.fake.sessions[record["tmux_name"]].update(
+            command="bash",
+            at_prompt=True,
+            agent_mode=False,
+            managed_agent=False,
+        )
+        self.store.update_instance(
+            agent["id"],
+            status="error",
+            last_error=(
+                "Safety ambiguity; exact-name force stop required: stale handoff"
+            ),
+        )
+
+        recovered = self.manager.get_instance(agent["id"])
+
+        self.assertEqual(recovered["kind"], "terminal")
+        self.assertEqual(recovered["status"], "running")
+        self.assertFalse(recovered["force_stop_required"])
 
     def test_live_unrecordable_launch_never_falls_back_to_terminal_mode(self):
         terminal = self.manager.create_terminal(
@@ -3161,6 +4046,71 @@ class TestInstanceManager(RemoteFixture):
         )
         self.assertIsNone(self.store.get_instance(terminal["id"]))
 
+    def test_kill_instance_serializes_verified_stop_and_delete_against_resume(self):
+        terminal = self.manager.create_terminal(
+            name="Atomic child",
+            workspace=str(self.workspace),
+            actor="admin",
+        )
+        original_kill = self.manager._kill_session_and_verify_absent
+        stop_entered = threading.Event()
+        allow_stop = threading.Event()
+        resume_started = threading.Event()
+        resume_finished = threading.Event()
+        kill_result: dict[str, object] = {}
+        resume_result: dict[str, object] = {}
+
+        def delayed_kill(*args, **kwargs):
+            stop_entered.set()
+            if not allow_stop.wait(timeout=2):
+                raise AssertionError("test did not release verified force stop")
+            return original_kill(*args, **kwargs)
+
+        def kill():
+            try:
+                self.manager.kill_instance(
+                    terminal["id"],
+                    confirmation=terminal["name"],
+                    actor="admin",
+                )
+                kill_result["deleted"] = True
+            except Exception as exc:  # pragma: no cover - asserted below
+                kill_result["error"] = exc
+
+        def resume():
+            resume_started.set()
+            try:
+                resume_result["value"] = self.manager.resume_instance(
+                    terminal["id"], actor="admin"
+                )
+            except Exception as exc:
+                resume_result["error"] = exc
+            finally:
+                resume_finished.set()
+
+        with patch.object(
+            self.manager,
+            "_kill_session_and_verify_absent",
+            side_effect=delayed_kill,
+        ):
+            kill_thread = threading.Thread(target=kill)
+            kill_thread.start()
+            self.assertTrue(stop_entered.wait(timeout=1))
+            resume_thread = threading.Thread(target=resume)
+            resume_thread.start()
+            self.assertTrue(resume_started.wait(timeout=1))
+            self.assertFalse(resume_finished.wait(timeout=0.05))
+            allow_stop.set()
+            kill_thread.join(timeout=2)
+            resume_thread.join(timeout=2)
+
+        self.assertFalse(kill_thread.is_alive())
+        self.assertFalse(resume_thread.is_alive())
+        self.assertEqual(kill_result, {"deleted": True})
+        self.assertIsInstance(resume_result.get("error"), InstanceError)
+        self.assertIn("Unknown session", str(resume_result["error"]))
+        self.assertIsNone(self.store.get_instance(terminal["id"]))
+
     def test_tmux_query_errors_never_masquerade_as_absent_sessions(self):
         terminal = self.manager.create_terminal(
             workspace=str(self.workspace), actor="admin"
@@ -3238,6 +4188,34 @@ class TestInstanceManager(RemoteFixture):
         self.assertEqual(durable["desired_state"], "running")
         self.assertEqual(durable["status"], "running")
 
+    def test_kill_instance_never_deletes_when_force_stop_is_ambiguous(self):
+        terminal = self.manager.create_terminal(
+            name="Ambiguous disposable child",
+            workspace=str(self.workspace),
+            actor="admin",
+        )
+        self.fake.kill_session_error = True
+        self.fake.query_error_after_kill = True
+
+        with self.assertRaisesRegex(InstanceError, "exact tmux session pane"):
+            self.manager.kill_instance(
+                terminal["id"],
+                confirmation=terminal["name"],
+                actor="admin",
+            )
+
+        durable = self.store.get_instance(terminal["id"])
+        self.assertIsNotNone(durable)
+        self.assertEqual(durable["desired_state"], "running")
+        self.assertEqual(durable["status"], "running")
+        self.assertFalse(
+            any(
+                row["action"] == "instance_deleted"
+                and row["instance_id"] == terminal["id"]
+                for row in self.store.recent_audit(limit=20)
+            )
+        )
+
     def test_delete_query_error_preserves_durable_tab(self):
         terminal = self.manager.create_terminal(
             name="Ambiguous delete shell",
@@ -3259,6 +4237,10 @@ class TestInstanceManager(RemoteFixture):
 
     def test_direct_provider_kill_ambiguity_never_claims_stopped(self):
         with (
+            patch(
+                "aeon.remote.instances.provider_status",
+                return_value={"installed": True, "connected": True},
+            ),
             patch(
                 "aeon.remote.instances.provider_agent_command",
                 return_value=SimpleNamespace(argv=("/safe/codex",)),
@@ -3347,6 +4329,10 @@ class TestInstanceManager(RemoteFixture):
         self.assertIn("--debug", launch)
         self.assertNotIn("sh", launch)
         self.assertIn(f"AEON_REMOTE_INSTANCE_ID={instance['id']}", launch)
+        self.assertIn(
+            f"AEON_INSTANCE_SKILLS_DIR={self.config.instance_state_dir / instance['id'] / 'skills'}",
+            launch,
+        )
         stored = self.store.get_instance(instance["id"])
         self.assertEqual(stored["created_by"], "local-user")
         self.assertEqual(stored["workspace"], str(local_workspace.resolve()))
@@ -3356,8 +4342,92 @@ class TestInstanceManager(RemoteFixture):
         # The same exact locally authorized directory stays resumable from the
         # dashboard even though it is not a browser-allowed creation root.
         self.fake.sessions.clear()
+        calls_before_resume = len(self.fake.calls)
         resumed = self.manager.resume_instance(instance["id"], actor="admin")
         self.assertEqual(resumed["status"], "running")
+        resumed_launch = next(
+            call
+            for call in self.fake.calls[calls_before_resume:]
+            if call[1] == "new-session"
+        )
+        self.assertIn("--resume-unfinished", resumed_launch)
+        self.assertNotIn("--start", resumed_launch)
+
+    def test_local_cli_adoption_uses_fixed_selected_opencode_harness(self):
+        local_workspace = Path(self.temp.name) / "outside-web-opencode"
+        local_workspace.mkdir()
+        objective = "Inspect this workspace"
+
+        instance = self.manager.adopt_local_cli(
+            workspace=local_workspace,
+            # OpenCode adoption ignores replayable compatibility argv and rebuilds
+            # the exact reviewed command from typed fields below.
+            cli_args=["--debug", "--harness", "legacy-aeon"],
+            objective=objective,
+            max_iterations=7,
+            model=None,
+            harness="opencode",
+            browser_profile="local-profile",
+            actor="local-user",
+        )
+
+        launch = next(call for call in self.fake.calls if call[1] == "new-session")
+        python_at = launch.index("/usr/bin/python3")
+        self.assertEqual(
+            launch[python_at:python_at + 3],
+            ["/usr/bin/python3", "-m", "aeon.harnesses.opencode_runtime"],
+        )
+        self.assertIn("--start", launch)
+        self.assertIn(objective, launch)
+        self.assertIn("--max-iterations", launch)
+        self.assertIn("7", launch)
+        self.assertIn("--browser-profile", launch)
+        self.assertIn("local-profile", launch)
+        self.assertNotIn("--debug", launch)
+        self.assertNotIn("legacy-aeon", launch)
+        setting = self.store.get_agent_setting(instance["id"], "aeon")
+        self.assertEqual(setting["desired_harness"], "opencode")
+        self.assertEqual(setting["applied_harness"], "opencode")
+
+    def test_explicit_end_cancels_stale_running_worker_checkpoint(self):
+        instance = self.manager.create_instance(
+            name="Checkpointed agent",
+            workspace=str(self.workspace),
+            objective="finish the requested work",
+            max_iterations=None,
+            actor="admin",
+        )
+        record = self.store.get_instance(instance["id"])
+        worker_state_root = Path(self.temp.name) / "explicit-end-worker-state"
+        with patch.dict(
+            os.environ, {"AEON_STATE_DIR": str(worker_state_root)}, clear=False
+        ):
+            directory = self.manager._worker_session_directory(record)
+            directory.mkdir(mode=0o700, parents=True)
+            state_path = directory / "session_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "instance_id": record["id"],
+                        "execution_state": "running",
+                        "objective": "finish the requested work",
+                        "request_contract": {
+                            "raw_request": "finish the requested work",
+                            "state": "running",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_path.chmod(0o600)
+
+            self.manager._cancel_worker_checkpoint_for_explicit_end(record)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["execution_state"], "cancelled")
+        self.assertEqual(saved["request_contract"]["state"], "cancelled")
+        self.assertEqual(saved["stop_reason"], "nexus-explicit-end")
+        self.assertEqual(saved["pid"], 0)
 
     def test_web_instance_never_inherits_local_workspace_bypass(self):
         outside = Path(self.temp.name) / "outside"
@@ -3434,12 +4504,21 @@ class TestInstanceManager(RemoteFixture):
         clean_environment = {
             "HOME": str(safe_home),
             "PATH": "/usr/bin:/bin",
+            "AEON_FLEET_SOCKET": "/tmp/forged-fleet-socket",
+            "FLEET_TICKET": "forged-fleet-ticket",
+            "GPU_AGENT_CLAIM_ID": "forged-gpu-claim",
+            "CUDA_VISIBLE_DEVICES": "forged-cuda-selector",
+            "DOCKER_HOST": "unix:///tmp/forged-docker.sock",
         }
         agent_command = SimpleNamespace(argv=("/safe/bin/claude",))
         login_command = SimpleNamespace(
             argv=("/safe/bin/claude", "auth", "login", "--claudeai")
         )
         with (
+            patch(
+                "aeon.remote.instances.provider_status",
+                return_value={"installed": True, "connected": True},
+            ),
             patch(
                 "aeon.remote.instances.provider_agent_command",
                 return_value=agent_command,
@@ -3470,7 +4549,29 @@ class TestInstanceManager(RemoteFixture):
             self.assertEqual(launch[env_at : env_at + 2], ["/usr/bin/env", "-i"])
             self.assertIn(f"HOME={safe_home}", launch)
             self.assertIn("PATH=/usr/bin:/bin", launch)
+            wrapper_at = launch.index(self.low_priority_wrapper)
+            self.assertGreater(wrapper_at, env_at)
+            self.assertTrue(
+                launch[wrapper_at + 1].startswith("/safe/bin/claude")
+            )
+            self.assertIn("CUDA_VISIBLE_DEVICES=void", launch)
+            self.assertIn("NVIDIA_VISIBLE_DEVICES=void", launch)
             self.assertFalse(any(value.startswith("NEXUS_") for value in launch))
+            rendered = "\x00".join(launch)
+            for inherited in (
+                "/tmp/forged-fleet-socket",
+                "forged-fleet-ticket",
+                "forged-gpu-claim",
+                "forged-cuda-selector",
+                "unix:///tmp/forged-docker.sock",
+            ):
+                self.assertNotIn(inherited, rendered)
+            # Provider agents keep ordinary public networking; this boundary adds
+            # priority/env containment, not the generic command tool's network ban.
+            self.assertNotIn("systemd-run", launch)
+            self.assertFalse(
+                any("RestrictAddressFamilies" in value for value in launch)
+            )
         self.assertEqual(agent["kind"], "claude")
         self.assertEqual(agent["provider"], "claude")
         self.assertFalse(agent["auth_session"])
@@ -3511,6 +4612,10 @@ class TestInstanceManager(RemoteFixture):
         }
         command = SimpleNamespace(argv=("/safe/bin/codex", "--no-alt-screen"))
         with (
+            patch(
+                "aeon.remote.instances.provider_status",
+                return_value={"installed": True, "connected": True},
+            ),
             patch(
                 "aeon.remote.instances.provider_agent_command",
                 return_value=command,
@@ -3566,7 +4671,7 @@ class TestInstanceManager(RemoteFixture):
         self.assertNotIn(base_text, audit_text)
         self.assertNotIn(local_text, audit_text)
 
-    def test_project_manager_is_pinned_home_terminal_then_same_tab_aeon(self):
+    def test_project_manager_is_pinned_nexus_terminal_then_same_tab_aeon(self):
         config = replace(self.config, allowed_roots=(Path("/home/aday"),))
         fake = FakeTmux()
         manager = InstanceManager(
@@ -3602,20 +4707,464 @@ class TestInstanceManager(RemoteFixture):
             sum(call[1] == "new-session" for call in fake.calls),
             launches_before_recovery + 1,
         )
-        agent = manager.activate_agent(
-            project_manager["id"], kind="aeon", actor="admin"
-        )
+        capability_path = config.state_dir / "orchestrator-control.token"
+        capability_path.write_text("test-capability", encoding="ascii")
+        capability_path.chmod(0o600)
+        with patch.dict(
+            os.environ,
+            {
+                "NEXUS_INTERNAL_ORCHESTRATOR_URL": (
+                    "http://127.0.0.1:8765/internal/orchestrator/agents"
+                )
+            },
+            clear=False,
+        ):
+            agent = manager.activate_agent(
+                project_manager["id"], kind="aeon", actor="admin"
+            )
         self.assertEqual(agent["id"], project_manager["id"])
         self.assertEqual(agent["mode"], "agent")
         command = fake.loaded_payloads[-1]
-        self.assertIn("--start", command)
-        self.assertIn("persistent project manager", command.lower())
+        self.assertNotIn("--start", command)
+        self.assertIn("AEON_MAIN_ORCHESTRATOR=1", command)
+        self.assertIn("AEON_CHAT_TRANSCRIPT_PATH=", command)
+        self.assertIn("NEXUS_INTERNAL_ORCHESTRATOR_URL=", command)
+        self.assertIn(f"NEXUS_ORCHESTRATOR_TOKEN_FILE={capability_path}", command)
+        launches_before_idempotent_start = len(fake.loaded_payloads)
+        ensured = manager.ensure_main_orchestrator(actor="admin")
+        self.assertEqual(ensured["id"], project_manager["id"])
+        self.assertEqual(len(fake.loaded_payloads), launches_before_idempotent_start)
+
+        # A managed Aeon may exit to the verified outer shell between Nexus
+        # supervision passes.  The supervisor must reconcile and reactivate it
+        # itself; recovery cannot depend on a browser list/refresh request.
+        stored_project_manager = self.store.get_instance(project_manager["id"])
+        pane = fake.sessions[stored_project_manager["tmux_name"]]
+        pane.update(
+            command="bash",
+            agent_mode=False,
+            managed_agent=False,
+            at_prompt=True,
+        )
+        launches_before_supervised_recovery = len(fake.loaded_payloads)
+        recovered = manager.ensure_main_orchestrator(actor="nexus-controller")
+        self.assertEqual(recovered["mode"], "agent")
+        self.assertEqual(recovered["kind"], "aeon")
+        self.assertEqual(
+            len(fake.loaded_payloads), launches_before_supervised_recovery + 1
+        )
+
+        sent = manager.send_main_orchestrator_message(
+            "Please review the workspace.", actor="admin"
+        )
+        self.assertEqual(sent["role"], "user")
+        self.assertEqual(sent["content"], "Please review the workspace.")
+        self.assertEqual(manager.read_main_orchestrator_chat(), [sent])
+        deliveries_after_sent = len(fake.loaded_payloads)
+        self.assertEqual(
+            manager.send_main_orchestrator_message(
+                "Please review the workspace.",
+                actor="admin",
+                message_id=sent["id"],
+            ),
+            sent,
+        )
+        self.assertEqual(len(fake.loaded_payloads), deliveries_after_sent)
+        self.assertEqual(
+            fake.loaded_payloads[-1],
+            "\x1b[200~"
+            + build_chat_delivery_envelope(sent["id"], sent["content"])
+            + "\x1b[201~\r",
+        )
+        stopped = manager.stop_main_orchestrator_turn(actor="admin")
+        self.assertTrue(stopped)
+        self.assertIn("/__nexus_stop_current_turn_", fake.loaded_payloads[-1])
+        stored_project_manager = self.store.get_instance(project_manager["id"])
+        self.assertTrue(fake.sessions[stored_project_manager["tmux_name"]]["agent_mode"])
+        image_bytes = io.BytesIO()
+        Image.new("RGB", (8, 6), "purple").save(image_bytes, format="PNG")
+        media = manager.send_main_orchestrator_message(
+            "What is shown?",
+            actor="admin",
+            uploads=[
+                SimpleNamespace(
+                    filename="../screen shot.png",
+                    content_type="image/png",
+                    file=io.BytesIO(image_bytes.getvalue()),
+                )
+            ],
+        )
+        attachment = media["attachments"][0]
+        self.assertEqual(attachment["name"], "screen shot.png")
+        self.assertNotIn(str(config.instance_state_dir), repr(media))
+        attachment_path, resolved = manager.resolve_main_orchestrator_attachment(
+            attachment["id"]
+        )
+        self.assertEqual(resolved, attachment)
+        self.assertEqual(attachment_path.stat().st_mode & 0o777, 0o600)
+        agent_path, agent_resolved = manager.resolve_agent_chat_attachment(
+            project_manager["id"], attachment["id"]
+        )
+        self.assertEqual(agent_path, attachment_path)
+        self.assertEqual(agent_resolved, attachment)
+        self.assertIn(str(attachment_path), fake.loaded_payloads[-1])
+        self.assertIn("use analyze_image", fake.loaded_payloads[-1])
+        visible_transcript = manager._main_orchestrator_chat_path().read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(str(attachment_path), visible_transcript)
+        self.assertNotIn("use analyze_image", visible_transcript)
+        deliveries_after_media = len(fake.loaded_payloads)
+        media_retry = manager.send_main_orchestrator_message(
+            "What is shown?",
+            actor="admin",
+            message_id=media["id"],
+            uploads=[
+                SimpleNamespace(
+                    filename="../screen shot.png",
+                    content_type="image/png",
+                    file=io.BytesIO(image_bytes.getvalue()),
+                )
+            ],
+        )
+        self.assertEqual(media_retry, media)
+        self.assertEqual(len(fake.loaded_payloads), deliveries_after_media)
+        changed_image_bytes = io.BytesIO()
+        Image.new("RGB", (8, 6), "blue").save(
+            changed_image_bytes, format="PNG"
+        )
+        self.assertEqual(
+            len(changed_image_bytes.getvalue()), len(image_bytes.getvalue())
+        )
+        with self.assertRaisesRegex(InstanceError, "identity conflicts"):
+            manager.send_main_orchestrator_message(
+                "What is shown?",
+                actor="admin",
+                message_id=media["id"],
+                uploads=[
+                    SimpleNamespace(
+                        filename="../screen shot.png",
+                        content_type="image/png",
+                        file=io.BytesIO(changed_image_bytes.getvalue()),
+                    )
+                ],
+            )
+        self.assertEqual(len(fake.loaded_payloads), deliveries_after_media)
+
+        self.assertEqual(manager.read_main_orchestrator_chat(), [sent, media])
+        deliveries_before_invalid = len(fake.loaded_payloads)
+        with self.assertRaisesRegex(InstanceError, "control characters"):
+            manager.send_main_orchestrator_message(
+                "do not deliver\x1bthis", actor="admin"
+            )
+        self.assertEqual(len(fake.loaded_payloads), deliveries_before_invalid)
+        self.assertEqual(manager.read_main_orchestrator_chat(), [sent, media])
+
+        ended = manager.end_agent(project_manager["id"], actor="admin")
+        self.assertEqual(ended["mode"], "terminal")
+        self.assertEqual(ended["status"], "running")
+        with patch.dict(
+            os.environ,
+            {
+                "NEXUS_INTERNAL_ORCHESTRATOR_URL": (
+                    "http://127.0.0.1:8765/internal/orchestrator/agents"
+                )
+            },
+            clear=False,
+        ):
+            restarted = manager.ensure_main_orchestrator(actor="admin")
+        self.assertEqual(restarted["id"], project_manager["id"])
+        self.assertEqual(restarted["mode"], "agent")
+        self.assertEqual(restarted["kind"], "aeon")
+        self.assertEqual(manager.read_main_orchestrator_chat(), [sent, media])
+
+        crash_message_id = "msg-" + "7" * 32
+        crash_message = "Recover after the append-to-state crash."
+        original_state_write = chat_transcript._write_delivery_entries_locked
+        injected = False
+
+        def fail_committed_state_once(directory_fd, entries):
+            nonlocal injected
+            crash_entry = entries.get(crash_message_id)
+            if (
+                not injected
+                and crash_entry is not None
+                and crash_entry.get("state") == "committed"
+            ):
+                injected = True
+                raise ChatTranscriptError("injected state receipt failure")
+            return original_state_write(directory_fd, entries)
+
+        deliveries_before_state_crash = len(fake.loaded_payloads)
+        with patch.object(
+            chat_transcript,
+            "_write_delivery_entries_locked",
+            side_effect=fail_committed_state_once,
+        ):
+            with self.assertRaisesRegex(InstanceError, "history could not be saved"):
+                manager.send_main_orchestrator_message(
+                    crash_message,
+                    actor="admin",
+                    message_id=crash_message_id,
+                )
+        with self.assertRaisesRegex(InstanceError, "delivery is ambiguous"):
+            manager.send_main_orchestrator_message(
+                crash_message,
+                actor="admin",
+                message_id=crash_message_id,
+            )
+        self.assertEqual(
+            len(fake.loaded_payloads), deliveries_before_state_crash + 1
+        )
+        self.assertEqual(
+            sum(
+                item.get("id") == crash_message_id
+                for item in manager.read_main_orchestrator_chat()
+            ),
+            1,
+        )
+
+        ambiguous_message_id = "msg-" + "8" * 32
+        deliveries_before_commit_failure = len(fake.loaded_payloads)
+        with patch(
+            "aeon.remote.instances.commit_chat_delivery",
+            side_effect=ChatTranscriptError("injected pre-append commit failure"),
+        ):
+            with self.assertRaisesRegex(InstanceError, "history could not be saved"):
+                manager.send_main_orchestrator_message(
+                    "Never paste this ambiguous turn twice.",
+                    actor="admin",
+                    message_id=ambiguous_message_id,
+                )
+        with self.assertRaisesRegex(InstanceError, "delivery is ambiguous"):
+            manager.send_main_orchestrator_message(
+                "Never paste this ambiguous turn twice.",
+                actor="admin",
+                message_id=ambiguous_message_id,
+            )
+        self.assertEqual(
+            len(fake.loaded_payloads), deliveries_before_commit_failure + 1
+        )
+
+        unacknowledged_message_id = "msg-" + "9" * 32
+        deliveries_before_unacknowledged = len(fake.loaded_payloads)
+        with patch(
+            "aeon.remote.instances.wait_for_chat_delivery_consumed",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(InstanceError, "delivery is ambiguous"):
+                manager.send_main_orchestrator_message(
+                    "Require an exact receiver acknowledgement.",
+                    actor="admin",
+                    message_id=unacknowledged_message_id,
+                )
+        with self.assertRaisesRegex(InstanceError, "delivery is ambiguous"):
+            manager.send_main_orchestrator_message(
+                "Require an exact receiver acknowledgement.",
+                actor="admin",
+                message_id=unacknowledged_message_id,
+            )
+        self.assertEqual(
+            len(fake.loaded_payloads), deliveries_before_unacknowledged + 1
+        )
+        self.assertEqual(
+            sum(
+                item.get("id") == unacknowledged_message_id
+                for item in manager.read_main_orchestrator_chat()
+            ),
+            1,
+        )
+
+        worker_state_root = Path(self.temp.name) / "worker-state"
+        with patch.dict(
+            os.environ, {"AEON_STATE_DIR": str(worker_state_root)}, clear=False
+        ):
+            worker_session = manager._worker_session_directory(
+                self.store.get_instance(project_manager["id"])
+            )
+            worker_session.mkdir(mode=0o700, parents=True)
+            (worker_session / "session_state.json").write_text(
+                json.dumps({"memories": {"old": "context"}}), encoding="utf-8"
+            )
+            (worker_session / "session_state.json").chmod(0o600)
+            (worker_session / "interrupted_session.json").write_text(
+                json.dumps({"objective": "old task"}), encoding="utf-8"
+            )
+            (worker_session / "interrupted_session.json").chmod(0o600)
+            fresh = manager.ensure_main_orchestrator(
+                actor="admin", fresh_context=True
+            )
+        self.assertEqual(fresh["mode"], "agent")
+        self.assertEqual(
+            json.loads((worker_session / "session_state.json").read_text()), {}
+        )
+        self.assertFalse((worker_session / "interrupted_session.json").exists())
+        self.assertEqual(manager.read_main_orchestrator_chat(), [])
+        reset_audits = [
+            item
+            for item in self.store.recent_audit(100)
+            if item["action"] == "agent_context_reset"
+        ]
+        self.assertEqual(len(reset_audits), 1)
+
+        invalid_target = Path(self.temp.name) / "invalid-interrupted-state"
+        invalid_target.write_text("not owned context", encoding="utf-8")
+        interrupted = worker_session / "interrupted_session.json"
+        interrupted.symlink_to(invalid_target)
+        with patch.dict(
+            os.environ, {"AEON_STATE_DIR": str(worker_state_root)}, clear=False
+        ):
+            with self.assertRaisesRegex(
+                InstanceError, "Interrupted agent context identity is invalid"
+            ):
+                manager.ensure_main_orchestrator(
+                    actor="admin", fresh_context=True
+                )
+            with self.assertRaisesRegex(
+                InstanceError, "waiting for a verified fresh-context reset"
+            ):
+                manager.ensure_main_orchestrator(actor="nexus-controller")
+            interrupted.unlink()
+            recovered_fresh = manager.ensure_main_orchestrator(
+                actor="admin", fresh_context=True
+            )
+        self.assertEqual(recovered_fresh["mode"], "agent")
+        calls_before_protected_kill = len(fake.calls)
+        with self.assertRaisesRegex(InstanceError, "permanent"):
+            manager.kill_instance(
+                project_manager["id"],
+                confirmation=project_manager["name"],
+                actor="admin",
+            )
+        self.assertEqual(len(fake.calls), calls_before_protected_kill)
+        self.assertIsNotNone(self.store.get_instance(project_manager["id"]))
+
+        ordinary = manager.create_terminal(
+            name="Ordinary terminal",
+            workspace="/home/aday/NexusAgentDashboard",
+            actor="admin",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "NEXUS_INTERNAL_ORCHESTRATOR_URL": (
+                    "http://127.0.0.1:8765/internal/orchestrator/agents"
+                )
+            },
+            clear=False,
+        ):
+            manager.activate_agent(ordinary["id"], kind="aeon", actor="admin")
+        ordinary_command = fake.loaded_payloads[-1]
+        self.assertNotIn("NEXUS_INTERNAL_ORCHESTRATOR_URL=", ordinary_command)
+        self.assertNotIn("NEXUS_ORCHESTRATOR_TOKEN_FILE=", ordinary_command)
+        self.assertIn("AEON_CHAT_TRANSCRIPT_PATH=", ordinary_command)
+        initial_chat_revision = manager.agent_chat_revision(ordinary["id"])
+        ordinary_message = manager.send_agent_chat_message(
+            ordinary["id"], "Talk through this task.", actor="admin"
+        )
+        message_chat_revision = manager.agent_chat_revision(ordinary["id"])
+        self.assertNotEqual(message_chat_revision, initial_chat_revision)
+        self.assertEqual(ordinary_message["content"], "Talk through this task.")
+        self.assertEqual(manager.read_agent_chat(ordinary["id"]), [ordinary_message])
+        self.assertEqual(
+            fake.loaded_payloads[-1],
+            "\x1b[200~"
+            + build_chat_delivery_envelope(
+                ordinary_message["id"], ordinary_message["content"]
+            )
+            + "\x1b[201~\r",
+        )
+        voice_id = "msg-" + "b" * 32
+        deliveries_before_retry = len(fake.loaded_payloads)
+        durable = manager.send_agent_chat_message(
+            ordinary["id"],
+            "Do not lose this voice turn.",
+            actor="admin",
+            message_id=voice_id,
+        )
+        retried = manager.send_agent_chat_message(
+            ordinary["id"],
+            "Do not lose this voice turn.",
+            actor="admin",
+            message_id=voice_id,
+        )
+        self.assertNotEqual(
+            manager.agent_chat_revision(ordinary["id"]),
+            message_chat_revision,
+        )
+        self.assertEqual(durable, retried)
+        self.assertEqual(durable["id"], voice_id)
+        self.assertEqual(len(fake.loaded_payloads), deliveries_before_retry + 1)
+        self.assertTrue(manager.stop_agent_chat_turn(ordinary["id"], actor="admin"))
+        self.assertIn("/__nexus_stop_current_turn_", fake.loaded_payloads[-1])
         with self.assertRaisesRegex(InstanceError, "permanent"):
             manager.delete_instance(
                 project_manager["id"],
                 confirmation=project_manager["name"],
                 actor="admin",
             )
+
+    def test_controller_starts_and_maintains_primary_without_a_browser(self):
+        config = replace(self.config, allowed_roots=(Path("/home/aday"),))
+        fake = FakeTmux()
+        manager = InstanceManager(
+            self.store,
+            config,
+            command_runner=fake,
+            pane_prompt_checker=fake.pane_at_prompt,
+            pane_foreground_checker=fake.pane_has_managed_foreground,
+        )
+        capability_path = config.state_dir / "orchestrator-control.token"
+        capability_path.write_text("test-capability", encoding="ascii")
+        capability_path.chmod(0o600)
+
+        with patch.dict(
+            os.environ,
+            {
+                "NEXUS_INTERNAL_ORCHESTRATOR_URL": (
+                    "http://127.0.0.1:8765/internal/orchestrator/agents"
+                )
+            },
+            clear=False,
+        ):
+            manager.ensure_persistent_main_orchestrator()
+            launches = len(fake.loaded_payloads)
+            manager.ensure_persistent_main_orchestrator()
+
+        primary = next(item for item in manager.list_instances() if item["pinned"])
+        self.assertEqual(primary["mode"], "agent")
+        self.assertEqual(primary["kind"], "aeon")
+        self.assertEqual(primary["status"], "running")
+        self.assertEqual(len(fake.loaded_payloads), launches)
+
+        # A reboot removes the tmux server without first returning the managed
+        # Aeon to its outer shell.  The controller must recreate that exact
+        # pinned shell and reactivate the agent without browser involvement.
+        fake.sessions.clear()
+        shell_launches = sum(call[1] == "new-session" for call in fake.calls)
+        agent_launches = len(fake.loaded_payloads)
+        with patch.dict(
+            os.environ,
+            {
+                "NEXUS_INTERNAL_ORCHESTRATOR_URL": (
+                    "http://127.0.0.1:8765/internal/orchestrator/agents"
+                )
+            },
+            clear=False,
+        ):
+            manager.ensure_persistent_main_orchestrator()
+
+        recovered = next(
+            item for item in manager.list_instances() if item["pinned"]
+        )
+        self.assertEqual(recovered["mode"], "agent")
+        self.assertEqual(recovered["kind"], "aeon")
+        self.assertEqual(recovered["status"], "running")
+        self.assertEqual(
+            sum(call[1] == "new-session" for call in fake.calls),
+            shell_launches + 1,
+        )
+        self.assertEqual(len(fake.loaded_payloads), agent_launches + 1)
 
 
 class TestRemoteStaticSafety(unittest.TestCase):

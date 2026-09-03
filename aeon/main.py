@@ -1,5 +1,5 @@
 # LIVE TEST RESTART 2026-05-15
-import os, argparse, json, time, sys, subprocess, requests, fcntl, signal, atexit, stat, threading, tempfile
+import os, argparse, hashlib, json, re, time, sys, subprocess, requests, fcntl, signal, atexit, stat, threading, tempfile
 from contextlib import contextmanager
 
 import psutil
@@ -16,6 +16,8 @@ except Exception:
 from pathlib import Path
 from aeon.core.logger import get_logger
 from aeon.core.presence import Presence
+from aeon.core.model_identity import AEON_DEFAULT_MODEL_NAME
+from aeon.core.skills.manager import INSTANCE_SKILLS_DIR_ENV
 from aeon.core.worker import Worker
 from aeon.core.llm import LLMClient
 from aeon.tools.loader import load_tools_from_directory
@@ -41,6 +43,65 @@ FLEET_LOW_PRIORITY = "/home/aday/bin/fleet-low-priority"
 MODEL_REGISTRY_SCHEMA_VERSION = 3
 _QWEN_LIFECYCLE_THREAD_LOCK = threading.RLock()
 _QWEN_LIFECYCLE_LOCAL = threading.local()
+_LOCAL_HTTP_KWARGS = {
+    # Local control/model traffic must never be influenced by a user's proxy
+    # environment and must not be redirected away from its fixed loopback
+    # origin.  These legacy Ollama helpers are normally dormant, but keeping
+    # their transport fail-closed prevents an old registry entry from widening
+    # the current Fleet-only boundary.
+    "allow_redirects": False,
+    "proxies": {"http": "", "https": ""},
+}
+
+
+def _configure_runtime_skill_overlay(
+    workspace: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Select a stable private learning overlay without touching shared skills.
+
+    Nexus and the bounded sub-agent wrapper provide an exact durable overlay.
+    An ordinary standalone CLI has no durable agent row, so its owner-private
+    learning state is scoped to the same canonical workspace identity used by
+    Worker session persistence.
+    """
+
+    supplied = os.environ.get(INSTANCE_SKILLS_DIR_ENV, "").strip()
+    packaged = Path(__file__).resolve().parent / "core" / "skills"
+    catalogs = [packaged]
+    configured_catalog = os.environ.get("AEON_SKILLS_DIR", "").strip()
+    if configured_catalog:
+        catalogs.append(Path(configured_catalog).expanduser().absolute())
+
+    def overlaps_catalog(path: Path) -> bool:
+        try:
+            candidate = path.resolve(strict=False)
+            for catalog in catalogs:
+                resolved_catalog = catalog.resolve(strict=False)
+                if candidate == resolved_catalog or resolved_catalog in candidate.parents:
+                    return True
+        except (OSError, RuntimeError):
+            return False
+        return False
+
+    if supplied:
+        overlay = Path(supplied).expanduser().absolute()
+        if overlaps_catalog(overlay):
+            raise RuntimeError("the runtime skill overlay cannot be the packaged catalog")
+        return overlay
+
+    configured = os.environ.get("AEON_STATE_DIR", "").strip()
+    state_root = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".aeon" / "state"
+    )
+    workspace_path = Path(workspace or Path.cwd()).expanduser().resolve(strict=True)
+    workspace_id = hashlib.sha256(str(workspace_path).encode("utf-8")).hexdigest()[:20]
+    overlay = (state_root / "workspaces" / workspace_id / "skills").absolute()
+    if overlaps_catalog(overlay):
+        raise RuntimeError("private skill state cannot be stored in the shared catalog")
+    os.environ[INSTANCE_SKILLS_DIR_ENV] = str(overlay)
+    return overlay
 
 
 class _RetryQwenAdmission(RuntimeError):
@@ -102,7 +163,7 @@ def _qwen_lifecycle_lock():
 # across the 48 GB (RTX 5000) and 96 GB (RTX 6000) Blackwell machines -- each
 # model is auto-deployed on coordinator-approved physical devices, always
 # keeping >=64k context and MTP where a draft head exists.
-from aeon.core.gpu import GpuInfo, detect_gpus, min_total_vram_gib
+from aeon.core.gpu import GpuInfo, min_total_vram_gib
 from aeon.core import model_catalog as _catalog
 from aeon.core.deploy_planner import plan as _plan_deploy
 
@@ -164,13 +225,9 @@ def _config_from_plan(entry, p, model_name):
 ENABLED_MODEL_NAMES = {
     _catalog.QWEN38_MODEL_NAME,          # solo default + dual-GPU option
 }
-# Offer the dual-copy (one model per GPU) + load-balancer deployment for models
-# that fit a single GPU. Of the enabled set only Qwen3.8 fits solo, so this adds
-# exactly the "Qwen3.8-27B-ARA-NVFP4-MTP
-# [dual-GPU]" option — two copies fronted by adaptive_lb.py so the principal and
-# its sub-agents are served concurrently across both GPUs.
-# One runtime claim maps to one exact GPU UUID. Multi-GPU placements stay off
-# until the coordinator lease API can bind one claim per node atomically.
+# A dual-copy menu entry would require two independently verified Fleet lanes.
+# One runtime claim maps to one exact GPU UUID, so multi-GPU placements stay off
+# until the broker can bind and expose the complete reviewed placement atomically.
 OFFER_DUAL_GPU = False
 
 
@@ -186,18 +243,15 @@ def build_local_model_configs():
 
     Disabled entries (see ENABLED_MODEL_NAMES) are skipped entirely.
     """
-    observed_local = [
-        gpu for gpu in detect_gpus()
-        if gpu.total_gib >= 90.0
-    ]
-    # Menu construction sizes the one supported release against its measured
-    # 96-GB class even when .177 is temporarily full. This is a planning profile,
-    # never an availability or numeric-device fallback: the central coordinator
-    # later selects an approved host and its UUID replaces index 0 before launch.
-    gpus = observed_local[:1] or [
+    # Model-menu construction is static planning, not placement or availability
+    # discovery.  In particular, it must never invoke the legacy coordinator
+    # client from an Aeon application process.  Fleet Compute alone performs live
+    # admission and returns the exact runtime endpoint; this synthetic shape only
+    # lets the catalog render the one reviewed 96-GB-class release profile.
+    gpus = [
         GpuInfo(
             index=0,
-            name="coordinator-selected 96GB Blackwell class",
+            name="Fleet-selected 96GB Blackwell class",
             total_gib=97887 / 1024.0,
             free_gib=0.0,
         )
@@ -212,7 +266,12 @@ def build_local_model_configs():
         solo = _plan_deploy(entry, gpus, mode='solo')
         if solo.tier == 'solo':
             # Primary: one copy with topology-aware tool placement.
-            configs.append(_config_from_plan(entry, solo, entry.name))
+            display_name = (
+                AEON_DEFAULT_MODEL_NAME
+                if entry.name == _catalog.QWEN38_MODEL_NAME
+                else entry.name
+            )
+            configs.append(_config_from_plan(entry, solo, display_name))
             # Alternative: dual-copy across both GPUs, when enabled and present.
             if OFFER_DUAL_GPU and n >= 2 and not entry.force_split:
                 dual = _plan_deploy(entry, gpus, mode='dual')
@@ -226,16 +285,16 @@ def build_local_model_configs():
 
 LLAMACPP_MODELS = build_local_model_configs()
 
-# The abliterated Qwen3.8-27B (ARA NVFP4 + native in-checkpoint MTP, solo) is
-# Aeon's main model: the picker's Enter-default on an interactive start,
-# and the straight-boot model for headless (-n) / no-TTY runs. A bare Enter boots
-# the preferred `.177` release, spilling only to an enabled worker capability.
-# Tools obtain their own coordinator claim; `.177` physical GPU 1 is never used.
-DEFAULT_MODEL = _catalog.QWEN38_MODEL_NAME
+# The 125B-A6B Flash-Next NVFP4 + MTP release is Aeon's logical default: the
+# picker's Enter-default on an interactive start and the straight-boot model for
+# headless (-n) / no-TTY runs. Fleet may route to the retained 27B runtime only
+# when no reviewed RTX PRO 6000 Flash-Next lane is ready. Tools obtain their own
+# coordinator claim; `.177` physical GPU 1 is never used.
+DEFAULT_MODEL = AEON_DEFAULT_MODEL_NAME
 
 def is_container_running(name):
     try: return bool(subprocess.check_output(["docker", "ps", "-q", "-f", f"name={name}"], stderr=subprocess.DEVNULL, text=True).strip())
-    except: return False
+    except Exception: return False
 
 
 def _owned_container_pid(config):
@@ -284,10 +343,15 @@ def wait_for_service(name, port, endpoint="/api/tags", timeout=60):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            if requests.get(f"http://localhost:{port}{endpoint}", timeout=2).status_code == 200: 
+            if requests.get(
+                f"http://127.0.0.1:{port}{endpoint}",
+                timeout=2,
+                **_LOCAL_HTTP_KWARGS,
+            ).status_code == 200:
                 print(" OK.")
                 return True
-        except: pass
+        except Exception:
+            pass
         time.sleep(2)
         print(".", end='', flush=True)
     print(" Timeout!")
@@ -309,9 +373,10 @@ def warm_up_models(local_model_names):
         try:
             print(f"[SYSTEM]    >> Loading {model}...", end='', flush=True)
             resp = requests.post(
-                "http://localhost:8000/api/generate",
+                "http://127.0.0.1:8000/api/generate",
                 json={"model": model, "prompt": "hello", "options": {"num_predict": 1}},
-                timeout=300
+                timeout=300,
+                **_LOCAL_HTTP_KWARGS,
             )
             if resp.status_code == 200:
                 print(" OK.")
@@ -337,73 +402,35 @@ def enable_utility_tier_if_available(model_config):
     os.environ.pop("AEON_UTILITY_MODEL", None)
     print("[CONFIG] Support tasks run on the strong model (no separate utility model).")
 
-def cleanup_transient_tools():
-    print("[SYSTEM] Cleaning up transient tool containers...")
-    try:
-        # Safely evaluate container cleanup using registry
-        import fcntl
-        my_pid = os.getpid()
-        
-        def _safe_cleanup(registry_path, lock_path, container_name, cleanup_callback=None):
-            try:
-                with open(lock_path, 'w') as lock_fd:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                    if os.path.exists(registry_path):
-                        with open(registry_path, 'r') as f:
-                            data = json.load(f)
-                        
-                        # Handle both list and dict formats (e.g., ComfyUI uses a dict)
-                        active_pids = data.get("pids", data) if isinstance(data, dict) else data
-                        
-                        other_alive_pids = []
-                        if isinstance(active_pids, list):
-                            for p in active_pids:
-                                if not isinstance(p, int): continue
-                                if p == my_pid: continue
-                                try:
-                                    os.kill(p, 0)
-                                    with open(f"/proc/{p}/cmdline", "r") as cmd_f:
-                                        if "aeon" in cmd_f.read().replace('\x00', ' ').lower():
-                                            other_alive_pids.append(p)
-                                except (OSError, FileNotFoundError):
-                                    pass
-                        
-                        if cleanup_callback:
-                            cleanup_callback()
-                                
-                        if not other_alive_pids:
-                            subprocess.run(
-                                ["docker", "stop", "--time", "30", container_name],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                timeout=45,
-                            )
-                            subprocess.run(
-                                ["docker", "rm", container_name],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                timeout=30,
-                            )
-            except:
-                pass
-        
-        _safe_cleanup("/tmp/aeon_comfyui_registry.json", "/tmp/aeon_comfyui_registry.lock", "aeon_comfyui")
+def cleanup_transient_tools(browser_profile="default"):
+    """Best-effort close of only this process's authenticated browser session.
 
-        def _close_browser_session():
-            try:
-                from aeon.tools.browser import browser_auth_headers
-                requests.post(
-                    "http://localhost:8030/close_session",
-                    json={"session_id": str(my_pid)},
-                    headers=browser_auth_headers(), timeout=2,
-                )
-            except:
-                pass
-                
-        _safe_cleanup("/tmp/aeon_browser_registry.json", "/tmp/aeon_browser_registry.lock", "aeon_browser", _close_browser_session)
-        
-    except Exception as e:
-        print(f"[WARN] Cleanup timed out or failed: {e}")
+    Browser container ownership belongs to its reviewed operator lifecycle.  An
+    Aeon process owns only the pages keyed by its PID and selected profile, so
+    process exit must never inspect a shared PID registry or stop/remove a
+    container by name.
+    """
+    print("[SYSTEM] Closing transient browser session...")
+    try:
+        from aeon.tools.browser import browser_auth_headers
+
+        with requests.Session() as browser_http:
+            # Loopback control must never inherit HTTP(S)_PROXY/NO_PROXY policy,
+            # and an authenticated cleanup request must never follow a redirect
+            # to a different origin.
+            browser_http.trust_env = False
+            browser_http.post(
+                "http://127.0.0.1:8030/close_session",
+                json={
+                    "session_id": str(os.getpid()),
+                    "profile": str(browser_profile or "default"),
+                },
+                headers=browser_auth_headers(),
+                timeout=2,
+                allow_redirects=False,
+            )
+    except Exception:
+        pass
 
 # =============================================================================
 # LLAMA.CPP SERVER LIFECYCLE
@@ -1154,7 +1181,11 @@ def _stop_llamacpp_server_locked(config):
 def unload_local_brain():
     print("[SYSTEM] Last agent exiting. Releasing Brain VRAM...")
     try:
-        resp = requests.get("http://localhost:8000/api/ps", timeout=3)
+        resp = requests.get(
+            "http://127.0.0.1:8000/api/ps",
+            timeout=3,
+            **_LOCAL_HTTP_KWARGS,
+        )
         if resp.status_code == 200:
             models = resp.json().get('models', [])
             if not models:
@@ -1162,7 +1193,12 @@ def unload_local_brain():
                 return
             for m in models:
                 print(f"[SYSTEM] Unloading {m['name']}...")
-                requests.post("http://localhost:8000/api/generate", json={"model": m['name'], "keep_alive": 0}, timeout=10)
+                requests.post(
+                    "http://127.0.0.1:8000/api/generate",
+                    json={"model": m['name'], "keep_alive": 0},
+                    timeout=10,
+                    **_LOCAL_HTTP_KWARGS,
+                )
             print("[SYSTEM] VRAM released.")
     except Exception as e:
         print(f"[WARN] Failed to release VRAM: {e}")
@@ -1462,7 +1498,12 @@ def register_models_for_agent(models):
             else:
                 print(f"[SYSTEM] Unloading orphaned Ollama model {model}...")
                 try:
-                    requests.post("http://localhost:8000/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
+                    requests.post(
+                        "http://127.0.0.1:8000/api/generate",
+                        json={"model": model, "keep_alive": 0},
+                        timeout=15,
+                        **_LOCAL_HTTP_KWARGS,
+                    )
                 except Exception:
                     pass
             teardown_pending.discard(model)
@@ -1529,7 +1570,12 @@ def unregister_models_for_agent(models):
             else:
                 print(f"[SYSTEM] Unloading Ollama model {model}...")
                 try:
-                    requests.post("http://localhost:8000/api/generate", json={"model": model, "keep_alive": 0}, timeout=15)
+                    requests.post(
+                        "http://127.0.0.1:8000/api/generate",
+                        json={"model": model, "keep_alive": 0},
+                        timeout=15,
+                        **_LOCAL_HTTP_KWARGS,
+                    )
                 except Exception as e:
                     print(f"[WARN] Failed to unload {model}: {e}")
             registry.pop(model, None)
@@ -1539,10 +1585,15 @@ def unregister_models_for_agent(models):
 
 def get_ollama_models():
     try:
-        resp = requests.get("http://localhost:8000/api/tags", timeout=1)
+        resp = requests.get(
+            "http://127.0.0.1:8000/api/tags",
+            timeout=1,
+            **_LOCAL_HTTP_KWARGS,
+        )
         if resp.status_code == 200:
             return sorted([m['name'] for m in resp.json().get('models', [])])
-    except: pass
+    except Exception:
+        pass
     return []
 
 # =============================================================================
@@ -1640,9 +1691,9 @@ class SessionManager:
     - Runtime Lock (shared): All running agents hold this. Last one out gets exclusive
       and cleans up brain VRAM.
     """
-    def __init__(self, *, compute_backend="coordinator"):
-        if compute_backend not in {"coordinator", "broker"}:
-            raise ValueError("compute_backend must be coordinator or broker")
+    def __init__(self, *, compute_backend="broker", browser_profile="default"):
+        if compute_backend != "broker":
+            raise ValueError("production Aeon compute must use the Fleet broker")
         self.compute_backend = compute_backend
         self.runtime_lock = None
         self.startup_lock = None
@@ -1655,6 +1706,7 @@ class SessionManager:
         self._llamacpp_configs = []  # llama.cpp model configs used by this agent
         self._lease_heartbeats = []
         self._broker_service = None
+        self.browser_profile = str(browser_profile or "default")
 
     def _start_qwen_heartbeat(self, config):
         """Attach one exact-PID heartbeat to this foreground Aeon session."""
@@ -1720,6 +1772,13 @@ class SessionManager:
             )
         self._start_qwen_heartbeat(config)
 
+    def set_qwen_endpoint_change_handler(self, handler):
+        """Bind broker runtime promotions at a foreground turn boundary."""
+
+        if self._broker_service is None:
+            raise RuntimeError("Qwen Fleet broker session is not active")
+        self._broker_service.set_endpoint_change_handler(handler)
+
     def enter(self, model_config=None, skip_warmup=False):
         """Enter the session: coordinate startup, warm models, acquire locks.
         
@@ -1748,6 +1807,16 @@ class SessionManager:
             print("[SESSION] Requesting Qwen through the Fleet Compute broker...")
             model_config["base_url"] = self._broker_service.start()
             print(f"[SESSION] Fleet broker endpoint ready: {model_config['base_url']}")
+
+        if (
+            model_config
+            and model_config.get("provider") == "local"
+            and not is_llamacpp_model(model_config)
+        ):
+            raise RuntimeError(
+                "this local model has no reviewed Fleet Compute profile; "
+                "select Qwen or a subscription/API model"
+            )
 
         # Determine if the selected model is local Ollama (needs brain + registry)
         local_models = []
@@ -1835,9 +1904,9 @@ class SessionManager:
     def exit(self):
         """Exit the session: cleanup tools, release locks, maybe unload brain / stop containers."""
         if self._cleanup_done:
-            return
+            return True
         if self._cleanup_in_progress:
-            return
+            return False
         self._cleanup_in_progress = True
         cleanup_succeeded = False
         
@@ -1851,19 +1920,41 @@ class SessionManager:
             
         try:
             print("[SESSION] Exiting... (Ctrl+C disabled during cleanup)")
+            broker_release_failed = False
             
             terminate_all_sub_agents()
-            cleanup_transient_tools()
+            cleanup_transient_tools(self.browser_profile)
 
             if self._models_used:
                 unregister_models_for_agent(self._models_used)
+                self._models_used.clear()
 
             if self._broker_service is not None:
+                broker_service = self._broker_service
                 try:
-                    self._broker_service.close()
+                    release_proof = broker_service.close()
+                    exact_release = release_proof == {
+                        "state": "released",
+                        "compute_state": "inactive",
+                    }
+                    no_ticket_remains = (
+                        release_proof is None
+                        and getattr(broker_service, "ticket_id", object()) is None
+                    )
+                    if exact_release:
+                        print("[SESSION] Fleet broker ticket release verified.")
                 except Exception as exc:
                     print(f"[WARN] Fleet broker ticket release failed: {exc}")
-                self._broker_service = None
+                    broker_release_failed = True
+                else:
+                    if exact_release or no_ticket_remains:
+                        self._broker_service = None
+                    else:
+                        print(
+                            "[WARN] Fleet broker ticket release proof was not exact; "
+                            "retaining the session for retry."
+                        )
+                        broker_release_failed = True
 
             # Last-owner unregister performs exact stop while these heartbeats
             # remain live. Only after unregister/teardown is safely journaled may
@@ -1876,17 +1967,20 @@ class SessionManager:
                 try:
                     fcntl.flock(self.runtime_lock, fcntl.LOCK_UN)
                     self.runtime_lock.close()
+                    self.runtime_lock = None
                 except Exception as e:
                     print(f"[WARN] Session cleanup error: {e}")
             
             if self.startup_lock:
                 try:
                     self.startup_lock.close()
-                except: pass
+                    self.startup_lock = None
+                except Exception:
+                    pass
             
             if self._original_sigterm is not None:  # SIG_DFL == 0 is falsy but valid
                 signal.signal(signal.SIGTERM, self._original_sigterm)
-            cleanup_succeeded = True
+            cleanup_succeeded = not broker_release_failed
         finally:
             self._cleanup_in_progress = False
             if cleanup_succeeded:
@@ -1894,45 +1988,57 @@ class SessionManager:
             if old_sigint is not None:
                 signal.signal(signal.SIGINT, old_sigint)
             print("[SESSION] Cleanup complete.")
+        return cleanup_succeeded
 
 
 def terminate_all_sub_agents():
-    """Find and terminate all running sub-agents using their pid.txt files."""
+    """Terminate only this Aeon instance's exactly-identified sub-agents."""
+    from aeon.core import runtime_signals as rt
+    from aeon.core.presence import process_instance_id
+    from aeon.core.sub_agent_state import (
+        ProcessIdentityError,
+        norm_status,
+        pid_alive,
+        resolve,
+        terminate_sub_agent,
+    )
+
     print("[SYSTEM] Terminating all active sub-agents...")
-    output_dir = Path("aeon_output")
-    if not output_dir.exists():
+    output_dir = Path("aeon_output") / process_instance_id() / "sub_agents"
+    if not output_dir.is_dir():
         print("[SYSTEM] No sub-agents directory found. Skipping.")
         return
 
     terminated_count = 0
-    for pid_file in output_dir.rglob("pid.txt"):
-        if "sub_agents" in pid_file.parts:
-            try:
-                pid_str = pid_file.read_text().strip()
-                if pid_str:
-                    pid = int(pid_str)
-                    os.kill(pid, signal.SIGKILL)
-                    try:
-                        os.waitpid(pid, 0)
-                    except ChildProcessError:
-                        for _ in range(10):
-                            try:
-                                os.kill(pid, 0)
-                                time.sleep(0.1)
-                            except OSError:
-                                break
-                    terminated_count += 1
-            except (ValueError, ProcessLookupError, PermissionError):
-                pass
-            
-            status_file = pid_file.parent / "status.txt"
-            if status_file.exists():
-                try:
-                    status_file.write_text("KILLED")
-                except:
-                    pass
+    refused_count = 0
+    for agent_dir in output_dir.iterdir():
+        if not agent_dir.is_dir():
+            continue
+        is_terminal, status, _ = resolve(agent_dir)
+        terminal_recorded = is_terminal and norm_status(status) in {
+            "COMPLETED", "FAILED", "KILLED"
+        }
+        if terminal_recorded and pid_alive(agent_dir) is not True:
+            continue
+        try:
+            signalled = terminate_sub_agent(agent_dir)
+        except ProcessIdentityError as exc:
+            refused_count += 1
+            print(f"[WARN] Refused unsafe sub-agent cleanup for {agent_dir.name[:8]}: {exc}")
+            continue
+        if not terminal_recorded:
+            rt.atomic_write_json(agent_dir / "output.json", {
+                "agent_id": agent_dir.name,
+                "status": "KILLED",
+                "result": "Terminated during shutdown of its owning Aeon instance.",
+            })
+            rt.atomic_write_text(agent_dir / "status.txt", "KILLED")
+        if signalled:
+            terminated_count += 1
     if terminated_count > 0:
         print(f"[SYSTEM] Terminated {terminated_count} sub-agents.")
+    if refused_count > 0:
+        print(f"[WARN] Left {refused_count} ambiguous sub-agent processes untouched.")
 
 def _restore_backup(aeon_code_dir, backup_exists):
     """Restore the aeon source directory from the tarball backup."""
@@ -1965,26 +2071,145 @@ def _restore_backup(aeon_code_dir, backup_exists):
         return False
 
 
+class _RestartExecBlocked(RuntimeError):
+    """The current process could not be replaced without abandoning ownership."""
+
+
+def _canonical_restart_source(aeon_code_dir):
+    """Return the exact running Aeon source root or fail closed.
+
+    A restart is a reload of this harness, not a general Python-package installer.
+    Resolving both sides permits the historical compatibility symlink while still
+    refusing a model-supplied alternate tree.
+    """
+
+    from aeon.core.paths import PROJECT_ROOT
+
+    canonical = Path(PROJECT_ROOT).resolve(strict=True)
+    raw_requested = str(aeon_code_dir or "").strip()
+    if not raw_requested:
+        raise ValueError("restart source is missing")
+    requested = Path(raw_requested).expanduser().resolve(strict=True)
+    if requested != canonical:
+        raise ValueError(
+            f"restart source must be the canonical Aeon tree ({canonical})"
+        )
+    if not (canonical / "aeon").is_dir():
+        raise ValueError(f"canonical Aeon package directory is missing: {canonical / 'aeon'}")
+    return str(canonical)
+
+
+def _restart_exec_environment(aeon_code_dir, source_environment=None):
+    """Build an exec environment that imports the canonical source first."""
+
+    environment = dict(os.environ if source_environment is None else source_environment)
+    canonical = str(Path(aeon_code_dir).resolve(strict=True))
+    inherited = []
+    for value in environment.get("PYTHONPATH", "").split(os.pathsep):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            if str(Path(value).expanduser().resolve()) == canonical:
+                continue
+        except (OSError, RuntimeError):
+            pass
+        inherited.append(value)
+    environment["PYTHONPATH"] = os.pathsep.join([canonical, *inherited])
+    environment["AEON_PROJECT_ROOT"] = canonical
+    return environment
+
+
+def _exec_after_exact_session_close(session, worker, argv, environment):
+    """Release this process's resources exactly, then replace it.
+
+    ``exec`` does not run ``finally`` or ``atexit`` handlers.  Treat an
+    unresolved broker ticket as a hard stop rather than letting a replacement
+    acquire a second demand while the first is left to TTL.
+    """
+
+    try:
+        cleanup_ok = session.exit()
+    except BaseException as exc:
+        raise _RestartExecBlocked(
+            f"session cleanup raised before process replacement: {exc}"
+        ) from exc
+    if cleanup_ok is not True or getattr(session, "_broker_service", None) is not None:
+        raise _RestartExecBlocked(
+            "Fleet broker ticket release is unresolved; refusing to replace the process"
+        )
+    if worker is not None and getattr(worker, "presence", None) is not None:
+        try:
+            worker.presence.mark_exit()
+        except Exception:
+            # Presence is display-only. Exact resource release above is the hard
+            # boundary; a stale display marker must not strand a closed process.
+            pass
+    try:
+        os.execvpe(sys.executable, argv, environment)
+    except BaseException as exc:
+        raise _RestartExecBlocked(
+            f"process replacement failed after exact session cleanup: {exc}"
+        ) from exc
+    raise _RestartExecBlocked("process replacement returned unexpectedly")
+
+
+def _establish_restart_boot_recovery(
+    aeon_code_dir: str, checkpoint_ref: str, *, reason: str = ""
+) -> None:
+    """Require a durable rollback checkpoint and boot marker before ``exec``."""
+
+    if not str(checkpoint_ref or "").strip():
+        raise RuntimeError(
+            "durable git checkpoint is unavailable; refusing process replacement"
+        )
+    from aeon.core import bootguard
+
+    if bootguard.mark_pending(
+        aeon_code_dir, checkpoint_ref, reason=reason
+    ) is not True:
+        raise RuntimeError(
+            "durable boot recovery marker could not be published; refusing process replacement"
+        )
+
+
+def _restart_validation_boundary_available():
+    """Whether modified source can execute inside the required OS boundary.
+
+    The current host can enforce all-network-denied generic services, but its
+    stable profile still permits reads of ordinary home data. Self-modification
+    imports require a masked-home dependency allowlist, so restart validation
+    remains fail-closed until that actively-probed profile exists.
+    """
+
+    from aeon.tools.restart import restart_validation_boundary_available
+
+    return restart_validation_boundary_available()
+
+
 def _execute_restart(session, worker=None):
-    """If restart_aeon was called, back up code, smoke test, reinstall, and re-exec.
+    """If restart_aeon was called, validate source, test, and re-exec.
 
     Safety sequence:
     1. Create a tarball backup of the aeon source directory
-    2. Clear __pycache__ and reinstall via pip
+    2. Clear __pycache__ without executing package build/install hooks
     3. Run smoke_test.py to verify the new code is importable
     4. If smoke test fails: restore from backup, delete state file, return
        (agent continues running old code)
-    5. If smoke test passes: os.execv to relaunch with --resume
+    5. If smoke test passes: exactly close the current Fleet session, then
+       re-exec with the canonical source first on PYTHONPATH and --resume
 
-    On success, this function never returns (os.execv replaces the process).
+    Ordinary source edits need no pip install: production uses the canonical
+    source tree directly. Dependency, console-script, and entry-point changes are
+    an explicit operator upgrade under the integrated operations runbook.
+
+    On success, this function never returns (exec replaces the process).
     On failure, it restores the backup, injects an error observation into the
     worker, and returns the objective string so the caller can re-run worker.run().
     Returns None if no restart was pending.
     """
     if not os.path.exists(RESTART_STATE_PATH):
         return
-
-    terminate_all_sub_agents()
 
     import shutil
     import tarfile
@@ -1998,13 +2223,17 @@ def _execute_restart(session, worker=None):
             state = json.load(f)
 
         objective = state.get('objective', '')
-        aeon_code_dir = state.get('aeon_code_dir')
-        if not aeon_code_dir or not os.path.isdir(aeon_code_dir):
-            print(f'[RESTART] ERROR: Invalid aeon_code_dir: {aeon_code_dir}')
+        requested_code_dir = state.get('aeon_code_dir')
+        try:
+            aeon_code_dir = _canonical_restart_source(requested_code_dir)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f'[RESTART] ERROR: Invalid aeon_code_dir: {requested_code_dir} ({exc})')
             os.remove(RESTART_STATE_PATH)
             if worker:
-                worker.last_observation = f'RESTART FAILED: Invalid aeon_code_dir: {aeon_code_dir}. Fix the path and try again.'
-                worker.action_log.append(f'[RESTART FAILED] Invalid aeon_code_dir: {aeon_code_dir}')
+                worker.last_observation = (
+                    f'RESTART FAILED: {exc}. Restart only the canonical Aeon source tree.'
+                )
+                worker.action_log.append(f'[RESTART FAILED] Invalid aeon_code_dir: {requested_code_dir}')
                 return objective
             return None
 
@@ -2017,6 +2246,22 @@ def _execute_restart(session, worker=None):
                 worker.action_log.append(f'[RESTART FAILED] No aeon_pkg_dir in {aeon_code_dir}')
                 return objective
             return None
+
+        if not _restart_validation_boundary_available():
+            message = (
+                "RESTART BLOCKED: modified Aeon source cannot be imported safely "
+                "until the deterministic validation service has an actively-probed "
+                "masked-home dependency boundary. No candidate code was executed."
+            )
+            print(f"[RESTART] {message}")
+            os.remove(RESTART_STATE_PATH)
+            if worker:
+                worker.last_observation = message
+                worker.action_log.append(f"[RESTART BLOCKED] {message}")
+                return objective
+            return None
+
+        terminate_all_sub_agents()
 
         # Phase 1: Backup the aeon source directory
         print(f'[RESTART] Creating backup of aeon source...')
@@ -2056,25 +2301,8 @@ def _execute_restart(session, worker=None):
                     pycache_count += 1
         print(f'[RESTART] Cleared {pycache_count} __pycache__ directories.')
 
-        # Phase 3: Reinstall
-        print(f'[RESTART] Reinstalling aeon from {aeon_code_dir}...')
-        result = subprocess.run(
-            [sys.executable, '-m', 'pip', 'install', '.', '--quiet'],
-            cwd=aeon_code_dir,
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            print(f'[RESTART] ERROR: pip install failed:\n{result.stderr}')
-            _restore_backup(aeon_code_dir, backup_created)
-            os.remove(RESTART_STATE_PATH)
-            if worker:
-                worker.last_observation = f'RESTART FAILED: pip install failed. Backup restored, old code is running.\nError: {result.stderr[:500]}\nFix the code and try restart_aeon again.'
-                worker.action_log.append(f'[RESTART FAILED] pip install error. Backup restored.')
-                return objective
-            return None
-        print('[RESTART] Reinstall complete.')
-
-        # Phase 4: Smoke test
+        # Phase 3: Smoke test.  Never run setup.py/PEP-517 hooks here: this is a
+        # source reload, while install metadata changes require operator review.
         smoke_test_path = os.path.join(aeon_code_dir, 'aeon', 'smoke_test.py')
         if os.path.exists(smoke_test_path):
             print('[RESTART] Running smoke test...')
@@ -2093,11 +2321,6 @@ def _execute_restart(session, worker=None):
                     print(smoke_result.stderr)
                 print('[RESTART] Restoring backup and aborting restart...')
                 _restore_backup(aeon_code_dir, backup_created)
-                # Reinstall the restored code
-                subprocess.run(
-                    [sys.executable, '-m', 'pip', 'install', '.', '--quiet'],
-                    cwd=aeon_code_dir, capture_output=True
-                )
                 os.remove(RESTART_STATE_PATH)
                 print('[RESTART] Backup restored. Agent will continue with old code.')
                 if worker:
@@ -2134,10 +2357,6 @@ def _execute_restart(session, worker=None):
                 if unit_output:
                     print(unit_output[-2000:])
                 _restore_backup(aeon_code_dir, backup_created)
-                subprocess.run(
-                    [sys.executable, '-m', 'pip', 'install', '.', '--quiet'],
-                    cwd=aeon_code_dir, capture_output=True
-                )
                 os.remove(RESTART_STATE_PATH)
                 print('[RESTART] Backup restored. Agent will continue with old code.')
                 if worker:
@@ -2166,29 +2385,33 @@ def _execute_restart(session, worker=None):
         model_name = state.get('model_name')
         if model_name:
             new_args.extend(['--model', model_name])
-
-        # Clean up backup on successful restart
-        if backup_created and os.path.exists(RESTART_BACKUP_PATH):
-            os.remove(RESTART_BACKUP_PATH)
+        exec_environment = _restart_exec_environment(aeon_code_dir)
 
         # Boot handshake: the smoke/unit gates above ran the new code as a SUBPROCESS,
         # but execv relaunches through the (untested) --resume path. Mark the boot as
         # pending and name the checkpoint to roll back to; the relaunched process clears
         # this once it boots healthy, and any fresh start that still sees it auto-reverts.
-        try:
-            from aeon.core import bootguard
-            bootguard.mark_pending(aeon_code_dir, ckpt_ref, reason=state.get('reason', ''))
-        except Exception as e:
-            print(f"[RESTART] WARNING: could not write boot marker: {e}.")
+        _establish_restart_boot_recovery(
+            aeon_code_dir, ckpt_ref, reason=state.get("reason", "")
+        )
+
+        # The durable git checkpoint and marker now own cross-process recovery.
+        # The PID-scoped tarball protects only this pre-exec transaction.
+        if backup_created and os.path.exists(RESTART_BACKUP_PATH):
+            os.remove(RESTART_BACKUP_PATH)
 
         print(f'[RESTART] Relaunching: {" ".join(new_args)}')
-        # execv preserves the PID and process creation time.  Close this run's
-        # unique manifest first so it cannot be mistaken for the replacement
-        # process's newly created manifest.
-        if worker is not None and getattr(worker, "presence", None) is not None:
-            worker.presence.mark_exit()
-        os.execv(sys.executable, new_args)
-        # os.execv never returns on success
+        _exec_after_exact_session_close(
+            session, worker, new_args, exec_environment
+        )
+        # exec never returns on success
+
+    except _RestartExecBlocked as exc:
+        # The old session has either retained an unresolved exact ticket or has
+        # already closed and cannot safely resume.  Leave state/backup/boot marker
+        # for supervised recovery and terminate so no second demand is created.
+        print(f'[RESTART] BLOCKED: {exc}')
+        raise SystemExit(1) from exc
 
     except Exception as e:
         print(f'[RESTART] ERROR during restart: {e}')
@@ -2220,7 +2443,12 @@ def _should_auto_adopt_tmux(args) -> bool:
     return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
 
-def _auto_adopt_tmux(args) -> bool:
+def _auto_adopt_tmux(
+    args,
+    *,
+    cli_args=None,
+    harness: str = "legacy-aeon",
+) -> bool:
     """Register and replace an ordinary CLI with its managed tmux attachment.
 
     Returns ``False`` only when nothing was launched and the caller should keep
@@ -2245,10 +2473,12 @@ def _auto_adopt_tmux(args) -> bool:
         manager = InstanceManager(store, config)
         instance = manager.adopt_local_cli(
             workspace=os.getcwd(),
-            cli_args=list(sys.argv[1:]),
+            cli_args=list(sys.argv[1:] if cli_args is None else cli_args),
             objective=args.start or "",
             max_iterations=args.max_iterations,
             model=args.model,
+            harness=harness,
+            browser_profile=getattr(args, "browser_profile", None) or "default",
             actor=getpass.getuser(),
         )
     except Exception as exc:
@@ -2290,6 +2520,248 @@ def _auto_adopt_tmux(args) -> bool:
     return True
 
 
+_CONTINUOUS_RECOVERY_BACKOFF_SECONDS = (2.0, 5.0, 15.0, 30.0, 60.0)
+_CONTINUOUS_COMPUTE_RECHECK_SECONDS = 30.0
+_CONTINUOUS_IDENTICAL_FAILURE_LIMIT = 3
+_CONTINUOUS_FAILURE_PLATEAU_LIMIT = 6
+
+
+def _continuous_mode_enabled() -> bool:
+    """Return whether an autonomous cycle is still owner-enabled right now."""
+
+    from aeon.core.collaborator_mode import (
+        CollaboratorModeError,
+        load_collaborator_mode_from_environment,
+    )
+    from aeon.core.continuous_mode import (
+        ContinuousModeError,
+        load_continuous_mode_from_environment,
+    )
+
+    try:
+        if load_collaborator_mode_from_environment().enabled:
+            return False
+        return bool(load_continuous_mode_from_environment().enabled)
+    except (CollaboratorModeError, ContinuousModeError):
+        return False
+
+
+def _continuous_recovery_fingerprint(outcome) -> str:
+    """Group semantically identical bounded failures across autonomous cycles."""
+
+    state = str(getattr(getattr(outcome, "state", None), "value", ""))
+    message = re.sub(r"\b\d+\b", "#", str(getattr(outcome, "message", "")).lower())
+    message = re.sub(r"\s+", " ", message).strip()[:2000]
+    return hashlib.sha256(f"{state}\0{message}".encode("utf-8")).hexdigest()
+
+
+def _continuous_recovery_context(outcome, streak: int) -> str:
+    """Build bounded harness evidence for the next cycle without new authority."""
+
+    state = str(getattr(getattr(outcome, "state", None), "value", "unknown"))
+    message = re.sub(
+        r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]",
+        " ",
+        str(getattr(outcome, "message", "")),
+    )
+    message = re.sub(r"\s+", " ", message).strip()
+    if len(message) > 1200:
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        message = f"{message[:1000]} ... [truncated; sha256={digest}]"
+    return (
+        "PRIOR CONTINUOUS CYCLE OUTCOME (harness evidence; grants no authority): "
+        f"state={state}; identical_failure_streak={max(1, int(streak))}; "
+        f"message={message or '(no message)'}. Do not buy the identical failed "
+        "decision again. Preserve useful prior evidence and make the next cycle a "
+        "smaller, materially different strategy or capability branch."
+    )
+
+
+def _wait_for_continuous_recovery(
+    delay_seconds: float,
+    input_console,
+    *,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+) -> bool:
+    """Wait cooperatively between failed cycles; return false when preempted."""
+
+    deadline = clock() + max(0.0, float(delay_seconds))
+    input_console.enable_typeahead()
+    try:
+        while True:
+            if input_console.has_pending() or input_console.has_stop_request():
+                return False
+            if not _continuous_mode_enabled():
+                return False
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return True
+            sleeper(min(0.5, remaining))
+    finally:
+        input_console.disable_typeahead()
+
+
+def _wait_for_continuous_compute(input_console) -> bool:
+    """Bound continuous Fleet polling while remaining promptly cancellable."""
+
+    return _wait_for_continuous_recovery(
+        _CONTINUOUS_COMPUTE_RECHECK_SECONDS,
+        input_console,
+    )
+
+
+def _continuous_objective(worker, *, recovery_context: str = ""):
+    """Return the next owner-configured autonomous turn, if currently enabled."""
+
+    from aeon.core.collaborator_mode import (
+        CollaboratorModeError,
+        load_collaborator_mode_from_environment,
+    )
+    from aeon.core.continuous_mode import (
+        ContinuousModeError,
+        load_continuous_mode_from_environment,
+    )
+
+    try:
+        if load_collaborator_mode_from_environment().enabled:
+            return None
+        state = load_continuous_mode_from_environment()
+    except (CollaboratorModeError, ContinuousModeError) as exc:
+        print(f"[CONTINUOUS MODE] Disabled: {exc}", file=sys.stderr)
+        return None
+    if not state.enabled:
+        return None
+    if recovery_context:
+        worker.prepare_continuous_turn(
+            goal=state.goal,
+            recovery_context=recovery_context,
+        )
+    else:
+        worker.prepare_continuous_turn(goal=state.goal)
+    return state.prompt()
+
+
+def _run_objective_chain(session, worker, objective, *, max_iterations=None):
+    """Run restarts and continuous turns while preserving queued user priority."""
+
+    from aeon.core.console import console
+
+    from aeon.core.agent_protocol import ExecutionState, RunOutcome
+
+    current = objective
+    repeated_failure_key = ""
+    repeated_failure_streak = 0
+    consecutive_failure_streak = 0
+    while current:
+        outcome = worker.run(current, max_iterations=max_iterations)
+        restarted = _execute_restart(session, worker)
+        if restarted:
+            repeated_failure_key = ""
+            repeated_failure_streak = 0
+            consecutive_failure_streak = 0
+            current = restarted
+            continue
+        # A real user message always wins over an autonomous continuation. The
+        # REPL remains its sole consumer so it enters history as the exact next
+        # user-role turn.
+        if console().has_pending():
+            return
+        if (
+            isinstance(outcome, RunOutcome)
+            and outcome.state in {ExecutionState.FAILED, ExecutionState.BLOCKED}
+            and _continuous_mode_enabled()
+        ):
+            failure_key = _continuous_recovery_fingerprint(outcome)
+            repeated_failure_streak = (
+                repeated_failure_streak + 1
+                if failure_key == repeated_failure_key
+                else 1
+            )
+            repeated_failure_key = failure_key
+            consecutive_failure_streak += 1
+            identical_circuit = (
+                repeated_failure_streak >= _CONTINUOUS_IDENTICAL_FAILURE_LIMIT
+            )
+            plateau_circuit = (
+                consecutive_failure_streak >= _CONTINUOUS_FAILURE_PLATEAU_LIMIT
+            )
+            if identical_circuit or plateau_circuit:
+                reason = (
+                    "three semantically identical failed cycles"
+                    if identical_circuit
+                    else "six consecutive failed or blocked cycles without progress"
+                )
+                message = (
+                    f"Continuous mode paused after {reason}. Its owner setting and "
+                    "durable goal remain enabled, but "
+                    "Aeon will not generate another unchanged retry until a user "
+                    "message, restart, configuration change, or mode toggle provides "
+                    "new evidence. No success is being claimed."
+                )
+                print(f"[CONTINUOUS MODE] {message}", flush=True)
+                try:
+                    from aeon.core.chat_transcript import (
+                        append_assistant_message_from_environment,
+                    )
+
+                    append_assistant_message_from_environment(message)
+                except Exception:
+                    pass
+                try:
+                    worker._presence_update(
+                        phase="blocked",
+                        objective=current,
+                        intent="continuous failure-plateau circuit breaker",
+                    )
+                except Exception:
+                    pass
+                return
+            delay = _CONTINUOUS_RECOVERY_BACKOFF_SECONDS[
+                min(
+                    repeated_failure_streak - 1,
+                    len(_CONTINUOUS_RECOVERY_BACKOFF_SECONDS) - 1,
+                )
+            ]
+            print(
+                "[CONTINUOUS MODE] Prior cycle ended "
+                f"{outcome.state.value}; changing strategy after a {delay:g}s "
+                f"cancellable backoff (matching streak {repeated_failure_streak}).",
+                flush=True,
+            )
+            if not _wait_for_continuous_recovery(delay, console()):
+                return
+            current = _continuous_objective(
+                worker,
+                recovery_context=_continuous_recovery_context(
+                    outcome, repeated_failure_streak
+                ),
+            )
+            continue
+        if (
+            isinstance(outcome, RunOutcome)
+            and outcome.state is ExecutionState.WAITING_COMPUTE
+            and _continuous_mode_enabled()
+        ):
+            repeated_failure_key = ""
+            repeated_failure_streak = 0
+            consecutive_failure_streak = 0
+            print(
+                "[CONTINUOUS MODE] Durable Fleet work is pending; rechecking the "
+                f"same owned job after {_CONTINUOUS_COMPUTE_RECHECK_SECONDS:g}s "
+                "(cancellable).",
+                flush=True,
+            )
+            if not _wait_for_continuous_compute(console()):
+                return
+            current = _continuous_objective(worker)
+            continue
+        repeated_failure_key = ""
+        repeated_failure_streak = 0
+        consecutive_failure_streak = 0
+        current = _continuous_objective(worker)
+
+
 def cli(argv=None):
     parser = argparse.ArgumentParser(
         prog='aeon',
@@ -2321,6 +2793,7 @@ def cli(argv=None):
                              'report at the limit. Default: unbounded.')
     parser.add_argument('--no-warmup', action='store_true', help='Skip model warmup (faster startup, slower first query)')
     parser.add_argument('--resume', type=str, default=None, help='Path to restart state file (used internally by restart_aeon)')
+    parser.add_argument('--resume-unfinished', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument(
         '--browser-profile', type=str,
         default=os.environ.get('AEON_BROWSER_PROFILE', 'default'),
@@ -2339,8 +2812,26 @@ def cli(argv=None):
 
     # Help/parser exits happen above, so they remain side-effect free. An inner
     # tmux/remote process skips this branch via its environment and starts Aeon.
-    if _auto_adopt_tmux(args):
+    if _auto_adopt_tmux(
+        args,
+        cli_args=list(sys.argv[1:] if argv is None else argv),
+        harness="legacy-aeon",
+    ):
         return
+
+    # Managed launches already carry a server-derived exact directory. A plain
+    # CLI gets a stable workspace-private overlay here so runtime learning can
+    # never fall back to mutating the packaged base catalog.
+    try:
+        _configure_runtime_skill_overlay()
+    except (OSError, RuntimeError) as exc:
+        parser.error(f"Could not configure private skill state: {exc}")
+
+    # Only the exact primary Aeon process may append assistant messages to a
+    # Nexus chat transcript. Sub-agents inherit the path but not this PID match.
+    from aeon.core.chat_transcript import CHAT_TRANSCRIPT_ENV, CHAT_WRITER_PID_ENV
+    if os.environ.get(CHAT_TRANSCRIPT_ENV):
+        os.environ[CHAT_WRITER_PID_ENV] = str(os.getpid())
 
     from aeon.core.fleet_backend import FleetBackendError, select_compute_backend
     try:
@@ -2348,12 +2839,6 @@ def cli(argv=None):
     except FleetBackendError as exc:
         parser.error(str(exc))
     print(f"[CONFIG] Compute backend: {compute_backend} ({backend_reason}).")
-
-    # Legacy lifecycle cleanup is valid only when the compatibility coordinator
-    # backend owns Qwen. A broker-owned runtime must never be inspected/stopped by
-    # the old per-process lifecycle.
-    if compute_backend == "coordinator":
-        cleanup_ghost_llamacpp_containers()
 
     # Register ordinary CLI starts as early as practical (after argument
     # validation, so `aeon --help` does not leave a phantom run).  Presence is
@@ -2398,8 +2883,8 @@ def cli(argv=None):
         model_config = find_model_config(DEFAULT_MODEL, menu)
         if model_config:
             placement_label = (
-                "release-bound fleet placement; 114688 ctx on .177 or 131072 ctx on .180"
-                if DEFAULT_MODEL == _catalog.QWEN38_MODEL_NAME
+                "qualified RTX PRO 6000 Flash-Next lane; automatic 27B RTX 5000 fallback"
+                if DEFAULT_MODEL == AEON_DEFAULT_MODEL_NAME
                 else model_config["label"]
             )
             print(f"[CONFIG] Booting default model: {DEFAULT_MODEL} ({placement_label}). "
@@ -2424,14 +2909,45 @@ def cli(argv=None):
     if not args.resume:
         try:
             from aeon.core import bootguard
-            bootguard.check_and_recover()
+            recovery = bootguard.check_and_recover()
+            if recovery.get("restart_required"):
+                recovery_root = _canonical_restart_source(
+                    recovery.get("aeon_code_dir")
+                )
+                recovery_argv = [
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "aeon.main",
+                    *sys.argv[1:],
+                ]
+                os.execvpe(
+                    sys.executable,
+                    recovery_argv,
+                    _restart_exec_environment(recovery_root),
+                )
+                raise RuntimeError("bootguard recovery re-exec returned unexpectedly")
+            if recovery.get("recovered") and not recovery.get("restored"):
+                raise RuntimeError(
+                    "a pending restart could not be restored to canonical source"
+                )
         except Exception as e:
             print(f"[BOOTGUARD] recovery check failed: {e}")
+            raise SystemExit(1) from e
 
-    session = SessionManager(compute_backend=compute_backend)
+    session = SessionManager(
+        compute_backend=compute_backend,
+        browser_profile=args.browser_profile,
+    )
 
     try:
         session.enter(model_config=model_config, skip_warmup=args.no_warmup)
+        if session._broker_service is not None:
+            from aeon.core.model_identity import wire_model_for_runtime_profiles
+
+            model_config["api_model"] = wire_model_for_runtime_profiles(
+                session._broker_service.runtime_profiles
+            )
         enable_utility_tier_if_available(model_config)
         # Vision reuse: Qwen3.8 is multimodal and serves images
         # on its own chat endpoint, so both the browser loop and analyze_image use it
@@ -2443,7 +2959,7 @@ def cli(argv=None):
         if model_config.get('multimodal') and model_config.get('base_url'):
             vis_base = model_config['base_url']
             vis_model = model_config.get('api_model') or model_config['model']
-            if vis_model != _catalog.VISION_MODEL_NAME:
+            if vis_model not in _catalog.VISION_MODEL_NAMES:
                 raise RuntimeError(
                     f"Refusing to configure vision through '{vis_model}'. Aeon's only "
                     f"approved vision model is '{_catalog.VISION_MODEL_NAME}'.")
@@ -2462,7 +2978,11 @@ def cli(argv=None):
                 from aeon.core.vision_selftest import run_vision_self_test, VisionSelfTestError
                 print(f"[VISION SELF-TEST] Verifying {vis_model} can read an image...")
                 try:
-                    code = run_vision_self_test(vis_base, vis_model)
+                    code = run_vision_self_test(
+                        vis_base,
+                        vis_model,
+                        compute_guard=session.ensure_qwen_compute,
+                    )
                     if code:
                         print(f"\033[92m[VISION SELF-TEST] PASS — model read the probe code "
                               f"'{code}'. Vision trusted for browsing.\033[0m")
@@ -2473,7 +2993,12 @@ def cli(argv=None):
                     # misattributed to a code change and rolled back on next start.
                     try:
                         from aeon.core import bootguard
-                        bootguard.mark_boot_ok()
+                        if bootguard.mark_boot_ok() is not True:
+                            print(
+                                "[BOOTGUARD] Healthy boot marker could not be cleared; "
+                                "the next startup may perform a conservative rollback.",
+                                file=sys.stderr,
+                            )
                     except Exception:
                         pass
                     bar = "=" * 72
@@ -2495,7 +3020,24 @@ def cli(argv=None):
             os.environ["AEON_VISION_MODEL"] = vis_model
             print(f"[CONFIG] Vision -> reusing the loaded multimodal model "
                   f"({os.environ['AEON_VISION_MODEL']}); no separate vision server.")
-        llm_client = LLMClient(model_config)
+        llm_client = LLMClient(
+            model_config,
+            before_local_request=session.ensure_qwen_compute,
+        )
+        if session._broker_service is not None:
+            def rebind_qwen_endpoint(endpoint, runtime_profiles):
+                from aeon.core.model_identity import wire_model_for_runtime_profiles
+
+                wire_model = wire_model_for_runtime_profiles(runtime_profiles)
+                llm_client.rebind_base_url(endpoint, api_model=wire_model)
+                model_config["base_url"] = endpoint
+                model_config["api_model"] = wire_model
+                if model_config.get("multimodal"):
+                    os.environ["AEON_VISION_BASE_URL"] = endpoint
+                    os.environ["AEON_VISION_MODEL"] = wire_model
+                print("[SESSION] Bound the promoted Fleet Qwen runtime.")
+
+            session.set_qwen_endpoint_change_handler(rebind_qwen_endpoint)
         worker = Worker(
             llm_client=llm_client,
             debug_mode=args.debug,
@@ -2508,29 +3050,27 @@ def cli(argv=None):
         worker.model_config = model_config
         deps = {'llm_client': llm_client, 'worker': worker}
         tools = load_tools_from_directory("aeon.tools", dependencies=deps)
-        
-        # Manual override for skill manager tools to bypass loader issues
-        try:
-            from aeon.tools.skills_manager_tool import ExpandSkillsCategory, CollapseSkillsCategory
-            manual_tools = [
-                ExpandSkillsCategory(worker=worker, llm_client=llm_client),
-                CollapseSkillsCategory(worker=worker, llm_client=llm_client)
-            ]
-            tools.extend(manual_tools)
-            print("[SYSTEM] Manually registered skill manager tools.")
-        except Exception as e:
-            print(f"[SYSTEM] Failed to manually register skill tools: {e}")
 
         worker.register_tools(tools)
+
+        if presence is not None:
+            try:
+                presence.update(
+                    phase="completed",
+                    intent="Ready for a message",
+                    model=model_config["model"],
+                )
+            except Exception:
+                pass
 
         # --- Startup Skills Summary ---
         try:
             from aeon.core.skills.manager import SkillsManager
             sm = SkillsManager()
             skills_dir = Path(sm.base_dir).resolve()
-            if skills_dir.exists():
+            if skills_dir.exists() or sm.instance_dir is not None:
                 root_skills = [f.stem for f in skills_dir.glob("*.txt") if not f.name.startswith('__')]
-                skill_categories = [d.name for d in skills_dir.iterdir() if d.is_dir() and not d.name.startswith('__')]
+                skill_categories = sm.list_categories()
                 
                 if root_skills or skill_categories:
                     print("\n\033[92m[S-V-S-S-S] Loaded Skills:\033[0m", file=sys.stderr)
@@ -2584,32 +3124,46 @@ def cli(argv=None):
             try:
                 with open(args.resume, 'r', encoding='utf-8') as f:
                     resume_state = json.load(f)
-                os.remove(args.resume)
                 worker.restore_state(resume_state)
                 # The relaunched code booted, imported, and restored state successfully —
                 # clear the pending marker so it is treated as the new known-good generation.
-                try:
-                    from aeon.core import bootguard
-                    bootguard.mark_boot_ok()
-                except Exception:
-                    pass
+                from aeon.core import bootguard
+                if bootguard.mark_boot_ok() is not True:
+                    raise _RestartExecBlocked(
+                        "restored state is intact, but the healthy-boot marker could "
+                        "not be cleared"
+                    )
+                os.remove(args.resume)
                 obj = resume_state.get('objective', '')
                 print(f"[RESUME] State restored. Continuing objective: {obj}")
-                while obj:
-                    worker.run(obj, max_iterations=args.max_iterations)
-                    obj = _execute_restart(session, worker)
+                _run_objective_chain(
+                    session, worker, obj, max_iterations=args.max_iterations
+                )
             except Exception as e:
-                print(f"[RESUME] Failed to restore state: {e}. Starting fresh.")
+                print(
+                    f"[RESUME] Failed to restore state: {e}. The snapshot was "
+                    "retained and this process will stop for supervised recovery."
+                )
                 import traceback
                 traceback.print_exc()
-                if os.path.exists(args.resume):
-                    os.remove(args.resume)
+                raise SystemExit(1) from e
+
+        if args.resume_unfinished:
+            obj = worker.resume_unfinished_lifecycle_request()
+            if obj:
+                print(f"[RECOVERY] Continuing unfinished objective: {obj}")
+                _run_objective_chain(
+                    session, worker, obj, max_iterations=args.max_iterations
+                )
 
         if args.start:
             obj = args.start
-            while obj:
-                worker.run(obj, max_iterations=args.max_iterations)
-                obj = _execute_restart(session, worker)
+            if worker.is_clear_command(obj):
+                worker.clear_context()
+            else:
+                _run_objective_chain(
+                    session, worker, obj, max_iterations=args.max_iterations
+                )
 
         # Headless mode: the --start objective (and any --resume) is done; exit instead
         # of dropping into the interactive prompt. Lets you "start it up with a task and
@@ -2617,15 +3171,35 @@ def cli(argv=None):
         if args.non_interactive:
             print("[CONFIG] Non-interactive mode: objective complete, exiting.")
         else:
-            from aeon.core.console import console
+            from aeon.core.console import TurnStopRequested, console
+            from aeon.core.continuous_mode import NEXUS_CONTINUOUS_WAKE_COMMAND
             while True:
                 try:
-                    obj = console().readline("> ")
+                    # Submitted user text has priority. Otherwise, continuous
+                    # mode starts the next autonomous cycle without waiting at
+                    # the prompt. A live Nexus toggle wakes this exact read with
+                    # a private control line that never becomes model input.
+                    obj = (
+                        console().readline("> ")
+                        if console().has_pending()
+                        else _continuous_objective(worker)
+                        or console().readline("> ")
+                    )
+                    if obj.strip() == NEXUS_CONTINUOUS_WAKE_COMMAND:
+                        continue
                     if obj.strip():
                         if obj.strip() in ['exit', 'quit']: break
-                        while obj:
-                            worker.run(obj, max_iterations=args.max_iterations)
-                            obj = _execute_restart(session, worker)
+                        if worker.is_clear_command(obj):
+                            worker.clear_context()
+                            continue
+                        _run_objective_chain(
+                            session, worker, obj, max_iterations=args.max_iterations
+                        )
+                except TurnStopRequested:
+                    # A stop control that raced the end of a turn is harmless at
+                    # the idle prompt. Consume it without exiting the Aeon process.
+                    console().take_stop_request()
+                    continue
                 except (KeyboardInterrupt, EOFError):
                     print("\n")
                     break

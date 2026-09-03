@@ -68,22 +68,25 @@ The implementation follows these recurring results from agent research:
 
 Simple inspection/extraction turns use low effort and one proposal. Established
 execution uses medium effort. A complex first decomposition uses high effort.
-Recovery events—not generic words such as “fix”—activate high effort and two
-independent candidates; a parent-goal reframe can use three. Every decision shares
-one hard call/token/time budget, and a valid proposal survives later verifier or
-candidate-budget exhaustion.
+Ordinary recovery stays at medium effort on one coherent trajectory; only a
+level-three parent-route reframe activates high effort. Multi-candidate sampling is
+an explicit operator override rather than an automatic latency multiplier. Every
+decision retains a hard call/token/time budget.
 
 ### Evidence-triggered recovery ladder
 
 The deterministic progress controller distinguishes exact actions, structural
 method families, and outcomes.
 
-1. First failure: name/falsify the failed assumption and inspect the missing
-   precondition.
+1. First failure: check a missing precondition or choose a different action.
 2. Repeated/equivalent failure: bar the exact call and require a different method
    family.
-3. A/B oscillation or broad plateau: reconstruct the parent objective and done
-   criteria, then choose an independent route.
+3. A/B oscillation or broad plateau: choose a different route to an unmet owner
+   outcome.
+
+Recovery text is a compact action constraint. It explicitly forbids narrating the
+recovery, restating the objective, or rewriting an unchanged plan; the harness owns
+the diagnosis and the model owns only the next evidence-producing decision.
 
 Parameter churn and rewording do not count as strategy diversity. The harness stops
 only after two ignored exact-call bars or a bounded multi-method plateau. Only typed
@@ -92,7 +95,8 @@ acceptance/evidence progress resets the epoch.
 ### Owner-goal evidence graph
 
 Conservative clause compilation separates aggregate, change, inspection,
-validation, and invariant goals. Complex actions bind to leaf IDs before execution.
+validation, and invariant goals. The harness infers omitted action bindings from
+typed targets and receipts; optional explicit leaf IDs disambiguate difficult cases.
 Change goals need a relevant mutation and validation after the final mutation;
 inspection goals need relevant information; validation goals need a relevant
 outcome check; invariants observe all mutations. A model-authored checklist is

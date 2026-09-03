@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 
 SOURCE_REPO = "trohrbaugh/Qwen3.8-27B-heretic-ara"

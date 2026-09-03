@@ -5,6 +5,7 @@
 release reports, requires semantically correct deterministic Aeon actions, and
 emits the manifest consumed by Aeon's deployment planner/launcher.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -35,16 +36,50 @@ from aeon.core.sampling import (
     QWEN_CONTROL_TEMPERATURE,
     QWEN_CONTROL_TOP_K,
     QWEN_CONTROL_TOP_P,
+    QWEN_SPEED_LAB_SAMPLING_PROFILES,
 )
 
 
 ENTRY_NAME = "Qwen3.8-27B-ARA-NVFP4-MTP"
-PROBE_SCHEMA_VERSION = "aeon-qwen38-mtp-probe-v2"
-SUITE_VERSION = "aeon-agent-mtp-suite-v5-deterministic-control"
+PROBE_SCHEMA_VERSION = "aeon-qwen38-mtp-probe-v3"
+SUITE_VERSION = "aeon-agent-mtp-suite-v6-long-context-control"
 RELEASE_DEPTHS = tuple(range(5))
 MIN_RELEASE_REPEATS = 3
 TOOL_NAMES = ("browser_interact", "open_file", "run_command", "task_complete")
 RESPONSE_SCHEMA = build_turn_schema(list(TOOL_NAMES))
+_DEFAULT_SAMPLING_PROFILE = "aeon-greedy-medium"
+if QWEN_SPEED_LAB_SAMPLING_PROFILES[_DEFAULT_SAMPLING_PROFILE] != {
+    "temperature": QWEN_CONTROL_TEMPERATURE,
+    "top_p": QWEN_CONTROL_TOP_P,
+    "top_k": QWEN_CONTROL_TOP_K,
+    "reasoning_effort": "medium",
+    "thinking": True,
+}:
+    raise RuntimeError("Aeon release-gate sampling profile changed")
+
+
+def _long_context_recall_prompt() -> str:
+    """Deterministic 10K+-token recall probe for captured-attention regressions."""
+    needle = "aeon-needle-moonweasel-7.service"
+    distractors = "\n".join(
+        (
+            f"Audit record {index:04d}: worker telemetry is informational only; "
+            "no service name, command, authorization, or requested action appears "
+            "in this record. Preserve the incident-ledger evidence instead."
+        )
+        for index in range(700)
+    )
+    return (
+        "Incident ledger evidence: the one authorized service identifier is exactly "
+        f"{needle}. Preserve that identifier verbatim; later records are distractors.\n\n"
+        f"{distractors}\n\n"
+        "Using only the incident-ledger evidence at the beginning, return exactly one "
+        "run_command action that executes systemctl status for the authorized service, "
+        "followed by --no-pager, with timeout 30. Set intent exactly to "
+        "AEON_LONG_RECALL. Do not substitute or invent a service identifier."
+    )
+
+
 CASES = [
     {
         "name": "code_failure_replan",
@@ -63,7 +98,9 @@ CASES = [
         "name": "browser_grounding",
         "expected_tool": "browser_interact",
         "expected_parameters": {
-            "action": "select", "element_id": 17, "value": "United States",
+            "action": "select",
+            "element_id": 17,
+            "value": "United States",
         },
         "marker": "AEON_BROWSER_SELECT",
         "vision": True,
@@ -102,6 +139,18 @@ CASES = [
             "keep every required metadata string concise."
         ),
     },
+    {
+        "name": "long_context_recall",
+        "expected_tool": "run_command",
+        "expected_parameters": {
+            "command": (
+                "systemctl status aeon-needle-moonweasel-7.service --no-pager"
+            ),
+            "timeout": 30,
+        },
+        "marker": "AEON_LONG_RECALL",
+        "prompt": _long_context_recall_prompt(),
+    },
 ]
 
 
@@ -113,13 +162,20 @@ def _vision_probe_png() -> bytes:
     draw = ImageDraw.Draw(image)
     try:
         font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48
+        )
         small = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 34)
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 34
+        )
     except OSError:
         font = small = ImageFont.load_default()
-    draw.rounded_rectangle((100, 85, 860, 445), radius=20, fill=(246, 248, 251),
-                           outline=(50, 70, 95), width=5)
+    draw.rounded_rectangle(
+        (100, 85, 860, 445),
+        radius=20,
+        fill=(246, 248, 251),
+        outline=(50, 70, 95),
+        width=5,
+    )
     draw.text((155, 140), "FORM VALIDATION", font=font, fill=(25, 35, 50))
     draw.text((155, 245), "Country is required", font=small, fill=(180, 25, 35))
     draw.text((155, 325), "[17] Country (closed)", font=small, fill=(15, 90, 45))
@@ -193,13 +249,60 @@ def _metric_snapshot(base_url):
 
 def _metric_delta(before, after):
     keys = set(before) | set(after)
-    return {key: max(0.0, after.get(key, 0.0) - before.get(key, 0.0))
-            for key in sorted(keys) if after.get(key, 0.0) - before.get(key, 0.0) > 0}
+    return {
+        key: max(0.0, after.get(key, 0.0) - before.get(key, 0.0))
+        for key in sorted(keys)
+        if after.get(key, 0.0) - before.get(key, 0.0) > 0
+    }
 
 
 def _is_sha256(value):
-    return (isinstance(value, str) and len(value) == 64
-            and all(char in "0123456789abcdef" for char in value))
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _validated_turn(content: str, case: dict) -> dict:
+    """Parse and independently enforce the exact benchmark turn contract."""
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid post-reasoning JSON for {case['name']}: {content[:240]!r}"
+        ) from exc
+    allowed_fields = set(RESPONSE_SCHEMA["properties"])
+    required_fields = set(TURN_FIELDS_REQUIRED)
+    metadata_fields = required_fields - {"actions"}
+    schema_valid = (
+        isinstance(parsed, dict)
+        and required_fields <= set(parsed) <= allowed_fields
+        and all(isinstance(parsed.get(field), str) for field in metadata_fields)
+        and parsed.get("kind") == "tool_calls"
+        and parsed.get("message") == ""
+        and ("updated_plan" not in parsed or isinstance(parsed["updated_plan"], str))
+        and isinstance(parsed.get("actions"), list)
+        and len(parsed["actions"]) == 1
+        and isinstance(parsed["actions"][0], dict)
+        and set(parsed["actions"][0]) == {"tool_name", "parameters"}
+        and parsed["actions"][0].get("tool_name") in TOOL_NAMES
+        and isinstance(parsed["actions"][0].get("parameters"), dict)
+    )
+    if not schema_valid:
+        raise ValueError(f"turn-schema gate failed for {case['name']}: {content[:500]}")
+    action = parsed["actions"][0]
+    semantic_valid = (
+        parsed["intent"] == case["marker"]
+        and action["tool_name"] == case["expected_tool"]
+        and action["parameters"] == case["expected_parameters"]
+    )
+    if not semantic_valid:
+        raise ValueError(
+            f"agent-action gate failed for {case['name']}: {content[:500]}"
+        )
+    return parsed
 
 
 def _validated_probe_stats(report, *, expected_k, expected_entry, script_hash):
@@ -214,10 +317,17 @@ def _validated_probe_stats(report, *, expected_k, expected_entry, script_hash):
         raise ValueError(f"K={expected_k} report is not an object")
     if report.get("schema_version") != PROBE_SCHEMA_VERSION:
         raise ValueError(f"K={expected_k} uses an unsupported probe schema")
-    if report.get("suite_version") != SUITE_VERSION or report.get("suite_sha256") != _suite_sha256():
-        raise ValueError(f"K={expected_k} was not produced by the current benchmark suite")
+    if (
+        report.get("suite_version") != SUITE_VERSION
+        or report.get("suite_sha256") != _suite_sha256()
+    ):
+        raise ValueError(
+            f"K={expected_k} was not produced by the current benchmark suite"
+        )
     if report.get("benchmark_script_sha256") != script_hash:
-        raise ValueError(f"K={expected_k} was not produced by this exact benchmark script")
+        raise ValueError(
+            f"K={expected_k} was not produced by this exact benchmark script"
+        )
     if report.get("entry_name") != expected_entry:
         raise ValueError(f"K={expected_k} is for a different catalog entry")
     if int(report.get("k", -1)) != expected_k:
@@ -232,13 +342,15 @@ def _validated_probe_stats(report, *, expected_k, expected_entry, script_hash):
     if repeats < MIN_RELEASE_REPEATS:
         raise ValueError(
             f"K={expected_k} has {repeats} repeats; release selection requires "
-            f"at least {MIN_RELEASE_REPEATS}")
+            f"at least {MIN_RELEASE_REPEATS}"
+        )
     expected_keys = {
         (case["name"], repeat) for repeat in range(repeats) for case in CASES
     }
     if int(report.get("request_count", -1)) != len(expected_keys):
         raise ValueError(
-            f"K={expected_k} did not declare all {len(expected_keys)} required requests")
+            f"K={expected_k} did not declare all {len(expected_keys)} required requests"
+        )
     records = report.get("records")
     errors = report.get("errors")
     if not isinstance(records, list) or not isinstance(errors, list):
@@ -249,35 +361,53 @@ def _validated_probe_stats(report, *, expected_k, expected_entry, script_hash):
             raise ValueError(f"K={expected_k} contains a non-object request record")
         key = (record.get("case"), record.get("repeat"))
         if key not in expected_keys or key in seen:
-            raise ValueError(f"K={expected_k} has an invalid or duplicate request key {key!r}")
+            raise ValueError(
+                f"K={expected_k} has an invalid or duplicate request key {key!r}"
+            )
         seen.add(key)
         if record.get("schema_valid") is not True:
-            raise ValueError(f"K={expected_k} persisted a successful record that failed its schema gate")
+            raise ValueError(
+                f"K={expected_k} persisted a successful record that failed its schema gate"
+            )
         if record.get("semantic_valid") is not True:
-            raise ValueError(f"K={expected_k} persisted a successful record that failed its semantic gate")
-        if (not _is_sha256(record.get("response_sha256"))
-                or not _is_sha256(record.get("final_sha256"))
-                or not _is_sha256(record.get("action_sha256"))):
-            raise ValueError(f"K={expected_k} request {key!r} has an invalid output digest")
+            raise ValueError(
+                f"K={expected_k} persisted a successful record that failed its semantic gate"
+            )
+        if (
+            not _is_sha256(record.get("response_sha256"))
+            or not _is_sha256(record.get("final_sha256"))
+            or not _is_sha256(record.get("action_sha256"))
+        ):
+            raise ValueError(
+                f"K={expected_k} request {key!r} has an invalid output digest"
+            )
         for field in ("decode_tps", "total_tps", "elapsed_seconds"):
             try:
                 value = float(record.get(field))
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"K={expected_k} request {key!r} has invalid {field}") from exc
+                raise ValueError(
+                    f"K={expected_k} request {key!r} has invalid {field}"
+                ) from exc
             if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"K={expected_k} request {key!r} has non-positive {field}")
+                raise ValueError(
+                    f"K={expected_k} request {key!r} has non-positive {field}"
+                )
 
     if int(report.get("successful_requests", -1)) != len(records):
-        raise ValueError(f"K={expected_k} successful_requests disagrees with its records")
+        raise ValueError(
+            f"K={expected_k} successful_requests disagrees with its records"
+        )
     recomputed_schema_valid = seen == expected_keys
-    recomputed_semantic_valid = (
-        recomputed_schema_valid and all(record["semantic_valid"] for record in records)
+    recomputed_semantic_valid = recomputed_schema_valid and all(
+        record["semantic_valid"] for record in records
     )
     if report.get("schema_valid") is not recomputed_schema_valid:
         raise ValueError(f"K={expected_k} schema_valid is internally inconsistent")
     if report.get("semantic_valid") is not recomputed_semantic_valid:
         raise ValueError(f"K={expected_k} semantic_valid is internally inconsistent")
-    recomputed_passed = recomputed_schema_valid and recomputed_semantic_valid and not errors
+    recomputed_passed = (
+        recomputed_schema_valid and recomputed_semantic_valid and not errors
+    )
     if report.get("passed") is not recomputed_passed:
         raise ValueError(f"K={expected_k} passed is internally inconsistent")
 
@@ -287,16 +417,21 @@ def _validated_probe_stats(report, *, expected_k, expected_entry, script_hash):
 
     median_decode = recompute("decode_tps")
     median_total = recompute("total_tps")
-    p95_latency = _percentile([float(record["elapsed_seconds"]) for record in records], 0.95)
-    for field, expected in (("median_decode_tps", median_decode),
-                            ("median_total_tps", median_total),
-                            ("p95_latency_seconds", p95_latency)):
+    p95_latency = _percentile(
+        [float(record["elapsed_seconds"]) for record in records], 0.95
+    )
+    for field, expected in (
+        ("median_decode_tps", median_decode),
+        ("median_total_tps", median_total),
+        ("p95_latency_seconds", p95_latency),
+    ):
         try:
             recorded = float(report.get(field))
         except (TypeError, ValueError) as exc:
             raise ValueError(f"K={expected_k} has invalid {field}") from exc
         if not math.isfinite(recorded) or not math.isclose(
-                recorded, expected, rel_tol=1e-10, abs_tol=1e-10):
+            recorded, expected, rel_tol=1e-10, abs_tol=1e-10
+        ):
             raise ValueError(f"K={expected_k} {field} disagrees with request records")
     return {
         "passed": recomputed_passed,
@@ -311,38 +446,53 @@ def _validated_probe_stats(report, *, expected_k, expected_entry, script_hash):
     }
 
 
-def _stream_request(base_url, model, case, repeat):
+def _stream_request(
+    base_url, model, case, repeat, sampling_profile=_DEFAULT_SAMPLING_PROFILE
+):
+    sampling = QWEN_SPEED_LAB_SAMPLING_PROFILES[sampling_profile]
     user_content = case["prompt"]
     if case.get("vision"):
         encoded = base64.b64encode(_vision_probe_png()).decode("ascii")
         user_content = [
             {"type": "text", "text": case["prompt"]},
-            {"type": "image_url", "image_url": {
-                "url": "data:image/png;base64," + encoded,
-            }},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64," + encoded,
+                },
+            },
         ]
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": (
-                "You are Aeon's local evidence reasoner. Analyze privately, then return only the "
-                "schema-constrained final object. Do not invent observations."
-            )},
+            {
+                "role": "system",
+                "content": (
+                    "You are Aeon's local evidence reasoner. Analyze privately, then return only the "
+                    "schema-constrained final object. Do not invent observations."
+                ),
+            },
             {"role": "user", "content": user_content},
         ],
-        # Import the exact control-plane profile used by LLMClient so the release
-        # gate can never silently benchmark a faster/different sampler.
-        "temperature": QWEN_CONTROL_TEMPERATURE,
-        "top_p": QWEN_CONTROL_TOP_P,
-        "top_k": QWEN_CONTROL_TOP_K,
+        # The default remains the exact control-plane profile used by LLMClient;
+        # the speed lab can explicitly request one other reviewed profile.
+        "temperature": sampling["temperature"],
+        "top_p": sampling["top_p"],
+        "top_k": sampling["top_k"],
         "min_p": 0.0,
         "repetition_penalty": 1.0,
-        "reasoning_effort": "medium",
-        "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True},
+        "reasoning_effort": sampling["reasoning_effort"],
+        "chat_template_kwargs": {
+            "enable_thinking": sampling["thinking"],
+            "preserve_thinking": sampling["thinking"],
+        },
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "aeon_mtp_benchmark", "strict": True,
-                            "schema": RESPONSE_SCHEMA},
+            "json_schema": {
+                "name": "aeon_mtp_benchmark",
+                "strict": True,
+                "schema": RESPONSE_SCHEMA,
+            },
         },
         "seed": 1701 + repeat,
         "max_tokens": 4096,
@@ -356,7 +506,9 @@ def _stream_request(base_url, model, case, repeat):
     finish_reason = None
     response = requests.post(
         base_url.rstrip("/") + "/v1/chat/completions",
-        json=payload, stream=True, timeout=(30, 300),
+        json=payload,
+        stream=True,
+        timeout=(30, 300),
     )
     response.raise_for_status()
     for line in response.iter_lines(decode_unicode=True):
@@ -392,38 +544,15 @@ def _stream_request(base_url, model, case, repeat):
             "structured decoding must begin only after </think>"
         )
     try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"invalid post-reasoning JSON for {case['name']}: "
-            f"content_chars={len(content)}, reasoning_chars={len(reasoning)}, "
-            f"finish_reason={finish_reason!r}, prefix={content[:240]!r}"
-        ) from exc
-    allowed_fields = set(RESPONSE_SCHEMA["properties"])
-    required_fields = set(TURN_FIELDS_REQUIRED)
-    metadata_fields = required_fields - {"actions"}
-    schema_valid = (
-        isinstance(parsed, dict)
-        and required_fields <= set(parsed) <= allowed_fields
-        and all(isinstance(parsed.get(field), str) for field in metadata_fields)
-        and ("updated_plan" not in parsed or isinstance(parsed["updated_plan"], str))
-        and isinstance(parsed.get("actions"), list)
-        and len(parsed["actions"]) == 1
-        and isinstance(parsed["actions"][0], dict)
-        and set(parsed["actions"][0]) == {"tool_name", "parameters"}
-        and parsed["actions"][0].get("tool_name") in TOOL_NAMES
-        and isinstance(parsed["actions"][0].get("parameters"), dict)
-    )
-    if not schema_valid:
-        raise ValueError(f"turn-schema gate failed for {case['name']}: {content[:500]}")
-    action = parsed["actions"][0]
-    semantic_valid = (
-        parsed["intent"] == case["marker"]
-        and action["tool_name"] == case["expected_tool"]
-        and action["parameters"] == case["expected_parameters"]
-    )
-    if not semantic_valid:
-        raise ValueError(f"agent-action gate failed for {case['name']}: {content[:500]}")
+        parsed = _validated_turn(content, case)
+    except ValueError as exc:
+        if str(exc).startswith("invalid post-reasoning JSON"):
+            raise ValueError(
+                f"invalid post-reasoning JSON for {case['name']}: "
+                f"content_chars={len(content)}, reasoning_chars={len(reasoning)}, "
+                f"finish_reason={finish_reason!r}, prefix={content[:240]!r}"
+            ) from exc
+        raise
     elapsed = end - start
     ttft = (first - start) if first is not None else elapsed
     decode_seconds = max(1e-9, end - (first if first is not None else start))
@@ -459,6 +588,7 @@ def _stream_request(base_url, model, case, repeat):
 
 def run_probe(args):
     base = args.base_url.rstrip("/")
+    sampling_profile = getattr(args, "sampling_profile", _DEFAULT_SAMPLING_PROFILE)
     health = requests.get(base + "/health", timeout=15)
     health.raise_for_status()
     version = {}
@@ -474,7 +604,7 @@ def run_probe(args):
     # runner does not mistake a broken endpoint for a completed benchmark.
     errors = []
     try:
-        _stream_request(base, args.model, CASES[0], 999)
+        _stream_request(base, args.model, CASES[0], 999, sampling_profile)
     except ValueError as exc:
         errors.append(f"excluded warmup: {type(exc).__name__}: {exc}")
     metrics_before = _metric_snapshot(base)
@@ -482,9 +612,13 @@ def run_probe(args):
     for repeat in range(args.repeats):
         for case in CASES:
             try:
-                records.append(_stream_request(base, args.model, case, repeat))
+                records.append(
+                    _stream_request(base, args.model, case, repeat, sampling_profile)
+                )
             except Exception as exc:
-                errors.append(f"{case['name']} repeat {repeat}: {type(exc).__name__}: {exc}")
+                errors.append(
+                    f"{case['name']} repeat {repeat}: {type(exc).__name__}: {exc}"
+                )
     metrics_after = _metric_snapshot(base)
     decode = [item["decode_tps"] for item in records]
     total = [item["total_tps"] for item in records]
@@ -499,6 +633,8 @@ def run_probe(args):
         "model": args.model,
         "k": args.k,
         "repeats": args.repeats,
+        "sampling_profile": sampling_profile,
+        "sampling": dict(QWEN_SPEED_LAB_SAMPLING_PROFILES[sampling_profile]),
         "runtime_profile": {
             "attention_backend": getattr(args, "attention_backend", "TRITON_ATTN"),
             "kv_cache_dtype": getattr(args, "kv_cache_dtype", "fp8_per_token_head"),
@@ -508,7 +644,8 @@ def run_probe(args):
         "server_version": version,
         "request_count": expected_count,
         "successful_requests": len(records),
-        "schema_valid": len(records) == expected_count and all(r["schema_valid"] for r in records),
+        "schema_valid": len(records) == expected_count
+        and all(r["schema_valid"] for r in records),
         "semantic_valid": (
             len(records) == expected_count and all(r["semantic_valid"] for r in records)
         ),
@@ -525,9 +662,22 @@ def run_probe(args):
         "speculative_metric_delta": _metric_delta(metrics_before, metrics_after),
     }
     _atomic_json(Path(args.output), report)
-    print(json.dumps({key: report[key] for key in (
-        "k", "passed", "successful_requests", "median_decode_tps",
-        "median_total_tps", "p95_latency_seconds")}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                key: report[key]
+                for key in (
+                    "k",
+                    "passed",
+                    "successful_requests",
+                    "median_decode_tps",
+                    "median_total_tps",
+                    "p95_latency_seconds",
+                )
+            },
+            sort_keys=True,
+        )
+    )
     return 0 if report["passed"] else 1
 
 
@@ -543,12 +693,16 @@ def run_select(args):
     if set(by_k) != release_depths:
         raise ValueError(
             f"reports must contain K={','.join(map(str, RELEASE_DEPTHS))} exactly; "
-            f"got {sorted(by_k)}")
+            f"got {sorted(by_k)}"
+        )
     script_hash = sha256_file(Path(__file__))
     validated_stats = {
         key: _validated_probe_stats(
-            by_k[key], expected_k=key, expected_entry=args.entry_name,
-            script_hash=script_hash)
+            by_k[key],
+            expected_k=key,
+            expected_entry=args.entry_name,
+            script_hash=script_hash,
+        )
         for key in RELEASE_DEPTHS
     }
     suite_hashes = {report.get("suite_sha256") for report in reports}
@@ -562,17 +716,24 @@ def run_select(args):
         )
         for report in reports
     }
-    if (suite_hashes != {_suite_sha256()} or entries != {args.entry_name}
-            or len(models) != 1 or len(runtime_profiles) != 1):
+    if (
+        suite_hashes != {_suite_sha256()}
+        or entries != {args.entry_name}
+        or len(models) != 1
+        or len(runtime_profiles) != 1
+    ):
         raise ValueError("probe reports do not bind the same suite/entry/model/runtime")
     runtime_profile = next(iter(runtime_profiles))
     expected_runtime_profile = (
-        args.attention_backend, args.kv_cache_dtype, args.image_id,
+        args.attention_backend,
+        args.kv_cache_dtype,
+        args.image_id,
     )
     if runtime_profile != expected_runtime_profile:
         raise ValueError(
             "probe runtime profile does not match the requested selection profile: "
-            f"measured={runtime_profile!r}, requested={expected_runtime_profile!r}")
+            f"measured={runtime_profile!r}, requested={expected_runtime_profile!r}"
+        )
 
     candidates = []
     for key in RELEASE_DEPTHS:
@@ -599,25 +760,32 @@ def run_select(args):
         if not semantic_equivalent:
             reasons.append("one or more responses chose the wrong Aeon action")
         if not deterministic:
-            reasons.append("tool/argument decisions varied across production-sampler seeds")
-        candidates.append({
-            "k": key,
-            "passed": passed,
-            "probe_passed": probe_passed,
-            "disqualified_reason": "; ".join(reasons),
-            "schema_valid": stats["schema_valid"],
-            "semantic_equivalent": semantic_equivalent,
-            "deterministic": deterministic,
-            "request_count": stats["request_count"],
-            "successful_requests": stats["successful_requests"],
-            "median_decode_tps": stats["median_decode_tps"],
-            "median_total_tps": stats["median_total_tps"],
-            "p95_latency_seconds": stats["p95_latency_seconds"],
-            "speculative_metric_delta": report.get("speculative_metric_delta") or {},
-            "report_sha256": sha256_file(report_paths[key]),
-        })
+            reasons.append(
+                "tool/argument decisions varied across production-sampler seeds"
+            )
+        candidates.append(
+            {
+                "k": key,
+                "passed": passed,
+                "probe_passed": probe_passed,
+                "disqualified_reason": "; ".join(reasons),
+                "schema_valid": stats["schema_valid"],
+                "semantic_equivalent": semantic_equivalent,
+                "deterministic": deterministic,
+                "request_count": stats["request_count"],
+                "successful_requests": stats["successful_requests"],
+                "median_decode_tps": stats["median_decode_tps"],
+                "median_total_tps": stats["median_total_tps"],
+                "p95_latency_seconds": stats["p95_latency_seconds"],
+                "speculative_metric_delta": report.get("speculative_metric_delta")
+                or {},
+                "report_sha256": sha256_file(report_paths[key]),
+            }
+        )
     if not candidates[0]["passed"]:
-        raise ValueError("non-speculative K=0 baseline failed; no selection is trustworthy")
+        raise ValueError(
+            "non-speculative K=0 baseline failed; no selection is trustworthy"
+        )
     selected = expected_winner({item["k"]: item for item in candidates})
 
     model_dir = Path(args.model_dir)
@@ -656,7 +824,8 @@ def run_select(args):
         "candidates": candidates,
     }
     validate_selection_manifest(
-        manifest, expected_entry=args.entry_name,
+        manifest,
+        expected_entry=args.entry_name,
         expected_model_build_sha256=manifest["artifact"]["build_manifest_sha256"],
         expected_sha256s_sha256=manifest["artifact"]["sha256s_sha256"],
         expected_image_id=args.image_id,
@@ -664,9 +833,17 @@ def run_select(args):
         expected_kv_cache_dtype=args.kv_cache_dtype,
     )
     _atomic_json(Path(args.output), manifest)
-    print(json.dumps({"selected_k": selected,
-                      "median_decode_tps": {str(c['k']): c['median_decode_tps'] for c in candidates}},
-                     sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "selected_k": selected,
+                "median_decode_tps": {
+                    str(c["k"]): c["median_decode_tps"] for c in candidates
+                },
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -674,16 +851,23 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="command", required=True)
     probe = subs.add_parser("probe")
-    probe.add_argument("--base-url", required=True, help="vLLM root, e.g. http://127.0.0.1:18033")
+    probe.add_argument(
+        "--base-url", required=True, help="vLLM root, e.g. http://127.0.0.1:18033"
+    )
     probe.add_argument("--model", required=True)
     probe.add_argument("--entry-name", default=ENTRY_NAME)
     # K=0..4 are the release-selection matrix. K=5..6 remain available for
     # exploratory sweeps; both regressed on the measured Blackwell profile.
-    probe.add_argument("--k", type=int, choices=range(7), required=True)
+    probe.add_argument("--k", type=int, choices=range(16), required=True)
     probe.add_argument("--repeats", type=int, default=2)
     probe.add_argument("--attention-backend", default="TRITON_ATTN")
     probe.add_argument("--kv-cache-dtype", default="fp8_per_token_head")
     probe.add_argument("--runtime-image-id", required=True)
+    probe.add_argument(
+        "--sampling-profile",
+        choices=tuple(QWEN_SPEED_LAB_SAMPLING_PROFILES),
+        default=_DEFAULT_SAMPLING_PROFILE,
+    )
     probe.add_argument("--output", required=True)
     probe.set_defaults(func=run_probe)
 

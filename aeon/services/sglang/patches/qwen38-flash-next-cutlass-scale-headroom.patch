@@ -1,0 +1,50 @@
+diff --git a/python/sglang/srt/layers/quantization/modelopt_quant.py b/python/sglang/srt/layers/quantization/modelopt_quant.py
+--- a/python/sglang/srt/layers/quantization/modelopt_quant.py
++++ b/python/sglang/srt/layers/quantization/modelopt_quant.py
+@@ -2265,32 +2265,41 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
+         )
+         layer.register_parameter("w13_weight_scale", w13_weight_scale)
+ 
+-        # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
+-        # during process_weights_after_loading, so skip the expensive
+-        # swizzle+allocate here to avoid GPU memory fragmentation
+-        if self.enable_flashinfer_trtllm_moe:
++        # CUTLASS derives its swizzled scale after the checkpoint scale is
++        # loaded, then alias_or_bind_derived_param reuses the source storage
++        # whenever the shapes match. Do not allocate a full-model set of
++        # uninitialized swizzled placeholders before that pass: those released
++        # blocks fragment the CUDA allocator and cannot satisfy a later large
++        # draft-model allocation. TRTLLM does not consume this attribute.
++        if (
++            self.enable_flashinfer_trtllm_moe
++            or self.enable_flashinfer_cutlass_moe
++        ):
+             layer.w13_blockscale_swizzled = None
+         else:
+             layer.w13_blockscale_swizzled = Parameter(
+                 swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
+             )
+ 
+         w2_weight_scale = ModelWeightParameter(
+             data=torch.empty(
+                 layer.num_local_experts,
+                 hidden_size,
+                 intermediate_size_per_partition // self.quant_config.group_size,
+                 dtype=weight_scale_dtype,
+             ),
+             input_dim=1,
+             output_dim=2,
+             weight_loader=weight_loader,
+         )
+         layer.register_parameter("w2_weight_scale", w2_weight_scale)
+ 
+-        if self.enable_flashinfer_trtllm_moe:
++        if (
++            self.enable_flashinfer_trtllm_moe
++            or self.enable_flashinfer_cutlass_moe
++        ):
+             layer.w2_blockscale_swizzled = None
+         else:
+             layer.w2_blockscale_swizzled = Parameter(
+                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
+             )

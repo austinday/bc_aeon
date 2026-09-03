@@ -1,0 +1,92 @@
+# syntax=docker/dockerfile:1
+# The amd64 child manifest is pinned deliberately.  The public multi-platform
+# index currently resolves to this child, but the build must not follow a future
+# tag or index update silently.
+FROM lmsysorg/sglang:qwen38flashnext@sha256:59f06adce6f91401adf443bd168d45fdb2044d77671fd591c7c57a29d851cbae
+
+USER root
+WORKDIR /sgl-workspace/sglang
+
+COPY patches/qwen38-flash-next-sm120-qsa-dac5523.patch /tmp/qwen38-flash-next-sm120-qsa.patch
+COPY patches/qwen38-flash-next-fused-shared-cdb7ac8.patch /tmp/qwen38-flash-next-fused-shared.patch
+COPY patches/qwen38-flash-next-mtp-shared-day0-cdb7-7db5.patch /tmp/qwen38-flash-next-mtp-shared.patch
+COPY patches/qwen38-flash-next-cutlass-scale-headroom.patch /tmp/qwen38-flash-next-cutlass-scale-headroom.patch
+COPY patches/qwen38-flash-next-mtp-share-before-pool.patch /tmp/qwen38-flash-next-mtp-share-before-pool.patch
+
+RUN test "$(uname -m)" = "x86_64" \
+    && test "$(sha256sum /tmp/qwen38-flash-next-sm120-qsa.patch | cut -d' ' -f1)" = "eba9b1b2c07f6bdfe42502ffc50667f7e1e5467dc1ee96f0a8e791562e1c9679" \
+    && test "$(sha256sum /tmp/qwen38-flash-next-fused-shared.patch | cut -d' ' -f1)" = "9c3d91412bd3599ccfb5a8879448423fbc34cc24659593933dabe22858ce7338" \
+    && test "$(sha256sum /tmp/qwen38-flash-next-mtp-shared.patch | cut -d' ' -f1)" = "e9f26827b1c0da319c1116caea575b89a794c983ed35671331d421d40137b7fb" \
+    && test "$(sha256sum /tmp/qwen38-flash-next-cutlass-scale-headroom.patch | cut -d' ' -f1)" = "a6c61ef9eaa1153551506b26aca7627f7ecc98851f6cd7e7038cd6d0a25b5c6a" \
+    && test "$(sha256sum /tmp/qwen38-flash-next-mtp-share-before-pool.patch | cut -d' ' -f1)" = "424eb761834646089437f7e2d16694ab06f03e102f045da07f4a35aa3c83b607" \
+    && test -f python/sglang/srt/models/qwen4_exp.py \
+    && test -f python/sglang/srt/models/qwen4_exp_mtp.py \
+    && test -f python/sglang/srt/models/qwen3_5_mtp.py \
+    && test -f python/sglang/srt/layers/quantization/modelopt_quant.py \
+    && test -f python/sglang/srt/speculative/eagle_worker_v2.py \
+    && git apply --check \
+        --include=python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py \
+        /tmp/qwen38-flash-next-sm120-qsa.patch \
+    && git apply \
+        --include=python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py \
+        /tmp/qwen38-flash-next-sm120-qsa.patch \
+    && git apply --check \
+        --include=python/sglang/srt/models/qwen4_exp.py \
+        /tmp/qwen38-flash-next-fused-shared.patch \
+    && git apply \
+        --include=python/sglang/srt/models/qwen4_exp.py \
+        /tmp/qwen38-flash-next-fused-shared.patch \
+    && git apply --check /tmp/qwen38-flash-next-mtp-shared.patch \
+    && git apply /tmp/qwen38-flash-next-mtp-shared.patch \
+    && git apply --check /tmp/qwen38-flash-next-cutlass-scale-headroom.patch \
+    && git apply /tmp/qwen38-flash-next-cutlass-scale-headroom.patch \
+    && git apply --check /tmp/qwen38-flash-next-mtp-share-before-pool.patch \
+    && git apply /tmp/qwen38-flash-next-mtp-share-before-pool.patch \
+    && git diff --check \
+    && python3 -m compileall -q \
+        python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py \
+        python/sglang/srt/layers/quantization/modelopt_quant.py \
+        python/sglang/srt/models/qwen3_5_mtp.py \
+        python/sglang/srt/models/qwen4_exp.py \
+        python/sglang/srt/models/qwen4_exp_mtp.py \
+        python/sglang/srt/speculative/eagle_worker_v2.py \
+    && grep -Fq 'is_sm100_supported() or is_sm120_supported()' \
+        python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py \
+    && grep -Fq 'sglang.kernels.ops.attention.flash_attention_v4' \
+        python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py \
+    && grep -Fq '_qwen4_exp_fused_shared_expert_mapping' \
+        python/sglang/srt/models/qwen4_exp.py \
+    && grep -Fq 'Required MTP shared-expert parameter could not be loaded' \
+        python/sglang/srt/models/qwen3_5_mtp.py \
+    && test "$(grep -Fc 'or self.enable_flashinfer_cutlass_moe' \
+        python/sglang/srt/layers/quantization/modelopt_quant.py)" = "2" \
+    && grep -Fq 'self._lm_head_shared = True' \
+        python/sglang/srt/speculative/eagle_worker_v2.py \
+    && grep -Fq 'if not getattr(self, "_lm_head_shared", False):' \
+        python/sglang/srt/speculative/eagle_worker_v2.py \
+    && rm -f \
+        /tmp/qwen38-flash-next-sm120-qsa.patch \
+        /tmp/qwen38-flash-next-fused-shared.patch \
+        /tmp/qwen38-flash-next-mtp-shared.patch \
+        /tmp/qwen38-flash-next-cutlass-scale-headroom.patch \
+        /tmp/qwen38-flash-next-mtp-share-before-pool.patch
+
+LABEL com.bc-aeon.qwen38-flash-next.artifact="Aeon-Qwen3.8-Flash-Next-NVFP4-MTP" \
+      com.bc-aeon.qwen38-flash-next.display-name="Aeon Qwen3.8-Flash-Next 125B-A6B NVFP4+MTP" \
+      com.bc-aeon.qwen38-flash-next.model-architecture="qwen4_exp" \
+      com.bc-aeon.qwen38-flash-next.base-image="lmsysorg/sglang:qwen38flashnext@sha256:59f06adce6f91401adf443bd168d45fdb2044d77671fd591c7c57a29d851cbae" \
+      com.bc-aeon.qwen38-flash-next.base-sglang-commit="d91c3682b0b429e4c70df63cd57f819588ce29b0" \
+      com.bc-aeon.qwen38-flash-next.qwen-overlay-pr="Qiaolin-Yu/sglang-qwen-next#38" \
+      com.bc-aeon.qwen38-flash-next.qwen-overlay-commits="3ea3a37a1,12070370f" \
+      com.bc-aeon.qwen38-flash-next.qwen-reference-commit="73a255206f916366c8d26d4022f82ddfb0ab558d" \
+      com.bc-aeon.qwen38-flash-next.sm120-fix-commit="dac5523d1e5d2f4297fec40ef02fc76fb0f662d1" \
+      com.bc-aeon.qwen38-flash-next.sm120-patch-sha256="eba9b1b2c07f6bdfe42502ffc50667f7e1e5467dc1ee96f0a8e791562e1c9679" \
+      com.bc-aeon.qwen38-flash-next.sm120-fp4-backend-selection-commit="3836cba9eed2cc0db093e58ca839215609a44c31" \
+      com.bc-aeon.qwen38-flash-next.fused-shared-expert-commit="cdb7ac8f4740f0baf5d01d673fd0fb671a14ebdf" \
+      com.bc-aeon.qwen38-flash-next.fused-shared-expert-patch-sha256="9c3d91412bd3599ccfb5a8879448423fbc34cc24659593933dabe22858ce7338" \
+      com.bc-aeon.qwen38-flash-next.mtp-shared-expert-commit="7db597910dab20741770862d328c1399be0e6ab8" \
+      com.bc-aeon.qwen38-flash-next.mtp-shared-expert-patch-sha256="e9f26827b1c0da319c1116caea575b89a794c983ed35671331d421d40137b7fb" \
+      com.bc-aeon.qwen38-flash-next.cutlass-scale-headroom-patch-sha256="a6c61ef9eaa1153551506b26aca7627f7ecc98851f6cd7e7038cd6d0a25b5c6a" \
+      com.bc-aeon.qwen38-flash-next.mtp-share-before-pool-issue="36452" \
+      com.bc-aeon.qwen38-flash-next.mtp-share-before-pool-patch-sha256="424eb761834646089437f7e2d16694ab06f03e102f045da07f4a35aa3c83b607" \
+      com.bc-aeon.qwen38-flash-next.source-stack-sha256="f9087c7d56219f49fb575c8b1008e923ddeea1ea878e46b20f8e5585317136ed"

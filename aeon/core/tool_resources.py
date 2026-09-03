@@ -21,6 +21,7 @@ class ToolComputeRoute(str, Enum):
     HOST_SERVICE = "host_service"
     ACTIVE_MODEL = "active_model"
     FLEET_SERVICE = "fleet_service"
+    FLEET_BATCH = "fleet_batch"
     FLEET_CHILD = "fleet_child"
     DYNAMIC_COMMAND = "dynamic_command"
     NEXUS_LIFECYCLE = "nexus_lifecycle"
@@ -107,6 +108,14 @@ _FLEET_SERVICE_TOOLS = {
     "generate_video": "aeon-video-comfyui",
 }
 
+_FLEET_BATCH_TOOLS = frozenset(
+    {
+        "fleet_batch_capabilities",
+        "fleet_batch_job_status",
+        "fleet_submit_batch_job",
+    }
+)
+
 _FLEET_CHILD_TOOLS = frozenset({"spawn_sub_agent", "verify_self_modification"})
 _DYNAMIC_COMMAND_TOOLS = frozenset({"run_command", "run_command_async"})
 _NEXUS_LIFECYCLE_TOOLS = frozenset(
@@ -130,6 +139,9 @@ _EXTERNAL_PROVIDER_TOOLS = frozenset(
         "huggingface_model_info",
         "huggingface_model_search",
         "huggingface_repo_file",
+        "huggingface_account",
+        "huggingface_publish_model",
+        "huggingface_verify_publication",
         "list_mcp_credentials",
         "list_payment_addresses",
         "list_mcp_tools",
@@ -164,6 +176,8 @@ def tool_resource_policy(name: str) -> ToolResourcePolicy:
             requires_primary_compute_guard=True,
             fleet_service=_FLEET_SERVICE_TOOLS[value],
         )
+    if value in _FLEET_BATCH_TOOLS:
+        return ToolResourcePolicy(ToolComputeRoute.FLEET_BATCH)
     if value in _FLEET_CHILD_TOOLS:
         return ToolResourcePolicy(ToolComputeRoute.FLEET_CHILD)
     if value in _DYNAMIC_COMMAND_TOOLS:
@@ -189,6 +203,7 @@ def declared_tool_names() -> frozenset[str]:
         | set(_ACTIVE_MODEL_TOOLS)
         | set(_HOST_SERVICE_TOOLS)
         | set(_FLEET_SERVICE_TOOLS)
+        | set(_FLEET_BATCH_TOOLS)
         | set(_FLEET_CHILD_TOOLS)
         | set(_DYNAMIC_COMMAND_TOOLS)
         | set(_NEXUS_LIFECYCLE_TOOLS)

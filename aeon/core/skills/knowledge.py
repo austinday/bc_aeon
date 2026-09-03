@@ -7,9 +7,9 @@ and can be copied only by the authenticated Nexus transfer workflow.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
-import fcntl
 import json
 import os
 import re
@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
 
+from aeon.core.utils.io import read_bounded_fd
 
 MAX_SKILL_KNOWLEDGE_BYTES = 64 * 1024
 MAX_SKILL_KNOWLEDGE_NOTES = 128
@@ -355,7 +356,9 @@ class SkillKnowledgeStore:
                 or metadata.st_size > MAX_SKILL_KNOWLEDGE_BYTES + 4096
             ):
                 raise SkillKnowledgeError("skill knowledge note is not private")
-            payload = os.read(fd, MAX_SKILL_KNOWLEDGE_BYTES + 4097)
+            payload = read_bounded_fd(
+                fd, MAX_SKILL_KNOWLEDGE_BYTES + 4096
+            )
             if len(payload) > MAX_SKILL_KNOWLEDGE_BYTES + 4096:
                 raise SkillKnowledgeError("skill knowledge note is too large")
             try:

@@ -1,0 +1,160 @@
+{
+  "schema_version": "aeon-qwen38-modelopt-runtime-wheel-closure-v1",
+  "complete": true,
+  "target": {
+    "implementation": "CPython",
+    "python": "3.12",
+    "platform": "Linux",
+    "machine": "x86_64"
+  },
+  "modelopt": {
+    "distribution": "nvidia-modelopt",
+    "version": "0.46.0",
+    "filename": "nvidia_modelopt-0.46.0-py3-none-any.whl",
+    "sha256": "1864b4e9921e287b065be3861ab48345144e673273ebb2b94bd9a6119a9eba8e",
+    "size": 2109913,
+    "metadata_sha256": "30f679fc36dc391dc8a9edeb7e65629be15bf2d7bd4712ceb4ab7b95ae4f3537",
+    "mandatory_requires_dist": [
+      "ninja",
+      "numpy",
+      "nvidia-ml-py>=12",
+      "packaging",
+      "setuptools>=80",
+      "torch>=2.8",
+      "tqdm",
+      "PyYAML>=6.0",
+      "omegaconf>=2.3.0",
+      "pulp<4.0",
+      "pydantic>=2.0",
+      "regex",
+      "rich",
+      "safetensors",
+      "scipy"
+    ]
+  },
+  "runtime_wheels": {
+    "annotated_types-0.7.0-py3-none-any.whl": {
+      "distribution": "annotated-types", "version": "0.7.0", "requires_python": ">=3.8", "size": 13643,
+      "sha256": "1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53",
+      "metadata_sha256": "ee5b6ac64b09274c026051813484025939564067801f485115d9cadc207cf791",
+      "requires_dist_sha256": "e15631a753acad112ff96746c52bc3baf47586eb1f23a57b2f57ee63ca8d2d5d",
+      "record_sha256": "68915929495feb5029ef0a3a39a419b170f63aa5f0ae9185ff575f256e93767a",
+      "member_count": 7, "member_names_sha256": "ca6e98c06ebf0a939c2ae4bb0f39954fc22c9d0b25e0d65aacd7931831ed1c84"
+    },
+    "antlr4_python3_runtime-4.9.3-py3-none-any.whl": {
+      "distribution": "antlr4-python3-runtime", "version": "4.9.3", "requires_python": null, "size": 144590,
+      "sha256": "a7755abf757539fcc42c2efc10d03a6f177418e62b9c743235d4de37f0f4f527",
+      "metadata_sha256": "bf325e5155318385a2fcc4680742da710bbadf13a3d1c0979a98b3487980f261",
+      "requires_dist_sha256": "768c6ebc6ff6688b62db3c4997abb5f223443a0fc17ff1ea013a2b201c345b3b",
+      "record_sha256": "30b4752c9834bf03c5ca03ee59d3e0ad11a767adb5c71170bcc3e650e5431afc",
+      "member_count": 61, "member_names_sha256": "f2a720c291c369aad52fbb7e7a1a30a723a144244f139fd149b5da179badc38e"
+    },
+    "ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl": {
+      "distribution": "ninja", "version": "1.13.0", "requires_python": ">=3.8", "size": 180716,
+      "sha256": "fb46acf6b93b8dd0322adc3a4945452a4e774b75b91293bafcc7b7f8e6517dfa",
+      "metadata_sha256": "8d76fc4e382cedcd22bcaeaa748af39b3fa7931b72442396d15cb181659d0a4e",
+      "requires_dist_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "record_sha256": "7231669bce3d90483c213519c513d1a6ee54c2278b949c04c984e63d1317accb",
+      "member_count": 13, "member_names_sha256": "28e5d237fe45a4fff89bc5565d1a97659e9abf750557164aa1302b476427ac33"
+    },
+    "nvidia_ml_py-13.610.43-py3-none-any.whl": {
+      "distribution": "nvidia-ml-py", "version": "13.610.43", "requires_python": null, "size": 53163,
+      "sha256": "f13c72698edef492f985cc225f14faafe68ae065a2e407f45bdf6f4b9b43fde8",
+      "metadata_sha256": "4b681b648e302800c83919435504193df847cb7229fecb4e0d6471aa6847f063",
+      "requires_dist_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "record_sha256": "34c85ed429754ab062230852cd2dd99906c6da840982a66aa92ca5edddaa162a",
+      "member_count": 6, "member_names_sha256": "7d06743ca9d78afbef96ecad7b7728b15cde36f7f3291d9cf669e088eee55371"
+    },
+    "omegaconf-2.3.1-py3-none-any.whl": {
+      "distribution": "omegaconf", "version": "2.3.1", "requires_python": ">=3.6", "size": 79502,
+      "sha256": "3d701d14e9a8828f1edd28bb70b725908b34277cdd72cf7d6a83f94dadc6b6a0",
+      "metadata_sha256": "24dc07ea1b801810c63c386cc47376727a774cce4493bfddf6454fe8335eb84e",
+      "requires_dist_sha256": "ba76f7d8eee841943b0ddd53622e63880d2570e6a7a7e44036d7f0a55a8525d0",
+      "record_sha256": "bbef8953c5b0d92a994a761a278d613342bc2a7b5756db55d44175d36e085981",
+      "member_count": 31, "member_names_sha256": "8524d478026b38e314d754e2277de9088e7ca9ea27c6ee15ff03a4fb2d30b4d6"
+    },
+    "pulp-3.3.2-py3-none-any.whl": {
+      "distribution": "PuLP", "version": "3.3.2", "requires_python": ">=3.10", "size": 16391742,
+      "sha256": "631b166f72086971a9597f7a0233ababa99bb8d50a01cd543f7758be5a9f86c0",
+      "metadata_sha256": "299bf95c684048f5ecc277717ad5e6a33dcd3afbf7cca9e079084f3805f0e731",
+      "requires_dist_sha256": "1b0429ad16eb5fa9e7bd469594eb0119101006b4acb9f16572ea1b3092ac58ed",
+      "record_sha256": "56a240f0a04fd6e2c123aeefa01b31f04335a3a2e8179dc791b22eabc5e719f4",
+      "member_count": 55, "member_names_sha256": "241b174eb2b3f53ecdc62a29892b0ba2f734ecd5fdaeff256b2478ffd2a6ed46"
+    },
+    "pydantic-2.13.4-py3-none-any.whl": {
+      "distribution": "pydantic", "version": "2.13.4", "requires_python": ">=3.9", "size": 472262,
+      "sha256": "45a282cde31d808236fd7ea9d919b128653c8b38b393d1c4ab335c62924d9aba",
+      "metadata_sha256": "d1e56c3412492512fb6b59a9dfc25ab7af2a8204585cd7bca000513023133394",
+      "requires_dist_sha256": "8bf3366ac1b61182f035c590085cfffc22ac116a3de5e5867df14ddc3c6ece9d",
+      "record_sha256": "78ab16ca0e9b7c1ce1a3262f1e41b3003792fb304cf490ed3ec05d6ba534bd7a",
+      "member_count": 111, "member_names_sha256": "5cf4997151d81da61d9eb1a2a145b4e489b0b20aba16392fc178ca70da42794e"
+    },
+    "pydantic_core-2.46.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl": {
+      "distribution": "pydantic_core", "version": "2.46.4", "requires_python": ">=3.9", "size": 2094516,
+      "sha256": "926c9541b14b12b1681dca8a0b75feb510b06c6341b70a8e500c2fdcff837cce",
+      "metadata_sha256": "135fa8b2f89473e9191c7078c2164e3ec6c8927a61c2379c2fddcc07f11f3bae",
+      "requires_dist_sha256": "057020282455fc0709bcac9d7283529bc51d2289c027f946e5c4cdf94e1043a4",
+      "record_sha256": "c0b40bc9fd9c3e5effd1d55c2be4cb73a7106ef1443475157e577b4c631d99aa",
+      "member_count": 10, "member_names_sha256": "f3eab95c5cf986a43508e6cf6b2dda79ed577a8c0824782d09feb5f723af67cb"
+    },
+    "scipy-1.18.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl": {
+      "distribution": "scipy", "version": "1.18.1", "requires_python": ">=3.12", "size": 35344199,
+      "sha256": "f55fa87b6c612ecd6b058f167c53231b1d14e412efe361d3d6e38b3631c73218",
+      "metadata_sha256": "6d1ebfbce110009e25e8249fea05e21c0449735144e9bd8df1a52931f957c1ea",
+      "requires_dist_sha256": "2c7bca895996afeabba7bb94c12c79baebe220a6e942faa68cf6a2ae71a4c2ea",
+      "record_sha256": "1d231715816e605e115513a68716747dbb43c1e62c7e101306bafd5ebd5f04b5",
+      "member_count": 1432, "member_names_sha256": "8e2b472e76b6592a71bd0b59ed7743bae6c81548a6ccba2a1f5068d672d905a9"
+    },
+    "setuptools-84.0.0-py3-none-any.whl": {
+      "distribution": "setuptools", "version": "84.0.0", "requires_python": ">=3.10", "size": 818216,
+      "sha256": "51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670",
+      "metadata_sha256": "3ef2975718dd31cabdd5829455e9b868ca14dbf79ed8fed2de0af4e87347006e",
+      "requires_dist_sha256": "7509ebd529fc32f23fac79bba5b9cb8ada84ed4d10561526a3a0a76fccb838b7",
+      "record_sha256": "8e50621059df808724912520d74765c1384bdb36be51ec3a92342dbbea30d630",
+      "member_count": 343, "member_names_sha256": "3ab9fb10513f24d1736b30615ee391fa5c6e82abf9aef606f5695f8bc3a0adfa"
+    },
+    "typing_extensions-4.16.0-py3-none-any.whl": {
+      "distribution": "typing_extensions", "version": "4.16.0", "requires_python": ">=3.9", "size": 45571,
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "metadata_sha256": "b05084ca1d50879865178d9fff9fabeab61bdfb1f361bfbde95421ffc8f9be46",
+      "requires_dist_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "record_sha256": "44dcf97810bea7b84bcd83890b6674bbcc2f4c5ef899a4887f15d524bdf6bb97",
+      "member_count": 5, "member_names_sha256": "e1c5dddc79315b9add6ab6506bca30b5128cc6d6b707a97714d2d5701f195394"
+    },
+    "typing_inspection-0.4.2-py3-none-any.whl": {
+      "distribution": "typing-inspection", "version": "0.4.2", "requires_python": ">=3.9", "size": 14611,
+      "sha256": "4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7",
+      "metadata_sha256": "61096cd0bfe3c7040b6f98c22b02d190fe01936d0ff7616c5134fed02891953a",
+      "requires_dist_sha256": "1f76177ffebc8e0fe1add8260e5648fa3338eac89f060c6925511367e32b6e19",
+      "record_sha256": "27ecdaf1676de517351f31b35c74b99cc57237735eed5441369e7c26ba2a946f",
+      "member_count": 9, "member_names_sha256": "447d5512b9772d91eb8dec3d9fff403739aca5418d0fee3e19de06e8a0f2d4a5"
+    }
+  },
+  "externally_satisfied": {
+    "PyYAML": "6.0.3", "accelerate": "1.12.0", "huggingface-hub": "1.28.0",
+    "numpy": "2.5.2", "packaging": "26.3", "peft": "0.19.1", "psutil": "7.2.2",
+    "regex": "2026.7.19", "rich": "15.0.0", "safetensors": "0.8.0",
+    "tokenizers": "0.23.1", "torch": "2.10.0+cu130", "tqdm": "4.70.0",
+    "transformers": "5.16.1"
+  },
+  "antlr_build": {
+    "official_pypi_sdist": {
+      "filename": "antlr4-python3-runtime-4.9.3.tar.gz",
+      "sha256": "f224469b4168294902bb1efa80a8bf7855f24c99aef99cbefc1bcd3cce77881b",
+      "size": 117034
+    },
+    "toolchain": {
+      "setuptools-84.0.0-py3-none-any.whl": {"version": "84.0.0", "sha256": "51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670", "size": 818216},
+      "wheel-0.48.0-py3-none-any.whl": {"version": "0.48.0", "sha256": "3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab", "size": 33320}
+    },
+    "command": "env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC PYTHONHASHSEED=0 PYTHONNOUSERSITE=1 SOURCE_DATE_EPOCH=315532800 PYTHONPATH=<isolated-toolchain-overlay> <cpython-3.12> setup.py bdist_wheel --dist-dir <dist> --bdist-dir <bdist>",
+    "independent_builds": 2,
+    "byte_identical": true,
+    "derived_wheel": "antlr4_python3_runtime-4.9.3-py3-none-any.whl",
+    "derived_sha256": "a7755abf757539fcc42c2efc10d03a6f177418e62b9c743235d4de37f0f4f527",
+    "derived_size": 144590,
+    "member_count": 61,
+    "member_names_sha256": "f2a720c291c369aad52fbb7e7a1a30a723a144244f139fd149b5da179badc38e",
+    "record_verified": true
+  }
+}

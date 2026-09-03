@@ -24,6 +24,7 @@ from aeon.core.fleet_backend import (
     validate_loopback_endpoint,
 )
 from aeon.core.skills.manager import INSTANCE_SKILLS_DIR_ENV
+from aeon.core.process_resources import register_service_owner, unregister_service_owner
 
 
 PRINCIPAL_ONLY_ENV_KEYS = frozenset(
@@ -40,6 +41,15 @@ PRINCIPAL_ONLY_ENV_KEYS = frozenset(
         "NEXUS_MCP_DELEGATION_ID",
         "NEXUS_MCP_DELEGATION_TOKEN_FILE",
     }
+)
+
+# These namespaces contain capabilities minted for the principal process.  A
+# bounded child must establish its own harness turn and benchmark authorization;
+# inheriting even the path to a principal's receipt/key file would collapse that
+# authority boundary.
+_PRINCIPAL_ONLY_ENV_PREFIXES = (
+    "AEON_BENCHMARK_GPU_CAPABILITY_",
+    "AEON_OPENCODE_",
 )
 
 VERIFICATION_PREBOUND_NONCE_ENV = "AEON_VERIFICATION_PREBOUND_NONCE"
@@ -120,6 +130,7 @@ def scrub_principal_capabilities(environment: MutableMapping[str, str]) -> None:
         upper = str(key).upper()
         remove = (
             upper in PRINCIPAL_ONLY_ENV_KEYS
+            or upper.startswith(_PRINCIPAL_ONLY_ENV_PREFIXES)
             or upper in LAUNCHER_ONLY_ENV_KEYS
             or upper in _EXACT_RESOURCE_AUTHORITY_KEYS
             or upper in NO_ACCELERATOR_ENV
@@ -191,6 +202,8 @@ class SubAgentFleetCompute:
         self._start_called = False
         if not self.required:
             self._start_done.set()
+        else:
+            register_service_owner(self)
 
     @property
     def consumer(self) -> str:
@@ -326,7 +339,9 @@ class SubAgentFleetCompute:
         with self._close_lock:
             session = self.session
             if session is None:
+                unregister_service_owner(self)
                 return None
             proof = session.close()
             self.session = None
+            unregister_service_owner(self)
             return proof

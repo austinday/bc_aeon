@@ -19,7 +19,7 @@ the mouse, sleeping between samples) lives in server.py and consumes these.
 """
 import math
 import random
-from typing import List, Sequence, Tuple
+from typing import List, Tuple
 
 Point = Tuple[float, float]
 

@@ -9,6 +9,7 @@ silently blessing edited instructions.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -16,13 +17,12 @@ import re
 import stat
 import time
 import uuid
-import fcntl
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from aeon.core.skills.knowledge import contains_persisted_secret
-
+from aeon.core.utils.io import read_bounded_fd
 
 MAX_PRIVATE_SKILLS = 16
 MAX_LIFECYCLE_BYTES = 64 * 1024
@@ -260,7 +260,7 @@ class LearnedSkillStore:
             opened = os.fstat(descriptor)
             if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
                 raise LearnedSkillError("learned-skill metadata changed while opening")
-            payload = os.read(descriptor, MAX_LIFECYCLE_BYTES + 1)
+            payload = read_bounded_fd(descriptor, MAX_LIFECYCLE_BYTES)
         finally:
             os.close(descriptor)
         if len(payload) > MAX_LIFECYCLE_BYTES:

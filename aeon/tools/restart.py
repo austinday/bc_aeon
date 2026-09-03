@@ -1,9 +1,16 @@
 import os
 import json
+from pathlib import Path
 from .base import BaseTool
 from ..core.prompts import TOOL_DESC_RESTART_AEON
 
 RESTART_STATE_PATH = f'/tmp/aeon_restart_state_{os.getpid()}.json'
+
+
+def restart_validation_boundary_available() -> bool:
+    """Loaded-code latch for the not-yet-proven candidate import sandbox."""
+
+    return False
 
 
 class RestartAeonTool(BaseTool):
@@ -40,9 +47,19 @@ class RestartAeonTool(BaseTool):
                         'auto-derived. Pass the absolute path to the Aeon source tree (the directory '
                         'containing setup.py).')
 
-        abs_dir = os.path.abspath(aeon_code_dir)
-        if not os.path.isdir(abs_dir):
-            return f'Error: Directory not found: {aeon_code_dir}'
+        canonical = self._default_code_dir()
+        if not canonical:
+            return 'Error: canonical Aeon source root could not be resolved.'
+        try:
+            abs_dir = str(Path(aeon_code_dir).expanduser().resolve(strict=True))
+            canonical_dir = str(Path(canonical).expanduser().resolve(strict=True))
+        except (OSError, RuntimeError, ValueError) as exc:
+            return f'Error: Invalid Aeon source directory: {exc}'
+        if abs_dir != canonical_dir:
+            return (
+                f'Error: restart_aeon only reloads its canonical source tree '
+                f'({canonical_dir}); alternate package installation is not allowed.'
+            )
 
         # Verify it looks like a Python package
         has_setup = os.path.exists(os.path.join(abs_dir, 'setup.py'))
@@ -51,6 +68,14 @@ class RestartAeonTool(BaseTool):
             return (
                 f'Error: {aeon_code_dir} does not appear to be a Python package '
                 f'(no setup.py or pyproject.toml found).'
+            )
+
+        if not restart_validation_boundary_available():
+            return (
+                "Error: restart is blocked because this host does not yet have "
+                "an actively-probed masked-home sandbox for importing modified "
+                "Aeon source. No restart state was written and no candidate code "
+                "was executed."
             )
 
         # Serialize worker state
@@ -69,6 +94,6 @@ class RestartAeonTool(BaseTool):
 
         return (
             f'Restart state saved. Reason: {reason}\n'
-            f'The agent will now terminate and restart with updated code from {abs_dir}.\n'
+            f'The agent will now terminate and reload updated canonical source from {abs_dir}.\n'
             f'All memories and action history will be preserved.'
         )

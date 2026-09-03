@@ -81,6 +81,7 @@ class CapabilityFamily(str, Enum):
     PROCESS_CONTROL = "process_control"
     SOURCE_REVERT = "source_revert"
     ACCESS_REVOCATION = "access_revocation"
+    FLEET_BATCH = "fleet_batch"
 
 
 class ToolStatus(str, Enum):
@@ -404,18 +405,21 @@ _MCP_CONNECTION_CAPABILITY_RE = re.compile(
     r"\bmcp\b[^?.!]{0,80}\b(?:connect|link|authorize)\b",
     re.IGNORECASE,
 )
-_EXTERNAL_INTERACTION_CAPABILITY_RE = re.compile(
-    r"\b(?:publish|make\s+live|deploy(?:\s+publicly)?|send|post|upload|submit|"
-    r"purchase|buy|schedule|book|order|pay|subscribe|log\s*in|sign\s*in|register|create\s+(?:an?\s+)?"
-    r"(?:account|repository|repo|pull\s+request|issue))\b",
+_FLEET_BATCH_CAPABILITY_RE = re.compile(
+    r"\b(?:fleet(?:\s+compute)?|our\s+gpus?|local\s+gpus?)\b[^?.!]{0,100}"
+    r"\b(?:batch|build|make|create|train|fine[- ]?tun|adapt|quantiz|convert|job|compute|run)\w*\b|"
+    r"\b(?:batch|build|make|create|train|fine[- ]?tun|adapt|quantiz|convert|job|compute|run)\w*\b"
+    r"[^?.!]{0,100}\b(?:fleet(?:\s+compute)?|our\s+gpus?|local\s+gpus?)\b|"
+    r"\b(?:build|make|create|train|fine[- ]?tun|adapt|quantiz|convert|run)\w*\b"
+    r"[^?.!]{0,100}\b(?:one|two|three|four|\d+)\s+"
+    r"(?:(?:nvidia|amd)\s+)?(?:rtx|gtx|tesla|quadro|a\d{2,3}|h\d{2,3}|"
+    r"l\d{1,3}|mi\d{2,3})[A-Za-z0-9 -]{0,24}\s+gpus?\b|"
+    r"\b(?:one|two|three|four|\d+)\s+"
+    r"(?:(?:nvidia|amd)\s+)?(?:rtx|gtx|tesla|quadro|a\d{2,3}|h\d{2,3}|"
+    r"l\d{1,3}|mi\d{2,3})[A-Za-z0-9 -]{0,24}\s+gpus?\b"
+    r"[^?.!]{0,100}\b(?:build|make|create|train|fine[- ]?tun|adapt|quantiz|convert|run)\w*\b",
     re.IGNORECASE,
 )
-_STRONG_EXTERNAL_INTERACTION_CAPABILITY_RE = re.compile(
-    r"\b(?:publish|make\s+live|deploy(?:\s+publicly)?|send|post|upload|submit|"
-    r"purchase|buy|schedule|book|order|pay|subscribe|log\s*in|sign\s*in)\b",
-    re.IGNORECASE,
-)
-
 _AEON_RESTART_CAPABILITY_RE = re.compile(
     r"\b(?:restart|reload)\b[^?.!]{0,50}\baeon\b|"
     r"\baeon\b[^?.!]{0,50}\b(?:restart|reload)\b",
@@ -816,6 +820,17 @@ def _effect_text(value: str) -> str:
     return _NEGATED_ACTION_RE.sub(" ", masked)
 
 
+def _mask_quoted_literals(value: str) -> str:
+    """Hide quoted copy from intent classification, while retaining its boundary."""
+
+    return re.sub(
+        r'"[^"\n]{0,1000}"|“[^”\n]{0,1000}”|`[^`\n]{0,1000}`|'
+        r"(?<![A-Za-z0-9])'[^'\n]{1,1000}'(?![A-Za-z0-9])",
+        " quoted-literal ",
+        str(value or ""),
+    )
+
+
 _SUBORDINATE_INSPECTION_FRAME_RE = re.compile(
     r"\b(?:how(?:\s+to)?|steps?(?:\s+needed)?\s+to|ways?\s+to|"
     r"plan\s+to|approach\s+to|whether(?:\s+or\s+not)?(?:\s+to)?|"
@@ -1001,6 +1016,7 @@ def classify_request_mode(text: str) -> RequestMode:
         # The manager, not the collaborator, adds this provenance marker. The
         # payload can propose work but cannot grant mutation authority.
         return RequestMode.PLAN
+    value = _mask_quoted_literals(value)
     if _STATUS_INSPECTION_RE.search(value):
         return RequestMode.INSPECT
     read_only_directives = list(_EXPLICIT_READ_ONLY_RE.finditer(value))
@@ -1143,6 +1159,13 @@ def _requested_capability_families(
     clauses = _explicit_action_clauses(value)
     families: set[CapabilityFamily] = set()
 
+    if mode in {
+        RequestMode.CHANGE_LOCAL,
+        RequestMode.EXTERNAL_ACTION,
+        RequestMode.DESTRUCTIVE,
+    } and any(_FLEET_BATCH_CAPABILITY_RE.search(clause) for clause in clauses):
+        families.add(CapabilityFamily.FLEET_BATCH)
+
     # Capability extraction is intentionally independent for compound owner
     # requests. A higher overall mode is an authority ceiling, not permission to
     # discard lower-level obligations such as "fix ... and push ...", nor to
@@ -1186,17 +1209,7 @@ def _requested_capability_families(
             None,
         )
         if (
-            any(
-                _EXTERNAL_INTERACTION_CAPABILITY_RE.search(clause)
-                for clause in clauses
-            )
-            or actionable_plural_upload
-        ) and (
-            not families
-            or any(
-                _STRONG_EXTERNAL_INTERACTION_CAPABILITY_RE.search(clause)
-                for clause in clauses
-            )
+            any(_external_operation_target(clause) for clause in clauses)
             or actionable_plural_upload
         ):
             families.add(CapabilityFamily.EXTERNAL_INTERACTION)
@@ -1289,6 +1302,10 @@ _READ_ONLY_TOOLS = frozenset(
         "github_repositories",
         "github_status",
         "github_verify_remote",
+        "huggingface_account",
+        "huggingface_verify_publication",
+        "fleet_batch_capabilities",
+        "fleet_batch_job_status",
     }
 )
 _AGENT_STATE_TOOLS = frozenset(
@@ -1335,6 +1352,7 @@ _LOCAL_MUTATION_TOOLS = frozenset(
         "verify_self_modification",
         "run_self_benchmark",
         "github_commit",
+        "fleet_submit_batch_job",
     }
 )
 _EXTERNAL_MUTATION_TOOLS = frozenset(
@@ -1347,6 +1365,7 @@ _EXTERNAL_MUTATION_TOOLS = frozenset(
         "call_mcp_tool",
         "create_collaboration_portal",
         "github_push",
+        "huggingface_publish_model",
     }
 )
 _DESTRUCTIVE_TOOLS = frozenset(
@@ -1650,6 +1669,8 @@ _TOOL_CAPABILITY_FAMILIES: dict[str, CapabilityFamily] = {
     "github_repositories": CapabilityFamily.GITHUB,
     "github_status": CapabilityFamily.GITHUB,
     "github_verify_remote": CapabilityFamily.GITHUB,
+    "huggingface_publish_model": CapabilityFamily.EXTERNAL_INTERACTION,
+    "fleet_submit_batch_job": CapabilityFamily.FLEET_BATCH,
     "job_output": CapabilityFamily.KILL_JOB,
     "get_sub_agent_report": CapabilityFamily.KILL_SUB_AGENT,
     "get_sub_agent_status": CapabilityFamily.KILL_SUB_AGENT,
@@ -1664,6 +1685,13 @@ _TOOL_CAPABILITY_FAMILIES: dict[str, CapabilityFamily] = {
     "kill_sub_agent": CapabilityFamily.KILL_SUB_AGENT,
     "restart_aeon": CapabilityFamily.RESTART_AEON,
     "revert_aeon": CapabilityFamily.REVERT_AEON,
+}
+
+# A typed provider tool cannot drift away from these destinations.  Treat the
+# platform as observed capability evidence rather than requiring every tool call
+# to repeat a destination that is immutable in the tool implementation.
+_TOOL_INTRINSIC_EXTERNAL_TARGETS: dict[str, tuple[str, ...]] = {
+    "huggingface_publish_model": ("platform:huggingface",),
 }
 
 _TARGET_REQUIRED_FAMILIES = frozenset(
@@ -1699,6 +1727,25 @@ _EXTERNAL_OPERATION_ALIASES = {
     "ping": "send",
     "reply": "send",
 }
+_PLATFORM_EXTERNAL_OPERATION_ALIASES: dict[str, dict[str, str]] = {
+    # On the Hub, publishing a model is performed by the upload gateway.  This
+    # is a platform semantic alias, not permission to equate upload and publish
+    # for arbitrary sites or recipients.
+    "platform:huggingface": {"publish": "upload"},
+}
+_EXTERNAL_SCOPE_MODIFIERS = frozenset(
+    {
+        "assigned",
+        "authenticated",
+        "configured",
+        "connected",
+        "credentialed",
+        "current",
+        "default",
+        "linked",
+        "selected",
+    }
+)
 _LOCAL_ARTIFACT_SUFFIX_RE = re.compile(
     r"(?:^|/)[A-Za-z0-9_.-]+\."
     r"(?:py|pyi|js|jsx|ts|tsx|java|go|rs|c|cc|cpp|h|hpp|cs|rb|php|swift|kt|"
@@ -1713,9 +1760,23 @@ def _external_operation_target(value: Any) -> str:
 
     text = " ".join(str(value or "").strip().split()).casefold()
     text = re.sub(r"[_-]+", " ", text)
+    text = re.sub(
+        r"^(?:(?:and\s+then|then|now|please)\s+)+|"
+        r"^(?:(?:i\s+(?:want|need)\s+you\s+to|your\s+goal\s+is\s+to|"
+        r"(?:can|could|would|will)\s+you(?:\s+please)?)\s+)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"^(?:if|when|once|after)\b[^,;]{1,240},\s*(?:then\s+)?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     if not text:
         return ""
-    match = re.search(
+    match = re.match(
         r"\b(make\s+live|publish|deploy|send|email|message|notify|reply|forward|"
         r"share|post|upload|submit|purchase|buy|schedule|book|order|pay|subscribe|"
         r"log\s*in|sign\s*in|register|invite|ping|dm)\b",
@@ -1733,6 +1794,24 @@ def _external_operation_target(value: Any) -> str:
     return f"operation:{operation}"
 
 
+def _canonicalize_external_operation_for_scopes(
+    target: str, scopes: Sequence[str]
+) -> str:
+    """Apply only unambiguous platform-specific operation synonyms."""
+
+    if not target.startswith("operation:"):
+        return target
+    operation = target.split(":", 1)[1]
+    candidates = {
+        aliases[operation]
+        for scope, aliases in _PLATFORM_EXTERNAL_OPERATION_ALIASES.items()
+        if scope in scopes and operation in aliases
+    }
+    if len(candidates) == 1:
+        return f"operation:{next(iter(candidates))}"
+    return target
+
+
 def _external_scope_target(value: Any) -> str:
     """Normalize an explicit recipient/platform/site/account scope."""
 
@@ -1742,6 +1821,10 @@ def _external_scope_target(value: Any) -> str:
     if not target:
         return ""
     lowered = target.casefold()
+    if lowered in _EXTERNAL_SCOPE_MODIFIERS:
+        # These are destination modifiers, not literal people/accounts.  A
+        # provider, site, or explicitly named account must supply the scope.
+        return ""
     if re.fullmatch(r"(?:recipient|platform|site|account):[^\s:][^\n]{0,240}", lowered):
         return lowered
     if re.fullmatch(
@@ -1759,8 +1842,10 @@ def _external_scope_target(value: Any) -> str:
         return f"site:{hostname}"
     if lowered in {
         "x", "twitter", "linkedin", "facebook", "instagram", "github",
-        "gitlab", "slack", "discord",
+        "gitlab", "slack", "discord", "huggingface", "hugging face",
     }:
+        if lowered == "hugging face":
+            lowered = "huggingface"
         return f"platform:{lowered}"
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{1,63}", target):
         return f"recipient:{lowered}"
@@ -3115,6 +3200,8 @@ def _request_capability_target_bindings(
     if CapabilityFamily.EXTERNAL_INTERACTION in family_set:
         external_clauses = _explicit_action_clauses(value)
         named_recipients: list[str] = []
+        if re.search(r"\bhugging\s*face\b", value, re.IGNORECASE):
+            bind(CapabilityFamily.EXTERNAL_INTERACTION, "platform:huggingface")
         for clause in external_clauses:
             operation = _external_operation_target(clause)
             if operation:
@@ -3191,7 +3278,7 @@ def _request_capability_target_bindings(
             for platform_match in re.finditer(
                 r"\b(?:post|share|publish|upload|deploy)\b[^.!?\n]{0,80}"
                 r"\b(?:on|to|via)\s+(?P<platform>X|Twitter|LinkedIn|Facebook|"
-                r"Instagram|GitHub|GitLab|Slack|Discord)\b",
+                r"Instagram|GitHub|GitLab|Slack|Discord|Hugging\s+Face|HuggingFace)\b",
                 clause,
                 re.IGNORECASE,
             ):
@@ -3221,7 +3308,7 @@ def _request_capability_target_bindings(
                 )
                 if account_name and account_name.casefold() not in {
                     "a", "an", "the", "this", "that", "report", "file", "document",
-                }:
+                } | _EXTERNAL_SCOPE_MODIFIERS:
                     bind(
                         CapabilityFamily.EXTERNAL_INTERACTION,
                         f"account:{account_name.casefold()}",
@@ -3239,7 +3326,7 @@ def _request_capability_target_bindings(
             "report", "file", "document", "message", "email", "them", "him",
             "her", "it",
             "portal", "site", "account", "platform",
-        }
+        } | _EXTERNAL_SCOPE_MODIFIERS
         flattened_recipients = [
             candidate
             for match in named_recipients
@@ -3303,6 +3390,15 @@ def _request_capability_target_bindings(
         if target not in existing:
             existing.append(target)
         bindings[key] = existing[:_MAX_CAPABILITY_TARGETS]
+    external_key = CapabilityFamily.EXTERNAL_INTERACTION.value
+    if external_key in bindings:
+        scopes = tuple(bindings[external_key])
+        bindings[external_key] = list(
+            dict.fromkeys(
+                _canonicalize_external_operation_for_scopes(target, scopes)
+                for target in bindings[external_key]
+            )
+        )[:_MAX_CAPABILITY_TARGETS]
     return {
         key: values[:_MAX_CAPABILITY_TARGETS]
         for key, values in bindings.items()
@@ -3318,6 +3414,14 @@ def _request_capability_action_bindings(
     """Preserve clause-local target pairings for compound capability calls."""
 
     groups: dict[str, list[list[str]]] = {}
+    global_bindings = _request_capability_target_bindings(
+        text,
+        families,
+        workspace_root=workspace_root,
+    )
+    global_external_scopes = tuple(
+        global_bindings.get(CapabilityFamily.EXTERNAL_INTERACTION.value, ())
+    )
     for clause in _explicit_action_clauses(_effect_text(str(text or ""))):
         clause_bindings = _request_capability_target_bindings(
             clause,
@@ -3330,6 +3434,15 @@ def _request_capability_action_bindings(
             existing = groups.setdefault(family, [])
             unique = list(dict.fromkeys(targets))[:_MAX_CAPABILITY_TARGETS]
             family_kind = CapabilityFamily(family)
+            if family_kind == CapabilityFamily.EXTERNAL_INTERACTION:
+                unique = list(
+                    dict.fromkeys(
+                        _canonicalize_external_operation_for_scopes(
+                            item, global_external_scopes
+                        )
+                        for item in unique
+                    )
+                )
             shared: list[str] = []
             alternatives: list[str] = []
             if family_kind == CapabilityFamily.EXTERNAL_INTERACTION:
@@ -3364,6 +3477,8 @@ def _capability_call_matches_group(
     family: CapabilityFamily,
     group: Sequence[str],
     observed: Sequence[str],
+    *,
+    intrinsic_targets: Sequence[str] = (),
 ) -> bool:
     if not group or not observed:
         return False
@@ -3377,9 +3492,19 @@ def _capability_call_matches_group(
             for target in scoped_observed
             if not target.startswith("agent-name:")
         ]
+    group_categories = {
+        bound.split(":", 1)[0]
+        for bound in group
+        if ":" in bound
+    }
+    intrinsic = set(intrinsic_targets)
     outside = [
         target
         for target in scoped_observed
+        if not (
+            target in intrinsic
+            and target.split(":", 1)[0] not in group_categories
+        )
         if not any(
             _capability_targets_match(bound, target, family=family)
             for bound in group
@@ -3388,11 +3513,6 @@ def _capability_call_matches_group(
     if outside:
         return False
     if family == CapabilityFamily.EXTERNAL_INTERACTION:
-        categories = {
-            bound.split(":", 1)[0]
-            for bound in group
-            if ":" in bound
-        }
         return all(
             any(
                 target.startswith(f"{category}:")
@@ -3403,7 +3523,7 @@ def _capability_call_matches_group(
                 )
                 for target in scoped_observed
             )
-            for category in categories
+            for category in group_categories
         )
     return all(
         any(
@@ -3520,7 +3640,9 @@ def _tool_capability_targets(
     if family == CapabilityFamily.EXTERNAL_INTERACTION:
         arguments = params.get("arguments")
         source = arguments if isinstance(arguments, Mapping) else params
-        targets: list[str] = []
+        targets: list[str] = list(
+            _TOOL_INTRINSIC_EXTERNAL_TARGETS.get(policy.name, ())
+        )
         # Generic browser calls carry harness-only scope declarations. MCP calls
         # must derive scope from the real provider tool name and forwarded
         # arguments; otherwise a caller can label delete_account as "send".
@@ -3683,10 +3805,12 @@ _GOAL_BULLET_RE = re.compile(
 _GOAL_ACTION_HEAD = (
     r"(?:fix|implement|build|write|generate|render|add|create|change|modify|edit|"
     r"update|apply|configure|install|integrate|back\s*up|improve|harden|refactor|"
-    r"research|audit|inspect|review|check|double\s+check|analy[sz]e|compare|"
+    r"research|do\s+research|audit|inspect|review|check|double\s+check|"
+    r"analy[sz]e|compare|look\s+(?:for|through|into)|find|consider|select|choose|"
     r"explain|describe|summari[sz]e|test|validate|verify|"
-    r"document|diagnose|investigate|repair|replace|streamline|optimi[sz]e|"
+    r"document|detail|diagnose|investigate|repair|replace|streamline|optimi[sz]e|"
     r"strengthen|rewrite|ensure|preserve|retain|leave|keep|avoid|maintain|"
+    r"train(?:/make)?|fine[- ]?tune|respond|"
     r"commit|push|publish|deploy|"
     r"upload|submit|send|share|email|message|notify|reply|forward|post|purchase|"
     r"buy|schedule|book|order|pay|subscribe|register|provision|connect|link|"
@@ -3701,9 +3825,14 @@ _COMPLEX_MULTI_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 _GOAL_WRAPPER_RE = re.compile(
-    r"^\s*(?:(?:also|additionally|then|next)\s*[,;:]?\s*)?"
-    r"(?:(?:i\s+(?:want|need)\s+you\s+to|please|you\s+should|"
+    r"^\s*(?:(?:also|additionally|then|next|however)\s*[,;:]?\s*)?"
+    r"(?:(?:i\s+(?:want|need)\s+you\s+to|your\s+goal\s+is\s+to|please|"
+    r"you\s+(?:should|must|need\s+to|can\s+even)|make\s+sure\s+to|"
     r"(?:can|could|would|will)\s+you(?:\s+please)?)\s+)?",
+    re.IGNORECASE,
+)
+_GOAL_CONDITIONAL_PREFIX_RE = re.compile(
+    r"^\s*(?:if|when|once|after)\b[^,;]{1,240},\s*(?:then\s+)?",
     re.IGNORECASE,
 )
 _MAX_GOAL_LEAVES = 32
@@ -3735,12 +3864,25 @@ def _explicit_goal_items(text: str) -> list[tuple[str, str]]:
     return items
 
 
+def _goal_action_text(value: str) -> str:
+    """Remove bounded directive framing while preserving the owner's criterion."""
+
+    compact = " ".join(str(value or "").split())
+    compact = _GOAL_WRAPPER_RE.sub("", compact)
+    compact = _GOAL_CONDITIONAL_PREFIX_RE.sub("", compact)
+    compact = _GOAL_WRAPPER_RE.sub("", compact)
+    return re.sub(
+        r"^(?:continuously|endlessly|always)\s+",
+        "",
+        compact,
+        flags=re.IGNORECASE,
+    )
+
+
 def _goal_kind(description: str, *, default: str = "change") -> str:
     """Classify an owner criterion without turning it into a mutation by default."""
 
-    value = _GOAL_WRAPPER_RE.sub(
-        "", " ".join(str(description or "").split())
-    )
+    value = _goal_action_text(description)
     if re.match(
         r"(?:all\b.{0,80})?\btests?\b.{0,80}\b(?:pass|succeed|remain\s+green)\b|"
         r"no\s+[^.!?]{0,80}regressions?\b|"
@@ -3753,6 +3895,7 @@ def _goal_kind(description: str, *, default: str = "change") -> str:
         return "validation"
     if re.match(
         r"(?:do\s+not|don['’]?t|dont|never|must\s+not|avoid|without)\b|"
+        r"only\b|"
         r"no\s+(?:code\s+|file\s+|state\s+)?changes?\b|"
         r"(?:preserve|retain|leave|keep)\b",
         value,
@@ -3761,7 +3904,8 @@ def _goal_kind(description: str, *, default: str = "change") -> str:
         return "invariant"
     if re.match(
         r"(?:audit|inspect|research|review|check|double\s+check|analy[sz]e|"
-        r"compare|explain|describe|summari[sz]e|deep\s+dive|"
+        r"do\s+research|compare|explain|describe|summari[sz]e|deep\s+dive|"
+        r"look\s+(?:for|through|into)|find|consider|select|choose|"
         r"take\s+a\s+(?:long\s+)?look|"
         r"assess|evaluate|examine|diagnose|investigate|trace|measure)\b",
         value,
@@ -3797,7 +3941,15 @@ def _unstructured_goal_items(
         items.append((_goal_kind(compact, default=default_kind), compact))
 
     for segment in segments:
-        clause = _GOAL_WRAPPER_RE.sub("", " ".join(segment.split()))
+        raw_clause = " ".join(segment.split())
+        for nested in re.finditer(
+            r"\((?P<body>(?:do\s+not|don['’]?t|dont|never|must\s+not|avoid|"
+            r"without)\b[^()]{1,240})\)",
+            raw_clause,
+            re.IGNORECASE,
+        ):
+            append(nested.group("body"))
+        clause = _goal_action_text(raw_clause)
         if not clause:
             continue
         # Repeated, explicitly headed clauses are independent obligations.
@@ -3821,7 +3973,7 @@ def _unstructured_goal_items(
         ):
             parts = [clause]
         for part in parts:
-            part = _GOAL_WRAPPER_RE.sub("", part).strip()
+            part = _goal_action_text(part).strip()
             if not part:
                 continue
             # A leading improvement verb governing a 3+ item comma list yields
@@ -3848,13 +4000,16 @@ def _unstructured_goal_items(
                     for component in components:
                         append(f"{governed.group('head')} {component}")
                     continue
+            action_candidate = re.sub(
+                r"^only\s+", "", part, flags=re.IGNORECASE
+            )
             actionable = bool(
                 re.match(
                     rf"(?:do\s+not|don['’]?t|dont|never|must\s+not|{_GOAL_ACTION_HEAD})\b",
-                    part,
+                    action_candidate,
                     re.IGNORECASE,
                 )
-                or _LEADING_INSPECTION_RE.match(part)
+                or _LEADING_INSPECTION_RE.match(action_candidate)
                 or _goal_kind(part, default="") in {"validation", "invariant"}
             )
             if actionable:
@@ -3980,27 +4135,49 @@ def _goal_evidence_relevant(
     *,
     include_edit_fragments: bool = False,
 ) -> bool:
-    keywords = _goal_keywords(description)
+    keywords, matches = _goal_evidence_matches(
+        description,
+        tool_name,
+        parameters,
+        result,
+        include_edit_fragments=include_edit_fragments,
+    )
     if not keywords:
         return False
+    # A single rare keyword is enough for a narrow criterion; broad root prose
+    # needs two independent lexical hooks before a green-only receipt can close.
+    required = 1 if len(keywords) <= 5 else 2
+    return len(matches) >= required
+
+
+def _goal_evidence_matches(
+    description: str,
+    tool_name: str,
+    parameters: Mapping[str, Any] | None,
+    result: ToolResult,
+    *,
+    include_edit_fragments: bool = False,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return substantive goal keywords and the subset present in a receipt."""
+
+    keywords = _goal_keywords(description)
+    if not keywords:
+        return (), ()
     haystack = _goal_evidence_haystack(
         tool_name,
         parameters,
         result,
         include_edit_fragments=include_edit_fragments,
     )
-    matches = [
+    matches = tuple(
         keyword
         for keyword in keywords
         if re.search(
             rf"(?<![a-z0-9]){re.escape(keyword)}(?:s|ed|ing)?(?![a-z0-9])",
             haystack,
         )
-    ]
-    # A single rare keyword is enough for a narrow criterion; broad root prose
-    # needs two independent lexical hooks before a green-only receipt can close.
-    required = 1 if len(keywords) <= 5 else 2
-    return len(matches) >= required
+    )
+    return keywords, matches
 
 
 def _goal_agent_state_targets(description: str) -> tuple[str, ...]:
@@ -5029,9 +5206,8 @@ class RequestContract:
             goal_id = str(item or "").upper()
             if goal_id in self.goal_anchors and goal_id not in refs:
                 refs.append(goal_id)
-        # A single owner goal has only one possible pre-execution binding. Let
-        # the harness supply it so routine tasks do not spend an extra turn
-        # parroting G0; multi-goal work remains explicit and auditable.
+        # A single owner goal has only one possible binding. Let the harness
+        # supply it so routine tasks do not spend an extra turn parroting G0.
         if not refs and len(self.goal_anchors) == 1:
             refs.append("G0")
         return tuple(refs)
@@ -5042,7 +5218,7 @@ class RequestContract:
         parameters: Mapping[str, Any] | None,
         goal_refs: object,
     ) -> str:
-        """Require complex-task evidence bindings before an action executes."""
+        """Validate optional model-supplied evidence bindings."""
 
         supplied = (
             [str(item or "").upper() for item in goal_refs[:13]]
@@ -5069,34 +5245,10 @@ class RequestContract:
             )
         if not self.semantic_evidence_required:
             return ""
-        effect = effective_tool_effect(policy, parameters)
-        validator = is_validation_call(policy.name, parameters)
-        generic_validator = bool(
-            validator
-            and policy.name == "run_command"
-            and not _command_has_explicit_mutation(
-                str((parameters or {}).get("command", ""))
-            )
-        )
-        consequential_mutation = bool(
-            effect
-            in {
-                SideEffect.LOCAL_MUTATION,
-                SideEffect.EXTERNAL_MUTATION,
-                SideEffect.DESTRUCTIVE,
-            }
-            and not generic_validator
-        )
-        if (
-            (validator or consequential_mutation)
-            and not supplied
-            and len(self.goal_anchors) > 1
-        ):
-            return (
-                "HARNESS BLOCKED: this complex request requires pre-execution "
-                "goal_refs on mutations and validators. Bind the action to one or "
-                "more TASK ACCEPTANCE IDs; evidence cannot be assigned retroactively."
-            )
+        # Missing refs are not an execution error.  The receipt observer binds
+        # omitted refs only to leaf goals whose text/targets actually match the
+        # typed action and result.  Explicit refs remain supported for ambiguous
+        # cases and are still validated above.
         return ""
 
     def goal_acceptance_marker(self) -> str:
@@ -5122,6 +5274,17 @@ class RequestContract:
                 key: tuple(sorted(values))
                 for key, values in sorted(self.satisfied_capability_targets.items())
             },
+            # Inspection goals advance when a relevant read crosses their
+            # evidence threshold.  Include the transition without treating every
+            # additional unique read as material progress.
+            "verified_goals": tuple(
+                sorted(
+                    goal_id
+                    for goal_id in self.goal_anchors
+                    if self.goal_kinds.get(goal_id) != "aggregate"
+                    and self._goal_verified(goal_id)
+                )
+            ),
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -5195,9 +5358,9 @@ class RequestContract:
             compact = " ".join(description.split())[:500]
             lines.append(f"- [{goal_id}] {state}: {compact}")
         lines.append(
-            "Change goals need a relevant pre-bound mutation plus a targeted "
-            "validator; validation-only and invariant goals need their own bound "
-            "checks. Same-probe fail→change→pass is stronger evidence when available."
+            "Change goals need a relevant mutation plus a targeted validator; "
+            "validation-only and invariant goals need their own relevant checks. "
+            "Same-probe fail→change→pass is stronger evidence when available."
         )
         return "\n".join(lines)
 
@@ -5232,8 +5395,8 @@ class RequestContract:
             "COMPLETION BLOCKED: owner-goal evidence remains unsupported: "
             + ", ".join(pending)
             + ". A model-authored plan/checkmark or generic green suite is not proof. "
-            "Bind goal_refs before acting, make a lexically/target-relevant change, "
-            "and run a targeted validator. Prefer same-probe fail→change→pass when practical."
+            "Make a target-relevant change and run a targeted validator. "
+            "Prefer same-probe fail→change→pass when practical."
         )
 
     def _observe_goal_evidence(
@@ -5258,7 +5421,13 @@ class RequestContract:
         }
         self.observation_sequence = min(1000000, self.observation_sequence + 1)
         sequence = self.observation_sequence
-        refs = self.normalized_goal_refs(goal_refs)
+        supplied_refs = self.normalized_goal_refs(goal_refs)
+        inferred_refs = not supplied_refs
+        refs = supplied_refs or tuple(
+            goal_id
+            for goal_id, kind in self.goal_kinds.items()
+            if kind not in {"aggregate", "overflow"}
+        )
         if not refs:
             return ContractDelta()
 
@@ -5271,6 +5440,60 @@ class RequestContract:
             and not _command_has_explicit_mutation(str(params.get("command", "")))
         )
         receipt_id = _goal_receipt_identity(result, sequence)
+
+        if inferred_refs:
+            # Bind an omitted hint to the best matching leaf or tied leaves, not
+            # every leaf sharing a generic word such as "recovery". Exact target
+            # checks remain in _goal_receipt_relevant; match count only
+            # disambiguates candidates that already passed them.
+            scored_refs: list[tuple[str, tuple[str, ...]]] = []
+            for goal_id in refs:
+                description = self.goal_anchors.get(goal_id, "")
+                relevant = _goal_receipt_relevant(
+                    description,
+                    policy,
+                    params,
+                    result,
+                    workspace_root=self.workspace_root,
+                    include_edit_fragments=bool(result.changed),
+                )
+                if (
+                    not relevant
+                    and validator
+                    and self.goal_kinds.get(goal_id) == "validation"
+                ):
+                    relevant = _validation_goal_relevant(
+                        description, result.tool_name, params, result
+                    )
+                if not relevant:
+                    continue
+                _, matches = _goal_evidence_matches(
+                    description,
+                    result.tool_name,
+                    params,
+                    result,
+                    include_edit_fragments=bool(result.changed),
+                )
+                scored_refs.append((goal_id, matches))
+            if scored_refs:
+                best_score = max(len(matches) for _, matches in scored_refs)
+                best = [
+                    (goal_id, matches)
+                    for goal_id, matches in scored_refs
+                    if len(matches) == best_score
+                ]
+                # A tie on the same generic evidence (for example only the word
+                # "recovery" across three recovery goals) is ambiguous, not a
+                # reason to credit every leaf. Distinct tied match sets can
+                # intentionally advance multiple named components.
+                distinct_match_sets = {frozenset(matches) for _, matches in best}
+                refs = (
+                    tuple(goal_id for goal_id, _ in best)
+                    if len(best) == 1 or len(distinct_match_sets) > 1
+                    else ()
+                )
+            else:
+                refs = ()
 
         if result.successful and effect == SideEffect.READ_ONLY:
             digest_payload = {
@@ -5368,16 +5591,18 @@ class RequestContract:
             for goal_id, kind in self.goal_kinds.items():
                 affects_goal = bool(
                     kind == "validation"
-                    or goal_id in refs
                     or (
-                        not refs
-                        and _goal_receipt_relevant(
-                            self.goal_anchors.get(goal_id, ""),
-                            policy,
-                            params,
-                            result,
-                            workspace_root=self.workspace_root,
-                            include_edit_fragments=True,
+                        goal_id in refs
+                        and (
+                            not inferred_refs
+                            or _goal_receipt_relevant(
+                                self.goal_anchors.get(goal_id, ""),
+                                policy,
+                                params,
+                                result,
+                                workspace_root=self.workspace_root,
+                                include_edit_fragments=True,
+                            )
                         )
                     )
                 )
@@ -5405,12 +5630,6 @@ class RequestContract:
                     violations.append(receipt_id)
                     del violations[:-20]
             for goal_id in refs:
-                evidence = self.goal_mutation_evidence.setdefault(goal_id, [])
-                if receipt_id not in evidence:
-                    evidence.append(receipt_id)
-                    del evidence[:-20]
-                self.goal_last_mutation_sequence[goal_id] = sequence
-                self.goal_relevant_mutation_evidence.pop(goal_id, None)
                 relevant_mutation = _goal_receipt_relevant(
                     self.goal_anchors.get(goal_id, ""),
                     policy,
@@ -5419,6 +5638,14 @@ class RequestContract:
                     workspace_root=self.workspace_root,
                     include_edit_fragments=True,
                 )
+                if inferred_refs and not relevant_mutation:
+                    continue
+                evidence = self.goal_mutation_evidence.setdefault(goal_id, [])
+                if receipt_id not in evidence:
+                    evidence.append(receipt_id)
+                    del evidence[:-20]
+                self.goal_last_mutation_sequence[goal_id] = sequence
+                self.goal_relevant_mutation_evidence.pop(goal_id, None)
                 if relevant_mutation:
                     relevant = self.goal_relevant_mutation_evidence.setdefault(
                         goal_id, []
@@ -5498,15 +5725,18 @@ class RequestContract:
             }
         ):
             for goal_id in refs:
-                self.goal_mutation_evidence[goal_id] = [receipt_id]
-                if _goal_receipt_relevant(
+                relevant_no_change = _goal_receipt_relevant(
                     self.goal_anchors.get(goal_id, ""),
                     policy,
                     params,
                     result,
                     workspace_root=self.workspace_root,
                     include_edit_fragments=True,
-                ):
+                )
+                if inferred_refs and not relevant_no_change:
+                    continue
+                self.goal_mutation_evidence[goal_id] = [receipt_id]
+                if relevant_no_change:
                     self.goal_relevant_mutation_evidence[goal_id] = [receipt_id]
                     self.goal_validation_evidence[goal_id] = [receipt_id]
 
@@ -5582,7 +5812,14 @@ class RequestContract:
         ).get(family.value, [])
         if action_groups:
             if any(
-                _capability_call_matches_group(family, group, observed)
+                _capability_call_matches_group(
+                    family,
+                    group,
+                    observed,
+                    intrinsic_targets=_TOOL_INTRINSIC_EXTERNAL_TARGETS.get(
+                        policy.name, ()
+                    ),
+                )
                 for group in action_groups
             ):
                 return ""
@@ -5824,6 +6061,10 @@ class RequestContract:
                     SideEffect.DESTRUCTIVE,
                 }
                 or policy.name == "github_commit"
+                or (
+                    family == CapabilityFamily.FLEET_BATCH
+                    and effect == SideEffect.LOCAL_MUTATION
+                )
                 or (
                     policy.name == "run_command"
                     and effect

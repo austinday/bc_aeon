@@ -1,41 +1,45 @@
-# RESEARCH SKILL: Deep Topic Research & Brainstorming Protocol
-# USE THIS SKILL WHEN: the task is to research, investigate, brainstorm, or reason about a
-# TOPIC, QUESTION, or IDEA that does NOT center on an existing codebase -- e.g. "research X",
-# "what are the best approaches to Y", "brainstorm ideas for Z", "investigate the
-# state-of-the-art in W", "compare options for V". The defining signal is that the work is
-# about a SUBJECT and is driven by external information / reasoning, NOT by reading source code.
-# DO NOT use this to analyze an existing codebase/repo (use analysis/codebase_analysis for that).
-# Goal: produce a thorough, well-sourced, multi-perspective answer or idea set by decomposing
-# the topic into orthogonal dimensions and researching each in parallel.
+# RESEARCH SKILL: Multi-source evidence synthesis
+# Use when answering a consequential or broad question requires current evidence from several sources, comparison, and explicit uncertainty.
 
-1. SCOPE & FRAMING (FIRST):
-- Restate the question/goal in your own words and define what a complete answer looks like
-  (a decision, a ranked set of options, a literature survey, a brainstormed idea list). If the
-  scope is ambiguous, ask ONE clarifying question; else state your assumption and proceed.
+## When to use
 
-2. DIMENSIONAL DECOMPOSITION (the core of topic research):
-- Break the topic into 3-5 ORTHOGONAL sub-questions / dimensions that together cover it with
-  minimal overlap (e.g. technical feasibility / cost / prior art / risks / alternatives). This
-  dimensionality reduction is what keeps the research comprehensive rather than tunnel-visioned.
+Use for literature or landscape reviews, option comparisons, due diligence, and
+questions whose answer depends on reconciling multiple current sources. Skip it for
+a simple factual lookup, casual brainstorming, or analysis centered on local source
+code rather than external evidence.
 
-3. PARALLEL RESEARCH:
-- Spawn ONE sub-agent per orthogonal dimension with a self-contained objective that names the
-  exact deliverable (the findings + sources for that dimension AS A STRUCTURED REPORT). Do your
-  own orthogonal research meanwhile (search_web for current, credible sources; prefer primary
-  sources). Then you MUST gather_sub_agents and get_sub_agent_report EACH spawned agent and fold
-  its findings in -- never complete while a spawned sub-agent's report is uncollected.
-- Use blackboard_post / blackboard_read so dimensions share facts and avoid duplicated effort.
+## Preconditions
 
-4. CRITICAL EVALUATION:
-- Cross-check claims across sources; note agreements, conflicts, and gaps. Distinguish
-  well-supported conclusions from speculation. Call out where the evidence is thin.
+- Define the question, decision or deliverable, relevant timeframe, and evidence
+  threshold. Make a reasonable scoped assumption unless a missing choice would
+  materially change the result.
+- Identify which claims require current external verification and what source types
+  can support them.
 
-5. SYNTHESIZE & DELIVER:
-- Integrate the dimensions into a coherent answer organized around the user's actual question
-  (not around the sub-agent structure). For brainstorming, present the idea set with the
-  trade-offs of each; for a research question, give the conclusion with its support and
-  caveats.
-- Cite sources for external claims; state remaining uncertainties.
-- Deliver the FULL result via say_to_user (or write_file for a long report) BEFORE
-  task_complete -- the content is the deliverable, not the task_complete reason. Then
-  deactivate_skill.
+## Procedure
+
+1. Break the question into the smallest useful set of distinct evidence questions;
+   do not manufacture dimensions merely to make the work look comprehensive.
+2. Search directly and favor current primary or authoritative sources. Use secondary
+   sources for context or competing interpretations, and track dates and scope.
+3. Cross-check material claims. Record agreements, contradictions, missing evidence,
+   and whether a conclusion is reported fact, source interpretation, or inference.
+4. Use read-only sub-agents only for large, genuinely independent evidence threads.
+   Collect every spawned report and verify consequential claims against its sources.
+5. Synthesize around the user's actual question, decision criteria, and tradeoffs,
+   not around search order or delegation structure.
+
+## Verification
+
+- Place source links near the claims they support and ensure each source actually
+  supports the stated scope.
+- Distinguish current facts, dated facts, inference, and unresolved uncertainty.
+- Check important numbers, identities, versions, and dates against primary evidence
+  when available.
+
+## Stop or adapt
+
+If sources invalidate the premise, reframe the question explicitly. If evidence is
+conflicting or incomplete, report the disagreement rather than forcing consensus.
+Stop when the defined evidence threshold is met or further searching has diminishing
+value; a finite unsuccessful search is not proof that something does not exist.

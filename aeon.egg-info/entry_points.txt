@@ -1,3 +1,0 @@
-[console_scripts]
-aeon = aeon.cli:main
-aeon-remote = aeon.remote.cli:main

@@ -44,7 +44,7 @@ database and transcript files are mode 0600.
 ## Install
 
 ~~~bash
-cd /home/aday/bc_aeon
+cd /home/aday/NexusAgentDashboard/bc_aeon
 python3 -m pip install '.[remote]'
 ~~~
 
@@ -136,9 +136,10 @@ versions, and local role remain stable. The legacy direct-agent creation endpoin
 is intentionally disabled; its start-here alias performs the same in-place
 activation.
 
-No user-controlled shell command is constructed for activation. Aeon's own
-coordinator-aware model launcher remains responsible for every GPU lease, UUID
-selector, hard VRAM cap, and renter reserve.
+No user-controlled shell command is constructed for activation. Aeon submits only
+opaque demand to Fleet Compute. Fleet's reviewed adapter and immutable coordinator
+API remain responsible for every GPU lease, UUID selector, hard VRAM cap, and
+renter reserve.
 
 - **Browser/web restart:** the tmux session continues and the browser reattaches to
   the same saved tab. Reconnects are bounded and tied to that tab's lifecycle
@@ -151,16 +152,108 @@ selector, hard VRAM cap, and renter reserve.
   prompt marker, Bash PID/session/TTY, and foreground process group.
 - **Force stop:** requires the exact visible tab name, removes only the exact tmux
   session, and records stopped only after absence is proven.
-- **Host reboot:** tmux does not survive. The database keeps the durable tab and
-  marks a previously running session interrupted. **Reopen terminal** creates its
-  fixed shell again; starting an agent remains a separate explicit action.
+- **Host reboot:** tmux does not survive. The database keeps the durable record and
+  marks a previously running session interrupted. The authenticated Main
+  orchestrator start recreates its fixed shell and Aeon foreground as needed.
 - **Delete:** removes only a proven-stopped registry row and preserves the workspace
-  and Aeon recovery state. The pinned Project Manager/Home row cannot be deleted.
+  and Aeon recovery state. The pinned Main orchestrator row cannot be deleted.
 
 Managed terminal-first tabs do not enable a pipe-pane transcript in terminal or
 agent mode. Older direct Aeon rows retain their bounded rotated transcript for
 backward-compatible resume; transcript content is never included in Nexus status
-or audit payloads.
+or audit payloads. The Main orchestrator chat instead uses its separate structured,
+owner-private user/assistant/progress message stream; it never scrapes terminal
+output. Progress records contain only a redacted one-sentence intent and allowlisted
+tool names. They never include hidden reasoning, tool parameters, command lines,
+prompts, or raw tool output. Assistant response records can carry separately named
+server usage counts, cache usage, served model, reasoning effort,
+speculative-decoding settings, and latency measurements. Aeon always requests
+vLLM's final usage chunk and publishes a rate only when it contains an
+authoritative completion-token count; a local tokenizer estimate remains console
+diagnostics and is never presented as model throughput. When the serving release
+emits opt-in per-request metrics, Aeon uses its exact decode interval and
+prefill/TTFT, queue, and mean-inter-token timings while retaining the independently
+observed client first-token wait. Older serving releases retain explicitly
+identified client-stream timing. The legacy tokens/second field remains
+the decode-rate compatibility value; vLLM's distinct inference rate includes
+prefill and is never relabeled as pure decode throughput.
+
+Each published assistant turn also retains a bounded, compressed, owner-private
+state checkpoint keyed to that transcript message. The authenticated fork lifecycle
+clones the exact visible transcript prefix (including independently copied
+attachments) into a deferred temporary Aeon instance and restores the nearest
+checkpoint at or before the selected user/assistant turn. Older turns without a
+checkpoint fall back to prefix-rebuilt conversational history while preserving safe
+durable memories. The branch gets a new instance/request identity and diverges on
+its first prompt; closing it uses the existing exact stop/delete lifecycle and does
+not mutate the parent.
+
+### Collaborator siblings
+
+Nexus collaboration portals use a clean deferred Aeon sibling, never a chat
+fork. The sibling copies only the target agent's selected Aeon model/effort,
+workspace, and project association. It does not copy transcript turns,
+attachments, worker state, memories, instruction profiles, credential grants, or
+continuous-mode state. A launch-bound mode-0600 control file selects a dedicated
+minimal liaison prompt. The worker omits ordinary core/primary/Docker layers,
+private and workspace instructions, workspace tree, system statistics, memories,
+plans, open files, skills, and ordinary tool categories. Its only executable
+capability is `send_collaborator_handoff`; collaborator launches also omit the MCP
+endpoint and cannot enable continuous mode. Nexus must additionally deny a
+collaborator identity at ordinary self-settings and MCP endpoints server-side.
+
+`create_collaboration_portal` is intentionally approval-gated. A managed owner
+agent can submit only `{name, project_brief}` to pin an owner-visible proposal.
+The tool accepts only an `awaiting_owner_approval` receipt and never receives a
+username, password, sibling, portal URL, or other access material. Only a later
+authenticated owner UI action may create the sibling and dashboard-owned portal
+credentials/public route. A collaborator sibling cannot invoke this tool.
+Approval creation and cancellation share one durable approval-request identity.
+Aeon's store serializes create versus tombstone under one transaction, so either
+creation wins and cancellation revokes that exact portal, or cancellation wins
+and every stale creator is refused. Nexus uses an exact pre-tombstone approval-key
+lookup to fence any legacy local credential; it never infers identity from a
+non-unique portal label.
+
+For each handoff, the manager captures the latest exact external user turn from
+the sibling's owner-private transcript. It persists a bounded verbatim excerpt
+and message ID separately from the liaison's model-authored summary, then injects
+both into the target through the ordinary structured agent-chat path. The fixed
+handoff marker classifies the injected turn as a proposal with no mutation
+authority. That provenance blocks network/browser/MCP access, shell execution,
+file reads, memory, session and skill controls, delegation, and every mutation;
+only reasoning, owner-facing dialogue, and truthful completion remain.
+The restriction survives target checkpoints, restarts, replies to a pending
+handoff question, and synthetic continuous-mode cycles. A genuinely new
+owner-authored request first removes the influenced history segment and cached
+file/tool context, then clears the restriction. Deterministic handoff and
+target-message IDs make retries idempotent:
+a stopped or not-ready target leaves the record queued, and target resume retries
+a bounded FIFO batch. A transcript receipt prevents duplicate paste if delivery
+succeeded before the database receipt was updated; revoked portals are never
+retried.
+
+The shared console pending-input path gives a real owner or collaborator handoff
+priority at the next safe turn boundary. It preempts the next autonomous
+continuous cycle without toggling or rewriting the target's durable continuous
+setting, so continuous work resumes after the human turn yields. Collaborator
+mode itself remains disabled for continuous scheduling on every launch/restart.
+
+The fake-backed regression suite for this boundary is:
+
+~~~bash
+python3 -m unittest \
+  aeon.tests.test_collaborator_mode \
+  aeon.tests.test_continuous_mode \
+  aeon.tests.test_chat_transcript \
+  aeon.tests.test_agent_protocol \
+  aeon.tests.test_tool_resources \
+  aeon.tests.test_worker_protocol
+~~~
+
+Bounded image/video/audio bytes live in a separate owner-private attachment
+directory, are referenced only by sanitized transcript metadata, and are retrieved
+only through the authenticated transcript-bound Nexus endpoint.
 
 Nexus extends this lifecycle with fixed native Codex, Claude Code, and Grok tabs.
 Those provider processes start through an empty environment plus a small non-secret
@@ -184,7 +277,8 @@ the cooperative coordinator on DAY2RTX6000PRO; Aeon Remote never uses
 nvidia-smi, never enumerates renter containers, and removes claim IDs, owners,
 commands, PIDs, and GPU UUIDs from the browser response.
 
-The resource panel is informational. Starting an agent never bypasses Aeon's own
-coordinator reservation path. Agent activity exposes a bounded compute state
+The resource panel is informational. Starting an agent never creates a coordinator
+claim. Aeon and its tools submit opaque demand to the single Fleet Compute broker,
+which alone may reserve through the coordinator and invoke reviewed adapters. Agent activity exposes a bounded compute state
 (`idle`, `waiting_for_compute`, `allocated`, or `unavailable`) and profile name,
 but never a claim ID, GPU UUID, owner, command, or coordinator message.

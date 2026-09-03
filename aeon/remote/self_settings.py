@@ -14,6 +14,7 @@ import stat
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
+from aeon.core.utils.io import read_bounded_fd
 
 SELF_JOB_ROLE_PATH = "/internal/agent/job-role"
 COLLABORATION_PORTAL_PATH = "/internal/agent/collaboration-portals"
@@ -183,7 +184,7 @@ def read_self_settings_token(path_value: str | Path) -> str:
             or metadata.st_size > MAX_CAPABILITY_BYTES
         ):
             raise SelfSettingsCapabilityError("Nexus capability file is not owner-safe")
-        raw = os.read(descriptor, MAX_CAPABILITY_BYTES + 1)
+        raw = read_bounded_fd(descriptor, MAX_CAPABILITY_BYTES)
         if len(raw) > MAX_CAPABILITY_BYTES:
             raise SelfSettingsCapabilityError("Nexus capability is malformed")
         token = raw.decode("ascii", errors="strict").strip()

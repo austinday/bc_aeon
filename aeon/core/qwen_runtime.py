@@ -8,6 +8,7 @@ released worker adapter. Fleet placement and SSH transport remain centralized on
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -22,10 +23,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
-import requests
-
-from .compute_profile import ComputeProfile, QWEN38_VLLM_PROFILE
+from .compute_profile import QWEN38_VLLM_PROFILE, ComputeProfile
 from .gpu_queue import (
     QWEN_LEASE_FILE,
     _coord,
@@ -34,16 +34,16 @@ from .gpu_queue import (
     release_vram,
 )
 from .qwen_capabilities import (
-    QwenCapabilityError,
-    QwenRuntimeCapability,
     RTX5000_RELEASE_CANDIDATE_KEY,
     STANDARD_CONTEXT_TOKENS,
     STANDARD_MIN_PHYSICAL_VRAM_GB,
     STANDARD_VRAM_BUDGET_GB,
+    QwenCapabilityError,
+    QwenRuntimeCapability,
     active_qwen_runtime_capability,
     validate_qwen_capability_receipt,
 )
-
+from .utils.io import read_bounded_fd
 
 LEGACY_SCHEMA_VERSION = 6
 SCHEMA_VERSION = 7
@@ -53,12 +53,14 @@ QWEN_CONTEXT_TOKENS = STANDARD_CONTEXT_TOKENS
 QWEN_GPU_MEMORY_UTILIZATION = 0.415
 QWEN_MAX_NUM_SEQS = 1
 QWEN_MAX_BATCHED_TOKENS = 32768
+QWEN_RELEASE_ATTENTION_BACKEND = "TRITON_ATTN"
 QWEN_CONTAINER_SHM_BYTES = 8 * 1024**3
 QWEN_RUNTIME_CACHE_BYTES = 8 * 1024**3
 QWEN_CONTAINER_TMPDIR = "/workspace/cache"
 QWEN_IMAGE_EXPOSED_PORTS = frozenset({"8000/tcp"})
 MAX_IMAGE_LOGICAL_BYTES = 64 * 1024**3
 MAX_MODEL_ARTIFACT_BYTES = 128 * 1024**3
+_MODEL_SHA256_VERIFICATION_SIDECAR = ".podcast-sha256-verified"
 RUNTIME_ROOT = Path("/home/aday/.aeon/runtime/qwen38")
 RUNTIME_STATE_FILE = RUNTIME_ROOT / "runtime.json"
 FLEET_LOW_PRIORITY = Path("/home/aday/bin/fleet-low-priority")
@@ -87,6 +89,94 @@ LOCAL_COORD_HOSTNAME = _ACTIVE_CAPABILITY.hostname
 APPROVED_HOSTS = {_ACTIVE_CAPABILITY.host: _ACTIVE_CAPABILITY.hostname}
 
 
+class _LoopbackResponse:
+    """Small streaming facade over one exact stdlib loopback connection."""
+
+    def __init__(
+        self,
+        connection: http.client.HTTPConnection,
+        response: http.client.HTTPResponse,
+    ) -> None:
+        self._connection = connection
+        self._response = response
+        self.status_code = response.status
+        self.headers = response.headers
+
+    def iter_content(self, *, chunk_size: int):
+        while True:
+            chunk = self._response.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+
+    def close(self) -> None:
+        try:
+            self._response.close()
+        finally:
+            self._connection.close()
+
+
+def _loopback_get(url: str, *, timeout: float) -> _LoopbackResponse:
+    """Stream one GET that cannot use proxies, redirects, DNS, or another host."""
+
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise QwenRuntimeError("Qwen loopback URL is malformed") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is None
+        or not 1024 <= port <= 65535
+        or parsed.fragment
+    ):
+        raise QwenRuntimeError("Qwen endpoint is not an exact loopback URL")
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request(
+            "GET",
+            target,
+            headers={"Accept": "application/json", "Connection": "close"},
+        )
+        response = connection.getresponse()
+    except BaseException:
+        connection.close()
+        raise
+    return _LoopbackResponse(connection, response)
+
+
+def _bounded_loopback_body(response: Any, maximum: int) -> bytes:
+    """Consume and close a streamed local runtime response within ``maximum``."""
+
+    if type(maximum) is not int or maximum <= 0:
+        raise QwenRuntimeError("Qwen endpoint response bound is invalid")
+    payload = bytearray()
+    try:
+        advertised = response.headers.get("content-length")
+        if advertised is not None:
+            try:
+                advertised_size = int(advertised)
+            except (TypeError, ValueError) as exc:
+                raise QwenRuntimeError(
+                    "Qwen endpoint response Content-Length is malformed"
+                ) from exc
+            if advertised_size < 0 or advertised_size > maximum:
+                raise QwenRuntimeError("Qwen endpoint response exceeded its bound")
+        for chunk in response.iter_content(chunk_size=min(64 * 1024, maximum + 1)):
+            payload.extend(chunk)
+            if len(payload) > maximum:
+                raise QwenRuntimeError("Qwen endpoint response exceeded its bound")
+    finally:
+        response.close()
+    return bytes(payload)
+
+
 def _is_finite_number(value: Any) -> bool:
     return (
         not isinstance(value, bool)
@@ -113,6 +203,34 @@ def _coordinator_status_claim_is_exclusive(value: Any) -> bool:
 
 SOURCE_FILES = (
     "aeon/__init__.py",
+    "aeon/core/__init__.py",
+    "aeon/core/action_schema.py",
+    "aeon/core/compute_profile.py",
+    "aeon/core/deploy_planner.py",
+    "aeon/core/fleet_hosts.py",
+    "aeon/core/gpu.py",
+    "aeon/core/gpu_queue.py",
+    "aeon/core/model_catalog.py",
+    "aeon/core/mtp_tuning.py",
+    "aeon/core/qwen_artifact_cache.py",
+    "aeon/core/qwen_capabilities.py",
+    "aeon/core/qwen_fleet_runtime.py",
+    "aeon/core/qwen_runtime.py",
+    "aeon/core/sampling.py",
+    "aeon/core/data/qwen38_mtp_selection.json",
+    "aeon/core/data/qwen38_rtx5000_178_128k_release_receipt.json",
+    "aeon/core/data/qwen38_rtx5000_128k_release_receipt.json",
+    "aeon/core/data/qwen_runtime_capabilities.json",
+    "aeon/scripts/vllm_uuid_sitecustomize.py",
+    "aeon/scripts/warmup_qwen38_vllm.py",
+    "aeon/scripts/qwen_remote_worker.py",
+)
+
+# Schema-6 teardown receipts used this exact ordered closure.  Keep it frozen so
+# an old runtime can still be proved and stopped safely; the interactive agent
+# entrypoint is deliberately not part of new Qwen serving releases.
+_LEGACY_SOURCE_FILES = (
+    "aeon/__init__.py",
     "aeon/main.py",
     "aeon/core/__init__.py",
     "aeon/core/action_schema.py",
@@ -122,16 +240,20 @@ SOURCE_FILES = (
     "aeon/core/gpu_queue.py",
     "aeon/core/model_catalog.py",
     "aeon/core/mtp_tuning.py",
+    "aeon/core/qwen_artifact_cache.py",
     "aeon/core/qwen_capabilities.py",
     "aeon/core/qwen_fleet_runtime.py",
     "aeon/core/qwen_runtime.py",
     "aeon/core/sampling.py",
     "aeon/core/data/qwen38_mtp_selection.json",
+    "aeon/core/data/qwen38_rtx5000_178_128k_release_receipt.json",
+    "aeon/core/data/qwen38_rtx5000_128k_release_receipt.json",
     "aeon/core/data/qwen_runtime_capabilities.json",
     "aeon/scripts/vllm_uuid_sitecustomize.py",
     "aeon/scripts/warmup_qwen38_vllm.py",
     "aeon/scripts/qwen_remote_worker.py",
 )
+SOURCE_MANIFEST_FILE = "aeon/core/data/qwen_runtime_source.SHA256SUMS"
 
 # These are the only schema-6 source closures reviewed for one-way teardown
 # migration. The first already requested executable tmpfs; the second relied
@@ -250,11 +372,20 @@ def _validate_relative_path(value: Any, label: str) -> str:
 def _validate_run_dir(value: Any) -> Path:
     raw = str(value or "")
     prefix = f"{RUNTIME_ROOT}/aeon-qwen38-vllm-"
-    if not raw.startswith(prefix) or ".." in PurePosixPath(raw).parts:
-        raise QwenRuntimeError("unexpected Qwen run directory")
     path = Path(raw)
+    if ".." in PurePosixPath(raw).parts:
+        raise QwenRuntimeError("unexpected Qwen run directory")
     suffix = path.name.removeprefix("aeon-qwen38-vllm-")
-    if path.parent != RUNTIME_ROOT or not _OWNER_RE.fullmatch(suffix):
+    legacy = (
+        raw.startswith(prefix)
+        and path.parent == RUNTIME_ROOT
+        and _OWNER_RE.fullmatch(suffix) is not None
+    )
+    fleet = (
+        path.parent == Path("/home/aday/.local/state/fleet-compute/runs")
+        and re.fullmatch(r"fr-[0-9a-f]{32}", path.name) is not None
+    )
+    if not legacy and not fleet:
         raise QwenRuntimeError("invalid Qwen run-directory owner")
     return path
 
@@ -275,6 +406,8 @@ def _validate_absolute_path(value: Any, label: str) -> Path:
 
 def _capability_from_receipt(
     receipt: Mapping[str, Any],
+    *,
+    allow_retired_manifest: bool = False,
 ) -> QwenRuntimeCapability:
     release_gate = receipt.get("release_gate")
     if (
@@ -293,13 +426,18 @@ def _capability_from_receipt(
             host=receipt.get("host"),
             physical_gpu=receipt.get("physical_gpu"),
             release_gate=False if release_gate is None else release_gate,
+            allow_retired_manifest=allow_retired_manifest,
         )
     except QwenCapabilityError as exc:
         raise QwenRuntimeError("Qwen runtime capability receipt changed") from exc
 
 
-def _validate_lease(lease: Mapping[str, Any]) -> dict[str, Any]:
-    capability = _capability_from_receipt(lease)
+def _validate_lease(
+    lease: Mapping[str, Any], *, allow_retired_manifest: bool = False
+) -> dict[str, Any]:
+    capability = _capability_from_receipt(
+        lease, allow_retired_manifest=allow_retired_manifest
+    )
     host = str(lease.get("host") or "")
     if host != capability.host or capability.runtime_adapter not in {
         "local-docker",
@@ -342,7 +480,16 @@ def _validate_lease(lease: Mapping[str, Any]) -> dict[str, Any]:
     }
     profile = lease_admission_profile(checked, validate_lease=False)
     if (
-        profile != QWEN38_VLLM_PROFILE
+        profile.key != QWEN38_VLLM_PROFILE.key
+        or any(
+            getattr(profile, field) < getattr(QWEN38_VLLM_PROFILE, field)
+            for field in (
+                "min_host_memory_gb",
+                "min_host_commit_gb",
+                "min_disk_free_gb",
+                "min_shm_free_gb",
+            )
+        )
         or capability.compute_profile != QWEN38_VLLM_PROFILE.key
         or capability.context_tokens < 65536
         or capability.gpu_memory_utilization is None
@@ -392,8 +539,10 @@ def runtime_state_matches_lease(
             or state["schema_version"] != SCHEMA_VERSION
         ):
             return False
-        checked = _validate_lease(lease)
-        checked_state = _validate_lease(state)
+        checked = _validate_lease(lease, allow_retired_manifest=True)
+        checked_state = _validate_lease(
+            state, allow_retired_manifest=True
+        )
         return (
             state.get("expected_hostname") == checked["expected_hostname"]
             and all(
@@ -597,10 +746,10 @@ def _validate_legacy_source_stage(
         lines = manifest_bytes.decode("utf-8").splitlines(keepends=True)
     except UnicodeDecodeError as exc:
         raise QwenRuntimeError("legacy source manifest is malformed") from exc
-    if len(lines) != len(SOURCE_FILES):
+    if len(lines) != len(_LEGACY_SOURCE_FILES):
         raise QwenRuntimeError("legacy source manifest file set changed")
     files: list[tuple[str, str]] = []
-    for expected_relative, line in zip(SOURCE_FILES, lines, strict=True):
+    for expected_relative, line in zip(_LEGACY_SOURCE_FILES, lines, strict=True):
         match = re.fullmatch(r"([a-f0-9]{64})  ([^\n]+)\n", line)
         if match is None or match.group(2) != expected_relative:
             raise QwenRuntimeError("legacy source manifest is malformed")
@@ -616,7 +765,7 @@ def _validate_legacy_source_stage(
     if (
         not isinstance(source_files, list)
         or len(source_files) != len(set(source_files))
-        or set(source_files) != {*SOURCE_FILES, "SOURCE_SHA256SUMS"}
+        or set(source_files) != {*_LEGACY_SOURCE_FILES, "SOURCE_SHA256SUMS"}
     ):
         raise QwenRuntimeError("legacy runtime source file receipt changed")
     _validate_source_stage(
@@ -676,7 +825,9 @@ def current_runtime_state(path: Path = RUNTIME_STATE_FILE) -> dict[str, Any] | N
         or state["schema_version"] != SCHEMA_VERSION
     ):
         raise QwenRuntimeError("unsupported Qwen runtime receipt schema")
-    capability = _capability_from_receipt(state)
+    capability = _capability_from_receipt(
+        state, allow_retired_manifest=True
+    )
     if (
         state.get("host") != capability.host
         or state.get("expected_hostname") != capability.hostname
@@ -718,10 +869,19 @@ def current_runtime_state(path: Path = RUNTIME_STATE_FILE) -> dict[str, Any] | N
         "releasing",
     }:
         raise QwenRuntimeError("runtime receipt phase is invalid")
+    if "warmup_failure" in state:
+        warmup_failure = state["warmup_failure"]
+        if (
+            state.get("phase") not in {"launching", "releasing"}
+            or not isinstance(warmup_failure, dict)
+            or type(warmup_failure.get("schema_version")) is not int
+            or warmup_failure != _validated_warmup_failure(warmup_failure)
+        ):
+            raise QwenRuntimeError("runtime warmup failure receipt is invalid")
     # The runtime receipt is also a durable copy of the exact lease accounting.
     # Validate it through the same release-bound contract before trusting any
     # saved process/container identity.
-    _validate_lease(state)
+    _validate_lease(state, allow_retired_manifest=True)
     container_id = state.get("container_id")
     if container_id is not None:
         _validate_token(container_id, _CONTAINER_ID_RE, "container ID")
@@ -829,11 +989,48 @@ def _exact_owned_tree(root: Path, expected_files: set[str]) -> int:
     return total
 
 
+def _model_verification_sidecar(
+    root: Path,
+    *,
+    checksummed_files: set[str],
+    sha256s_sha256: str,
+) -> set[str]:
+    """Validate the one permitted non-payload model-tree attestation."""
+
+    name = _MODEL_SHA256_VERIFICATION_SIDECAR
+    if name in checksummed_files:
+        raise QwenRuntimeError("model verification marker is part of the payload")
+    path = root / name
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        raise QwenRuntimeError("model verification marker is unreadable") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or metadata.st_size != 65
+    ):
+        raise QwenRuntimeError("model verification marker is unsafe")
+    expected = f"{sha256s_sha256}\n".encode("ascii")
+    try:
+        observed = path.read_bytes()
+    except OSError as exc:
+        raise QwenRuntimeError("model verification marker is unreadable") from exc
+    if observed != expected:
+        raise QwenRuntimeError("model verification marker identity changed")
+    return {name}
+
+
 def load_artifact_identity(
     model_dir: Path,
     *,
     verify_payload: bool = True,
     command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    progress_check: Callable[[], None] | None = None,
 ) -> ArtifactIdentity:
     expanded = model_dir.expanduser()
     metadata = expanded.lstat()
@@ -890,34 +1087,74 @@ def load_artifact_identity(
         files.append(relative)
     if not {"BUILD_MANIFEST.json", "config.json", "model.safetensors.index.json"}.issubset(seen):
         raise QwenRuntimeError("model checksum manifest is incomplete")
+    sha256s_sha256 = _sha256(sums_path)
     expected_files = {*seen, "SHA256SUMS"}
+    expected_files.update(
+        _model_verification_sidecar(
+            root,
+            checksummed_files=seen,
+            sha256s_sha256=sha256s_sha256,
+        )
+    )
     total = _exact_owned_tree(root, expected_files)
     if not 0 < total <= MAX_MODEL_ARTIFACT_BYTES:
         raise QwenRuntimeError("model artifact exceeds its size bound")
     if verify_payload:
-        result = command_runner(
-            [
-                str(HOST_BASH),
-                str(FLEET_LOW_PRIORITY),
-                str(HOST_SHA256SUM),
-                "--check",
-                "--strict",
-                "SHA256SUMS",
-            ],
-            cwd=str(root),
-            env=dict(HOST_LAUNCH_ENV),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=1800,
-        )
+        command = [
+            str(HOST_BASH),
+            str(FLEET_LOW_PRIORITY),
+            str(HOST_SHA256SUM),
+            "--check",
+            "--strict",
+            "SHA256SUMS",
+        ]
+        if progress_check is None:
+            result = command_runner(
+                command,
+                cwd=str(root),
+                env=dict(HOST_LAUNCH_ENV),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1800,
+            )
+        else:
+            progress_check()
+            process = subprocess.Popen(
+                command,
+                cwd=str(root),
+                env=dict(HOST_LAUNCH_ENV),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                while True:
+                    try:
+                        _output, error = process.communicate(timeout=60)
+                        break
+                    except subprocess.TimeoutExpired:
+                        progress_check()
+            except BaseException:
+                if process.returncode is None:
+                    try:
+                        process.terminate()
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
+                raise
+            result = subprocess.CompletedProcess(
+                command, process.returncode, stdout=None, stderr=error
+            )
         if result.returncode != 0:
             raise QwenRuntimeError("canonical model payload verification failed")
     return ArtifactIdentity(
         model_dir=root,
         manifest_sha256=_sha256(manifest_path),
-        sha256s_sha256=_sha256(sums_path),
+        sha256s_sha256=sha256s_sha256,
         files=tuple(files),
         total_bytes=total,
         root_device=root.lstat().st_dev,
@@ -957,7 +1194,11 @@ def revalidate_artifact_identity(identity: ArtifactIdentity) -> None:
     ):
         raise QwenRuntimeError("canonical model root changed after verification")
     expected = {relative for relative, *_rest in identity.file_stats}
-    if expected != {*identity.files, "SHA256SUMS"}:
+    payload_files = {*identity.files, "SHA256SUMS"}
+    if expected != payload_files and expected != {
+        *payload_files,
+        _MODEL_SHA256_VERIFICATION_SIDECAR,
+    }:
         raise QwenRuntimeError("canonical model receipt is internally inconsistent")
     _exact_owned_tree(root, expected)
     for receipt in identity.file_stats:
@@ -983,6 +1224,11 @@ def revalidate_artifact_identity(identity: ArtifactIdentity) -> None:
         or _sha256(root / "SHA256SUMS") != identity.sha256s_sha256
     ):
         raise QwenRuntimeError("canonical model manifest identity changed")
+    _model_verification_sidecar(
+        root,
+        checksummed_files=set(identity.files),
+        sha256s_sha256=identity.sha256s_sha256,
+    )
 
 
 def local_image_id(
@@ -1287,9 +1533,21 @@ def _source_identity(package_root: Path, run_dir: Path) -> SourceIdentity:
         except ValueError as exc:
             raise QwenRuntimeError("runtime source escaped its package root") from exc
         files.append((relative, _sha256(resolved)))
-    manifest = "".join(
+    generated_manifest = "".join(
         f"{digest}  {relative}\n" for relative, digest in files
     ).encode("utf-8")
+    manifest_path = root / SOURCE_MANIFEST_FILE
+    manifest_metadata = manifest_path.lstat()
+    if (
+        not stat.S_ISREG(manifest_metadata.st_mode)
+        or manifest_metadata.st_uid != os.geteuid()
+        or manifest_metadata.st_mode & 0o022
+        or manifest_metadata.st_size > 64 * 1024
+    ):
+        raise QwenRuntimeError("runtime source manifest is mutable or unowned")
+    manifest = manifest_path.read_bytes()
+    if manifest != generated_manifest:
+        raise QwenRuntimeError("runtime source manifest is stale")
     identity = hashlib.sha256(manifest).hexdigest()
     return SourceIdentity(
         package_root=root,
@@ -1642,7 +1900,7 @@ def _planner_contract(
     method = str(deploy_environment.get("AEON_MTP_METHOD") or "")
     if (
         served != "Qwen3.8-27B-ARA-NVFP4-MTP"
-        or attention != "TRITON_ATTN"
+        or attention != QWEN_RELEASE_ATTENTION_BACKEND
         or kv_dtype != "fp8_per_token_head"
         or str(plan.get("entry_name") or "") != "Qwen3.8-27B-ARA-NVFP4-MTP"
     ):
@@ -1652,7 +1910,12 @@ def _planner_contract(
     )
     selection_path = package_root / "aeon/core" / manifest_rel
     try:
-        from .mtp_tuning import load_selection
+        from .mtp_tuning import (
+            PACKAGED_SELECTION_BENCHMARK_SCRIPT_SHA256,
+            PACKAGED_SELECTION_SUITE_SHA256,
+            PACKAGED_SELECTION_SUITE_VERSION,
+            load_selection,
+        )
 
         selected_k, _selection = load_selection(
             selection_path,
@@ -1662,6 +1925,11 @@ def _planner_contract(
             expected_image_id=image_id,
             expected_attention_backend=attention,
             expected_kv_cache_dtype=kv_dtype,
+            expected_suite_version=PACKAGED_SELECTION_SUITE_VERSION,
+            expected_suite_sha256=PACKAGED_SELECTION_SUITE_SHA256,
+            expected_benchmark_script_sha256=(
+                PACKAGED_SELECTION_BENCHMARK_SCRIPT_SHA256
+            ),
         )
         declared_k = int(deploy_environment.get("AEON_MTP_NMAX") or 0)
     except Exception as exc:
@@ -2200,7 +2468,7 @@ def _read_cidfile(run_dir: Path) -> str | None:
             or metadata.st_mode & 0o022
         ):
             raise _ContainerIdReceiptError("container ID receipt is unsafe")
-        value = os.read(descriptor, 256).decode("ascii").strip()
+        value = read_bounded_fd(descriptor, 128).decode("ascii").strip()
     except (OSError, UnicodeDecodeError) as exc:
         raise _ContainerIdReceiptError("container ID receipt is unreadable") from exc
     finally:
@@ -2695,7 +2963,9 @@ def _validate_network_receipt(
 def _inspect_identity(item: Mapping[str, Any], state: Mapping[str, Any]) -> tuple[str, int | None]:
     """Validate the full create receipt; return active/exited and exact host PID."""
 
-    capability = _capability_from_receipt(state)
+    capability = _capability_from_receipt(
+        state, allow_retired_manifest=True
+    )
     if state.get("image_id") != capability.image_id:
         raise QwenRuntimeError("container state is outside its runtime capability")
     try:
@@ -3001,13 +3271,16 @@ def local_container_pid(
 def _endpoint_identity(
     state: Mapping[str, Any],
     *,
-    request_get: Callable[..., Any] = requests.get,
+    request_get: Callable[..., Any] = _loopback_get,
 ) -> None:
     base = f"http://127.0.0.1:{state['local_port']}"
     try:
         health = request_get(f"{base}/health", timeout=3)
+        health_status = health.status_code
+        _bounded_loopback_body(health, 64 * 1024)
         models = request_get(f"{base}/v1/models", timeout=5)
-        payload = models.json()
+        models_status = models.status_code
+        payload = json.loads(_bounded_loopback_body(models, 256 * 1024))
     except Exception as exc:
         raise QwenRuntimeLoadingError("exact Qwen endpoint is not ready") from exc
     identifiers = {
@@ -3015,7 +3288,11 @@ def _endpoint_identity(
         for item in payload.get("data", [])
         if isinstance(item, dict)
     } if isinstance(payload, dict) else set()
-    if health.status_code != 200 or models.status_code != 200 or identifiers != {state["served_name"]}:
+    if (
+        health_status != 200
+        or models_status != 200
+        or identifiers != {state["served_name"]}
+    ):
         raise QwenRuntimeLoadingError("Qwen endpoint model identity is not exact")
 
 
@@ -3082,6 +3359,239 @@ def _source_from_state(state: Mapping[str, Any], package_root: Path) -> SourceId
     return identity
 
 
+_WARMUP_FAILURE_SCHEMA_VERSION = 1
+_WARMUP_FAILURE_MAX_BYTES = 256
+_WARMUP_TURN_FAILURE_CODES = frozenset(
+    {
+        "input_build",
+        "http_timeout",
+        "http_request",
+        "http_status",
+        "response_json",
+        "completion_count",
+        "completion_content",
+        "turn_json",
+        "turn_not_object",
+        "turn_missing_required",
+        "turn_unexpected_fields",
+        "turn_action",
+        "internal",
+    }
+)
+_WARMUP_FAILURE_CODES_BY_STAGE = {
+    "preflight": frozenset({"staged_imports", "internal"}),
+    "text": _WARMUP_TURN_FAILURE_CODES,
+    "vision": _WARMUP_TURN_FAILURE_CODES,
+    "runner": frozenset(
+        {
+            "exec_error",
+            "invalid_diagnostic",
+            "result_mismatch",
+            "timeout",
+        }
+    ),
+}
+
+
+def _validated_warmup_failure(value: Any) -> dict[str, Any]:
+    """Return only the bounded v1 warmup failure contract or a safe fallback."""
+
+    fallback = {
+        "schema_version": _WARMUP_FAILURE_SCHEMA_VERSION,
+        "stage": "runner",
+        "code": "invalid_diagnostic",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "stage", "code"}
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != _WARMUP_FAILURE_SCHEMA_VERSION
+    ):
+        return fallback
+    stage = value.get("stage")
+    code = value.get("code")
+    if (
+        not isinstance(stage, str)
+        or not isinstance(code, str)
+        or code not in _WARMUP_FAILURE_CODES_BY_STAGE.get(stage, frozenset())
+    ):
+        return fallback
+    return {
+        "schema_version": _WARMUP_FAILURE_SCHEMA_VERSION,
+        "stage": stage,
+        "code": code,
+    }
+
+
+def _warmup_runner_failure(code: str) -> dict[str, Any]:
+    return _validated_warmup_failure(
+        {
+            "schema_version": _WARMUP_FAILURE_SCHEMA_VERSION,
+            "stage": "runner",
+            "code": code,
+        }
+    )
+
+
+def _read_warmup_failure(descriptor: int) -> dict[str, Any]:
+    """Read at most one exact private failure envelope from an inherited file."""
+
+    fallback = _warmup_runner_failure("invalid_diagnostic")
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_nlink > 1
+            or not 0 < metadata.st_size <= _WARMUP_FAILURE_MAX_BYTES
+        ):
+            return fallback
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        payload = read_bounded_fd(descriptor, _WARMUP_FAILURE_MAX_BYTES)
+        if len(payload) != metadata.st_size:
+            return fallback
+    except OSError:
+        return fallback
+    try:
+        raw = payload.decode("ascii")
+        value = json.loads(raw)
+        canonical = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+        return fallback
+    if raw not in {canonical, f"{canonical}\n"}:
+        return fallback
+    return _validated_warmup_failure(value)
+
+
+def _warmup_receipt_size(descriptor: int) -> int | None:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError:
+        return None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+        or metadata.st_nlink > 1
+        or metadata.st_size < 0
+    ):
+        return None
+    return metadata.st_size
+
+
+def _record_warmup_failure(
+    state: Mapping[str, Any],
+    state_path: Path,
+    value: Any,
+) -> None:
+    """Durably record and raise one sanitized warmup failure diagnosis."""
+
+    failure = _validated_warmup_failure(value)
+    try:
+        _private_json_write(
+            state_path,
+            {
+                **dict(state),
+                "warmup_failure": failure,
+                "updated_at": time.time(),
+            },
+        )
+    except Exception:
+        raise QwenRuntimeError(
+            "Qwen structured release warmup diagnostic write failed"
+        ) from None
+    raise QwenRuntimeError(
+        "Qwen structured release warmup failed "
+        f"[v{failure['schema_version']}:{failure['stage']}:{failure['code']}]"
+    ) from None
+
+
+def _run_structured_warmup(
+    command: list[str],
+    *,
+    cwd: str | Path,
+    environment: Mapping[str, str],
+    receipt_dir: Path,
+    state: Mapping[str, Any],
+    state_path: Path,
+    command_runner: Callable[..., subprocess.CompletedProcess[Any]],
+) -> None:
+    """Run the warmup with no output pipes and one bounded diagnostic receipt."""
+
+    try:
+        receipt = tempfile.TemporaryFile(mode="w+b", dir=receipt_dir)
+    except Exception:
+        _record_warmup_failure(
+            state,
+            state_path,
+            _warmup_runner_failure("exec_error"),
+        )
+    try:
+        with receipt:
+            try:
+                descriptor = receipt.fileno()
+                os.fchmod(descriptor, 0o600)
+            except Exception:
+                _record_warmup_failure(
+                    state,
+                    state_path,
+                    _warmup_runner_failure("exec_error"),
+                )
+            try:
+                result = command_runner(
+                    [*command, "--failure-fd", str(descriptor)],
+                    cwd=str(cwd),
+                    env=dict(environment),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    pass_fds=(descriptor,),
+                    timeout=600,
+                )
+                returncode = result.returncode
+                if isinstance(returncode, bool) or not isinstance(returncode, int):
+                    raise QwenRuntimeError("warmup runner result is malformed")
+            except subprocess.TimeoutExpired:
+                _record_warmup_failure(
+                    state,
+                    state_path,
+                    _warmup_runner_failure("timeout"),
+                )
+            except Exception:
+                _record_warmup_failure(
+                    state,
+                    state_path,
+                    _warmup_runner_failure("exec_error"),
+                )
+            if returncode != 0:
+                _record_warmup_failure(
+                    state,
+                    state_path,
+                    _read_warmup_failure(descriptor),
+                )
+            if _warmup_receipt_size(descriptor) != 0:
+                _record_warmup_failure(
+                    state,
+                    state_path,
+                    _warmup_runner_failure("result_mismatch"),
+                )
+    except QwenRuntimeError:
+        raise
+    except Exception:
+        _record_warmup_failure(
+            state,
+            state_path,
+            _warmup_runner_failure("exec_error"),
+        )
+
+
 def start_local_runtime(
     lease: Mapping[str, Any],
     deploy_environment: Mapping[str, Any],
@@ -3096,7 +3606,7 @@ def start_local_runtime(
     image_size_bytes: int | None = None,
     state_path: Path = RUNTIME_STATE_FILE,
     command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    request_get: Callable[..., Any] = requests.get,
+    request_get: Callable[..., Any] = _loopback_get,
     sleep_func: Callable[[float], None] = time.sleep,
     readiness_timeout: float = 2100,
     progress_check: Callable[[], None] | None = None,
@@ -3233,7 +3743,7 @@ def start_local_runtime(
         if progress_check is not None:
             progress_check()
         warmup = source.stage_dir / "aeon/scripts/warmup_qwen38_vllm.py"
-        warmup_result = command_runner(
+        _run_structured_warmup(
             [
                 str(HOST_BASH),
                 str(FLEET_LOW_PRIORITY),
@@ -3245,19 +3755,17 @@ def start_local_runtime(
                 served_name,
             ],
             cwd=str(source.stage_dir),
-            env={
+            environment={
                 **HOST_LAUNCH_ENV,
                 "PYTHONPATH": str(source.stage_dir),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "AEON_STAGED_SOURCE_ROOT": str(source.stage_dir),
             },
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=600,
+            receipt_dir=run_dir,
+            state=state,
+            state_path=state_path,
+            command_runner=command_runner,
         )
-        if warmup_result.returncode != 0:
-            raise QwenRuntimeError("Qwen structured release warmup failed")
         if verify_func is not None:
             verify_func(checked)
         status, pid, state = _resolve_container(
@@ -3294,7 +3802,7 @@ def reuse_qwen_runtime(
     package_root: Path,
     state_path: Path = RUNTIME_STATE_FILE,
     command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    request_get: Callable[..., Any] = requests.get,
+    request_get: Callable[..., Any] = _loopback_get,
     lease_override: Mapping[str, Any] | None = None,
     coordinator_verify_func: Callable[[Mapping[str, Any]], Any] | bool | None = None,
 ) -> int | None:
@@ -3414,7 +3922,7 @@ def _remove_cidfile(
             return False
         if not recovery_authorized:
             try:
-                value = os.read(descriptor, 256).decode("ascii").strip()
+                value = read_bounded_fd(descriptor, 128).decode("ascii").strip()
                 value = _validate_token(value, _CONTAINER_ID_RE, "container ID")
             except (OSError, UnicodeDecodeError, QwenRuntimeError):
                 return False
@@ -3560,7 +4068,9 @@ def stop_qwen_runtime(
 
 
 def _coordinator_claim_matches(state: Mapping[str, Any]) -> tuple[int, dict[str, Any] | None]:
-    capability = _capability_from_receipt(state)
+    capability = _capability_from_receipt(
+        state, allow_retired_manifest=True
+    )
     try:
         result = _coord("status", "--json", check=False)
     except Exception as exc:

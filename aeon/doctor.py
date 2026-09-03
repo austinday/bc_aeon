@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from aeon.core.fleet_backend import FleetBackendError, select_compute_backend
+from aeon.core.fleet_hosts import (
+    canonicalize_host_display_text,
+    host_display_name,
+)
+from aeon.core.model_identity import AEON_DEFAULT_MODEL_NAME
 from aeon.core.qwen_capabilities import (
     QwenCapabilityError,
     STANDARD_IMAGE_ID,
@@ -21,6 +26,7 @@ from aeon.core.workspace_instructions import (
     WorkspaceInstructionError,
     discover_workspace_instructions,
 )
+from aeon.harnesses.opencode_install import opencode_status
 
 
 COORDINATOR = Path("/home/aday/website_hosting/gpu_coord.py")
@@ -76,6 +82,25 @@ def collect_diagnostics() -> dict[str, Any]:
         )
     )
 
+    try:
+        harness_status = opencode_status()
+        harness_ready = harness_status.get("ready") is True
+        harness_version = str(harness_status.get("version") or "unknown")
+        harness_reason = str(harness_status.get("reason") or "status unavailable")
+        checks.append(
+            _check(
+                "OpenCode harness",
+                harness_ready,
+                f"v{harness_version}: {harness_reason}",
+            )
+        )
+    except Exception as exc:
+        # Diagnostics stay read-only and bounded even if installation metadata is
+        # malformed; readiness fails closed without attempting repair/download.
+        checks.append(
+            _check("OpenCode harness", False, f"status failed: {type(exc).__name__}")
+        )
+
     required_model_files = (
         "config.json",
         "model.safetensors.index.json",
@@ -123,7 +148,8 @@ def collect_diagnostics() -> dict[str, Any]:
     try:
         capabilities, manifest_sha256 = enabled_qwen_runtime_capabilities()
         detail = ", ".join(
-            f"{item.host}:{item.context_tokens // 1024}k/{item.runtime_adapter}"
+            f"{host_display_name(item.host)}:"
+            f"{item.context_tokens // 1024}k/{item.runtime_adapter}"
             for item in capabilities
         )
         checks.append(
@@ -133,8 +159,14 @@ def collect_diagnostics() -> dict[str, Any]:
                 f"{detail} (manifest {manifest_sha256[:12]})",
             )
         )
-    except QwenCapabilityError as exc:
-        checks.append(_check("Qwen fleet releases", False, str(exc)))
+    except (QwenCapabilityError, ValueError) as exc:
+        checks.append(
+            _check(
+                "Qwen fleet releases",
+                False,
+                canonicalize_host_display_text(str(exc)),
+            )
+        )
 
     try:
         backend, reason = select_compute_backend()
@@ -154,7 +186,7 @@ def collect_diagnostics() -> dict[str, Any]:
         "ok": all(item["ok"] for item in checks if item["required"]),
         "workspace": str(workspace),
         "backend": backend,
-        "primary_model": "Qwen3.8-27B-ARA-NVFP4-MTP",
+        "primary_model": AEON_DEFAULT_MODEL_NAME,
         "checks": checks,
     }
 

@@ -1,27 +1,44 @@
-# Verifying Change Propagation Protocol
+# CODING SKILL: Safe cross-boundary change propagation
+# Use when an implementation or refactor can affect callers, consumers, persisted data, configuration, or runtime behavior beyond one local edit.
 
-This skill is to be implemented whenever the agent intends to make a change to an existing codebase to standardize the analysis of implications and ensure system stability.
+## When to use
 
-## Phase 1: Dependency Mapping
-1. **Initial Analysis:** Identify the target file(s) for modification.
-2. **Link Identification:** Identify all other files that call the target file (upstream) and all files that the target file calls (downstream).
-3. **Sub-Agent Deployment:** For each identified link (upstream or downstream), spawn a dedicated sub-agent to analyze the specific connection.
-4. **Analysis Criteria:** Each sub-agent must evaluate:
-    - **Path Dependencies:** Are file paths still valid? Are files expected to be in locations that have changed?
-    - **Interface Integrity:** Are function signatures, class interfaces, or API contracts still valid? (e.g., check for new flags, changed arguments, or removed optional parameters).
-    - **Connectivity:** Are there any broken imports or calls resulting from the change?
-    - **Renaming Awareness:** If the target file was renamed, the sub-agent must compare the previous filename/structure with the new one to ensure all references are updated.
-    - **Constraint:** Sub-agents are strictly forbidden from making changes; they perform search and analysis only.
+Use for interface, schema, path, configuration, command, state, or process-boundary
+changes and for behavior-preserving refactors with a meaningful blast radius. Skip it
+for a truly isolated change whose complete behavior is covered by one local check.
 
-## Phase 2: Consensus Audit
-1. **Synthesis:** The primary agent collects all reports from the dependency sub-agents.
-2. **Audit Spawning:** The primary agent must spawn at least 3 independent audit sub-agents.
-3. **Audit Task:** Each auditor is provided with the proposed changes and the dependency reports. They must independently audit the potential implications and determine if the changes are safe or likely to cause regressions.
-4. **Consensus Evaluation:** The primary agent assesses the 3 audit reports:
-    - **Positive Consensus:** If at least 2 out of 3 auditors agree the changes are safe, the primary agent may proceed.
-    - **Negative Consensus:** If at least 2 out of 3 auditors identify a specific issue, this is treated as a confirmed bug/regression.
+## Preconditions
 
-## Phase 3: Iterative Correction
-1. **Debugging:** If a negative consensus is reached, the primary agent uses the audit findings as debugging input to correct the proposed changes.
-2. **Verification Loop:** After correcting the changes, the agent must repeat Phase 1 and Phase 2 from the beginning to ensure the new fix hasn't introduced further propagation issues.
-3. **Final Implementation:** Only the primary agent is authorized to write changes to the codebase. All other agents remain in an advisory/validation role.
+- State the intended behavior and the contracts that must remain compatible.
+- Inspect applicable instructions, current callers and consumers, tests, and
+  unrelated dirty-worktree changes that must be preserved.
+- Establish a passing baseline. For a behavior-preserving refactor without coverage,
+  add or identify a focused characterization check before restructuring.
+
+## Procedure
+
+1. Map the changed surface: symbols, signatures, defaults, serialization, files and
+   paths, configuration, side effects, persisted state, and failure behavior.
+2. Search current imports, callers, downstream consumers, generated artifacts, and
+   operational boundaries that actually depend on that surface.
+3. Implement the smallest coherent change. Keep compatibility or migration handling
+   explicit, and update references and tests in the same logical change.
+4. Validate the changed contract first, then run broader regression checks in
+   proportion to impact. Inspect fresh output and the final diff rather than relying
+   on an unrelated passing test.
+5. Report what was exercised, what changed, and which consumers or environments
+   remain unverified.
+
+## Verification
+
+- Behavior-preserving work must still pass its original baseline or characterization.
+- Changed behavior must have a focused check proving the new contract and important
+  compatibility or failure paths.
+- Confirm that no intended reference, migration, or runtime consumer was omitted.
+
+## Stop or adapt
+
+If a correction changes the contract again, remap only the affected propagation path
+and rerun its checks. Preserve unexpected unrelated changes rather than overwriting
+them. If a consumer cannot be inspected or exercised, state that limitation instead
+of repeatedly rerunning the same partial test or claiming complete propagation.

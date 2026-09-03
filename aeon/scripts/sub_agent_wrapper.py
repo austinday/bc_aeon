@@ -1,43 +1,45 @@
-import os
-import sys
-import json
 import argparse
 import ctypes
+import json
+import os
 import re
-import stat
-import time
-import threading
 import signal
+import stat
+import sys
+import threading
+import time
 from pathlib import Path, PurePosixPath
-from aeon.core.worker import Worker
-from aeon.core.agent_protocol import ExecutionState, RunOutcome, SideEffect
-from aeon.core.llm import LLMClient
-from aeon.tools.loader import load_tools_from_directory
+
 from aeon.core import runtime_signals as rt
+from aeon.core.agent_protocol import ExecutionState, RunOutcome, SideEffect
+from aeon.core.fleet_backend import FleetBackendError, validate_loopback_endpoint
+from aeon.core.llm import LLMClient
+from aeon.core.skills.manager import INSTANCE_SKILLS_DIR_ENV
 from aeon.core.sub_agent_changes import (
     SubAgentChangeError,
     snapshot_mutable_changes,
 )
 from aeon.core.sub_agent_environment import (
     CHILD_FLEET_CONFIGURATION_KEYS,
-    SubAgentFleetCompute,
     VERIFICATION_PREBOUND_NONCE_ENV,
     VERIFICATION_PREBOUND_RECEIPT,
+    SubAgentFleetCompute,
     scrub_principal_capabilities,
 )
-from aeon.core.fleet_backend import FleetBackendError, validate_loopback_endpoint
-from aeon.core.skills.manager import INSTANCE_SKILLS_DIR_ENV
 from aeon.core.sub_agent_state import (
     CPU_SANDBOX_SLICE_ENV,
     ProcessIdentityError,
     sub_agent_systemd_units,
 )
+from aeon.core.utils.io import read_bounded_fd
+from aeon.core.worker import Worker
 from aeon.remote.mcp_capability import (
     MCP_DELEGATION_ID_ENV,
     MCP_DELEGATION_TOKEN_FILE_ENV,
     MCP_URL_ENV,
     validate_mcp_base_endpoint,
 )
+from aeon.tools.loader import load_tools_from_directory
 
 # Tools a sub-agent is NOT allowed to have: no recursive spawning (runaway GPU
 # oversubscription) and no self-modification/restart of the framework.
@@ -266,7 +268,7 @@ def _consume_prebound_verification_capability(args, config) -> str | None:
             os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
         )
         metadata = os.fstat(descriptor)
-        raw = os.read(descriptor, 4097)
+        raw = read_bounded_fd(descriptor, 4096)
     except OSError as exc:
         raise RuntimeError("verification Fleet receipt is unavailable") from exc
     finally:
@@ -348,6 +350,7 @@ def _release_browser_profile(agent_id):
     agent never browsed (service not running / profile never created)."""
     try:
         import requests
+
         from aeon.tools.browser import BROWSER_API_URL, browser_auth_headers
         with requests.Session() as browser_http:
             browser_http.trust_env = False

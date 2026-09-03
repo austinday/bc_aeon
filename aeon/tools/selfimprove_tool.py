@@ -9,8 +9,9 @@ class RunSelfBenchmarkTool(BaseTool):
         super().__init__(
             name="run_self_benchmark",
             description=(
-                "Measure the agent's CURRENT capability by running the self-improvement benchmark in "
-                "an isolated sandbox copy of the source, and compare the score to the last recorded "
+                "Fail-closed capability benchmark. Candidate imports are currently blocked until an "
+                "actively-probed masked-home dependency sandbox is installed; do not retry or bypass "
+                "that blocker with direct Python/shell execution. Once available, compare the score to the last recorded "
                 "baseline (the champion). Use this to (a) establish a baseline BEFORE a self-modification, "
                 "and (b) AFTER restarting, confirm the change held or improved the score and did not "
                 "regress any task. A regression is the signal to revert_aeon. Results are appended to the "

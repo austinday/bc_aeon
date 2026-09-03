@@ -1,17 +1,30 @@
-import os
 import queue
-import signal
 import subprocess
 import time
 import shutil
 import getpass
 import threading
+from pathlib import Path
 from .base import BaseTool
 from ..core import runtime_signals as rt
+from ..core.process_resources import (
+    register_receipted_command,
+    unregister_receipted_command,
+)
 from ..core.prompts import (
     TOOL_DESC_RUN_COMMAND,
     TOOL_DESC_TASK_COMPLETE,
     TOOL_DESC_GET_USER_INPUT,
+)
+from .command_fleet_guard import (
+    FleetCommandGuardError,
+    SERVICE_GATE_TIMEOUT,
+    finalize_sandbox_service,
+    guard_fleet_shell_command,
+    launch_sandbox_service,
+    prepare_fleet_shell_boundary,
+    resolve_command_cwd,
+    stop_sandbox_service,
 )
 
 
@@ -57,28 +70,6 @@ class RunCommandTool(BaseTool):
             description=TOOL_DESC_RUN_COMMAND
         )
 
-    @staticmethod
-    def _kill_process_tree(process):
-        """Kill the command's entire process group, not just the bash shell.
-
-        With shell=True the bash spawns children (builds, training scripts,
-        servers); killing only the shell leaves those running as orphans that
-        keep holding GPU/CPU on a shared box. We launch the command in its own
-        session (start_new_session=True) so the whole tree shares a process
-        group we can signal here.
-        """
-        if process is None:
-            return
-        try:
-            pgid = os.getpgid(process.pid)
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            # Group already gone, or no permission -> fall back to the shell PID.
-            try:
-                process.kill()
-            except Exception:
-                pass
-
     def _truncate(self, text: str) -> str:
         if len(text) <= self.MAX_RETURN_CHARS:
             return text
@@ -95,9 +86,22 @@ class RunCommandTool(BaseTool):
             + text[len(text) - tail:]
         )
 
-    def execute(self, command: str, timeout: int = 300) -> str:
+    def execute(
+        self,
+        command: str,
+        timeout: int = 300,
+        cwd: str | None = None,
+    ) -> str:
         if not command:
             return "Error: command parameter is required."
+
+        cleanup_token: str | None = None
+
+        def _register_active_receipt(receipt) -> None:
+            nonlocal cleanup_token
+            cleanup_token = register_receipted_command(
+                lambda: stop_sandbox_service(receipt)
+            )
 
         try:
             timeout = int(timeout)
@@ -109,11 +113,47 @@ class RunCommandTool(BaseTool):
         # the command's own timeout fires first, not a sub-agent kill).
         effective_timeout = 300 if timeout <= 0 else min(timeout, self.HARD_MAX_TIMEOUT)
 
-        output_lines = []
-        start_time = time.time()
-        wrapped_command = f"source ~/.bashrc 2>/dev/null; {command}"
+        # Admission and fixed-file validation happen before any process. The
+        # service bootstrap then remains behind its gate until the actual unit's
+        # sandbox, MainPID/cgroup, optional parent slice, and InvocationID are
+        # externally read back and the receipt is durably stored.
+        try:
+            session_root = Path.cwd().resolve(strict=True)
+            command_cwd = resolve_command_cwd(cwd, session_root=session_root)
+            cwd_metadata = command_cwd.stat(follow_symlinks=False)
+            cwd_identity = (int(cwd_metadata.st_dev), int(cwd_metadata.st_ino))
+            command = guard_fleet_shell_command(command)
+            boundary, manager_environment = prepare_fleet_shell_boundary(
+                cwd=command_cwd,
+                session_root=session_root,
+                expected_cwd_identity=cwd_identity,
+                runtime_max_seconds=effective_timeout + int(SERVICE_GATE_TIMEOUT) + 5
+            )
+            handle = launch_sandbox_service(
+                command,
+                boundary,
+                manager_environment,
+                on_receipt=_register_active_receipt,
+            )
+        except FleetCommandGuardError as exc:
+            unregister_receipted_command(cleanup_token)
+            return str(exc)
+        except Exception as exc:
+            unregister_receipted_command(cleanup_token)
+            return (
+                "COMMAND REFUSED: transient-service sandbox startup failed "
+                f"({type(exc).__name__}). The requested command was not executed."
+            )
 
-        process = None
+        output_lines = [handle.initial_output] if handle.initial_output else []
+        # Test doubles and compatible downstream launchers may not implement the
+        # pre-gate callback yet. Keep the post-return registration as a bounded
+        # compatibility fallback; the production launcher always registers
+        # before opening the payload gate.
+        if cleanup_token is None:
+            _register_active_receipt(handle.receipt)
+        start_time = time.time()
+        process = handle.process
         # Keep the liveness heartbeat fresh for the whole command so a long-but-alive
         # command (e.g. a slow build) is never mistaken for a hang by the watchdog.
         # Harmless no-op in the primary agent.
@@ -126,20 +166,6 @@ class RunCommandTool(BaseTool):
         threading.Thread(target=_toucher, daemon=True).start()
 
         try:
-            process = subprocess.Popen(
-                wrapped_command,
-                shell=True,
-                executable="/bin/bash",
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1,
-                start_new_session=True,  # own process group -> killable as a tree
-            )
-
             # Read stdout on a dedicated thread so the wall-clock timeout is
             # enforced even when the command produces NO output (a silent hang
             # used to block readline() past the timeout indefinitely). The
@@ -158,10 +184,15 @@ class RunCommandTool(BaseTool):
 
             while True:
                 if time.time() - start_time > effective_timeout:
-                    self._kill_process_tree(process)
+                    stop_sandbox_service(handle.receipt)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
                     partial = self._truncate("".join(output_lines))
                     return (
-                        f"COMMAND TIMED OUT after {effective_timeout}s (process killed).\n\n"
+                        f"COMMAND TIMED OUT after {effective_timeout}s "
+                        "(exact transient service stopped).\n\n"
                         f"PARTIAL OUTPUT:\n{partial}\n\n"
                         f"HINT: If this is expected to run long, raise 'timeout' (capped at "
                         f"{self.HARD_MAX_TIMEOUT}s), run it in the background, or bound its runtime."
@@ -188,27 +219,41 @@ class RunCommandTool(BaseTool):
             if return_code != 0:
                 diag = _diagnose_failure(command, output)
                 body = self._truncate(output) if output.strip() else "(no output)"
-                return f"COMMAND FAILED (Exit Code {return_code})\n\nOUTPUT:\n{body}{diag}"
+                return (
+                    f"COMMAND FAILED (Exit Code {return_code})\n"
+                    f"WORKING DIRECTORY: {boundary.cwd}\n\nOUTPUT:\n{body}{diag}"
+                )
 
             if not output.strip():
-                return "COMMAND SUCCESS (no output)."
-            return f"COMMAND SUCCESS\n\nOUTPUT:\n{self._truncate(output)}"
+                return (
+                    "COMMAND SUCCESS (no output).\n"
+                    f"WORKING DIRECTORY: {boundary.cwd}"
+                )
+            return (
+                f"COMMAND SUCCESS\nWORKING DIRECTORY: {boundary.cwd}\n\n"
+                f"OUTPUT:\n{self._truncate(output)}"
+            )
 
         except KeyboardInterrupt:
-            print("\n[RunCommand] Interrupted! Stopping subprocess tree...", flush=True)
-            if process:
-                self._kill_process_tree(process)
-                try:
-                    process.wait(timeout=1)
-                except Exception:
-                    pass
+            print("\n[RunCommand] Interrupted! Stopping exact transient service...", flush=True)
+            stop_sandbox_service(handle.receipt)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
             raise
 
         except Exception as e:
+            try:
+                stop_sandbox_service(handle.receipt)
+            except Exception:
+                pass
             return f"An error occurred while running the command: {type(e).__name__}: {e}"
 
         finally:
             stop_toucher.set()
+            unregister_receipted_command(cleanup_token)
+            finalize_sandbox_service(handle)
 
 
 class TaskCompleteTool(BaseTool):

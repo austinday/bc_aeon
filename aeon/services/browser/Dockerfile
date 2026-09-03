@@ -1,8 +1,12 @@
 FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 
-# start_browser.sh refuses older images without this marker so a stale,
-# unauthenticated browser backend can never be launched accidentally.
-LABEL com.bc_aeon.browser.auth="required-v1"
+# browser_service.py validates these labels against both an immutable local
+# image receipt and the exact source hash supplied by the operator build. A
+# stale or differently built image can therefore never be selected by tag at
+# service-launch time.
+ARG AEON_BROWSER_SOURCE_SHA256
+LABEL com.bc_aeon.browser.auth="required-v1" \
+      com.bc_aeon.browser.source-sha256="${AEON_BROWSER_SOURCE_SHA256}"
 
 # Install REAL Google Chrome (for channel='chrome' max-stealth browsing) plus
 # Xvfb so Chrome can run HEADED (far less detectable than headless).
@@ -17,8 +21,8 @@ RUN export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install -
 
 WORKDIR /app
 
-# Build context is aeon/services/browser/ (set by setup_environment.sh), so the
-# service files are at the root of the context — reference them by bare name.
+# Build context is aeon/services/browser/. Only these explicit runtime sources
+# are admitted by .dockerignore and copied into the image.
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 # Patchright's patched Chromium is the fallback if real Chrome is ever absent.
@@ -28,7 +32,7 @@ RUN python3 -m patchright install chromium
 # logins/cookies survive container restarts (see start_browser.sh).
 RUN mkdir -p /profiles
 
-COPY . .
+COPY server.py browser_util.py media_safety.py human_motion.py entrypoint.sh ./
 
 # Capability marker checked by the launcher so an authenticated but stale image
 # cannot silently run without coordinate actions/dialog policy/extraction.

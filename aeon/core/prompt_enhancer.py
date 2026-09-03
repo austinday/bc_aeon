@@ -1,10 +1,10 @@
 """LLM-driven prompt enhancement for the image/video generators.
 
-The local generators reward verbose, concrete prompts far more than terse ones:
-FLUX/Qwen images want composition/lighting/lens detail, and LTX/10Eros video has
-almost no self-reasoning -- any unstated motion, camera move, or detail simply
-does not happen. This rewrites a short prompt into the dialect each generator
-wants, using the single (uncensored, local) agent model, so explicit intent is
+The local generators reward concrete, model-native prompts far more than terse
+ones: FLUX/Qwen images want composition/lighting/lens detail, LTX/10Eros needs
+explicit temporal motion, and MiniMax H3 expects a structured audiovisual IR.
+This rewrites a short prompt into the dialect each generator wants, using the
+single (uncensored, local) agent model, so explicit intent is
 preserved -- a censored rewriter would silently sanitize it.
 
 Fail loud, never fall back: if enhancement is requested but the local model is
@@ -44,6 +44,19 @@ _ADULT_MARKERS = (
 )
 
 _BASE = {
+    "video_h3": (
+        "You are the director and prompt compiler for the local MiniMax H3 audiovisual "
+        "generator. Convert the creative brief into H3's exact English IR using these three "
+        "fields in this order: integrated_multimodal_description, overall_soundscape, and "
+        "non_diegetic_music. Begin the first field with [Shot 1]. For each later cut write "
+        "[Shot N] At 00:SS.mmm, the camera cuts to... with strictly increasing times inside "
+        "the target duration. Describe composition, stable subject identity, visible action, "
+        "camera type/amplitude/speed, lighting, synchronized physical sound, and a concrete "
+        "ending. Put dialogue only in <d>[Language] exact words</d> and give each speaker a "
+        "stable (S1) ID. overall_soundscape is 1-4 sentences of ambience/action sounds; "
+        "non_diegetic_music is 1-3 concrete sentences or N/A. Preserve requested dialogue, "
+        "visible text, references, style, and intent exactly. "
+    ),
     "video": (
         "You are a prompt engineer for the LTX-2 / 10Eros text-to-video model. Rewrite the "
         "user's request into ONE vivid, concrete English paragraph optimized for video. The "
@@ -100,7 +113,7 @@ def _system_for(media_type: str, adult: bool) -> str:
 
 
 def enhance_prompt(llm_client, raw: str, media_type: str = "image",
-                   force: Optional[bool] = None) -> str:
+                   force: Optional[bool] = None, context: str = "") -> str:
     """Return an enhanced prompt for media_type ('video' | 'image').
 
     force=True  -> always enhance.
@@ -116,13 +129,24 @@ def enhance_prompt(llm_client, raw: str, media_type: str = "image",
     if not raw or force is False:
         return raw
     if force is None and len(raw.split()) >= _PASSTHROUGH_WORDS:
-        return raw
+        if media_type != "video_h3" or all(
+            field in raw
+            for field in (
+                "integrated_multimodal_description:",
+                "overall_soundscape:",
+                "non_diegetic_music:",
+            )
+        ):
+            return raw
     if llm_client is None:
         raise ValueError("enhance_prompt: enhancement requested but no llm_client was provided.")
 
     # Classify intent deterministically, then pick ONE unambiguous system prompt:
     # clean-steer for neutral requests (brand-safe), faithful/uncensored for adult.
     system = _system_for(media_type, wants_adult(raw))
+    user_content = raw
+    if context and context.strip():
+        user_content = f"{context.strip()}\n\nCreative brief:\n{raw}"
     limiter = getattr(llm_client, "support_request_kwargs", None)
     support_limits = (
         limiter(requested_tokens=2048, phase="media prompt enhancement")
@@ -134,7 +158,7 @@ def enhance_prompt(llm_client, raw: str, media_type: str = "image",
         # uses -- the display name ('model') 404s against vLLM's served name.
         model=llm_client.api_model,
         messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": raw}],
+                  {"role": "user", "content": user_content}],
         temperature=0.7,
         **support_limits,
     )

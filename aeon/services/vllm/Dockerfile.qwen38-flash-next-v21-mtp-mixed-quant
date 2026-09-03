@@ -1,0 +1,26 @@
+# Release overlay for a mixed-quant MTP: routed experts are NVFP4 while the
+# shared expert remains BF16 and must never be fused into the packed tensor.
+FROM aeon/vllm:qwen38-flash-next-v20-bf16-ple-attested-5d4ba3b4
+
+ARG MTP_PATCH_SHA256
+
+LABEL com.bc_aeon.component="qwen38-flash-next-v21-mtp-mixed-quant" \
+      com.bc_aeon.mtp.shared-expert-fusion="disabled" \
+      com.bc_aeon.mtp.patch.sha256="${MTP_PATCH_SHA256}"
+
+COPY patches/qwen38-flash-next-mtp-disable-shared-expert-fusion.patch /tmp/mtp.patch
+
+RUN test -n "${MTP_PATCH_SHA256}" \
+    && test "$(sha256sum /tmp/mtp.patch | cut -d' ' -f1)" = "${MTP_PATCH_SHA256}" \
+    && patch --dry-run --batch --fuzz=0 -p1 \
+         -d /usr/local/lib/python3.12/dist-packages \
+         --input=/tmp/mtp.patch \
+    && patch --batch --fuzz=0 -p1 \
+         -d /usr/local/lib/python3.12/dist-packages \
+         --input=/tmp/mtp.patch \
+    && grep -A6 -F 'weights = maybe_fuse_shared_experts(' \
+         /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/mtp.py \
+         | grep -Fx '            enabled=False,' \
+    && python3 -m py_compile \
+         /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/mtp.py \
+    && rm -f /tmp/mtp.patch

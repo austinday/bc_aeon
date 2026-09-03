@@ -11,11 +11,12 @@ transition-only-automatic into an action the agent can take after live testing.
 import json
 import os
 
+from . import restart as restart_lifecycle
 from .base import BaseTool
-from ..core import checkpoint
 
-# Same staging file the restart machinery in main.py consumes.
-RESTART_STATE_PATH = f"/tmp/aeon_restart_state_{os.getpid()}.json"
+# Same staging file the restart machinery in main.py consumes. Keep a local
+# name so tests and operators can redirect this exact write boundary.
+RESTART_STATE_PATH = restart_lifecycle.RESTART_STATE_PATH
 
 
 class RevertAeonTool(BaseTool):
@@ -44,6 +45,18 @@ class RevertAeonTool(BaseTool):
             return os.getcwd()
 
     def execute(self, checkpoint: str = None, reason: str = "Reverting a regressed self-modification") -> str:
+        # A rollback mutates the canonical source before the normal restart path
+        # gets a chance to validate it.  Use the exact same loaded-code boundary
+        # latch as restart_aeon and refuse before even consulting git/checkpoints
+        # when this host cannot safely import modified source.
+        if not restart_lifecycle.restart_validation_boundary_available():
+            return (
+                "Error: revert is blocked because this host does not yet have "
+                "an actively-probed masked-home sandbox for importing modified "
+                "Aeon source. No checkpoint, git/source, or restart-state mutation "
+                "was attempted."
+            )
+
         from ..core import checkpoint as ckpt  # local alias; param shadows the module name
         root = self._root()
 
@@ -65,7 +78,7 @@ class RevertAeonTool(BaseTool):
             return (f"Error: could not restore checkpoint '{target}': {res.get('reason')}. "
                     f"Available checkpoints: {avail}")
 
-        # Stage a restart so the reverted source is reinstalled and relaunched. The
+        # Stage a restart so the reverted canonical source is reloaded. The
         # same path the restart_aeon tool uses; _execute_restart in main.py consumes it.
         try:
             state = self.worker.serialize_state()

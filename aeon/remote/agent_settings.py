@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aeon.core.model_catalog import QWEN38_MODEL_NAME
+from aeon.core.model_identity import (
+    AEON_DEFAULT_MODEL_NAME,
+    QWEN38_LEGACY_WIRE_ALIAS,
+)
+from aeon.harnesses.catalog import public_harness_catalog
 
 
 class AgentSettingsError(ValueError):
@@ -31,9 +35,9 @@ class AgentSettingCatalog:
 _CATALOGS = {
     "aeon": AgentSettingCatalog(
         kind="aeon",
-        models=(QWEN38_MODEL_NAME,),
+        models=(AEON_DEFAULT_MODEL_NAME,),
         efforts=("",),
-        default_model=QWEN38_MODEL_NAME,
+        default_model=AEON_DEFAULT_MODEL_NAME,
         default_effort="",
         model_editable=False,
         effort_editable=False,
@@ -84,6 +88,13 @@ def normalize_settings(
     catalog = catalog_for(kind)
     normalized_model = "" if model is None else str(model).strip()
     normalized_effort = "" if effort is None else str(effort).strip().lower()
+    # The Flash-Next rollout changed Aeon's user-facing logical service name,
+    # while existing durable tabs still carry the reviewed 27B wire alias.
+    # Treat that one exact historical value as the current logical service so
+    # restarts can reach Fleet and use either the preferred runtime or its 27B
+    # fallback. Arbitrary or older unreviewed values remain rejected below.
+    if kind == "aeon" and normalized_model == QWEN38_LEGACY_WIRE_ALIAS:
+        normalized_model = AEON_DEFAULT_MODEL_NAME
     if normalized_model not in catalog.models:
         raise AgentSettingsError("That model is not available for this agent")
     if normalized_effort not in catalog.efforts:
@@ -97,7 +108,7 @@ def normalize_settings(
 
 def public_catalog(kind: str) -> dict[str, object]:
     catalog = catalog_for(kind)
-    return {
+    payload = {
         "kind": catalog.kind,
         "models": [
             {"id": value, "label": value or "Provider default"}
@@ -112,6 +123,9 @@ def public_catalog(kind: str) -> dict[str, object]:
         "model_editable": catalog.model_editable,
         "effort_editable": catalog.effort_editable,
     }
+    if kind == "aeon":
+        payload["harnesses"] = public_harness_catalog()
+    return payload
 
 
 __all__ = (

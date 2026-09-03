@@ -36,8 +36,8 @@ class ProgressControllerScenarios(unittest.TestCase):
         self.assertFalse(decision.block_exact_action)
         self.assertTrue(decision.recovery_required)
         self.assertEqual(decision.recovery_level, 1)
-        self.assertIn("LEVEL 1", controller.recovery_directive())
-        self.assertIn("failed assumption", controller.recovery_directive())
+        self.assertIn("RECOVERY REQUIRED (level 1)", controller.recovery_directive())
+        self.assertIn("Do not narrate recovery", controller.recovery_directive())
 
     def test_equivalent_failures_escalate_to_level_two_and_bar_family(self):
         controller = ProgressController()
@@ -76,7 +76,7 @@ class ProgressControllerScenarios(unittest.TestCase):
             set(decisions[-1].barred_actions), {"run(a)", "read(b)"}
         )
         self.assertIn("A/B/A/B", decisions[-1].reason)
-        self.assertIn("parent objective", controller.recovery_directive())
+        self.assertIn("different route", controller.recovery_directive())
 
     def test_exact_block_hard_stops_only_after_two_ignored_bar_reproposals(self):
         controller = ProgressController()

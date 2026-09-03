@@ -152,6 +152,14 @@ def make_model(base: Path) -> runtime.ArtifactIdentity:
     )
 
 
+def add_model_verification_sidecar(model_dir: Path) -> Path:
+    sums_sha256 = hashlib.sha256((model_dir / "SHA256SUMS").read_bytes()).hexdigest()
+    marker = model_dir / ".podcast-sha256-verified"
+    marker.write_bytes(f"{sums_sha256}\n".encode("ascii"))
+    marker.chmod(0o600)
+    return marker
+
+
 def make_source_tree(base: Path) -> Path:
     """Create the exact immutable host-launch closure used by source tests."""
 
@@ -166,7 +174,23 @@ def make_source_tree(base: Path) -> Path:
             current = current.parent
         path.write_text(f"hermetic release input: {relative}\n", encoding="utf-8")
         path.chmod(0o600)
+    write_source_manifest(root)
     return root
+
+
+def write_source_manifest(root: Path) -> None:
+    manifest = root / runtime.SOURCE_MANIFEST_FILE
+    manifest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    manifest.write_bytes(
+        b"".join(
+            hashlib.sha256((root / relative).read_bytes()).hexdigest().encode("ascii")
+            + b"  "
+            + relative.encode("utf-8")
+            + b"\n"
+            for relative in runtime.SOURCE_FILES
+        )
+    )
+    manifest.chmod(0o600)
 
 
 def deploy_environment(image: str = "aeon_vllm:latest"):
@@ -490,7 +514,7 @@ def durable_runtime_state(tmp: Path):
             "source_dir": str(
                 Path(state["run_dir"]) / f"local-source-{source_hash}"
             ),
-            "source_files": [*runtime.SOURCE_FILES, "SOURCE_SHA256SUMS"],
+            "source_files": [*runtime._LEGACY_SOURCE_FILES, "SOURCE_SHA256SUMS"],
             "launch_spec_sha256": "d" * 64,
             "scratch_cleaned": False,
             "cidfile_recovery_authorized": False,
@@ -512,7 +536,7 @@ def make_legacy_runtime_state(root: Path, *, executable: bool):
     source_seed = root / "legacy-source-seed"
     source_seed.mkdir(mode=0o700)
     files = []
-    for relative in runtime.SOURCE_FILES:
+    for relative in runtime._LEGACY_SOURCE_FILES:
         path = source_seed / relative
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         current = path.parent
@@ -540,7 +564,7 @@ def make_legacy_runtime_state(root: Path, *, executable: bool):
             "schema_version": runtime.LEGACY_SCHEMA_VERSION,
             "source_manifest_sha256": manifest_sha256,
             "source_dir": str(stage),
-            "source_files": [*runtime.SOURCE_FILES, "SOURCE_SHA256SUMS"],
+            "source_files": [*runtime._LEGACY_SOURCE_FILES, "SOURCE_SHA256SUMS"],
             "container_tmpfs_options": None,
             "teardown_only": None,
         }
@@ -583,18 +607,25 @@ class RuntimeCapabilityTests(unittest.TestCase):
             capability.host = "192.168.0.179"
 
     def test_disabled_and_unknown_targets_never_become_capacity(self):
-        for host in ("192.168.0.178", "192.168.0.179"):
-            with self.subTest(host=host), self.assertRaises(
-                qwen_capabilities.QwenCapabilityError
-            ):
-                qwen_capabilities.require_enabled_qwen_target(host, 0)
-        for physical_gpu in (0, 1):
-            capability, _manifest = qwen_capabilities.require_enabled_qwen_target(
-                "192.168.0.180", physical_gpu
-            )
-            self.assertEqual(
-                capability.key, qwen_capabilities.RTX5000_RELEASE_CAPABILITY_KEY
-            )
+        with self.assertRaises(qwen_capabilities.QwenCapabilityError):
+            qwen_capabilities.require_enabled_qwen_target("192.168.0.179", 0)
+        for host, expected_key in (
+            (
+                "192.168.0.178",
+                qwen_capabilities.RTX5000_178_RELEASE_CAPABILITY_KEY,
+            ),
+            (
+                "192.168.0.180",
+                qwen_capabilities.RTX5000_180_RELEASE_CAPABILITY_KEY,
+            ),
+        ):
+            for physical_gpu in (0, 1):
+                capability, _manifest = (
+                    qwen_capabilities.require_enabled_qwen_target(
+                        host, physical_gpu
+                    )
+                )
+                self.assertEqual(capability.key, expected_key)
         with self.assertRaises(qwen_capabilities.QwenCapabilityError):
             qwen_capabilities.require_enabled_qwen_target("192.168.0.250", 0)
         with self.assertRaises(qwen_capabilities.QwenCapabilityError):
@@ -619,7 +650,7 @@ class RuntimeCapabilityTests(unittest.TestCase):
             (0, "vram_budget_gb", 41.7),
             (0, "image_id", "sha256:" + "a" * 64),
             (1, "enabled", True),
-            (2, "enabled", True),
+            (2, "enabled", False),
         )
         for index, field, value in mutations:
             changed_manifest = copy.deepcopy(raw)
@@ -696,10 +727,248 @@ class RuntimeCapabilityTests(unittest.TestCase):
             ),
             capability,
         )
+        promoted, promoted_manifest = qwen_capabilities.qwen_runtime_capability(
+            qwen_capabilities.RTX5000_178_RELEASE_CAPABILITY_KEY
+        )
+        self.assertTrue(promoted.enabled)
+        self.assertEqual(promoted.host, "192.168.0.178")
+        self.assertEqual(promoted.context_tokens, 131072)
+        self.assertEqual(promoted.vram_budget_gb, 41.25)
+        self.assertEqual(promoted.max_num_seqs, 8)
+        self.assertEqual(promoted_manifest, manifest_sha256)
+
+    def test_compact_host_receipt_is_semantically_bound_to_its_capability(self):
+        capability, _manifest = qwen_capabilities.qwen_runtime_capability(
+            qwen_capabilities.RTX5000_180_RELEASE_CAPABILITY_KEY
+        )
+        payload = qwen_capabilities.RTX5000_180_RELEASE_RECEIPT_FILE.read_bytes()
+        qwen_capabilities._validate_packaged_remote_release_receipt(
+            capability, payload
+        )
+        receipt = json.loads(payload)
+        mutations = []
+        for path, value in (
+            (("host",), "192.168.0.178"),
+            (("status",), "provisional"),
+            (("runtime", "model_manifest_sha256"), "0" * 64),
+            (("gates", "long_context_exact_recall"), False),
+            (("raw_reports", "long_batch_sha256"), "not-a-hash"),
+        ):
+            changed_receipt = copy.deepcopy(receipt)
+            selected = changed_receipt
+            for component in path[:-1]:
+                selected = selected[component]
+            selected[path[-1]] = value
+            mutations.append((path, changed_receipt))
+        for path, changed_receipt in mutations:
+            with self.subTest(path=path), self.assertRaises(
+                qwen_capabilities.QwenCapabilityError
+            ):
+                qwen_capabilities._validate_packaged_remote_release_receipt(
+                    capability,
+                    json.dumps(changed_receipt).encode("utf-8"),
+                )
+
+    def test_178_release_is_enabled_and_exact_receipt_bound(self):
+        promoted_key = qwen_capabilities.RTX5000_178_RELEASE_CAPABILITY_KEY
+        existing_key = qwen_capabilities.RTX5000_180_RELEASE_CAPABILITY_KEY
+        self.assertEqual(promoted_key, "qwen38-compact-178-128k")
+        self.assertEqual(
+            qwen_capabilities.COMPACT_REMOTE_DOCKER_CAPABILITY_KEYS,
+            frozenset({promoted_key, existing_key}),
+        )
+        self.assertNotEqual(
+            qwen_capabilities._PACKAGED_REMOTE_RELEASE_RECEIPTS[promoted_key],
+            qwen_capabilities._PACKAGED_REMOTE_RELEASE_RECEIPTS[existing_key],
+        )
+        capability, manifest = qwen_capabilities.qwen_runtime_capability(
+            promoted_key
+        )
+        self.assertTrue(capability.enabled)
+        self.assertEqual(capability.host, "192.168.0.178")
+        self.assertEqual(
+            capability.release_receipt_sha256,
+            "fef559cd0b88506b7b0b29f12cd6c1fdee8b525fa2962358c16048529804f13d",
+        )
+
+        payload = qwen_capabilities.RTX5000_178_RELEASE_RECEIPT_FILE.read_bytes()
+        self.assertEqual(
+            stat.S_IMODE(
+                qwen_capabilities.RTX5000_178_RELEASE_RECEIPT_FILE.stat().st_mode
+            ),
+            0o644,
+        )
+        self.assertEqual(
+            hashlib.sha256(payload).hexdigest(),
+            capability.release_receipt_sha256,
+        )
+        qwen_capabilities._validate_packaged_remote_release_receipt(
+            capability, payload
+        )
+        receipt = json.loads(payload)
+        self.assertEqual(receipt["status"], "passed")
+        self.assertIs(receipt["gates"]["exact_teardown_and_release"], True)
+        self.assertEqual(
+            receipt["raw_reports"]["exact_teardown_sha256"],
+            "af5d320b6db7629f4ca2b505f08ee16a6cde2e903cfb62b53ff9fa1426f53417",
+        )
+        for physical_gpu in (0, 1):
+            self.assertEqual(
+                qwen_capabilities.validate_qwen_capability_receipt(
+                    key=promoted_key,
+                    manifest_sha256=manifest,
+                    runtime_adapter="remote-docker",
+                    host="192.168.0.178",
+                    physical_gpu=physical_gpu,
+                ),
+                capability,
+            )
         with self.assertRaises(qwen_capabilities.QwenCapabilityError):
             qwen_capabilities.qwen_release_candidate_capability(
                 qwen_capabilities.RTX5000_RELEASE_CANDIDATE_KEY
             )
+
+    def test_178_release_receipt_rejects_every_evidence_mutation(self):
+        capability, _manifest = qwen_capabilities.qwen_runtime_capability(
+            qwen_capabilities.RTX5000_178_RELEASE_CAPABILITY_KEY
+        )
+        receipt = json.loads(
+            qwen_capabilities.RTX5000_178_RELEASE_RECEIPT_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+        mutations = (
+            (("status",), "provisional"),
+            (("capability_candidate_manifest_sha256",), "0" * 64),
+            (("host",), "192.168.0.180"),
+            (("runtime", "largest_sampled_memory_used_mib"), 42241),
+            (("gates", "semantic_mtp_requests_passed"), 14),
+            (("gates", "long_context_exact_recall"), False),
+            (("gates", "normal_aeon_workspace_pwd"), "/tmp"),
+            (("gates", "exact_teardown_and_release"), False),
+            (("raw_reports", "mtp_k3_sha256"), "0" * 64),
+            (("raw_reports", "normal_aeon_sha256"), "0" * 64),
+            (("raw_reports", "exact_teardown_sha256"), "0" * 64),
+        )
+        for path, value in mutations:
+            changed_receipt = copy.deepcopy(receipt)
+            selected = changed_receipt
+            for component in path[:-1]:
+                selected = selected[component]
+            selected[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(
+                qwen_capabilities.QwenCapabilityError
+            ):
+                qwen_capabilities._validate_packaged_remote_release_receipt(
+                    capability, json.dumps(changed_receipt).encode("utf-8")
+                )
+
+    def test_178_release_receipt_contains_no_transient_runtime_identifiers(self):
+        receipt = json.loads(
+            qwen_capabilities.RTX5000_178_RELEASE_RECEIPT_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+        forbidden_keys = {
+            "base_url",
+            "claim_id",
+            "container_id",
+            "container_name",
+            "endpoint",
+            "gpu_uuid",
+            "local_port",
+            "physical_gpu",
+            "pid",
+            "remote_port",
+            "run_dir",
+            "source_dir",
+            "ticket_id",
+        }
+
+        def walk(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    self.assertNotIn(key, forbidden_keys)
+                    yield from walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from walk(item)
+            elif isinstance(value, str):
+                yield value
+
+        strings = tuple(walk(receipt))
+        self.assertEqual(
+            [value for value in strings if value.startswith("/home/")],
+            ["/home/aday/NexusAgentDashboard/bc_aeon"],
+        )
+        for marker in ("://", "fd-", "fr-", "gc-"):
+            with self.subTest(marker=marker):
+                self.assertFalse(any(marker in value for value in strings))
+
+    def test_retired_manifest_is_recovery_only_and_key_scoped(self):
+        capability, current = qwen_capabilities.qwen_runtime_capability(
+            qwen_capabilities.LOCAL_DOCKER_CAPABILITY_KEY
+        )
+        retired = (
+            "52e2d54b70c14eefac3d5cae796b1f1ce40ececb95961a42d1c8ec6457254b6a"
+        )
+        receipt = {
+            "key": capability.key,
+            "manifest_sha256": retired,
+            "runtime_adapter": capability.runtime_adapter,
+            "host": capability.host,
+            "physical_gpu": 0,
+        }
+        self.assertNotEqual(retired, current)
+        with self.assertRaises(qwen_capabilities.QwenCapabilityError):
+            qwen_capabilities.validate_qwen_capability_receipt(**receipt)
+        self.assertEqual(
+            qwen_capabilities.validate_qwen_capability_receipt(
+                **receipt, allow_retired_manifest=True
+            ),
+            capability,
+        )
+        with self.assertRaises(qwen_capabilities.QwenCapabilityError):
+            qwen_capabilities.validate_qwen_capability_receipt(
+                **{**receipt, "key": qwen_capabilities.RTX5000_RELEASE_CANDIDATE_KEY},
+                allow_retired_manifest=True,
+            )
+
+    def test_current_manifest_snapshot_is_prepared_only_for_future_recovery(self):
+        prepared = (
+            "d36efd8a0b7b6c22bc10803b11bbc48ee61e9cc4893fef04aa230cb0ce223f96"
+        )
+        self.assertEqual(
+            qwen_capabilities._RETIRED_ENABLED_MANIFEST_KEYS[prepared],
+            frozenset(
+                {
+                    qwen_capabilities.LOCAL_DOCKER_CAPABILITY_KEY,
+                    qwen_capabilities.RTX5000_180_RELEASE_CAPABILITY_KEY,
+                }
+            ),
+        )
+        self.assertNotIn(
+            qwen_capabilities.RTX5000_RELEASE_CANDIDATE_KEY,
+            qwen_capabilities._RETIRED_ENABLED_MANIFEST_KEYS[prepared],
+        )
+        self.assertNotIn(
+            qwen_capabilities.RTX5000_178_RELEASE_CAPABILITY_KEY,
+            qwen_capabilities._RETIRED_ENABLED_MANIFEST_KEYS[prepared],
+        )
+
+
+class RetiredDirectReleaseGateTests(unittest.TestCase):
+    def test_direct_start_refuses_before_any_coordinator_or_runtime_action(self):
+        from aeon.scripts import gate_qwen38_rtx5000 as retired_gate
+
+        source = Path(retired_gate.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("from aeon.core.gpu_queue", source)
+        self.assertNotIn("reserve_named_lease(", source)
+        self.assertNotIn("start_managed_remote_runtime(", source)
+        with self.assertRaisesRegex(
+            runtime.QwenRuntimeError, "direct coordinator release-gate launch is retired"
+        ):
+            retired_gate.start()
 
 
 class ReservationTests(unittest.TestCase):
@@ -1109,6 +1378,25 @@ class ReservationTests(unittest.TestCase):
 
 
 class AdmissionIdentityTests(unittest.TestCase):
+    def test_stricter_remote_resource_floors_are_accepted_but_weaker_are_not(self):
+        stricter = runtime._validate_lease(
+            lease(min_disk_free_gb=80.0, min_shm_free_gb=24.0)
+        )
+        self.assertEqual(stricter["min_disk_free_gb"], 80.0)
+        self.assertEqual(stricter["min_shm_free_gb"], 24.0)
+
+        for field in (
+            "min_host_memory_gb",
+            "min_host_commit_gb",
+            "min_disk_free_gb",
+            "min_shm_free_gb",
+        ):
+            weakened = getattr(QWEN38_VLLM_PROFILE, field) - 0.5
+            with self.subTest(field=field), self.assertRaisesRegex(
+                runtime.QwenRuntimeError, "lease profile changed"
+            ):
+                runtime._validate_lease(lease(**{field: weakened}))
+
     def test_lease_receipt_uses_round_exclusive_local_gpu0_and_floors(self):
         value = lease()
         with patch.object(runtime, "_coord", return_value=completed(json.dumps(inventory_for(value)))):
@@ -1546,6 +1834,81 @@ class AdmissionIdentityTests(unittest.TestCase):
             with self.assertRaises(runtime.QwenRuntimeError):
                 runtime.load_artifact_identity(identity.model_dir, verify_payload=False)
 
+    def test_model_allows_exact_private_sha256_verification_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp:
+            baseline = make_model(Path(temp))
+            marker = add_model_verification_sidecar(baseline.model_dir)
+            identity = runtime.load_artifact_identity(
+                baseline.model_dir, verify_payload=False
+            )
+
+            self.assertEqual(identity.manifest_sha256, baseline.manifest_sha256)
+            self.assertEqual(identity.sha256s_sha256, baseline.sha256s_sha256)
+            self.assertEqual(identity.files, baseline.files)
+            self.assertEqual(identity.total_bytes, baseline.total_bytes + 65)
+            self.assertEqual(marker.stat().st_size, 65)
+            self.assertIn(marker.name, {item[0] for item in identity.file_stats})
+            runtime.revalidate_artifact_identity(identity)
+
+    def test_model_rejects_malformed_sha256_verification_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp:
+            identity = make_model(Path(temp))
+            marker = add_model_verification_sidecar(identity.model_dir)
+            exact = marker.read_bytes()
+            malformed_payloads = (
+                b"0" * 64 + b"\n",
+                exact[:-1],
+                exact + b"\n",
+                exact.upper(),
+            )
+            for payload in malformed_payloads:
+                with self.subTest(payload=payload):
+                    marker.write_bytes(payload)
+                    marker.chmod(0o600)
+                    with self.assertRaises(runtime.QwenRuntimeError):
+                        runtime.load_artifact_identity(
+                            identity.model_dir, verify_payload=False
+                        )
+
+    def test_model_rejects_unsafe_or_nonexclusive_verification_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp:
+            identity = make_model(Path(temp))
+            marker = add_model_verification_sidecar(identity.model_dir)
+            for mode in (0o400, 0o640, 0o700):
+                with self.subTest(mode=oct(mode)):
+                    marker.chmod(mode)
+                    with self.assertRaises(runtime.QwenRuntimeError):
+                        runtime.load_artifact_identity(
+                            identity.model_dir, verify_payload=False
+                        )
+            marker.chmod(0o600)
+            link = marker.with_name("marker-hardlink")
+            os.link(marker, link)
+            with self.assertRaises(runtime.QwenRuntimeError):
+                runtime.load_artifact_identity(identity.model_dir, verify_payload=False)
+
+    def test_model_sidecar_does_not_allow_any_other_extra_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            identity = make_model(Path(temp))
+            add_model_verification_sidecar(identity.model_dir)
+            extra = identity.model_dir / "generation_config.json"
+            extra.write_text("{}", encoding="utf-8")
+            extra.chmod(0o600)
+            with self.assertRaises(runtime.QwenRuntimeError):
+                runtime.load_artifact_identity(identity.model_dir, verify_payload=False)
+
+    def test_model_sidecar_is_bound_into_post_reserve_stat_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            baseline = make_model(Path(temp))
+            marker = add_model_verification_sidecar(baseline.model_dir)
+            identity = runtime.load_artifact_identity(
+                baseline.model_dir, verify_payload=False
+            )
+            marker.write_bytes(b"0" * 64 + b"\n")
+            marker.chmod(0o600)
+            with self.assertRaises(runtime.QwenRuntimeError):
+                runtime.revalidate_artifact_identity(identity)
+
     def test_model_hash_launcher_bypasses_env_shebang_and_uses_fixed_path(self):
         with tempfile.TemporaryDirectory() as temp:
             identity = make_model(Path(temp))
@@ -1593,6 +1956,7 @@ class AdmissionIdentityTests(unittest.TestCase):
                     current = current.parent
                 path.write_text(relative, encoding="utf-8")
                 path.chmod(0o600)
+            write_source_manifest(root)
             runtime._source_identity(root, root / "run")
             target = root / runtime.SOURCE_FILES[0]
             target.chmod(0o620)
@@ -1603,10 +1967,9 @@ class AdmissionIdentityTests(unittest.TestCase):
             with self.assertRaises(runtime.QwenRuntimeError):
                 runtime._source_identity(root, root / "run")
 
-    def test_source_receipt_covers_warmup_dependencies_and_host_launcher(self):
+    def test_source_receipt_covers_only_qwen_serving_dependencies(self):
         required = {
             "aeon/__init__.py",
-            "aeon/main.py",
             "aeon/core/__init__.py",
             "aeon/core/action_schema.py",
             "aeon/core/compute_profile.py",
@@ -1619,6 +1982,8 @@ class AdmissionIdentityTests(unittest.TestCase):
             "aeon/core/qwen_runtime.py",
             "aeon/core/sampling.py",
             "aeon/core/data/qwen38_mtp_selection.json",
+            "aeon/core/data/qwen38_rtx5000_178_128k_release_receipt.json",
+            "aeon/core/data/qwen38_rtx5000_128k_release_receipt.json",
             "aeon/core/data/qwen_runtime_capabilities.json",
             "aeon/scripts/vllm_uuid_sitecustomize.py",
             "aeon/scripts/warmup_qwen38_vllm.py",
@@ -1629,20 +1994,31 @@ class AdmissionIdentityTests(unittest.TestCase):
             root = make_source_tree(base)
             before = runtime._source_identity(root, base / "unused-run")
             for relative in (
-                "aeon/main.py",
                 "aeon/core/action_schema.py",
                 "aeon/core/qwen_capabilities.py",
                 "aeon/core/sampling.py",
+                "aeon/core/data/qwen38_rtx5000_178_128k_release_receipt.json",
+                "aeon/core/data/qwen38_rtx5000_128k_release_receipt.json",
                 "aeon/core/data/qwen_runtime_capabilities.json",
             ):
                 target = root / relative
                 original = target.read_bytes()
                 target.write_bytes(original + b"# changed\n")
                 target.chmod(0o600)
+                write_source_manifest(root)
                 after = runtime._source_identity(root, base / "unused-run")
                 self.assertNotEqual(after.manifest_sha256, before.manifest_sha256)
                 target.write_bytes(original)
                 target.chmod(0o600)
+                write_source_manifest(root)
+
+            main = root / "aeon/main.py"
+            main.write_bytes(b"# interactive harness change\n")
+            main.chmod(0o600)
+            self.assertEqual(
+                runtime._source_identity(root, base / "unused-run").manifest_sha256,
+                before.manifest_sha256,
+            )
 
     def test_staged_warmup_dependency_mutation_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1757,6 +2133,20 @@ print(json.dumps([
             plan["nodes"][0]["ctx"] = 262144
             environment["AEON_DEPLOY_PLAN"] = json.dumps(plan)
             with patch("aeon.core.mtp_tuning.load_selection", return_value=(3, {})), self.assertRaises(runtime.QwenRuntimeError):
+                runtime._planner_contract(
+                    environment, value, artifact, "sha256:" + "a" * 64,
+                    Path(temp), container_name="aeon_qwen_test", port=8033,
+                )
+
+    def test_flashinfer_attention_backend_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = make_model(Path(temp))
+            value = lease(Path(temp))
+            environment = deploy_environment()
+            environment["AEON_VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+            with patch(
+                "aeon.core.mtp_tuning.load_selection", return_value=(3, {})
+            ), self.assertRaises(runtime.QwenRuntimeError):
                 runtime._planner_contract(
                     environment, value, artifact, "sha256:" + "a" * 64,
                     Path(temp), container_name="aeon_qwen_test", port=8033,
@@ -3495,6 +3885,48 @@ class FinalOwnerTeardownTests(unittest.TestCase):
         heartbeat.stop.assert_not_called()
 
 
+class LoopbackHttpTests(unittest.TestCase):
+    def test_stdlib_loopback_get_streams_bounded_response_without_redirects(self):
+        response = Mock()
+        response.status = 200
+        response.headers = {"content-length": "2"}
+        response.read.side_effect = [b"{}", b""]
+        connection = Mock()
+        connection.getresponse.return_value = response
+
+        with patch.object(
+            runtime.http.client, "HTTPConnection", return_value=connection
+        ) as factory:
+            result = runtime._loopback_get(
+                "http://127.0.0.1:8033/v1/models", timeout=3
+            )
+            self.assertEqual(runtime._bounded_loopback_body(result, 32), b"{}")
+
+        factory.assert_called_once_with("127.0.0.1", 8033, timeout=3)
+        connection.request.assert_called_once_with(
+            "GET",
+            "/v1/models",
+            headers={"Accept": "application/json", "Connection": "close"},
+        )
+        response.close.assert_called_once_with()
+        connection.close.assert_called_once_with()
+
+    def test_loopback_get_rejects_every_nonliteral_destination(self):
+        for url in (
+            "http://localhost:8033/health",
+            "http://192.168.0.178:8033/health",
+            "https://127.0.0.1:8033/health",
+            "http://user@127.0.0.1:8033/health",
+            "http://127.0.0.1:80/health",
+            "http://127.0.0.1:8033/health#fragment",
+        ):
+            with self.subTest(url=url), patch.object(
+                runtime.http.client, "HTTPConnection"
+            ) as connection, self.assertRaises(runtime.QwenRuntimeError):
+                runtime._loopback_get(url, timeout=1)
+            connection.assert_not_called()
+
+
 class LoadingHeartbeatTests(unittest.TestCase):
     def test_schema6_teardown_finishes_before_fresh_admission(self):
         from aeon import main
@@ -3723,13 +4155,14 @@ class StaticIntegrationTests(unittest.TestCase):
         registry = qwen_capabilities.load_qwen_runtime_capabilities()
         self.assertEqual(
             [item.host for item in registry.enabled],
-            ["192.168.0.177", "192.168.0.180"],
+            ["192.168.0.177", "192.168.0.178", "192.168.0.180"],
         )
         self.assertTrue(
             all(
                 not item.enabled
                 for item in registry.capabilities
-                if item.host not in {"192.168.0.177", "192.168.0.180"}
+                if item.host
+                not in {"192.168.0.177", "192.168.0.178", "192.168.0.180"}
             )
         )
         self.assertIn("enabled_qwen_runtime_capabilities", main_source)

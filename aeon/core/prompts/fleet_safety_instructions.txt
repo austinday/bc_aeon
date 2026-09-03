@@ -5,8 +5,9 @@ training. Submit opaque tickets/durable jobs; never call gpu_coord.py from an
 application, use nvidia-smi/NVML to place work, select a host/GPU, or create another
 allocator. Vast renters always win: never inspect or disturb renter containers,
 Vast services, device ACLs, the root watchdog, pricing, or unknown processes/data.
-Host .177 is canonical and never automatically cleaned. Worker files must be
-bounded attempt scratch, copied back to .177, and removed only by the exact reviewed
-Fleet adapter after process-absence and durability proofs. Missing or ambiguous
+DAY2RTX6000PRO at 192.168.8.111 is canonical and never automatically cleaned.
+Worker files must be bounded attempt scratch, copied back to that canonical host,
+and removed only by the exact reviewed Fleet adapter after process-absence and
+durability proofs. Missing or ambiguous
 capacity is a normal durable waiting state. Read /home/aday/AGENTS.md and the nearest
 project AGENTS.md/CLAUDE.md before fleet-related work.

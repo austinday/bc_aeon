@@ -1,0 +1,55 @@
+{
+  "schema_version": "aeon-qwen38-flash-next-quant-resume-source-v1",
+  "complete": true,
+  "canonical_root": "/home/aday/.local/state/fleet-compute/artifacts/aeon-qwen38-flash-next-build/fr-f373582e1dc84651b212ab76f6b05436",
+  "source_runtime": {
+    "runtime_id": "fr-f373582e1dc84651b212ab76f6b05436",
+    "profile_id": "aeon-qwen38-flash-next-build-v2",
+    "job_id": "fj-eee786d1f0d94ddb893e6f492e2c58f6",
+    "state": "stopped",
+    "process_absent": true,
+    "pid": 2220878,
+    "modelopt_pid": 2352061,
+    "claim_id": "gc-20260827T052145Z-b8d9e52f",
+    "owner": "aeon-qwen38-flash-next-build-day2rtx6000pro-20260827T052145Z-8a439d",
+    "host": "192.168.0.177",
+    "physical_gpu": 0,
+    "deployment_revision": "c2567378dee35f1f3e7bf9f008af410d1a6d344a1adbd71461908c2e3b6b6703",
+    "request_sha256": "ec34659a33773cfbdda3cfc1986c1b7372fe53903c0d410e6645d1fc6c49df7c",
+    "process_identity": "aeon-flash-next-build:fr-f373582e1dc84651b212ab76f6b05436:ec34659a33773cfbdda3cfc1986c1b7372fe53903c0d410e6645d1fc6c49df7c:2220878"
+  },
+  "storage": {
+    "state": "complete",
+    "output_settled": true,
+    "cleanup_complete": true,
+    "reclaimed_bytes": 0,
+    "canonical_output_path": "/home/aday/.local/state/fleet-compute/artifacts/aeon-qwen38-flash-next-build/fr-f373582e1dc84651b212ab76f6b05436"
+  },
+  "coordinator_release": {
+    "event_id": 14263,
+    "happened_at": "2026-08-27T06:07:23+00:00",
+    "event_type": "released",
+    "claim_id": "gc-20260827T052145Z-b8d9e52f",
+    "owner": "aeon-qwen38-flash-next-build-day2rtx6000pro-20260827T052145Z-8a439d",
+    "detail": "retrying cancelled batch runtime stop"
+  },
+  "receipts": {
+    "qwen-flash-next-build-request.json": {"sha256": "ec34659a33773cfbdda3cfc1986c1b7372fe53903c0d410e6645d1fc6c49df7c", "size": 11340},
+    "spawn.json": {"sha256": "948f902432192fa58a544e6d6599b16234ea10a2f0694c773fe91d3ae5bdea35", "size": 262},
+    "output/preflight.json": {"sha256": "65d99586ed83a5d3c4e7fe748c970f4e3fb160567ef581458f3c555468c5ee82", "size": 1321},
+    "output/result.json": {"sha256": "f5372ca52990f84663d0ef14a39ad35251716cc4426d9328388fa3b0ecf074b7", "size": 203},
+    "output/builder-result.json": {"sha256": "3898fd6f4270893c20474aad8569bddee2cc09251dd864db590ee6af6a23414d", "size": 217},
+    "output/MANIFEST.sha256": {"sha256": "ff4dc2aa13cbdee4532144f8d057746264bef2fdaa6a8eaa02fd1f2b8c5fb7e1", "size": 321},
+    "hybrid/HYBRID_MANIFEST.json": {"sha256": "62b757cef2cffb6603008ca514ecb080d01662aed73dead87ad93b7a3b0858aa", "size": 20214},
+    "behavior-receipt.json": {"sha256": "a08184ae3d312710316fa74544490bd9dee0acfd6d54b28ef0a23bf4dfdc0c01", "size": 762},
+    "behavior-adapter/aeon_behavior_manifest.json": {"sha256": "551c64ae0bba8f807774ec283eb8e94488b7bab2edc65cdf65c54df19db79966", "size": 37009}
+  },
+  "failure_boundary": {
+    "result_failure": "NVFP4 builder failed",
+    "builder_failure": "ModelOpt NVFP4QTensor could not be imported",
+    "final_model_absent": true,
+    "official_untuned_model_absent": true,
+    "sibling_manifest_absent": true,
+    "quantized_layer_files": 0
+  }
+}

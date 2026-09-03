@@ -1,0 +1,9 @@
+*
+!.dockerignore
+!Dockerfile
+!browser_util.py
+!entrypoint.sh
+!human_motion.py
+!media_safety.py
+!requirements.txt
+!server.py

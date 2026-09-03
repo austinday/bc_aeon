@@ -1,0 +1,70 @@
+# PUBLISHING SKILL: Aday Labs mailboxes and subdomain products
+
+## When to use
+
+Use when the owner asks to create or disable an `@adaylabs.com` mailbox, build or
+publish a demonstration/product website at a first-level `adaylabs.com` subdomain,
+or plan the associated Cloudflare DNS/tunnel handoff. Do not use for unrelated
+domains, ordinary email reading/sending, or a site that is not being published.
+
+## Preconditions
+
+- This playbook is guidance, not authority. Require the current request to name
+  the mailbox or hostname and explicitly authorize any external publication.
+- Read `/home/aday/website_hosting/ADAYLABS_PUBLISHING.md` completely when the
+  file is available to the current workspace. It is the canonical maintained
+  procedure and wins over this summary.
+- Distinguish `name@adaylabs.com` (an application mailbox) from
+  `label.adaylabs.com` (a website) and `name@label.adaylabs.com` (a separate mail
+  domain requiring separate explicit design and authorization).
+- Never request, display, copy, or embed a Cloudflare token. The only canonical
+  registry is `/home/aday/CloudfareCredentials.txt`, and a sandbox refusal to read
+  it is an intended capability boundary.
+
+## Mailbox procedure
+
+1. Validate the requested local part and preserve the exact requested display
+   name. Do not create per-address DNS, MX, Worker, or forwarding rules.
+2. When the current workspace can access the owner-local site project, run:
+
+   `cd /home/aday/website_hosting/adaylabs-mail && python manage.py create LOCAL_PART --display-name "DISPLAY NAME"`
+
+3. Verify the exact enabled address through `python manage.py list`. Do not print
+   message bodies or unrelated mailbox data.
+4. Disabling retains stored messages but rejects new delivery. It requires the
+   owner to identify the exact target and the command's exact confirmation:
+
+   `python manage.py disable LOCAL_PART --confirm LOCAL_PART@adaylabs.com`
+
+   Never disable `inbox@adaylabs.com` or edit the live SQLite database directly.
+
+## Website procedure
+
+1. Validate one first-level label and inspect existing source, public behavior,
+   DNS, tunnel ingress, wildcard/delegation, and ownership before building.
+   `mail.adaylabs.com`, apex email records, `_dmarc`, and `_domainkey` records are
+   protected system state.
+2. Build a task-owned CPU origin below `/home/aday/website_hosting` with semantic
+   health, exact-Host restriction, resource limits, an unprivileged/read-only
+   container, no host port, and the existing private `bcsite_default` network.
+   Any GPU-backed component remains a Fleet Compute client.
+3. If the runtime lacks credential/network capability, stop at a verified origin
+   and report an exact publication handoff. Do not bypass the sandbox or claim the
+   site is live.
+4. An authorized native capability must read the full publication runbook, load
+   the existing owner-only credential without output, re-resolve the exact active
+   zone and tunnel, hold the shared Cloudflare lock, preserve every unrelated
+   ingress rule, and create only the exact task-owned proxied CNAME.
+5. Private/admin/mutation surfaces require Cloudflare Access before DNS plus both
+   unauthenticated-denial and authorized-success proofs. Public demonstrations
+   still require TLS, redirect, semantic identity, and unchanged apex/mail state.
+6. Finish with a secret-free receipt containing exact object identities, hashes,
+   verification, and task-owned rollback information. Never purchase a paid
+   feature without explicit price authorization.
+
+## Verification and completion
+
+Report exactly one truthful outcome: the mailbox is enabled; the exact site URL
+is live and verified; or the origin is ready but publication is blocked on a named
+capability/conflict. A local build, open port, unverified DNS response, or
+capability-denied handoff is not a live product.

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -37,7 +39,10 @@ def _state() -> dict:
         "gpu_uuid": "GPU-12345678-abcd",
         "claim_id": "gc-test-remote",
         "owner": "owner-test-remote",
-        "run_dir": "/home/aday/.aeon/runtime/qwen38/aeon-test-owner",
+        "run_dir": (
+            "/home/aday/.aeon/runtime/qwen38/"
+            "aeon-qwen38-vllm-owner-test-remote"
+        ),
         "source_manifest_sha256": "1" * 64,
         "model_manifest_sha256": capability.model_manifest_sha256,
         "model_sha256s_sha256": capability.model_sha256s_sha256,
@@ -55,6 +60,96 @@ def _state() -> dict:
 
 
 class RemoteStateTests(unittest.TestCase):
+    def test_remote_worker_source_imports_under_isolated_python(self):
+        package_root = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                (
+                    "import sys; sys.modules['requests']=None; "
+                    "sys.modules['fleet_compute']=None; "
+                    "sys.path.insert(0, sys.argv[1]); "
+                    "import aeon.scripts.qwen_remote_worker"
+                ),
+                str(package_root),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fleet_tree_payload_receipts_are_verified_then_canonicalized(self):
+        capability, _manifest = _remote_capability()
+        source_digest = "1" * 64
+        image_digest = str(capability.image_id).removeprefix("sha256:")
+        source = qwen_runtime.SourceIdentity(
+            package_root=Path("/unused"),
+            stage_dir=Path("/unused"),
+            manifest_sha256=source_digest,
+            manifest_bytes=b"",
+            file_sha256=(),
+        )
+
+        def binding(
+            artifact_id: str,
+            kind: str,
+            digest: str,
+            *,
+            size_bytes: int,
+            inode_count: int,
+        ) -> dict[str, object]:
+            return {
+                "artifact_id": artifact_id,
+                "kind": kind,
+                "worker_path": str(fleet._cache_entry_path(digest)),
+                "digest_sha256": digest,
+                "size_bytes": size_bytes,
+                "inode_count": inode_count,
+                "filesystem_id": "66306",
+                "payload_sha256": digest,
+            }
+
+        bindings = {
+            fleet.QWEN_SOURCE_CACHE_ARTIFACT_ID: binding(
+                fleet.QWEN_SOURCE_CACHE_ARTIFACT_ID,
+                "manifested_tree",
+                source_digest,
+                size_bytes=100,
+                inode_count=2,
+            ),
+            fleet.QWEN_MODEL_CACHE_ARTIFACT_ID: binding(
+                fleet.QWEN_MODEL_CACHE_ARTIFACT_ID,
+                "manifested_tree",
+                capability.model_sha256s_sha256,
+                size_bytes=200,
+                inode_count=22,
+            ),
+            fleet.QWEN_IMAGE_CACHE_ARTIFACT_ID: binding(
+                fleet.QWEN_IMAGE_CACHE_ARTIFACT_ID,
+                "oci_archive",
+                image_digest,
+                size_bytes=229,
+                inode_count=1,
+            ),
+        }
+
+        request = fleet.qwen_remote_artifact_cache(
+            capability, source, bindings
+        ).to_request()
+
+        self.assertNotIn("payload_sha256", request["source"])
+        self.assertNotIn("payload_sha256", request["model"])
+        self.assertEqual(request["image"]["payload_sha256"], image_digest)
+
+        bindings[fleet.QWEN_MODEL_CACHE_ARTIFACT_ID]["payload_sha256"] = "0" * 64
+        with self.assertRaisesRegex(QwenRuntimeError, "cache binding changed"):
+            fleet.qwen_remote_artifact_cache(capability, source, bindings)
+
     def test_receipt_binds_capability_lease_runtime_and_tunnel_fields(self):
         state = _state()
         self.assertEqual(fleet._validate_remote_state(state), state)
@@ -101,6 +196,10 @@ class RemoteStateTests(unittest.TestCase):
             "claim_id": state["claim_id"],
             "container_id": state["container_id"],
             "container_pid": state["container_pid"],
+            "run_dir": state["run_dir"],
+            "physical_gpu": state["physical_gpu"],
+            "gpu_uuid": state["gpu_uuid"],
+            "owner": state["owner"],
         }
         with patch.object(fleet, "remote_state", return_value=state), patch.object(
             fleet, "_capability_for_state", return_value=(capability, "f" * 64)
@@ -115,6 +214,101 @@ class RemoteStateTests(unittest.TestCase):
                     fleet, "remote_call", return_value={**active, field: value}
                 ):
                     self.assertEqual(fleet.remote_runtime_liveness(), "ambiguous")
+
+    def test_pre_cache_ready_receipt_still_probes_and_stops(self):
+        old_source = (
+            "49ccbbb5bd4ef96f1fef48added9e7625838acb0e8e296dc8eff0b2003fd9491"
+        )
+        old_manifest = (
+            "be70339f04d54ba9a2fc71267d1bfa9edd3fec6687dd721f27523c12c4674981"
+        )
+        state = {
+            **_state(),
+            "source_manifest_sha256": old_source,
+            "runtime_capability_manifest_sha256": old_manifest,
+        }
+        capability, _current_manifest = _remote_capability()
+        status = {
+            "ok": True,
+            "state": "active",
+            **{
+                field: state[field]
+                for field in (
+                    "run_dir",
+                    "physical_gpu",
+                    "gpu_uuid",
+                    "claim_id",
+                    "owner",
+                    "container_id",
+                    "container_pid",
+                )
+            },
+        }
+        stopped = {
+            "ok": True,
+            "state": "stopped",
+            "scratch_cleaned": True,
+            **{
+                field: state[field]
+                for field in (
+                    "run_dir",
+                    "physical_gpu",
+                    "gpu_uuid",
+                    "claim_id",
+                    "owner",
+                )
+            },
+        }
+        calls = []
+
+        def remote_call(_capability, source, action, _request, **_kwargs):
+            calls.append((source, action))
+            return {
+                "status": status,
+                "stop": stopped,
+                "clear": {"ok": True, "state": "cleared", "receipt_absent": True},
+            }[action]
+
+        with tempfile.TemporaryDirectory() as temp:
+            receipt = Path(temp) / "remote-runtime.json"
+            receipt.write_text("{}", encoding="utf-8")
+            receipt.chmod(0o600)
+            with patch.object(fleet, "REMOTE_STATE_FILE", receipt), patch.object(
+                fleet, "remote_state", return_value=state
+            ), patch.object(
+                fleet, "_capability_for_state", return_value=(capability, old_manifest)
+            ), patch.object(fleet, "remote_call", side_effect=remote_call), patch.object(
+                fleet, "stop_tunnel", return_value=True
+            ), patch.object(fleet, "_private_json_write"):
+                self.assertEqual(fleet.remote_runtime_liveness(), "active")
+                source = qwen_runtime.SourceIdentity(
+                    package_root=Path("/unused"),
+                    stage_dir=Path("/unused"),
+                    manifest_sha256=old_source,
+                    manifest_bytes=b"",
+                    file_sha256=(),
+                )
+                self.assertTrue(
+                    fleet.stop_managed_remote_runtime(
+                        capability,
+                        old_manifest,
+                        source,
+                        release_reason="rolling compatibility test",
+                        release_claim=False,
+                    )
+                )
+        self.assertEqual(
+            calls,
+            [
+                (old_source, "status"),
+                (old_source, "status"),
+                (old_source, "stop"),
+                (old_source, "clear"),
+            ],
+        )
+        command = fleet._remote_command(capability, old_source, "status", None)
+        self.assertIn(str(fleet.REMOTE_RELEASE_ROOT / old_source), " ".join(command))
+        self.assertNotIn("-I", command)
 
 
 class RemoteTransportTests(unittest.TestCase):
@@ -141,7 +335,10 @@ class RemoteTransportTests(unittest.TestCase):
         state = _state()
         capability, _manifest = _remote_capability()
         expected = fleet._tunnel_argv(
-            capability, state["remote_port"], state["tunnel_nonce"]
+            capability,
+            state["local_port"],
+            state["remote_port"],
+            state["tunnel_nonce"],
         )
         self.assertIn(f"tunnel-{state['tunnel_nonce']}.sock", " ".join(expected))
         with patch.object(fleet, "_process_create_time", return_value=999), patch.object(
@@ -152,6 +349,60 @@ class RemoteTransportTests(unittest.TestCase):
             fleet, "_process_argv", return_value=[*expected, "extra"]
         ):
             self.assertFalse(fleet.tunnel_is_exact(state))
+
+    def test_tunnel_lifecycle_never_scans_or_adopts_global_processes(self):
+        source = Path(fleet.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('Path("/proc").iterdir()', source)
+        self.assertNotIn("def _tunnel_candidates", source)
+
+    def test_tunnel_refuses_preexisting_pidless_launch_intent(self):
+        state = {
+            **_state(),
+            "tunnel_pid": None,
+            "tunnel_create_time": None,
+        }
+        capability, _manifest = _remote_capability()
+        receipt = Path("/tmp/not-written.json")
+        with patch.object(
+            fleet, "_remote_state_entry", return_value=(state, receipt, True)
+        ), patch.object(fleet, "_private_json_write") as write, patch.object(
+            fleet.subprocess, "Popen"
+        ) as popen:
+            with self.assertRaisesRegex(QwenRuntimeError, "intent is ambiguous"):
+                fleet.start_tunnel(capability, state)
+        write.assert_not_called()
+        popen.assert_not_called()
+
+    def test_tunnel_health_response_is_streamed_and_bounded(self):
+        class Response:
+            headers = {"content-length": str(64 * 1024 + 1)}
+
+            def close(self):
+                self.closed = True
+
+            def iter_content(self, **_kwargs):
+                raise AssertionError("advertised oversize must fail before reading")
+
+        response = Response()
+        with self.assertRaisesRegex(QwenRuntimeError, "exceeded"):
+            fleet._bounded_loopback_body(response, 64 * 1024)
+        self.assertTrue(response.closed)
+
+    def test_stop_tunnel_refuses_identity_drift_after_sigterm(self):
+        state = _state()
+        with patch.object(
+            fleet, "tunnel_liveness", side_effect=["active", "ambiguous"]
+        ), patch.object(fleet.os, "kill") as kill:
+            self.assertFalse(fleet.stop_tunnel(state))
+        kill.assert_called_once_with(state["tunnel_pid"], fleet.signal.SIGTERM)
+
+    def test_stop_tunnel_accepts_only_exact_pid_absence_after_sigterm(self):
+        state = _state()
+        with patch.object(
+            fleet, "tunnel_liveness", side_effect=["active", "gone"]
+        ), patch.object(fleet.os, "kill") as kill:
+            self.assertTrue(fleet.stop_tunnel(state))
+        kill.assert_called_once_with(state["tunnel_pid"], fleet.signal.SIGTERM)
 
     def test_only_observational_remote_calls_retry(self):
         capability, _manifest = _remote_capability()

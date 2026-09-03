@@ -15,7 +15,8 @@ class ExpandSkillsCategory(BaseTool):
         if not self.worker:
             return "Error: Worker not initialized."
         
-        self.worker.expanded_categories.add(category_path)
+        skill_key = f"skill:{category_path}"
+        self.worker.expanded_categories.add(skill_key)
         return f"Skill category '{category_path}' has been expanded."
 
 class CollapseSkillsCategory(BaseTool):
@@ -32,7 +33,8 @@ class CollapseSkillsCategory(BaseTool):
         if not self.worker:
             return "Error: Worker not initialized."
         
-        if category_path in self.worker.expanded_categories:
-            self.worker.expanded_categories.remove(category_path)
+        skill_key = f"skill:{category_path}"
+        if skill_key in self.worker.expanded_categories:
+            self.worker.expanded_categories.remove(skill_key)
             return f"Skill category '{category_path}' has been collapsed."
         return f"Skill category '{category_path}' was not expanded."

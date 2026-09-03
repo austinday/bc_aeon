@@ -52,7 +52,20 @@ recovery context, with cancellable 2/5/15/30/60-second backoff for equivalent
 failures. The next cycle must change source, method, hypothesis, modality, scale, or
 contribution instead of retrying an unchanged obstacle. A cycle final is therefore
 a checkpoint, not evidence that continuous demand is exhausted or permission to
-turn the mode off.
+turn the mode off. Generation-budget failures contain no executed action or task
+evidence, so their exact synthetic continuous-prompt/failure pairs are removed
+from the next model projection instead of accumulating as a self-reinforcing loop;
+the terminal harness message itself is not replayed into model history, and its
+dangling synthetic prompt is discarded at the failure boundary. Legacy pairs are
+also removed while restoring a checkpoint, before any new model projection can
+see them. After three
+semantically identical failed or blocked cycles, the CLI opens a circuit and yields
+at its ordinary prompt rather than generating a fourth unchanged retry. Six
+consecutive failed/blocked cycles also open the circuit, so alternating error text
+cannot evade the liveness bound. The saved
+continuous setting and goal remain enabled, so a user message, managed restart,
+configuration correction, or mode toggle can resume from durable context. The
+owner-visible transcript and all successful assistant/tool groups are retained.
 
 Continuous research also preserves the ordinary evidence boundary. Retained
 receipts are historical evidence, not authorization or automatic current
@@ -125,13 +138,19 @@ forks and public collaborator agents cannot transfer durable skills.
 For a genuinely multi-step request, `updated_plan` is a concise user-visible
 Markdown checklist rather than a hidden thought summary. The harness separately
 compiles conservative owner-authored acceptance leaves (`G1`, `G2`, ...); the model
-cannot satisfy them by checking off its own plan. Mutations and validators on a
-complex request carry `goal_refs` before execution, aggregate goals cannot receive
-evidence directly, and every leaf retains its own typed mutation, inspection,
-validation, or invariant receipts. A later consequential mutation invalidates old
-positive validation, and an invariant observes every mutation even when the model
-omits that invariant's ID. If an unusually large request exceeds the bounded goal
-compiler, completion fails explicitly instead of silently dropping criteria.
+cannot satisfy them by checking off its own plan. `goal_refs` remain available as
+optional precision hints, but the normal path binds typed receipts to matching leaf
+targets after execution so the model does not have to operate internal bookkeeping.
+Explicit aggregate refs are rejected, inferred evidence cannot cross unrelated
+leaves, and every leaf retains its own typed mutation, inspection, validation, or
+invariant receipts. A later relevant mutation invalidates old positive validation,
+and an invariant observes every mutation even when the model omits that invariant's
+ID. If an unusually large request exceeds the bounded goal compiler, completion
+fails explicitly instead of silently dropping criteria.
+Directive framing such as “your goal is to,” “you must,” “make sure to,” and a
+bounded conditional preamble does not hide the action that follows it. Explicit
+selection limits and parenthesized prohibitions become invariant leaves, while
+research, build, publication, and documentation clauses retain separate evidence.
 
 Aeon publishes each material checklist revision as a bounded, redacted `plan`
 transcript record; an empty record clears a previous request's checklist. Nexus can
@@ -165,6 +184,11 @@ account, platform, site, or operation while recovering. A targetless request yie
 only for the concrete missing scope; “Should I proceed?” and other generic
 permission questions are rejected when the owner's request already grants the
 necessary authority.
+Quoted copy is excluded from authority classification, and descriptive modifiers
+such as “authenticated,” “credentialed,” or “current” are never treated as literal
+recipients or account names. Typed provider tools contribute their immutable
+platform as observed scope, and platform-specific operation synonyms are
+canonicalized only through reviewed metadata; they are not global aliases.
 
 A mutation is an observation boundary: later actions and success prose are
 deferred to a new model decision. Mutation requests need a successful change
@@ -205,10 +229,17 @@ automatic deletion.
 
 The model loop is finite independently of model compliance. One request gets at
 most 64 decision turns. One decision and all of its recovery/search calls share a
-six-call, 12,288-completion-token, 90-second generation budget; if candidate search
+six-call, 65,536-completion-token, 1,800-second generation budget; if candidate search
 has already produced a valid proposal, later budget exhaustion retains that
-proposal instead of wasting the decision. The support-model path has its own
-smaller shared ceiling.
+proposal instead of wasting the decision. If the attempt still exhausts that
+budget before a usable turn, the worker permits one separate compact recovery:
+candidate search and hidden thinking are disabled, its prompt reserves only the
+smaller output allowance, and one low-effort semantic generation shares an
+8,192-output-token aggregate, six-call compatibility-negotiation, 180-second wall
+budget. A proposal-specific length exhaustion does not abort a still-affordable
+independent candidate; if none succeeds, the typed generation-budget failure is
+preserved rather than being converted to a generic retryable error. The support-
+model path has its own smaller shared ceiling.
 
 No-progress handling is event-triggered rather than a fixed retry counter. The
 first grounded failure bars the exact call and requests diagnosis; recurrence

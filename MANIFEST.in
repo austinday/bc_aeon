@@ -1,0 +1,4 @@
+include README.md
+include docs/BENCHMARKS.md
+include docs/HARNESS_PROTOCOL.md
+include docs/OPENCODE_HARNESS.md

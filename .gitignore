@@ -23,6 +23,9 @@ data/
 !aeon/core/data/
 !aeon/core/data/qwen38_mtp_selection.json
 aeon_output/
+# Raw per-run benchmark and qualification reports remain owner-local. Reviewed,
+# sanitized release-control evidence belongs under aeon/core/data instead.
+insights/*/*.json
 
 # IDEs
 .vscode/

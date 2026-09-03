@@ -1,0 +1,24 @@
+# Runtime-attestation overlay for the split Qwen3.8 target/draft MoE backend
+# canary.  The parent is the exact already-qualified PLE/placement image; this
+# layer changes only engine-native receipt coverage and never changes kernels.
+# BuildKit resolves a local OCI manifest digest through a registry even with
+# --pull=false.  Use the local immutable-content tag, then fail closed on both
+# the inherited attestation bytes below and the recorded parent manifest.
+ARG BASE_IMAGE=aeon/vllm:qwen38-flash-next-radixark-ple-fp8-attested-80459aac
+FROM ${BASE_IMAGE}
+
+ARG PARENT_ATTESTATION_SOURCE_SHA256=80459aacc387a5a70c46a3bbbb17322fe7f93e4dc30fc7e12b70da923bc34d17
+ARG ATTESTATION_SOURCE_SHA256
+
+RUN test "$(sha256sum /usr/local/lib/python3.12/dist-packages/vllm/qwen38_flash_next_attestation.py | cut -d' ' -f1)" = "${PARENT_ATTESTATION_SOURCE_SHA256}"
+
+COPY qwen38_flash_next_attestation.py /usr/local/lib/python3.12/dist-packages/vllm/qwen38_flash_next_attestation.py
+
+RUN test -n "${ATTESTATION_SOURCE_SHA256}" \
+    && test "$(sha256sum /usr/local/lib/python3.12/dist-packages/vllm/qwen38_flash_next_attestation.py | cut -d' ' -f1)" = "${ATTESTATION_SOURCE_SHA256}" \
+    && python3 -m py_compile /usr/local/lib/python3.12/dist-packages/vllm/qwen38_flash_next_attestation.py
+
+LABEL com.bc_aeon.component="qwen38-flash-next-radixark-ple-fp8-b12x-attested" \
+      com.bc_aeon.parent.manifest="sha256:277f87d25d8c8559849bcec660816efed1b25a3ae4701e6bbd5f815589e3af45" \
+      com.bc_aeon.attestation.parent-source.sha256="${PARENT_ATTESTATION_SOURCE_SHA256}" \
+      com.bc_aeon.attestation.source.sha256="${ATTESTATION_SOURCE_SHA256}"

@@ -47,7 +47,7 @@ class FakeStore:
 
 
 class TestProjectManagerLifecycle(unittest.TestCase):
-    def test_canonical_record_is_uuid_shaped_exact_home_and_dormant(self):
+    def test_canonical_record_is_uuid_shaped_home_workspace_and_dormant(self):
         record = build_project_manager_record(default_model="fixture-model", now=123.5)
 
         self.assertEqual(uuid.UUID(hex=PROJECT_MANAGER_INSTANCE_ID).hex, record["id"])
@@ -107,7 +107,7 @@ class TestProjectManagerLifecycle(unittest.TestCase):
     def test_current_workspace_is_mutable_runtime_state(self):
         store = FakeStore()
         record = build_project_manager_record(default_model="fixture", now=100)
-        record["workspace"] = "/home/aday/dashboard"
+        record["workspace"] = "/home/aday/NexusAgentDashboard/dashboard"
         store.rows[record["id"]] = record
 
         existing, was_created = ensure_project_manager(
@@ -115,7 +115,7 @@ class TestProjectManagerLifecycle(unittest.TestCase):
         )
 
         self.assertFalse(was_created)
-        self.assertEqual(existing["workspace"], "/home/aday/dashboard")
+        self.assertEqual(existing["workspace"], "/home/aday/NexusAgentDashboard/dashboard")
         self.assertEqual(store.create_calls, [])
 
     def test_user_facing_name_is_mutable_without_changing_protected_identity(self):

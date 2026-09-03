@@ -3,16 +3,15 @@ import gzip
 import hashlib
 import re
 import time
-import sys
 import os
 import psutil
 import stat
 from datetime import datetime, timezone
 from collections import deque
 from pathlib import Path
-from typing import List, Any, Dict, Callable, Optional
+from typing import List, Any, Callable, Optional
 
-from .llm import DecisionGenerationBudgetExceeded, LLMClient
+from .llm import DecisionGenerationBudget, DecisionGenerationBudgetExceeded, LLMClient
 from .durable_agent_guard import (
     DurableAgentTurnGuard,
     INTENT_CAPABILITY,
@@ -69,7 +68,6 @@ from .prompts import (
     CORE_DIRECTIVES,
     DOCKER_DIRECTIVES,
     IMPORTANT_REMINDERS,
-    PRIMARY_AGENT_INSTRUCTIONS,
     TOOLS_SECTION,
     OBJECTIVE_SECTION,
     load_prompt,
@@ -150,6 +148,23 @@ INCIDENTAL_PARAM_KEYS = frozenset({
 # model turns after the harness had already recognized a loop.  Explicit CLI/UI
 # limits still win; this is the generous harness-owned backstop when none is set.
 DEFAULT_MAX_DECISION_TURNS = 64
+
+# A generation-budget retry is a liveness escape hatch, not another full search.
+# Keeping xhigh reasoning and a 32K allowance reproduced the same hidden-reasoning
+# loop byte-for-byte until the server's length ceiling.  One low-effort 8K attempt
+# is ample for the schema envelope plus one small action and fails quickly if the
+# served model is still unable to terminate.
+COMPACT_GENERATION_RECOVERY_TOKENS = 8_192
+COMPACT_GENERATION_RECOVERY_MODEL_CALLS = 6
+COMPACT_GENERATION_RECOVERY_WALL_SECONDS = 180.0
+
+_CONTINUOUS_OBJECTIVE_PREFIX = (
+    "CONTINUOUS MODE: Begin another autonomous work cycle toward the durable "
+)
+_GENERATION_BUDGET_FAILURE_PREFIX = (
+    "Aeon stopped after both the initial generation and one automatic compact "
+    "recovery exhausted their finite local generation backstops"
+)
 
 # Session checkpoints are rewritten at tool/decision boundaries, so every
 # persisted collection must remain strictly bounded.  Eight MiB is generous for
@@ -400,6 +415,7 @@ class Worker:
         # contracts (and checkpoints) until a genuinely new owner request starts.
         self._untrusted_collaborator_influence = False
         self._next_request_is_continuous = False
+        self._active_request_is_continuous = False
         self._continuous_authority_goal = ""
         self._continuous_recovery_context = ""
         self._last_turn_tool_results: List[ToolResult] = []
@@ -753,15 +769,9 @@ class Worker:
     def _get_active_tool_directives(self) -> str:
         """Collect directives from currently expanded categories and all active tools
         (top-level tools + tools in expanded categories)."""
-        from aeon.tools.categories import (
-            TOP_LEVEL_TOOLS, 
-            get_all_categorized_tools, get_tools_in_category
-        )
         from aeon.core.prompts.manager import load_cat_prompt, load_tool_prompt
         
         active_directives = []
-        categorized = get_all_categorized_tools()
-        
         # Determine which tools are currently "active" (visible)
         active_tool_names = self._active_tool_names()
             
@@ -1846,6 +1856,7 @@ class Worker:
                                   if isinstance(m, dict) and m.get('role') in
                                   {'system', 'user', 'assistant', 'tool'}]
         self._restore_history_archive_metadata(state)
+        self._prune_actionless_generation_history()
         self._restore_strategy_events(state)
         self._history_seeded = bool(self._history_messages)
         self._trim_history()
@@ -2573,6 +2584,7 @@ class Worker:
                                   if isinstance(m, dict) and m.get('role') in
                                   {'system', 'user', 'assistant', 'tool'}]
         self._restore_history_archive_metadata(data)
+        self._prune_actionless_generation_history()
         self._restore_strategy_events(data)
         self._history_seeded = bool(self._history_messages)
         self._trim_history()
@@ -2696,6 +2708,7 @@ class Worker:
             and message.get("role") in {"system", "user", "assistant", "tool"}
         ]
         self._restore_history_archive_metadata(data)
+        self._prune_actionless_generation_history()
         self._restore_strategy_events(data)
         self._history_seeded = bool(self._history_messages)
         self._trim_history()
@@ -2952,6 +2965,7 @@ class Worker:
                 and message.get("role") in {"user", "assistant", "tool"}
             ]
             self._restore_history_archive_metadata(data)
+            self._prune_actionless_generation_history()
             self._restore_strategy_events(data)
             self._history_seeded = bool(self._history_messages)
             self._trim_history()
@@ -3018,6 +3032,7 @@ class Worker:
                                       if isinstance(m, dict) and m.get('role') in
                                       {'system', 'user', 'assistant', 'tool'}]
             self._restore_history_archive_metadata(data)
+            self._prune_actionless_generation_history()
             self._restore_strategy_events(data)
             self._history_seeded = bool(self._history_messages)
             self._trim_history()
@@ -3184,7 +3199,7 @@ class Worker:
             self._save_objective(objective)
             if new_plan:
                 self._update_current_plan(new_plan)
-            note = directive or f"The user's input has been folded into the objective."
+            note = directive or "The user's input has been folded into the objective."
             self.last_observation = (
                 "** OBJECTIVE REVISED from user input **\n"
                 f"{note}\n"
@@ -3443,14 +3458,16 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
         )
         controller = getattr(self, "_progress_controller", None)
 
-        # Event-triggered recovery receives the deepest reasoning. Do not inspect
-        # the immutable objective for generic words such as "fix" here: doing so
-        # kept every routine coding turn at xhigh forever.
+        # Ordinary recovery needs a focused next action, not automatically the
+        # most expensive reasoning mode. Reserve xhigh for a true level-three
+        # parent-route reframe; this prevents a single failed call from turning
+        # every later decision into a long deliberation.
         if (bool(getattr(controller, "recovery_required", False))
                 or getattr(self, "_failures_since_external_consult", 0) > 0
                 or getattr(self, "_no_progress_streak", 0) > 0
                 or bool(getattr(self, "_stuck_banner", ""))):
-            return "xhigh"
+            recovery_level = int(getattr(controller, "recovery_level", 0) or 0)
+            return "xhigh" if recovery_level >= 3 else "medium"
 
         # Lifecycle capability/create turns must never fall through the generic
         # "can you...?" conversational fast path. The deterministic guard is
@@ -3486,13 +3503,11 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
     def _local_search_candidate_count(self, objective: str, reasoning_effort: str,
                                       has_images: bool = False,
                                       context_diagnostics: str = "") -> int:
-        """Return one fast-path proposal or bounded independent recovery options.
+        """Return one adaptive proposal or an operator-requested candidate count.
 
-        Local search is intentionally selective: it is most valuable for a
-        visually ambiguous browser challenge, the first decision of an unusually
-        high-risk task, or a harness-triggered recovery checkpoint. Routine turns
-        remain one call; recovery gets independent method families instead of
-        spending deeper reasoning on the same single hypothesis.
+        Adaptive mode keeps ordinary and recovery turns on one coherent
+        trajectory. A visually ambiguous browser challenge may use two readings;
+        broader candidate search requires an explicit operator override.
         ``AEON_LOCAL_SEARCH=off|adaptive|2|3|always`` is an explicit operator
         escape hatch; all modes still use only the local model.
         """
@@ -3514,10 +3529,11 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
         observation = str(getattr(self, "last_observation", "") or "")
         combined = f"{objective or ''}\n{observation}\n{context_diagnostics or ''}".lower()
 
-        if recovery_level >= 3:
-            return 3
+        # Adaptive mode keeps a single coherent trajectory.  Multi-candidate
+        # sampling multiplies latency and failure surface and is available only
+        # through the explicit AEON_LOCAL_SEARCH override above.
         if recovery_level or stuck or failures or stalled:
-            return 2
+            return 1
 
         # Visual controls whose decisive evidence is often a tiny/localized patch
         # deserve two independent readings, but ordinary screenshot turns do not.
@@ -3527,15 +3543,7 @@ Output EXACTLY ONE valid JSON object and nothing else: multi-line code goes insi
                 combined):
             return 2
 
-        iteration = int(getattr(getattr(self, "llm_client", None),
-                                "current_iteration", 0) or 0)
-        hard_first_decision = (
-            reasoning_effort == "xhigh" and iteration <= 1 and re.search(
-                r"\b(architect|migration|migrate|security|benchmark|race condition|"
-                r"intermittent|diagnose|forensic|integration review|code review)\b",
-                combined)
-        )
-        return 2 if hard_first_decision else 1
+        return 1
 
     def _local_search_evidence_hint(self, objective: str) -> str:
         """Name the authoritative evidence channel for the local verifier."""
@@ -3656,6 +3664,13 @@ Follow the fixed collaborator contract below and the exact public conversation. 
                 "- First-class provider credentials such as Hugging Face are listed by "
                 "`list_provider_credentials`, never by the MCP inventory. A listing does "
                 "not create a missing provider action or publication tool."
+            )
+        if "fleet_batch_capabilities" in names:
+            lines.append(
+                "- For GPU batch/build work, call `fleet_batch_capabilities` before "
+                "local toolchain, GPU, SSH, Docker, or broker audits. Only a recipe "
+                "returned there is executable; an empty list is a stable absence of a "
+                "reviewed batch lane for this goal, not a reason to probe for a bypass."
             )
         return "\n".join(lines)
 
@@ -4161,7 +4176,7 @@ This system block is live harness state, not a user request. Follow the exact us
         events = self._strategy_event_buffer()
         if not events:
             return "No prior strategic transitions in this request."
-        return "\n".join(f"- {item}" for item in list(events)[-12:])
+        return "\n".join(f"- {item}" for item in list(events)[-6:])
 
     def _task_acceptance_completion_error(self, contract: RequestContract) -> str:
         return contract.goal_completion_error()
@@ -4233,6 +4248,10 @@ This system block is live harness state, not a user request. Follow the exact us
             and self.request_contract.raw_request == exact_text
             and self.current_objective == exact_text
         ):
+            self._active_request_is_continuous = bool(
+                self.request_contract.authority_request
+                != self.request_contract.raw_request
+            )
             # Raw tool payloads are intentionally absent from the restart
             # checkpoint. Re-open the evidence epoch fail-closed instead of
             # treating the retained strategy ledger as current receipts.
@@ -4259,6 +4278,7 @@ This system block is live harness state, not a user request. Follow the exact us
             getattr(self, "_next_request_is_continuous", False)
         )
         self._next_request_is_continuous = False
+        self._active_request_is_continuous = synthetic_continuous
         continuous_authority_goal = str(
             getattr(self, "_continuous_authority_goal", "") or ""
         )
@@ -4479,6 +4499,56 @@ This system block is live harness state, not a user request. Follow the exact us
         self._persist_session_state()
         return contract
 
+    def _prune_actionless_generation_history(self) -> int:
+        """Remove only synthetic cycles and terminals that generated no action."""
+
+        history_messages = getattr(self, "_history_messages", None)
+        if not history_messages:
+            return 0
+        compacted_history = []
+        index = 0
+        while index < len(history_messages):
+            current = history_messages[index]
+            following = (
+                history_messages[index + 1]
+                if index + 1 < len(history_messages)
+                else None
+            )
+            if (
+                isinstance(current, dict)
+                and current.get("role") == "user"
+                and str(current.get("content") or "").startswith(
+                    _CONTINUOUS_OBJECTIVE_PREFIX
+                )
+                and isinstance(following, dict)
+                and following.get("role") == "assistant"
+                and str(following.get("content") or "").startswith(
+                    _GENERATION_BUDGET_FAILURE_PREFIX
+                )
+            ):
+                index += 2
+                continue
+            if (
+                isinstance(current, dict)
+                and current.get("role") == "assistant"
+                and str(current.get("content") or "").startswith(
+                    _GENERATION_BUDGET_FAILURE_PREFIX
+                )
+            ):
+                # Bounded projection may already have omitted the synthetic user
+                # half of the oldest pair. The harness terminal is still
+                # actionless and carries no task evidence.
+                index += 1
+                continue
+            compacted_history.append(current)
+            index += 1
+        removed = len(history_messages) - len(compacted_history)
+        if removed:
+            self._history_messages = compacted_history
+            self._history_seeded = bool(compacted_history)
+            self._trim_history()
+        return removed
+
     def prepare_continuous_turn(
         self,
         *,
@@ -4498,6 +4568,15 @@ This system block is live harness state, not a user request. Follow the exact us
         from .continuous_mode import normalize_continuous_goal
 
         normalized_goal = normalize_continuous_goal(goal, enabled=True)
+        # Failed generations execute no tool and add no task evidence.  A
+        # long-running continuous session used to retain every synthetic
+        # continuous prompt plus its identical harness-authored failure in model
+        # history, feeding the same failure back into the next request.  Remove
+        # only those exact pairs whenever continuous mode begins again, including
+        # after an owner stop/re-enable; successful/model-authored turns, tool
+        # receipts, plans, memories, and the owner-visible transcript remain
+        # untouched.
+        self._prune_actionless_generation_history()
         self._next_request_is_continuous = True
         self._continuous_authority_goal = normalized_goal
         self._continuous_recovery_context = str(recovery_context or "")[:2400]
@@ -4575,11 +4654,19 @@ do not infer that omitted context proves success."""
         objective: str,
         *,
         has_images: bool,
+        output_reserve_tokens: Optional[int] = None,
     ) -> tuple[list[dict], str]:
         """Apply one global prompt budget after all independently bounded sections."""
 
         context_limit = int(getattr(self.llm_client, "context_limit", 114688) or 114688)
-        output_reserve = int(getattr(self.llm_client, "max_turn_tokens", 8192) or 8192)
+        configured_output_reserve = (
+            output_reserve_tokens
+            if isinstance(output_reserve_tokens, int)
+            and not isinstance(output_reserve_tokens, bool)
+            and output_reserve_tokens > 0
+            else getattr(self.llm_client, "max_turn_tokens", 32768)
+        )
+        output_reserve = min(context_limit, int(configured_output_reserve or 32768))
         safety_reserve = 4096 + (8192 if has_images else 0)
         prompt_budget = context_limit - output_reserve - safety_reserve
         if prompt_budget < 4096:
@@ -4690,7 +4777,13 @@ do not infer that omitted context proves success."""
             raise ContextBudgetError("global prompt projection exceeded its strict budget")
         return messages, current_state
 
-    def _protocol_call_context(self, objective: str, iteration: int) -> tuple[list[dict], str, list[str]]:
+    def _protocol_call_context(
+        self,
+        objective: str,
+        iteration: int,
+        *,
+        output_reserve_tokens: Optional[int] = None,
+    ) -> tuple[list[dict], str, list[str]]:
         """Build typed messages with a stable prefix and volatile system tail."""
 
         self._refresh_action_schema()
@@ -4720,6 +4813,7 @@ do not infer that omitted context proves success."""
                 current_state,
                 objective,
                 has_images=False,
+                output_reserve_tokens=output_reserve_tokens,
             )
             return messages, current_state, []
         tool_list = self._get_tools_description()
@@ -4739,6 +4833,7 @@ do not infer that omitted context proves success."""
                 current_state,
                 objective,
                 has_images=False,
+                output_reserve_tokens=output_reserve_tokens,
             )
             return messages, current_state, []
         memories = self._format_memories()
@@ -4777,26 +4872,47 @@ do not infer that omitted context proves success."""
             current_state,
             objective,
             has_images=bool(images),
+            output_reserve_tokens=output_reserve_tokens,
         )
         return messages, current_state, images
 
     def _call_protocol_model(self, objective: str, iteration: int) -> dict:
-        messages, current_state, images = self._protocol_call_context(objective, iteration)
-        reasoning_effort = self._select_reasoning_effort(
+        compact_generation_recovery = bool(
+            getattr(self, "_generation_budget_recovery_active", False)
+        )
+        recovery_output_tokens = min(
+            COMPACT_GENERATION_RECOVERY_TOKENS,
+            int(getattr(self.llm_client, "max_turn_tokens", 32768) or 32768),
+        )
+        messages, current_state, images = self._protocol_call_context(
+            objective,
+            iteration,
+            output_reserve_tokens=(
+                recovery_output_tokens if compact_generation_recovery else None
+            ),
+        )
+        selected_reasoning_effort = self._select_reasoning_effort(
             objective,
             has_images=bool(images),
             context_diagnostics=current_state[-3000:],
+        )
+        reasoning_effort = (
+            "low" if compact_generation_recovery else selected_reasoning_effort
         )
         prompt_tokens = sum(estimate_tokens(LLMClient._msg_text(message)) for message in messages)
         self.prev_prompt_tokens = prompt_tokens
         self.print_func(
             f"Thinking (reasoning={reasoning_effort}, context≈{prompt_tokens:,} tokens)..."
         )
-        candidate_count = self._local_search_candidate_count(
-            objective,
-            reasoning_effort,
-            has_images=bool(images),
-            context_diagnostics=current_state[-3000:],
+        candidate_count = (
+            1
+            if compact_generation_recovery
+            else self._local_search_candidate_count(
+                objective,
+                reasoning_effort,
+                has_images=bool(images),
+                context_diagnostics=current_state[-3000:],
+            )
         )
         if candidate_count > 1 and hasattr(
             self.llm_client, "get_verified_primary_agent_response"
@@ -4810,11 +4926,26 @@ do not infer that omitted context proves success."""
                 evidence_hint=self._local_search_evidence_hint(objective),
             )
         else:
+            recovery_budget = (
+                DecisionGenerationBudget(
+                    max_model_calls=COMPACT_GENERATION_RECOVERY_MODEL_CALLS,
+                    max_completion_tokens=recovery_output_tokens,
+                    max_wall_seconds=COMPACT_GENERATION_RECOVERY_WALL_SECONDS,
+                )
+                if compact_generation_recovery
+                else None
+            )
             raw = self.llm_client.get_primary_agent_response(
                 messages=messages,
                 diagnostic_str="",
                 images=images or None,
                 reasoning_effort=reasoning_effort,
+                max_retries=1 if compact_generation_recovery else 3,
+                _max_output_tokens=(
+                    recovery_output_tokens if compact_generation_recovery else None
+                ),
+                _decision_budget=recovery_budget,
+                _disable_thinking=compact_generation_recovery,
             )
         data = raw if isinstance(raw, dict) else json.loads(self._clean_action_json(str(raw)))
         turn = normalize_turn_envelope(data)
@@ -4856,13 +4987,20 @@ do not infer that omitted context proves success."""
                     return [str(path)]
         return []
 
-    def _publish_protocol_message(self, turn: dict, state: ExecutionState) -> RunOutcome:
+    def _publish_protocol_message(
+        self,
+        turn: dict,
+        state: ExecutionState,
+        *,
+        record_history: bool = True,
+    ) -> RunOutcome:
         """Publish exactly one visible assistant message and yield."""
 
         message = str(turn.get("message") or "").strip()
         self.last_say_to_user = message
         self.last_observation = message
-        self._append_history_turn(turn, [])
+        if record_history:
+            self._append_history_turn(turn, [])
         self.print_func(f"\n{C_GREEN}{message}{C_RESET}")
         outcome = self._set_protocol_outcome(state, message)
         transcript_record = None
@@ -4884,6 +5022,24 @@ do not infer that omitted context proves success."""
         if isinstance(transcript_record, dict):
             self._persist_fork_checkpoint(str(transcript_record.get("id") or ""))
         return outcome
+
+    def _discard_failed_continuous_prompt(self, objective: str) -> None:
+        """Drop only the harness-created user turn for an actionless failed cycle."""
+
+        if not getattr(self, "_active_request_is_continuous", False):
+            return
+        history = getattr(self, "_history_messages", None)
+        if not history:
+            return
+        latest = history[-1]
+        if (
+            isinstance(latest, dict)
+            and latest.get("role") == "user"
+            and str(latest.get("content") or "") == str(objective or "")
+            and str(objective or "").startswith(_CONTINUOUS_OBJECTIVE_PREFIX)
+        ):
+            history.pop()
+            self._trim_history()
 
     def _unresolved_sub_agent_error(self) -> str:
         try:
@@ -5608,6 +5764,27 @@ do not infer that omitted context proves success."""
         except ToolResourceError:
             return False
         if (
+            resource.route == ToolComputeRoute.FLEET_BATCH
+        ):
+            raw = result.raw
+            if not isinstance(raw, dict):
+                return False
+            job_id = raw.get("job_id")
+            if not isinstance(job_id, str) or not re.fullmatch(
+                r"fj-[0-9a-f]{32}", job_id
+            ):
+                return False
+            if raw.get("owned_by_agent") is not True:
+                return False
+            return raw.get("state") in {
+                "queued",
+                "waiting_for_compute",
+                "starting",
+                "running",
+                "settling_output",
+                "cleanup_pending",
+            }
+        if (
             resource.route != ToolComputeRoute.FLEET_SERVICE
             or not resource.fleet_service
         ):
@@ -5749,12 +5926,15 @@ do not infer that omitted context proves success."""
             )
             if value not in outcomes:
                 outcomes.append(value)
+        # Keep factual strategy continuity without echoing model-authored intent
+        # prose back into the next prompt. Recovery narration in an intent is not
+        # evidence and previously reinforced itself across many turns.
         strategic_event = (
-            f"iter {iteration}; intent={str(turn.get('intent') or '(none)')[:180]}; "
-            f"methods={','.join(methods) or 'none'}; goals={','.join(goal_ids) or 'auto/none'}; "
+            f"iter {iteration}; methods={','.join(methods) or 'none'}; "
+            f"goals={','.join(goal_ids) or 'auto'}; "
             f"strategy={','.join(method_families) or 'none'}; "
             f"outcome={','.join(outcomes) or 'none'}"
-        )[:1200]
+        )[:600]
         strategy_events = self._strategy_event_buffer()
         if not strategy_events or strategy_events[-1] != strategic_event:
             strategy_events.append(strategic_event)
@@ -6042,6 +6222,7 @@ do not infer that omitted context proves success."""
         )
         iteration = 0
         invalid_turns = 0
+        generation_budget_recoveries = 0
         rejection_counts: dict[str, int] = {}
         rejection_total = 0
         requested_turn_limit = (
@@ -6191,6 +6372,9 @@ do not infer that omitted context proves success."""
                 step_callback(iteration, decision_turn_limit, "Deciding")
 
             try:
+                self._generation_budget_recovery_active = (
+                    generation_budget_recoveries > 0
+                )
                 with input_console.interruptible():
                     turn = self._call_protocol_model(objective, iteration)
             except ContextBudgetError as exc:
@@ -6207,20 +6391,33 @@ do not infer that omitted context proves success."""
                     },
                     ExecutionState.BLOCKED,
                 )
-            except DecisionGenerationBudgetExceeded:
+            except DecisionGenerationBudgetExceeded as exc:
+                if generation_budget_recoveries < 1:
+                    generation_budget_recoveries += 1
+                    self.last_observation = (
+                        "LOCAL GENERATION RECOVERY: the prior model call exhausted "
+                        "its finite output/time backstop before producing an action. "
+                        "No tool ran. Use the compact low-reasoning path, skip "
+                        "candidate search, and return one schema-valid turn that "
+                        "makes the smallest useful next step within 8K tokens."
+                    )
+                    self.logger.warning("%s Detail: %s", self.last_observation, exc)
+                    continue
+                self._discard_failed_continuous_prompt(objective)
                 return self._publish_protocol_message(
                     {
                         "kind": TurnKind.FINAL.value,
                         "intent": "generation budget exhausted",
                         "message": (
-                            "Aeon stopped because the model exhausted the harness-owned "
-                            "generation budget for one decision before producing a usable "
-                            "turn. The decision was not retried as a new budget, no tool ran "
-                            "for it, and no success is being claimed."
+                            "Aeon stopped after both the initial generation and one "
+                            "automatic compact recovery exhausted their finite local "
+                            "generation backstops before producing a usable turn. No tool "
+                            "ran for either attempt and no success is being claimed."
                         ),
                         "actions": [],
                     },
                     ExecutionState.FAILED,
+                    record_history=False,
                 )
             except KeyboardInterrupt:
                 stopped = stop_outcome()
@@ -6256,6 +6453,8 @@ do not infer that omitted context proves success."""
                         ExecutionState.FAILED,
                     )
                 continue
+            finally:
+                self._generation_budget_recovery_active = False
 
             stopped = stop_outcome()
             if stopped is not None:
@@ -6280,6 +6479,7 @@ do not infer that omitted context proves success."""
                     )
                 continue
             invalid_turns = 0
+            generation_budget_recoveries = 0
             if input_console.has_pending():
                 self._write_stop_dump("new-user-message-after-decision")
                 return self._set_protocol_outcome(

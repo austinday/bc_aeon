@@ -15,6 +15,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from .utils.io import read_bounded_fd
 
 COLLABORATOR_MODE_ENV = "AEON_COLLABORATOR_MODE_PATH"
 COLLABORATOR_MODE_FILENAME = "collaborator-mode.json"
@@ -204,7 +205,7 @@ def load_collaborator_mode(
             or metadata.st_size > MAX_COLLABORATOR_STATE_BYTES
         ):
             raise CollaboratorModeError("Collaborator control file is not owner-safe")
-        payload = os.read(descriptor, MAX_COLLABORATOR_STATE_BYTES + 1)
+        payload = read_bounded_fd(descriptor, MAX_COLLABORATOR_STATE_BYTES)
         if len(payload) > MAX_COLLABORATOR_STATE_BYTES:
             raise CollaboratorModeError("Collaborator control file is too large")
         document = json.loads(payload.decode("utf-8"))

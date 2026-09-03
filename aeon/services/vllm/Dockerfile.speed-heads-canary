@@ -1,0 +1,23 @@
+FROM aeon_vllm-speed-0ecc28479:canary
+
+LABEL com.bc_aeon.component="qwen38-speed-heads-canary" \
+      com.bc_aeon.vllm-commit="0ecc284790e5403f74b899524ef82ecb69f83cb3" \
+      com.bc_aeon.speed-patch="aeon-qwen38-speed-heads-dflash2-load-0ecc-v4"
+
+COPY patches/aeon-qwen38-speed-heads-a047e.patch /tmp/aeon-qwen38-speed-heads.patch
+
+RUN patch --dry-run --fuzz=0 -p1 \
+      -d /opt/venv/lib/python3.12/site-packages \
+      --input=/tmp/aeon-qwen38-speed-heads.patch \
+    && patch --fuzz=0 -p1 \
+      -d /opt/venv/lib/python3.12/site-packages \
+      --input=/tmp/aeon-qwen38-speed-heads.patch \
+    && python3 -m py_compile \
+      /opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_5.py \
+      /opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_5_mtp.py \
+    && grep -q '^    decoder_layer_cls = DFlashQwen3DecoderLayer$' \
+      /opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash.py \
+    && grep -q '^                self[.]decoder_layer_cls($' \
+      /opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash.py \
+    && rm -f /tmp/aeon-qwen38-speed-heads.patch

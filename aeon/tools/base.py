@@ -2,8 +2,6 @@
 
 from abc import ABC, abstractmethod
 import inspect
-import json
-import re
 import types
 from typing import Any, Dict, List, Union, get_args, get_origin, get_type_hints
 
@@ -13,32 +11,6 @@ from aeon.core.tool_resources import (
     ToolResourcePolicy,
     tool_resource_policy,
 )
-
-
-_TOOL_EXAMPLE_RE = re.compile(
-    r"(?m)^(?P<prefix>\s*(?:(?:Example(?:s?|\s+\([^\n)]*\))?):\s*)?)"
-    r"(?P<payload>\{[^\n]*\"tool_name\"[^\n]*\})\s*$"
-)
-
-
-def _bind_goal_refs_in_examples(description: str) -> str:
-    """Keep human-readable examples aligned with the decode-time action schema."""
-
-    def bind(match: re.Match) -> str:
-        try:
-            payload = json.loads(match.group("payload"))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return match.group(0)
-        if not isinstance(payload, dict) or not {
-            "tool_name", "parameters"
-        }.issubset(payload):
-            return match.group(0)
-        payload.setdefault("goal_refs", [])
-        return match.group("prefix") + json.dumps(
-            payload, ensure_ascii=False, separators=(",", ":")
-        )
-
-    return _TOOL_EXAMPLE_RE.sub(bind, str(description or ""))
 
 
 class BaseTool(ABC):
@@ -62,7 +34,7 @@ class BaseTool(ABC):
         resource_policy: ToolResourcePolicy | None = None,
     ):
         self.name = name
-        self.description = _bind_goal_refs_in_examples(description)
+        self.description = str(description or "")
         self.underlying_model = underlying_model
         self.policy = policy or infer_tool_policy(name)
         # Compute routing is a separate, explicit contract from side effects.

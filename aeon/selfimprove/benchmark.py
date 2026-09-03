@@ -38,33 +38,42 @@ def _t_tools_import_clean():
 
 
 def _t_edit_tools_roundtrip():
-    """write_file creates, str_replace edits, and a broken write raises a syntax warning."""
+    """Writes are hash-bound and syntactically invalid content is rejected."""
+    import hashlib
     import os
     import tempfile
     from aeon.tools.file_io import WriteFileTool, StrReplaceTool
 
     class _W:
-        def __init__(self): self.open_files = {}
+        def __init__(self, root):
+            self.open_files = {}
+            self.workspace_root = root
+            metadata = os.stat(root, follow_symlinks=False)
+            self.workspace_root_identity = (metadata.st_dev, metadata.st_ino)
         def is_file_open(self, p): return os.path.abspath(p) in self.open_files
         def close_file(self, p): self.open_files.pop(os.path.abspath(p), None); return True
         def update_open_file(self, p, c): self.open_files[os.path.abspath(p)] = c
 
     d = tempfile.mkdtemp()
-    w = _W()
+    w = _W(d)
     wf, sr = WriteFileTool(w), StrReplaceTool(w)
     path = os.path.join(d, "m.py")
     if "Created" not in wf.execute(path, "def f():\n    return 1\n"):
         return False, "write_file create failed", None
-    r = sr.execute(path, old_str="return 1", new_str="return 2")
+    with open(path, "rb") as source:
+        receipt = hashlib.sha256(source.read()).hexdigest()
+    r = sr.execute(
+        path, old_str="return 1", new_str="return 2", expected_sha256=receipt
+    )
     if "Successfully applied" not in r or "DIFF" not in r:
         return False, f"str_replace/diff failed: {r[:120]}", None
     with open(path) as f:
         if "return 2" not in f.read():
             return False, "edit not persisted", None
     broken = wf.execute(os.path.join(d, "b.py"), "def x(:\n    pass\n")
-    if "SYNTAX WARNING" not in broken:
-        return False, "syntax check did not fire on broken python", None
-    return True, "edit tools + diff + syntax check intact", None
+    if "Refusing" not in broken or os.path.exists(os.path.join(d, "b.py")):
+        return False, "invalid Python was not rejected before write", None
+    return True, "hash-bound edit + diff + pre-write syntax gate intact", None
 
 
 def _t_protected_guard_active():

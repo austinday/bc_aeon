@@ -13,13 +13,47 @@ import asyncio
 import os
 import time
 import logging
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response
 
-NODES = [u.strip() for u in os.environ.get("AEON_LB_NODES", "").split(",") if u.strip()]
+
+def _validated_loopback_node(value: str) -> str:
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("AEON_LB_NODES contains an invalid port") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or port is None
+        or not 1024 <= port <= 65535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("AEON_LB_NODES must contain exact loopback HTTP origins")
+    canonical = (
+        f"http://[::1]:{port}"
+        if parsed.hostname == "::1"
+        else f"http://127.0.0.1:{port}"
+    )
+    if value not in {canonical, canonical + "/"}:
+        raise RuntimeError("AEON_LB_NODES contains a non-canonical origin")
+    return canonical
+
+
+NODES = [
+    _validated_loopback_node(value.strip())
+    for value in os.environ.get("AEON_LB_NODES", "").split(",")
+    if value.strip()
+]
 LB_PORT = int(os.environ.get("AEON_LB_PORT", "8013"))
 HEALTH_INTERVAL = 30
 
@@ -31,6 +65,8 @@ client = httpx.AsyncClient(
     timeout=None,
     limits=httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=30.0),
     http2=False,
+    trust_env=False,
+    follow_redirects=False,
 )
 
 active = {u: 0 for u in NODES}

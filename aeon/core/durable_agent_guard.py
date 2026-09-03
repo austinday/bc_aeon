@@ -152,6 +152,7 @@ _CANCEL_PENDING_RE = re.compile(
 
 _ALLOWED_KINDS = frozenset({"aeon", "codex", "claude", "grok"})
 _INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_PROJECT_ID_RE = re.compile(r"^pr-[0-9a-f]{32}$")
 
 
 def classify_project_manager_agent_intent(
@@ -241,6 +242,7 @@ def verified_start_receipt(
     expected_kind: str,
     expected_continuous: bool = False,
     expected_goal: str = "",
+    expected_project_id: str | None = None,
 ) -> VerifiedNexusAgentStart:
     """Validate and freeze the durable record returned by Nexus."""
 
@@ -251,6 +253,7 @@ def verified_start_receipt(
     workspace = instance.get("workspace")
     kind = instance.get("kind")
     status = instance.get("status")
+    project_id = instance.get("project_id")
     if not isinstance(instance_id, str) or not _INSTANCE_ID_RE.fullmatch(instance_id):
         raise ValueError("Nexus returned a malformed agent id")
     if not isinstance(name, str) or name.strip() != str(expected_name).strip():
@@ -267,6 +270,18 @@ def verified_start_receipt(
         raise ValueError("Nexus returned a mismatched agent workspace")
     if not isinstance(status, str) or not status.strip() or len(status) > 64:
         raise ValueError("Nexus returned a malformed agent status")
+    if project_id is not None and (
+        not isinstance(project_id, str) or not _PROJECT_ID_RE.fullmatch(project_id)
+    ):
+        raise ValueError("Nexus returned a malformed project id")
+    if expected_project_id is not None:
+        if (
+            not isinstance(expected_project_id, str)
+            or not _PROJECT_ID_RE.fullmatch(expected_project_id)
+        ):
+            raise ValueError("Expected project id is invalid")
+        if project_id != expected_project_id:
+            raise ValueError("Nexus returned a mismatched project id")
     awaiting_objective = instance.get("awaiting_objective")
     if not isinstance(awaiting_objective, bool):
         raise ValueError("Nexus returned a malformed awaiting-objective state")
@@ -289,6 +304,8 @@ def verified_start_receipt(
         kind.strip().lower() != "aeon" or status.strip().lower() != "idle"
     ):
         raise ValueError("Nexus returned an inconsistent deferred Aeon state")
+    if not awaiting_objective and status.strip().lower() != "running":
+        raise ValueError("Nexus did not confirm that the agent is running")
 
     record = {
         "id": instance_id,
@@ -298,6 +315,7 @@ def verified_start_receipt(
         "mode": instance.get("mode"),
         "status": status.strip(),
         "awaiting_objective": awaiting_objective,
+        "project_id": project_id,
         "continuous_mode": {
             "enabled": continuous_enabled,
             "goal": str(continuous.get("goal") or "") if isinstance(continuous, Mapping) else "",

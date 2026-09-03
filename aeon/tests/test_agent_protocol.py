@@ -686,6 +686,35 @@ class MutationValidationScenarios(unittest.TestCase):
                 "",
             )
 
+    def test_fleet_batch_submission_requires_explicit_gpu_batch_authority(self):
+        parameters = {
+            "recipe_id": "qwen38-dflash-adapt-v1",
+            "request_key": "candidate-one",
+        }
+        authorized = RequestContract.from_request(
+            "Build the Qwen3.8 DFlash adaptation through Fleet Compute.",
+            workspace_root="/workspace/project",
+        )
+        self.assertIn("fleet_batch", authorized.capability_families)
+        self.assertEqual(
+            authorized.authorization_error(
+                infer_tool_policy("fleet_submit_batch_job"), parameters
+            ),
+            "",
+        )
+
+        unrelated = RequestContract.from_request(
+            "Upload the finished model to Hugging Face.",
+            workspace_root="/workspace/project",
+        )
+        self.assertNotIn("fleet_batch", unrelated.capability_families)
+        self.assertIn(
+            "not 'fleet_batch'",
+            unrelated.authorization_error(
+                infer_tool_policy("fleet_submit_batch_job"), parameters
+            ),
+        )
+
     def test_skill_state_changes_do_not_create_workspace_validation_debt(self):
         cases = (
             (
@@ -993,6 +1022,90 @@ class MutationValidationScenarios(unittest.TestCase):
                     },
                 )
                 self.assertIn("bound to scope", operation_error)
+
+    def test_huggingface_continuous_upload_binds_typed_publisher(self):
+        request = (
+            "Look for a useful model you can create on Hugging Face. Make it, "
+            "then upload it, document it, and do this endlessly."
+        )
+        contract = RequestContract.from_request(
+            request, workspace_root="/home/aday/agents/usefulHuggingface"
+        )
+        self.assertEqual(
+            contract.capability_target_bindings["external_interaction"],
+            ["platform:huggingface", "operation:upload"],
+        )
+        policy = infer_tool_policy("huggingface_publish_model")
+        self.assertEqual(
+            contract.authorization_error(
+                policy,
+                {
+                    "repository": "Alday777/useful-model",
+                    "folder": "/home/aday/agents/usefulHuggingface/release",
+                    "commit_message": "Initial release",
+                    "public": True,
+                    "authority_operation": "upload",
+                },
+            ),
+            "",
+        )
+
+    def test_provider_scope_ignores_quoted_copy_and_destination_modifiers(self):
+        request = (
+            'Publish the release to the credentialed Hugging Face account and '
+            'add the exact card text "Buy me a beer" at the bottom.'
+        )
+        contract = RequestContract.from_request(
+            request, workspace_root="/workspace/project"
+        )
+
+        self.assertEqual(
+            contract.capability_target_bindings["external_interaction"],
+            ["platform:huggingface", "operation:upload"],
+        )
+        self.assertNotIn(
+            "operation:purchase",
+            contract.capability_target_bindings["external_interaction"],
+        )
+        self.assertNotIn(
+            "recipient:credentialed",
+            contract.capability_target_bindings["external_interaction"],
+        )
+        self.assertEqual(
+            contract.authorization_error(
+                infer_tool_policy("huggingface_publish_model"),
+                {
+                    "repository": "owner/release",
+                    "folder": "/workspace/project/release",
+                    "commit_message": "Publish release",
+                    "public": True,
+                    "authority_operation": "upload",
+                },
+            ),
+            "",
+        )
+
+    def test_quoted_external_verb_does_not_elevate_local_copy_edit(self):
+        contract = RequestContract.from_request(
+            'Write README.md with the literal label "Buy me a beer"'
+        )
+
+        self.assertEqual(contract.mode, RequestMode.CHANGE_LOCAL)
+        self.assertNotIn("external_interaction", contract.capability_families)
+
+    def test_destination_modifiers_do_not_replace_named_recipients(self):
+        contract = RequestContract.from_request(
+            "Send the report using the authenticated account to Alice"
+        )
+
+        self.assertEqual(
+            contract.capability_target_bindings["external_interaction"],
+            ["operation:send", "recipient:alice"],
+        )
+        self.assertNotIn(
+            "account:authenticated",
+            contract.capability_target_bindings["external_interaction"],
+        )
 
     def test_owner_target_correction_replaces_recipient_and_platform_on_restore(self):
         cases = (
@@ -1303,22 +1416,83 @@ class GoalEvidenceScenarios(unittest.TestCase):
             ["change", "change", "change", "change"],
         )
 
-    def test_aggregate_or_unbound_goal_refs_cannot_receive_complex_evidence(self):
+    def test_durable_directive_frames_compile_build_research_and_invariants(self):
+        request = (
+            "Your goal is to look through recent packages that we could train using "
+            "two RTX 6000 GPUs. Only consider popular and recent releases. You must "
+            "endlessly look for gaps. If you find a gap, train/make the artifact and "
+            "publish it to the credentialed Hugging Face account and add the exact "
+            'label "Buy me a beer" only at the bottom. Make sure to detail the base, '
+            "what changed, and how to use it. If the list is exhausted (don't consider "
+            "packages older than a month), then do research into requested variants."
+        )
+        contract = RequestContract.from_request(
+            request, workspace_root="/workspace/project"
+        )
+        leaves = list(contract.goal_anchors.values())[1:]
+
+        self.assertIn("fleet_batch", contract.capability_families)
+        self.assertTrue(any(item.startswith("look through recent") for item in leaves))
+        self.assertTrue(any(item == "train/make the artifact" for item in leaves))
+        self.assertTrue(any(item.startswith("publish it") for item in leaves))
+        self.assertTrue(any(item.startswith("detail the base") for item in leaves))
+        self.assertTrue(any(item.startswith("do research") for item in leaves))
+        recency_goal = next(
+            goal_id
+            for goal_id, description in contract.goal_anchors.items()
+            if description == "Only consider popular and recent releases"
+        )
+        age_goal = next(
+            goal_id
+            for goal_id, description in contract.goal_anchors.items()
+            if description == "don't consider packages older than a month"
+        )
+        self.assertEqual(contract.goal_kinds[recency_goal], "invariant")
+        self.assertEqual(contract.goal_kinds[age_goal], "invariant")
+
+    def test_aggregate_refs_are_rejected_but_omitted_refs_are_inferred(self):
         contract = RequestContract.from_request(
             "Improve parser recovery, scheduler recovery, and delegation recovery"
         )
         policy = infer_tool_policy("str_replace")
         parameters = {"file_path": "parser_recovery.py"}
 
-        self.assertIn(
-            "requires pre-execution goal_refs",
-            contract.goal_ref_error(policy, parameters, []),
-        )
+        self.assertEqual(contract.goal_ref_error(policy, parameters, []), "")
         self.assertIn(
             "aggregate/overflow goal IDs cannot receive",
             contract.goal_ref_error(policy, parameters, ["G0"]),
         )
         self.assertEqual(contract.goal_ref_error(policy, parameters, ["G1"]), "")
+
+        self._observe_edit(
+            contract,
+            "src/parser_recovery.py",
+            [],
+            call_id="auto-edit-parser",
+        )
+        self._observe_test(
+            contract,
+            "python3 -m pytest -q tests/test_parser_recovery.py",
+            [],
+            call_id="auto-test-parser",
+        )
+        self.assertTrue(contract._goal_verified("G1"))
+        self.assertFalse(contract._goal_verified("G2"))
+        self.assertFalse(contract._goal_verified("G3"))
+
+    def test_omitted_refs_do_not_credit_ambiguous_generic_evidence(self):
+        contract = RequestContract.from_request(
+            "Improve parser recovery, scheduler recovery, and delegation recovery"
+        )
+        self._observe_edit(
+            contract,
+            "src/recovery.py",
+            [],
+            call_id="ambiguous-edit",
+        )
+
+        for goal_id in ("G1", "G2", "G3"):
+            self.assertFalse(contract.goal_relevant_mutation_evidence.get(goal_id))
 
     def test_goal_compiler_overflow_is_explicit_and_survives_restore(self):
         request = "Requirements:\n" + "\n".join(
@@ -1758,6 +1932,7 @@ class CompletionEvidenceScenarios(unittest.TestCase):
         contract = RequestContract.from_request(
             "Inspect auth.py", workspace_root="/workspace/project"
         )
+        progress_before = contract.goal_acceptance_marker()
         policy = infer_tool_policy("open_file")
         unrelated = {"file_path": "unrelated.py"}
         contract.observe(
@@ -1786,6 +1961,7 @@ class CompletionEvidenceScenarios(unittest.TestCase):
             policy=policy,
             parameters=exact,
         )
+        self.assertNotEqual(contract.goal_acceptance_marker(), progress_before)
         self.assertEqual(contract.completion_error(message), "")
         self.assertEqual(contract.final_state(message), ExecutionState.DONE)
 

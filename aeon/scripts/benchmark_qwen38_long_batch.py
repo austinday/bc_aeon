@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import math
 import statistics
@@ -17,6 +18,7 @@ import requests
 
 
 MODEL = "Qwen3.8-27B-ARA-NVFP4-MTP"
+REPORT_SCHEMA_VERSION = 2
 NEEDLE = "AEON-128K-NEEDLE-7F3C91B2"
 FILLER = (
     "Archive record: amber cedar delta ember falcon granite harbor iris "
@@ -34,9 +36,19 @@ def _atomic_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def _script_sha256() -> str:
+    """Bind future reports to the exact benchmark implementation that ran."""
+
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
 def _post(base_url: str, route: str, payload: dict[str, Any], timeout: float):
     response = requests.post(
-        base_url.rstrip("/") + route, json=payload, timeout=(15, timeout)
+        base_url.rstrip("/") + route,
+        json=payload,
+        timeout=(15, timeout),
+        allow_redirects=False,
+        proxies={"http": "", "https": ""},
     )
     response.raise_for_status()
     return response.json()
@@ -94,21 +106,28 @@ def run_long(base_url: str, target_tokens: int) -> dict[str, Any]:
     )
     elapsed = time.perf_counter() - started
     choice = value["choices"][0]["message"]
-    text = "\n".join(
-        str(choice.get(key) or "") for key in ("reasoning_content", "content")
-    ).strip()
+    content = choice.get("content")
+    if not isinstance(content, str):
+        content = ""
+    text = content.strip()
     usage = value.get("usage") or {}
+    reported_prompt_tokens = usage.get("prompt_tokens")
     exact = text.strip() == NEEDLE
     contains = NEEDLE in text
     return {
         "prompt_tokens_measured": prompt_tokens,
-        "prompt_tokens_reported": usage.get("prompt_tokens"),
+        "prompt_tokens_reported": reported_prompt_tokens,
         "completion_tokens": usage.get("completion_tokens"),
         "elapsed_seconds": elapsed,
         "exact_answer": exact,
         "contains_answer": contains,
         "answer_tail": text[-256:],
-        "passed": prompt_tokens >= 120000 and contains,
+        "passed": (
+            prompt_tokens >= 120000
+            and type(reported_prompt_tokens) is int
+            and reported_prompt_tokens == prompt_tokens
+            and exact
+        ),
     }
 
 
@@ -142,6 +161,35 @@ def _batch_request(base_url: str, request_id: int, max_tokens: int) -> dict[str,
     return {"elapsed_seconds": elapsed, "completion_tokens": completion}
 
 
+def _batch_release_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    serial = next(item for item in results if item["concurrency"] == 1)
+    concurrency_8 = next(item for item in results if item["concurrency"] == 8)
+    best = max(results, key=lambda item: item["aggregate_decode_tps"])
+    return {
+        "levels": results,
+        "best_concurrency": best["concurrency"],
+        "best_aggregate_decode_tps": best["aggregate_decode_tps"],
+        "serial_aggregate_decode_tps": serial["aggregate_decode_tps"],
+        "concurrency_8_aggregate_decode_tps": concurrency_8[
+            "aggregate_decode_tps"
+        ],
+        "throughput_scale_vs_serial": (
+            best["aggregate_decode_tps"] / serial["aggregate_decode_tps"]
+        ),
+        "concurrency_8_scale_vs_serial": (
+            concurrency_8["aggregate_decode_tps"]
+            / serial["aggregate_decode_tps"]
+        ),
+        "passed": (
+            math.isfinite(serial["aggregate_decode_tps"])
+            and serial["aggregate_decode_tps"] > 0
+            and math.isfinite(concurrency_8["aggregate_decode_tps"])
+            and concurrency_8["aggregate_decode_tps"]
+            > serial["aggregate_decode_tps"]
+        ),
+    }
+
+
 def run_batch(base_url: str, levels: list[int], max_tokens: int) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     for concurrency in levels:
@@ -169,18 +217,7 @@ def run_batch(base_url: str, levels: list[int], max_tokens: int) -> dict[str, An
                 ),
             }
         )
-    serial = next(item for item in results if item["concurrency"] == 1)
-    best = max(results, key=lambda item: item["aggregate_decode_tps"])
-    return {
-        "levels": results,
-        "best_concurrency": best["concurrency"],
-        "best_aggregate_decode_tps": best["aggregate_decode_tps"],
-        "throughput_scale_vs_serial": (
-            best["aggregate_decode_tps"] / serial["aggregate_decode_tps"]
-        ),
-        "passed": math.isfinite(best["aggregate_decode_tps"])
-        and best["aggregate_decode_tps"] > serial["aggregate_decode_tps"],
-    }
+    return _batch_release_summary(results)
 
 
 def main() -> int:
@@ -192,12 +229,21 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     levels = [int(item) for item in args.batch_levels.split(",")]
-    if not levels or 1 not in levels or any(item < 1 or item > 8 for item in levels):
-        raise SystemExit("batch levels must include 1 and stay within 1..8")
+    if (
+        not levels
+        or 1 not in levels
+        or 8 not in levels
+        or len(set(levels)) != len(levels)
+        or any(item < 1 or item > 8 for item in levels)
+    ):
+        raise SystemExit(
+            "batch levels must include distinct 1 and 8 values and stay within 1..8"
+        )
     if not 120000 <= args.target_prompt_tokens <= 130000:
         raise SystemExit("target prompt tokens must stay within 120000..130000")
     receipt = {
-        "schema_version": 1,
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "benchmark_script_sha256": _script_sha256(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model": MODEL,
         "base_url": args.base_url,

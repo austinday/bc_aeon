@@ -1,0 +1,22 @@
+{
+  "schema": "aeon-bare-engine-closure-v1",
+  "archive_sha256": "278fd5ac8447f73cb727f16d85717762c5f615fd5221bad7e2a350023d424baa",
+  "root": "venv",
+  "manifest_sha256": "c93285eebb7a61bb988fd909f05f2bba575026bfbb6175408935c5a2c1d7b7c1",
+  "entries": 81903,
+  "files": 73103,
+  "directories": 8796,
+  "symlinks": 4,
+  "regular_bytes": 8460059803,
+  "python_executable_sha256": "1e4461092175d186c4bcdb19ee2849a45d6e4d8d1f6a871e45f63418d52a4e35",
+  "python_executable_bytes": 30936528,
+  "python_version": "3.12.13 (main, Jul 23 2026, 14:43:28) [Clang 22.1.3 ]",
+  "python_cache_tag": "cpython-312",
+  "python_soabi": "cpython-312-x86_64-linux-gnu",
+  "allowed_symlinks": {
+    "bin/python": "python3.12",
+    "bin/python3": "python3.12",
+    "bin/python3.12": "/usr/bin/python3.12",
+    "lib64": "lib"
+  }
+}

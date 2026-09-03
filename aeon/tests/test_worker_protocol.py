@@ -723,6 +723,7 @@ class WorkerProtocolScenarios(unittest.TestCase):
         original_ledger = worker._format_strategy_ledger()
         self.assertIn("methods=write_file", original_ledger)
         self.assertIn("write_file:failed:tool_failed", original_ledger)
+        self.assertNotIn("try a direct overwrite", original_ledger)
 
         restored, _ = self.worker([], FailingWrite())
         restored.restore_state(worker.serialize_state())
@@ -730,7 +731,7 @@ class WorkerProtocolScenarios(unittest.TestCase):
         self.assertEqual(restored.execution_state, ExecutionState.RUNNING)
         self.assertEqual(restored._format_strategy_ledger(), original_ledger)
         self.assertTrue(restored._progress_controller.recovery_required)
-        self.assertIn("STRATEGIC RECOVERY", restored._stuck_banner)
+        self.assertIn("RECOVERY REQUIRED", restored._stuck_banner)
 
     def test_collaborator_influence_persists_through_both_restart_paths(self):
         handoff_text = (

@@ -1,0 +1,50 @@
+{
+  "schema_version": "aeon-qwen38-rtx5000-release-v1",
+  "status": "passed",
+  "completed_at": "2026-08-25T21:14:52Z",
+  "capability_candidate_manifest_sha256": "d36efd8a0b7b6c22bc10803b11bbc48ee61e9cc4893fef04aa230cb0ce223f96",
+  "host": "192.168.0.178",
+  "hostname": "DAY2XRTX5000",
+  "gpu_model": "NVIDIA RTX PRO 5000 Blackwell",
+  "memory_total_mib": 48935,
+  "vram_budget_gib": 41.25,
+  "context_tokens": 131072,
+  "runtime": {
+    "image_id": "sha256:d57400972ab0ae46baac64d4bfcc49cb136c07d8b0c50a76c7e2d81bd8a9fe47",
+    "model_manifest_sha256": "1a3ba1eb88d0507bdef3798a6db59830dc076199b7db7d111201f6997588220e",
+    "model_sha256s_sha256": "e7eca7ebee03c4f27482d4fe421ca1fac9f1d9986663a51fd7614361010c1237",
+    "vllm_version": "0.23.0",
+    "attention_backend": "TRITON_ATTN",
+    "kv_cache_dtype": "fp8_per_token_head",
+    "mtp_k": 3,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 8192,
+    "largest_sampled_memory_used_mib": 35376,
+    "sampled_ready_memory_free_mib": 13028,
+    "vram_budget_committed_mib": 42240,
+    "vram_budget_capacity_mib": 42791
+  },
+  "gates": {
+    "structured_text_and_vision_warmup": true,
+    "semantic_mtp_requests_passed": 15,
+    "serial_median_decode_tps": 115.3366489005115,
+    "long_prompt_tokens": 125985,
+    "long_context_exact_recall": true,
+    "batch_8_aggregate_decode_tps": 483.8710217019877,
+    "batch_scale_vs_suite_serial": 5.834420636815434,
+    "normal_aeon_spill_start": true,
+    "normal_aeon_vision_selftest": true,
+    "normal_aeon_workspace_pwd": "/home/aday/NexusAgentDashboard/bc_aeon",
+    "routed_semantic_transport": true,
+    "ready_state_memory_sample_under_hard_cap": true,
+    "exact_teardown_and_release": true
+  },
+  "raw_reports": {
+    "mtp_k3_sha256": "62f98e6a056fd0355dc1ce3d5d35c7bdd8729768c656ce32d91933f8764abc5c",
+    "long_batch_sha256": "f5d84bb3bdabfea9ca50417c6345b7397b3f49accfa7f9c118285826f79ad7c4",
+    "normal_aeon_sha256": "b370182a891c944fa9eac602abcdd602ee6219c768d7d8a097cb0860a29e025e",
+    "lifecycle_state_sha256": "82f873dbf106c903ecfa45b0848e5bdca01fa982f3423d4fe69a522cd0ba3a9f",
+    "exact_teardown_sha256": "af5d320b6db7629f4ca2b505f08ee16a6cde2e903cfb62b53ff9fa1426f53417",
+    "release_evidence_validator_sha256": "dd8f636f7c8d6f6608f36725e6598de26d778223a5c880c20ad6d3295b38683b"
+  }
+}

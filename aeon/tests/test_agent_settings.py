@@ -1,6 +1,9 @@
 import unittest
 
-from aeon.core.model_catalog import QWEN38_MODEL_NAME
+from aeon.core.model_identity import (
+    AEON_DEFAULT_MODEL_NAME,
+    QWEN38_LEGACY_WIRE_ALIAS,
+)
 from aeon.remote.agent_settings import (
     AgentSettingsError,
     normalize_settings,
@@ -11,11 +14,21 @@ from aeon.remote.agent_settings import (
 class AgentSettingsTests(unittest.TestCase):
     def test_aeon_is_bound_to_the_validated_release(self):
         self.assertEqual(
-            normalize_settings("aeon", model=QWEN38_MODEL_NAME, effort=None),
-            (QWEN38_MODEL_NAME, ""),
+            normalize_settings(
+                "aeon", model=AEON_DEFAULT_MODEL_NAME, effort=None
+            ),
+            (AEON_DEFAULT_MODEL_NAME, ""),
         )
         with self.assertRaises(AgentSettingsError):
             normalize_settings("aeon", model="another-model", effort="")
+
+    def test_aeon_legacy_wire_alias_migrates_to_logical_service(self):
+        self.assertEqual(
+            normalize_settings(
+                "aeon", model=QWEN38_LEGACY_WIRE_ALIAS, effort=""
+            ),
+            (AEON_DEFAULT_MODEL_NAME, ""),
+        )
 
     def test_codex_and_claude_are_strict_allowlists(self):
         self.assertEqual(

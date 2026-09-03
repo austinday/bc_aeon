@@ -16,6 +16,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from .utils.io import read_bounded_fd
 
 CONTINUOUS_MODE_ENV = "AEON_CONTINUOUS_MODE_PATH"
 CONTINUOUS_MODE_FILENAME = "continuous-mode.json"
@@ -130,7 +131,9 @@ def load_continuous_mode(path_value: str | os.PathLike[str] | None) -> Continuou
             or metadata.st_size > MAX_CONTINUOUS_GOAL_BYTES + 1024
         ):
             raise ContinuousModeError("Continuous-mode control file is not owner-safe")
-        payload = os.read(descriptor, MAX_CONTINUOUS_GOAL_BYTES + 1025)
+        payload = read_bounded_fd(
+            descriptor, MAX_CONTINUOUS_GOAL_BYTES + 1024
+        )
         if len(payload) > MAX_CONTINUOUS_GOAL_BYTES + 1024:
             raise ContinuousModeError("Continuous-mode control file is too large")
         document = json.loads(payload.decode("utf-8"))

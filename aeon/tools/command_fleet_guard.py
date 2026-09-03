@@ -26,7 +26,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from typing import IO, Any, Iterable, Mapping
+from typing import IO, Any, Callable, Iterable, Mapping
 import uuid
 
 
@@ -1192,7 +1192,10 @@ def scrubbed_payload_environment(
 
     environment = scrubbed_fleet_command_environment(source)
     for name in list(environment):
-        if name.upper() in _REMOVED_PAYLOAD_ENV:
+        if (
+            name.upper() in _REMOVED_PAYLOAD_ENV
+            or name.upper().startswith("AEON_OPENCODE_")
+        ):
             environment.pop(name, None)
     environment.pop(CPU_SANDBOX_SLICE_ENV, None)
     environment.update(_NO_ACCELERATOR_ENV)
@@ -1272,9 +1275,12 @@ def trusted_guardrail_paths() -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
-def inaccessible_sandbox_paths() -> tuple[str, ...]:
+def inaccessible_sandbox_paths(
+    source_environment: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
     """Return fixed control/coordinator paths hidden from every payload."""
 
+    source = os.environ if source_environment is None else source_environment
     paths: list[str] = []
     for path in _INACCESSIBLE_PATH_CANDIDATES:
         # InaccessiblePaths accepts a '-' prefix for absent runtime sockets. The
@@ -1289,6 +1295,30 @@ def inaccessible_sandbox_paths() -> tuple[str, ...]:
             paths.append(str(path.resolve(strict=True)))
         except OSError:
             pass
+    state_value = source.get("AEON_OPENCODE_COMPLETION_STATE", "")
+    key_value = source.get("AEON_OPENCODE_COMPLETION_KEY_FILE", "")
+    if state_value or key_value:
+        state_path = Path(state_value)
+        key_path = Path(key_value)
+        if (
+            not state_path.is_absolute()
+            or not key_path.is_absolute()
+            or state_path.name != "completion-state.json"
+            or key_path.name != "completion-key.bin"
+            or state_path.parent != key_path.parent
+        ):
+            raise FleetCommandGuardError(
+                "COMMAND REFUSED: OpenCode completion guardrail is invalid."
+            )
+        completion_root = _canonical_existing_path(
+            state_path.parent,
+            label="OpenCode completion guardrail",
+        )
+        if not any(
+            _paths_overlap(Path(existing), Path(completion_root))
+            for existing in paths
+        ):
+            paths.append(completion_root)
     return tuple(dict.fromkeys(paths))
 
 
@@ -1573,7 +1603,7 @@ def prepare_fleet_shell_boundary(
             "The requested command was not launched."
         )
     source_guardrails = trusted_guardrail_paths()
-    base_inaccessible = inaccessible_sandbox_paths()
+    base_inaccessible = inaccessible_sandbox_paths(source)
     state_guardrail: tuple[str, ...] = ()
     if internal_state_path is not None:
         try:
@@ -1991,6 +2021,7 @@ def launch_sandbox_service(
     receipt_path: str | Path | None = None,
     output_path: str | Path | None = None,
     payload_environment: Mapping[str, str] | None = None,
+    on_receipt: Callable[[SandboxServiceReceipt], None] | None = None,
 ) -> SandboxServiceHandle:
     """Launch, verify, receipt, and only then release one service payload."""
 
@@ -2049,6 +2080,12 @@ def launch_sandbox_service(
             else Path(boundary.control_dir) / "service_receipt.json"
         )
         _atomic_write_json(durable_path, receipt.to_json())
+        # Synchronous callers install their cooperative stop callback here,
+        # while the payload is still held behind its private gate.  Therefore
+        # there is no signal window in which model code is running but its exact
+        # InvocationID/cgroup receipt is not registered for cleanup.
+        if on_receipt is not None:
+            on_receipt(receipt)
         # The shim has already loaded the spec into private memory. Remove it
         # before opening the read-only gate so payload code cannot recover stale
         # manager/Fleet environment from the control directory.

@@ -1,0 +1,66 @@
+# Minimal overlay for RadixArk's hybrid NVFP4 + FP8-PLE checkpoint.
+#
+# Docker Hub's signed manifest chain requires pulling the immutable index. The
+# explicit platform selects its audited amd64 child, whose registry digest is
+# recorded below and in the image labels.
+ARG TARGETPLATFORM=linux/amd64
+FROM vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8
+
+ARG TARGETARCH
+ARG TARGETPLATFORM
+ARG PLE_PATCH_SHA256=9fba0f454fab86efad4f13e9f836409c5d3e69cb2709275506cdfbc06d60c03f
+ARG ATTESTATION_PATCH_SHA256=81fcf77c7a83ec177ee98010d1ace082e978567f8490fadeab48d2d71044a81e
+ARG ATTESTATION_SOURCE_SHA256=80459aacc387a5a70c46a3bbbb17322fe7f93e4dc30fc7e12b70da923bc34d17
+
+LABEL com.bc_aeon.component="qwen38-flash-next-radixark-ple-fp8" \
+      com.bc_aeon.base.index.digest="sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8" \
+      com.bc_aeon.base.amd64.digest="sha256:0aea30240f3e3d9ffae8526643950e170eb5fa07fc427016a9dd90892afa2aa3" \
+      com.bc_aeon.base.ple-layer.sha256="a71144c1d36e06f22a2da1b1ada900076597fe5e824a911e7ada86249a0993e7" \
+      com.bc_aeon.patch.sha256="${PLE_PATCH_SHA256}" \
+      com.bc_aeon.patch.source="https://github.com/x00byte/Qwen3.8-Flash-Dual-Spark-Recipe" \
+      com.bc_aeon.patch.source.commit="ba89c550dc9ff82159079c313e55fb51e1c407b5" \
+      com.bc_aeon.patched.ple-layer.sha256="fa75692d4fb941180cb4868800934cbb68a8cf26899941f5d7367d1716a90bfb" \
+      com.bc_aeon.attestation.patch.sha256="${ATTESTATION_PATCH_SHA256}" \
+      com.bc_aeon.attestation.source.sha256="${ATTESTATION_SOURCE_SHA256}" \
+      com.bc_aeon.attestation.gpu-worker.base.sha256="923767cea120a027ca36683bd48b7659eadbfa4cbd4acbcf52a80cee0c0a0ec4" \
+      com.bc_aeon.attestation.gpu-worker.patched.sha256="38820bebca30c15be82eac14f641218d5d14b8c129c1df96245da18f841817b2" \
+      com.bc_aeon.attestation.ple-worker.base.sha256="f93a0a8c40ee3c536e60cb027f5d6e76cde0a51e62b540c82e2c15b2a72b7f5f" \
+      com.bc_aeon.attestation.ple-worker.patched.sha256="721a15c3440e45fd7dc41c8b5a1c441c142a1520113635ec77d78bfc833746e7"
+
+COPY patches/qwen38-flash-next-radixark-ple-fp8.patch /tmp/radixark-ple-fp8.patch
+COPY patches/qwen38-flash-next-runtime-attestation.patch /tmp/runtime-attestation.patch
+COPY qwen38_flash_next_attestation.py /usr/local/lib/python3.12/dist-packages/vllm/qwen38_flash_next_attestation.py
+
+RUN test "${TARGETARCH:-amd64}" = "amd64" \
+    && test "${TARGETPLATFORM:-linux/amd64}" = "linux/amd64" \
+    && test "$(sha256sum /tmp/radixark-ple-fp8.patch | cut -d' ' -f1)" = "${PLE_PATCH_SHA256}" \
+    && test "$(sha256sum /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py | cut -d' ' -f1)" = "a71144c1d36e06f22a2da1b1ada900076597fe5e824a911e7ada86249a0993e7" \
+    && patch --dry-run --batch --fuzz=0 -p1 \
+         -d /usr/local/lib/python3.12/dist-packages \
+         --input=/tmp/radixark-ple-fp8.patch \
+    && patch --batch --fuzz=0 -p1 \
+         -d /usr/local/lib/python3.12/dist-packages \
+         --input=/tmp/radixark-ple-fp8.patch \
+    && test "$(sha256sum /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py | cut -d' ' -f1)" = "fa75692d4fb941180cb4868800934cbb68a8cf26899941f5d7367d1716a90bfb" \
+    && python3 -m py_compile \
+         /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py \
+    && python3 -c 'import importlib.metadata as m; assert m.version("vllm") == "0.1.dev20073+g8e685d198"' \
+    && rm -f /tmp/radixark-ple-fp8.patch
+
+RUN test "$(sha256sum /tmp/runtime-attestation.patch | cut -d' ' -f1)" = "${ATTESTATION_PATCH_SHA256}" \
+    && test "$(sha256sum /usr/local/lib/python3.12/dist-packages/vllm/qwen38_flash_next_attestation.py | cut -d' ' -f1)" = "${ATTESTATION_SOURCE_SHA256}" \
+    && test "$(sha256sum /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py | cut -d' ' -f1)" = "923767cea120a027ca36683bd48b7659eadbfa4cbd4acbcf52a80cee0c0a0ec4" \
+    && test "$(sha256sum /usr/local/lib/python3.12/dist-packages/vllm/v1/ple_offload/worker.py | cut -d' ' -f1)" = "f93a0a8c40ee3c536e60cb027f5d6e76cde0a51e62b540c82e2c15b2a72b7f5f" \
+    && patch --dry-run --batch --fuzz=0 -p1 \
+         -d /usr/local/lib/python3.12/dist-packages \
+         --input=/tmp/runtime-attestation.patch \
+    && patch --batch --fuzz=0 -p1 \
+         -d /usr/local/lib/python3.12/dist-packages \
+         --input=/tmp/runtime-attestation.patch \
+    && test "$(sha256sum /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py | cut -d' ' -f1)" = "38820bebca30c15be82eac14f641218d5d14b8c129c1df96245da18f841817b2" \
+    && test "$(sha256sum /usr/local/lib/python3.12/dist-packages/vllm/v1/ple_offload/worker.py | cut -d' ' -f1)" = "721a15c3440e45fd7dc41c8b5a1c441c142a1520113635ec77d78bfc833746e7" \
+    && python3 -m py_compile \
+         /usr/local/lib/python3.12/dist-packages/vllm/qwen38_flash_next_attestation.py \
+         /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py \
+         /usr/local/lib/python3.12/dist-packages/vllm/v1/ple_offload/worker.py \
+    && rm -f /tmp/runtime-attestation.patch

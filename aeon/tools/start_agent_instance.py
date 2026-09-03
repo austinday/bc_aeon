@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import stat
 import urllib.error
 import urllib.request
@@ -14,9 +16,9 @@ from aeon.core.durable_agent_guard import (
     VerifiedNexusAgentStart,
     verified_start_receipt,
 )
+from aeon.core.utils.io import read_bounded_fd
 from aeon.remote.project_manager import PROJECT_MANAGER_INSTANCE_ID
 from aeon.tools.base import BaseTool
-
 
 _ENDPOINT_PATH = "/internal/orchestrator/agents"
 _ALLOWED_ENDPOINT_ORIGINS = frozenset(
@@ -27,6 +29,7 @@ _ALLOWED_ENDPOINT_ORIGINS = frozenset(
     }
 )
 _CREDENTIAL_ID_ALIASES = {"github.token": "github"}
+_HARNESS_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -62,7 +65,9 @@ class StartAgentInstanceTool(BaseTool):
                 "target directory. A can/could/would/how question requests a plan, "
                 "not this tool. This capability is available only to the primary "
                 "Project Manager. Parameters: name, directory, kind (default aeon), "
-                "goal, personality, system_prompt, and continuous_mode. The new agent "
+                "goal, personality, system_prompt, continuous_mode, and optional "
+                "project_id. Nexus also associates the agent automatically when the "
+                "directory exactly matches one active project root. The new agent "
                 "may receive allowed_credentials as exact IDs from "
                 "list_mcp_credentials; omitted means no credential access. The new agent "
                 "is registered as its own manageable Nexus tab. A non-continuous Aeon "
@@ -93,7 +98,9 @@ class StartAgentInstanceTool(BaseTool):
                 or metadata.st_size > 256
             ):
                 raise RuntimeError("Nexus capability file is not owner-safe")
-            token = os.read(descriptor, 257).decode("ascii", errors="strict").strip()
+            token = read_bounded_fd(descriptor, 256).decode(
+                "ascii", errors="strict"
+            ).strip()
         finally:
             os.close(descriptor)
         if len(token) < 32 or len(token) > 256:
@@ -118,6 +125,25 @@ class StartAgentInstanceTool(BaseTool):
             raise RuntimeError("Nexus orchestrator endpoint is not an approved local URL")
         return value
 
+    def _creation_request_id(self, name: object) -> str:
+        """Derive one retry key per durable name in the current user request."""
+
+        request_id = getattr(getattr(self, "worker", None), "request_id", None)
+        if (
+            not isinstance(request_id, str)
+            or not _HARNESS_REQUEST_ID_RE.fullmatch(request_id)
+        ):
+            raise RuntimeError("current Project Manager request identity is unavailable")
+        # A single user request may legitimately create several differently
+        # named agents. SQLite already makes names case-insensitively unique, so
+        # name + harness request is the correct retry scope for this operation.
+        key_material = json.dumps(
+            [request_id, str(name or "").strip().casefold()],
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        return "agent-request-" + hashlib.sha256(key_material).hexdigest()
+
     def execute(
         self,
         name: str,
@@ -128,6 +154,7 @@ class StartAgentInstanceTool(BaseTool):
         system_prompt: str = "",
         continuous_mode: bool = False,
         allowed_credentials: list[str] | None = None,
+        project_id: str | None = None,
     ) -> str | VerifiedNexusAgentStart:
         if self.is_internal:
             return "Error: only the primary Nexus Project Manager may start standalone agents."
@@ -138,6 +165,7 @@ class StartAgentInstanceTool(BaseTool):
             token = self._token(
                 os.environ.get("NEXUS_ORCHESTRATOR_TOKEN_FILE", "")
             )
+            creation_request_id = self._creation_request_id(name)
         except (OSError, RuntimeError, UnicodeError) as exc:
             return f"Error: standalone agent control is unavailable: {exc}"
 
@@ -149,6 +177,7 @@ class StartAgentInstanceTool(BaseTool):
             "personality": personality,
             "system_prompt": system_prompt,
             "continuous_mode": continuous_mode,
+            "creation_request_id": creation_request_id,
         }
         if allowed_credentials:
             # Older prompts and persisted plans may refer to GitHub by the
@@ -159,6 +188,8 @@ class StartAgentInstanceTool(BaseTool):
                 _CREDENTIAL_ID_ALIASES.get(credential_id, credential_id)
                 for credential_id in allowed_credentials
             ))
+        if project_id is not None:
+            payload["project_id"] = project_id
         request = urllib.request.Request(
             endpoint,
             data=json.dumps(payload).encode("utf-8"),
@@ -197,6 +228,7 @@ class StartAgentInstanceTool(BaseTool):
                 expected_kind=kind,
                 expected_continuous=continuous_mode,
                 expected_goal=goal,
+                expected_project_id=project_id,
             )
         except (OSError, ValueError) as exc:
             return f"Error: {exc}."

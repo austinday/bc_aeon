@@ -23,13 +23,15 @@ from aeon.tests.test_worker_protocol import (
 from aeon.tools.base import BaseTool
 
 
-def test_generation_budget_exhaustion_is_published_once_without_retry() -> None:
+def test_generation_budget_exhaustion_gets_one_compact_recovery_before_publish() -> None:
     worker, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
     calls = 0
+    recovery_modes = []
 
     def exhaust(_self, _objective, _iteration):
         nonlocal calls
         calls += 1
+        recovery_modes.append(_self._generation_budget_recovery_active)
         raise DecisionGenerationBudgetExceeded("decision wall deadline exhausted")
 
     worker._call_protocol_model = types.MethodType(exhaust, worker)
@@ -38,10 +40,241 @@ def test_generation_budget_exhaustion_is_published_once_without_retry() -> None:
     ) as publish:
         outcome = worker._run_objective("Inspect the project")
 
-    assert calls == 1
+    assert calls == 2
+    assert recovery_modes == [False, True]
     assert outcome.state is ExecutionState.FAILED
-    assert "generation budget" in outcome.message
+    assert "automatic compact recovery" in outcome.message
     publish.assert_called_once()
+
+
+def test_generation_budget_compact_recovery_can_finish_the_same_objective() -> None:
+    worker, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+    recovery_modes = []
+
+    def recover(_self, _objective, _iteration):
+        recovery_modes.append(_self._generation_budget_recovery_active)
+        if len(recovery_modes) == 1:
+            raise DecisionGenerationBudgetExceeded("decision token ceiling reached")
+        return final("Recovered with one concise response.")
+
+    worker._call_protocol_model = types.MethodType(recover, worker)
+    outcome = worker._run_objective("Say hello")
+
+    assert recovery_modes == [False, True]
+    assert outcome.state is ExecutionState.DONE
+    assert outcome.message == "Recovered with one concise response."
+    assert worker._generation_budget_recovery_active is False
+
+
+def test_generation_budget_recovery_is_genuinely_compact() -> None:
+    worker, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+    captured = []
+    context_reserves = []
+    worker._generation_budget_recovery_active = True
+    worker.llm_client.last_reasoning_effort = "xhigh"
+    worker._protocol_call_context = types.MethodType(
+        lambda _self, _objective, _iteration, **kwargs: (
+            context_reserves.append(kwargs.get("output_reserve_tokens"))
+            or (
+                [{"role": "user", "content": "recover"}],
+                "compact recovery state",
+                [],
+            )
+        ),
+        worker,
+    )
+    worker._select_reasoning_effort = types.MethodType(
+        lambda _self, _objective, **_kwargs: "medium",
+        worker,
+    )
+
+    def respond(**kwargs):
+        captured.append(kwargs)
+        return final("Recovered through the compact path.")
+
+    worker.llm_client.get_primary_agent_response = respond
+    turn = type(worker)._call_protocol_model(worker, "Inspect the project", 2)
+
+    assert turn["message"] == "Recovered through the compact path."
+    assert captured[0]["reasoning_effort"] == "low"
+    assert captured[0]["max_retries"] == 1
+    assert captured[0]["_max_output_tokens"] == 8192
+    assert captured[0]["_disable_thinking"] is True
+    budget = captured[0]["_decision_budget"]
+    assert budget.max_model_calls == 6
+    assert budget.max_completion_tokens == 8192
+    assert budget.max_wall_seconds == 180.0
+    assert context_reserves == [8192]
+
+
+def test_terminal_generation_failure_is_visible_but_not_replayed_to_model() -> None:
+    worker, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+
+    def exhaust(_self, _objective, _iteration):
+        raise DecisionGenerationBudgetExceeded("length ceiling")
+
+    worker._call_protocol_model = types.MethodType(exhaust, worker)
+    with patch(
+        "aeon.core.chat_transcript.append_assistant_message_from_environment"
+    ) as publish:
+        outcome = worker._run_objective("Inspect the project")
+
+    assert outcome.state is ExecutionState.FAILED
+    assert not any(
+        "automatic compact recovery" in str(message.get("content") or "")
+        for message in worker._history_messages
+    )
+    publish.assert_called_once()
+
+
+def test_terminal_continuous_generation_failure_discards_dangling_synthetic_prompt() -> None:
+    worker, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+    objective = (
+        "CONTINUOUS MODE: Begin another autonomous work cycle toward the durable "
+        "goal. Keep improving the project safely."
+    )
+    worker.prepare_continuous_turn(goal="keep improving the project safely")
+
+    def exhaust(_self, _objective, _iteration):
+        raise DecisionGenerationBudgetExceeded("length ceiling")
+
+    worker._call_protocol_model = types.MethodType(exhaust, worker)
+    outcome = worker._run_objective(objective)
+
+    assert outcome.state is ExecutionState.FAILED
+    assert not any(
+        message.get("role") == "user" and message.get("content") == objective
+        for message in worker._history_messages
+    )
+
+
+def test_continuous_generation_recovery_prunes_only_synthetic_failed_pairs() -> None:
+    worker, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+    continuous = (
+        "CONTINUOUS MODE: Begin another autonomous work cycle toward the durable goal."
+    )
+    failure = (
+        "Aeon stopped after both the initial generation and one automatic compact "
+        "recovery exhausted their finite local generation backstops before producing "
+        "a usable turn. No tool ran."
+    )
+    preserved_user = {"role": "user", "content": "Original owner request"}
+    preserved_assistant = {"role": "assistant", "content": "Made verified progress"}
+    worker._history_messages = [
+        {"role": "assistant", "content": failure},
+        preserved_user,
+        preserved_assistant,
+        {"role": "user", "content": continuous},
+        {"role": "assistant", "content": failure},
+        {"role": "user", "content": continuous},
+        {"role": "assistant", "content": failure},
+    ]
+
+    worker.prepare_continuous_turn(
+        goal="keep improving the project safely",
+        recovery_context=(
+            "PRIOR CONTINUOUS CYCLE OUTCOME: " + failure
+        ),
+    )
+
+    assert worker._history_messages == [preserved_user, preserved_assistant]
+
+
+def test_continuous_reenable_also_prunes_prior_generation_failures() -> None:
+    worker, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+    worker._history_messages = [
+        {
+            "role": "user",
+            "content": (
+                "CONTINUOUS MODE: Begin another autonomous work cycle toward the "
+                "durable goal."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "Aeon stopped after both the initial generation and one automatic "
+                "compact recovery exhausted their finite local generation backstops."
+            ),
+        },
+    ]
+
+    worker.prepare_continuous_turn(goal="keep improving the project safely")
+
+    assert worker._history_messages == []
+
+
+def test_restart_restore_prunes_legacy_generation_failure_pairs() -> None:
+    worker, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+    continuous = (
+        "CONTINUOUS MODE: Begin another autonomous work cycle toward the durable "
+        "goal."
+    )
+    failure = (
+        "Aeon stopped after both the initial generation and one automatic compact "
+        "recovery exhausted their finite local generation backstops."
+    )
+    state = worker.serialize_state()
+    state["history_messages"] = [
+        {"role": "user", "content": "Original owner request"},
+        {"role": "assistant", "content": "Verified useful result"},
+        {"role": "user", "content": continuous},
+        {"role": "assistant", "content": failure},
+        {"role": "assistant", "content": failure},
+    ]
+
+    restored, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+    restored.restore_state(state)
+
+    assert restored._history_messages == [
+        {"role": "user", "content": "Original owner request"},
+        {"role": "assistant", "content": "Verified useful result"},
+    ]
+
+
+def test_oversized_restart_pruning_extends_instead_of_overwriting_archive_chain() -> None:
+    worker, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+    state = worker.serialize_state()
+    prior_digest = "1" * 64
+    state["history_archive_digest"] = prior_digest
+    state["history_archive_messages"] = 7
+    history = []
+    for index in range(100):
+        history.extend(
+            (
+                {"role": "user", "content": f"owner {index} " + "x" * 4000},
+                {"role": "assistant", "content": f"result {index} " + "y" * 4000},
+            )
+        )
+    history.extend(
+        (
+            {
+                "role": "user",
+                "content": (
+                    "CONTINUOUS MODE: Begin another autonomous work cycle toward "
+                    "the durable goal."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "Aeon stopped after both the initial generation and one automatic "
+                    "compact recovery exhausted their finite local generation backstops."
+                ),
+            },
+        )
+    )
+    state["history_messages"] = history
+
+    restored, _ = _protocol_tests.WorkerProtocolScenarios().worker([])
+    restored.restore_state(state)
+
+    assert restored._history_archive_messages > 7
+    assert restored._history_archive_digest != prior_digest
+    assert not any(
+        "automatic compact recovery" in str(message.get("content") or "")
+        for message in restored._history_messages
+    )
 
 
 def test_identical_rejected_final_stops_after_two_and_publishes_once() -> None:

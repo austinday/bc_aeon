@@ -12,7 +12,7 @@ from aeon.core.prompts import (
 from aeon.tools.base import BaseTool
 
 
-EXPECTED_ACTION_REQUIRED = ["tool_name", "parameters", "goal_refs"]
+EXPECTED_ACTION_REQUIRED = ["tool_name", "parameters"]
 EXPECTED_GOAL_REFS_SCHEMA = {
     "type": "array",
     "maxItems": 13,
@@ -20,19 +20,13 @@ EXPECTED_GOAL_REFS_SCHEMA = {
 }
 
 
-def test_prompt_requires_evidence_bound_goals_and_event_triggered_recovery():
-    assert "`- [ ]` / `- [x]`" in PRIMARY_AGENT_INSTRUCTIONS
-    assert "TASK ACCEPTANCE" in PRIMARY_AGENT_INSTRUCTIONS
-    assert '"goal_refs"' in PRIMARY_AGENT_INSTRUCTIONS
-    assert "Never cite aggregate `G0`" in PRIMARY_AGENT_INSTRUCTIONS
-    assert (
-        "Plan text is coordination state, not completion evidence"
-        in PRIMARY_AGENT_INSTRUCTIONS
-    )
-    assert "STRATEGIC RECOVERY" in PRIMARY_AGENT_INSTRUCTIONS
-    assert "parent goal and done criteria" in PRIMARY_AGENT_INSTRUCTIONS
-    assert "materially different method families" in PRIMARY_AGENT_INSTRUCTIONS
-    assert "Do not spend an extra" in PRIMARY_AGENT_INSTRUCTIONS
+def test_prompt_keeps_execution_policy_compact_and_action_oriented():
+    assert "installed schema" in PRIMARY_AGENT_INSTRUCTIONS
+    assert "goal_refs` are optional precision hints" in PRIMARY_AGENT_INSTRUCTIONS
+    assert "Do not narrate internal" in PRIMARY_AGENT_INSTRUCTIONS
+    assert "RECOVERY REQUIRED" in PRIMARY_AGENT_INSTRUCTIONS
+    assert "Do not retry a barred action" in PRIMARY_AGENT_INSTRUCTIONS
+    assert len(PRIMARY_AGENT_INSTRUCTIONS) < 2_500
     assert "Primary strong-model reasoning call at xhigh effort" in TOOL_DESC_THINK
 
 
@@ -81,7 +75,7 @@ def test_each_turn_branch_projects_the_complete_required_envelope():
     assert schema["additionalProperties"] is False
 
 
-def test_each_union_branch_requires_goal_refs_and_retains_exact_tool_arguments():
+def test_each_union_branch_accepts_optional_goal_refs_and_retains_exact_tool_arguments():
     parameters = {
         "type": "object",
         "properties": {"command": {"type": "string"}},
@@ -114,7 +108,7 @@ def test_zero_tool_schema_omits_impossible_tool_call_turns():
     )
 
 
-def test_runtime_tool_examples_include_decode_required_goal_refs():
+def test_runtime_tool_examples_do_not_inject_optional_harness_bookkeeping():
     class ExampleTool(BaseTool):
         def __init__(self, description):
             super().__init__(
@@ -140,4 +134,4 @@ def test_runtime_tool_examples_include_decode_required_goal_refs():
             if '"tool_name"' in line and "{" in line
         ]
         assert example_lines
-        assert all('"goal_refs":[]' in line for line in example_lines)
+        assert all('"goal_refs"' not in line for line in example_lines)

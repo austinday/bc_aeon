@@ -232,6 +232,7 @@ class Presence:
             "cwd": working_directory,
             "pid": self.pid,
             "process_create_time": self.process_create_time,
+            "turn_control_version": 1,
             "phase": "startup",
             "iteration": 0,
             "objective_summary": "",

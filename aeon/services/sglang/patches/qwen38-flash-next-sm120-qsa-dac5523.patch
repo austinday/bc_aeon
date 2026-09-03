@@ -1,0 +1,110 @@
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index 7758a88fea..693a0e366e 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -53,9 +53,9 @@ def _resolve_trtllm_sparse_decode():
+     at decode row counts; the trtllm-gen decode kernel over a page-aligned
+     scratch measures ~35% faster for the gather+attention pair.
+     """
+-    from sglang.srt.utils import is_sm100_supported
++    from sglang.srt.utils import is_sm100_supported, is_sm120_supported
+ 
+-    if not is_sm100_supported():
++    if not (is_sm100_supported() or is_sm120_supported()):
+         return None
+     try:
+         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+@@ -68,9 +68,17 @@ def _resolve_flash_attn_varlen_func():
+     """The dense varlen kernel behind the packed sparse-decode fallback.
+ 
+-    Classic flash_attn (FA2, Ampere/Hopper) is preferred when installed;
+-    flash-attn-4's cute interface serves the same call shape on Blackwell.
++    SM120 uses SGLang's architecture-owned FA4 dispatcher. Other platforms
++    prefer classic flash_attn (FA2) before flash-attn-4's cute interface.
+     """
++    from sglang.srt.utils import is_sm120_supported
++
++    if is_sm120_supported():
++        from sglang.kernels.ops.attention.flash_attention_v4 import (
++            flash_attn_varlen_func,
++        )
++
++        return flash_attn_varlen_func
+     try:
+         from flash_attn import flash_attn_varlen_func
+ 
+         return flash_attn_varlen_func
+diff --git a/test/registered/kernels/test_qsa.py b/test/registered/kernels/test_qsa.py
+index b9cbed29bc..eff2eafdec 100644
+--- a/test/registered/kernels/test_qsa.py
++++ b/test/registered/kernels/test_qsa.py
+@@ -1,5 +1,5 @@
+ import sys
+-from types import SimpleNamespace
++from types import ModuleType, SimpleNamespace
+ 
+ import pytest
+ import torch
+@@ -44,6 +44,62 @@ BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
+ FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
+ 
+ 
++def test_qsa_trtllm_sparse_decode_is_enabled_on_sm120(monkeypatch):
++    resolver = qsa_backend_module._resolve_trtllm_sparse_decode
++    resolver.cache_clear()
++
++    trtllm_decode_func = object()
++    flashinfer_decode = ModuleType("flashinfer.decode")
++    flashinfer_decode.trtllm_batch_decode_with_kv_cache = trtllm_decode_func
++
++    monkeypatch.setattr("sglang.srt.utils.is_sm100_supported", lambda: False)
++    monkeypatch.setattr("sglang.srt.utils.is_sm120_supported", lambda: True)
++    monkeypatch.setitem(sys.modules, flashinfer_decode.__name__, flashinfer_decode)
++
++    try:
++        assert resolver() is trtllm_decode_func
++    finally:
++        resolver.cache_clear()
++
++
++def test_qsa_varlen_fallback_uses_sglang_fa4_on_sm120(monkeypatch):
++    resolver = qsa_backend_module._resolve_flash_attn_varlen_func
++    resolver.cache_clear()
++
++    sglang_varlen_func = object()
++    classic_varlen_func = object()
++    sglang_fa4 = ModuleType("sglang.kernels.ops.attention.flash_attention_v4")
++    sglang_fa4.flash_attn_varlen_func = sglang_varlen_func
++    classic_fa = ModuleType("flash_attn")
++    classic_fa.flash_attn_varlen_func = classic_varlen_func
++
++    monkeypatch.setattr("sglang.srt.utils.is_sm120_supported", lambda: True)
++    monkeypatch.setitem(sys.modules, sglang_fa4.__name__, sglang_fa4)
++    monkeypatch.setitem(sys.modules, classic_fa.__name__, classic_fa)
++
++    try:
++        assert resolver() is sglang_varlen_func
++    finally:
++        resolver.cache_clear()
++
++
++def test_qsa_varlen_fallback_keeps_classic_fa_preference_off_sm120(monkeypatch):
++    resolver = qsa_backend_module._resolve_flash_attn_varlen_func
++    resolver.cache_clear()
++
++    classic_varlen_func = object()
++    classic_fa = ModuleType("flash_attn")
++    classic_fa.flash_attn_varlen_func = classic_varlen_func
++
++    monkeypatch.setattr("sglang.srt.utils.is_sm120_supported", lambda: False)
++    monkeypatch.setitem(sys.modules, classic_fa.__name__, classic_fa)
++
++    try:
++        assert resolver() is classic_varlen_func
++    finally:
++        resolver.cache_clear()
++
++
+ def test_qwen4_exp_indexer_config_is_read_from_text_config():
+     config = Qwen4ExpConfig(
+         text_config={

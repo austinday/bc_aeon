@@ -34,9 +34,10 @@ import json
 import os
 import random
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import Request as URLRequest, urlopen
+from urllib.request import Request as URLRequest
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -55,12 +56,28 @@ from patchright.async_api import async_playwright, Page, BrowserContext, Error a
 # runs `uvicorn server:app` from /app where both files sit side by side.
 from human_motion import mouse_path, scroll_ticks, type_delays, idle_drift_target
 from browser_util import (
-    bearer_is_authorized, is_destructive_dialog, parse_proxy, primary_locale,
-    read_auth_token, valid_timezone,
+    bearer_is_authorized, benchmark_fixture_page_url, is_destructive_dialog,
+    parse_proxy, primary_locale, read_auth_token, seed_benchmark_fixture_page,
+    validate_benchmark_fixture_request, valid_timezone,
+    verify_benchmark_fixture_page,
+)
+from media_safety import (
+    BrowserMediaSafetyError,
+    bounded_download,
+    normalize_public_navigation_url,
+    run_cpu_helper,
+    strict_url_opener,
+    validate_public_browser_request_url,
 )
 
 app = FastAPI()
 BROWSER_API_VERSION = "human_v6"
+BROWSER_SERVICE_ID = os.environ.get("AEON_BROWSER_SERVICE_ID", "")
+if not (
+    len(BROWSER_SERVICE_ID) == 32
+    and all(character in "0123456789abcdef" for character in BROWSER_SERVICE_ID)
+):
+    raise RuntimeError("AEON_BROWSER_SERVICE_ID must be an exact 128-bit service identity")
 
 # --- Configuration ----------------------------------------------------------
 BROWSER_AUTH_TOKEN_FILE = os.environ.get(
@@ -98,6 +115,10 @@ MAX_INDEXED_ELEMENTS = 250
 MAX_FRAMES = 30               # cap frames scanned per observation
 ACTION_SETTLE_CAP_MS = 600    # max wait for the DOM to quiesce after an action
 DOWNLOAD_DIR = os.environ.get("AEON_BROWSER_DOWNLOADS", "/profiles/downloads")
+MAX_IMAGE_DOWNLOAD_BYTES = 64 * 1024 * 1024
+MAX_VIDEO_DOWNLOAD_BYTES = 512 * 1024 * 1024
+MAX_PDF_DOWNLOAD_BYTES = 128 * 1024 * 1024
+MAX_GENERAL_DOWNLOAD_BYTES = 512 * 1024 * 1024
 SCREEN_W, SCREEN_H = 1920, 1080  # Xvfb screen (matches entrypoint.sh)
 
 # Structural/semantic roles kept in the TEXT element list but NOT drawn as boxes
@@ -126,10 +147,14 @@ def _resolve_geo():
         # limits shared/cloud egress, so use two independent providers before
         # falling back. No IP/address is logged or returned to the agent.
         proxy_raw = (os.environ.get("AEON_BROWSER_PROXY") or "").strip()
-        opener = None
-        if proxy_raw:
-            from urllib.request import ProxyHandler, build_opener
-            opener = build_opener(ProxyHandler({"http": proxy_raw, "https": proxy_raw}))
+        try:
+            # This fixed public lookup never follows redirects or inherits a
+            # container proxy environment. A configured HTTP(S) proxy is used
+            # only when explicitly supplied; SOCKS-only browser setups simply
+            # retain the configured timezone/locale fallback.
+            opener = strict_url_opener(proxy_raw)
+        except BrowserMediaSafetyError:
+            opener = None
         country_locales = {
             "US": "en-US", "GB": "en-GB", "CA": "en-CA", "AU": "en-AU",
             "NZ": "en-NZ", "DE": "de-DE", "FR": "fr-FR", "ES": "es-ES",
@@ -146,9 +171,16 @@ def _resolve_geo():
         ):
             try:
                 req = URLRequest(endpoint, headers={"User-Agent": "Mozilla/5.0"})
-                response = opener.open(req, timeout=5) if opener else urlopen(req, timeout=5)
+                if opener is None:
+                    raise BrowserMediaSafetyError(
+                        "geo lookup has no reviewed HTTP transport"
+                    )
+                response = opener.open(req, timeout=5)
                 with response as r:
-                    d = json.loads(r.read().decode())
+                    raw = r.read(65537)
+                    if len(raw) > 65536:
+                        raise ValueError("geo lookup response is oversized")
+                    d = json.loads(raw.decode())
                 if provider == "ipwho":
                     if d.get("success") is False:
                         raise ValueError(str(d.get("message") or "provider rejected lookup"))
@@ -199,6 +231,10 @@ contexts: Dict[str, BrowserContext] = {}
 _launch_locks: Dict[str, asyncio.Lock] = {}
 # page_key -> Page  (page_key = "<profile>::<session_id>::<tab_id>")
 pages: Dict[str, Page] = {}
+# Exact Page object IDs created only by the authenticated benchmark endpoint,
+# bound to fixture ID and its service-owned expected URL. Any other navigation
+# removes this exception and returns to the normal public-HTTP(S) policy.
+benchmark_pages: Dict[int, tuple[Page, str, str]] = {}
 # page_key -> {aeon_id: element_info}  (last observed snapshot, for verification)
 last_elements: Dict[str, Dict[int, Dict[str, Any]]] = {}
 # page_key -> {aeon_id: Frame}  (which frame owns each id, for frame-aware actions)
@@ -714,17 +750,9 @@ async def _ensure_browser(profile: str = DEFAULT_PROFILE):
         # no-window-manager default (~945x973).
         args = ["--no-sandbox", "--disable-dev-shm-usage", "--start-maximized",
                 "--disable-blink-features=AutomationControlled"]
-        # GPU-accelerated WebGL (only when the container has a GPU, signalled by
-        # AEON_BROWSER_GPU). Without this, Chrome under Xvfb falls back to the
-        # SwiftShader software renderer — a datacenter/headless fingerprint tell
-        # ("WebGL Renderer: SwiftShader"). With a real GPU + these flags it reports
-        # the actual NVIDIA renderer like a normal desktop. Default (unset) keeps
-        # the safe software path so machines without a browser GPU still work.
-        gpu_flags = []
-        if os.environ.get("AEON_BROWSER_GPU"):
-            gpu_flags = ["--ignore-gpu-blocklist", "--enable-gpu-rasterization",
-                         "--use-gl=angle", "--use-angle=vulkan", "--enable-features=Vulkan"]
-            args += gpu_flags
+        # Browser rendering is unconditionally CPU-only. Screenshot understanding
+        # is a separate Fleet-backed tool route; this host service must never turn
+        # an environment variable into implicit accelerator placement.
         if proxy:
             # Behind a proxy, stop WebRTC from revealing the real local/host IP via
             # STUN — a classic leak that unmasks an otherwise-clean proxied session.
@@ -734,7 +762,8 @@ async def _ensure_browser(profile: str = DEFAULT_PROFILE):
             user_data_dir=pdir,
             headless=False,
             no_viewport=True,           # use the real OS window size, no viewport tell
-            accept_downloads=True,      # so the download handler can save files
+            accept_downloads=True,      # handler cancels then performs its own bounded fetch
+            service_workers="block",   # otherwise service-worker fetches bypass route()
             locale=loc,                 # language/Accept-Language matched to the egress IP
             timezone_id=tz,             # clock matched to the egress IP
             args=args,
@@ -744,9 +773,6 @@ async def _ensure_browser(profile: str = DEFAULT_PROFILE):
             # aware sites work smoothly and consistently (no mismatch, no prompt hang).
             launch_kwargs["geolocation"] = geoloc
             launch_kwargs["permissions"] = ["geolocation"]
-        if gpu_flags:
-            # Drop Playwright's SwiftShader-forcing defaults so our real-GPU flags win.
-            launch_kwargs["ignore_default_args"] = ["--enable-unsafe-swiftshader", "--disable-gpu"]
         if proxy:
             launch_kwargs["proxy"] = proxy
         try:
@@ -755,6 +781,10 @@ async def _ensure_browser(profile: str = DEFAULT_PROFILE):
             # Fall back to the patched Chromium if real Chrome isn't present.
             print(f"[browser] real Chrome channel unavailable ({e}); using patched Chromium.")
             ctx = await _playwright.chromium.launch_persistent_context(**launch_kwargs)
+        # Enforce the public-network boundary before registering or returning any
+        # page. Playwright invokes this for redirect targets as well as initial
+        # document and subresource requests.
+        await ctx.route("**/*", _route_public_network)
         # Capture popups/new tabs (OAuth windows, target=_blank) for THIS profile.
         ctx.on("page", lambda p, prof=profile: _register_popup(prof, p))
         # Crash recovery: if the context dies, drop its state so the next request
@@ -775,6 +805,7 @@ def _purge_profile_state(profile: str):
         _announced_popups.discard(k)
         if pg is not None:
             page_events.pop(id(pg), None)
+            benchmark_pages.pop(id(pg), None)
 
 
 def _on_context_close(profile: str):
@@ -800,6 +831,31 @@ def _event_url(raw: str) -> str:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))[:240]
     except Exception:
         return "(unknown URL)"
+
+
+async def _route_public_network(route, request):
+    """Block every non-public browser request, including redirect hops.
+
+    ``BrowserContext.route`` is invoked for each network request and each
+    redirect target. Service workers are disabled at context creation so they
+    cannot bypass this admission point. In-document data/blob resources are
+    permitted because they make no network request; they are never accepted as
+    a top-level ``/navigate`` destination.
+    """
+
+    try:
+        scheme = urlsplit(str(request.url or "")).scheme.lower()
+        if scheme in {"data", "blob"} and request.resource_type != "document":
+            await route.continue_()
+            return
+        await asyncio.to_thread(
+            validate_public_browser_request_url,
+            request.url,
+        )
+    except Exception:
+        await route.abort("blockedbyclient")
+        return
+    await route.continue_()
 
 
 def _on_request_failed(page: Page, request):
@@ -914,15 +970,50 @@ async def _handle_dialog(page: Page, dialog):
 
 
 async def _handle_download(page: Page, download):
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    name = (download.suggested_filename or "download").replace("/", "_")
-    dest = os.path.join(DOWNLOAD_DIR, name)
+    # Playwright's save_as has no byte ceiling and uses Chrome's independent DNS
+    # connection. Cancel that transfer immediately, then re-fetch only a public
+    # HTTP(S) URL through the same size-bounded, single-resolution IP-pinned path
+    # used by explicit media capture. Blob/data downloads are deliberately not
+    # persisted because they cannot be revalidated as a network destination.
     try:
-        await download.save_as(dest)
+        await download.cancel()
+    except Exception:
+        pass
+    temporary = None
+    try:
+        await _require_public_page(page)
+        source_url = str(download.url or "").split("#", 1)[0]
+        if not source_url.lower().startswith(("http://", "https://")):
+            raise BrowserMediaSafetyError(
+                "download source was not public HTTP(S)"
+            )
+        temporary, _content_type, size = await _fetch_to_private_file(
+            page,
+            source_url,
+            DOWNLOAD_DIR,
+            max_bytes=MAX_GENERAL_DOWNLOAD_BYTES,
+        )
+        suggested = os.path.basename(str(download.suggested_filename or ""))
+        suffix = os.path.splitext(suggested)[1].lower()
+        if not (2 <= len(suffix) <= 9 and suffix[1:].isalnum()):
+            suffix = ".bin"
+        name = _unique_name("download", suffix)
+        dest = os.path.join(DOWNLOAD_DIR, name)
+        os.replace(temporary, dest)
+        temporary = None
         host = dest.replace("/profiles", "~/.aeon/browser_profiles", 1)
-        _note_event(page, f"[download] saved '{name}' -> {host}")
+        _note_event(
+            page,
+            f"[download] saved bounded copy '{name}' ({size:,} bytes) -> {host}",
+        )
     except Exception as e:
-        _note_event(page, f"[download] failed for '{name}': {e}")
+        _note_event(page, f"[download] refused or failed: {str(e)[:300]}")
+    finally:
+        if temporary:
+            try:
+                os.remove(temporary)
+            except FileNotFoundError:
+                pass
 
 
 def _register_popup(profile: str, page: Page):
@@ -955,10 +1046,47 @@ async def _get_page(profile: str, session_id: str, tab_id: str) -> Page:
         raise HTTPException(status_code=404, detail=f"Tab '{tab_id}' not found. Navigate to open it.")
     if page.is_closed():
         # A tab that closed itself (e.g. an OAuth popup) — clean it up and report.
-        pages.pop(k, None); last_elements.pop(k, None); frame_maps.pop(k, None)
+        pages.pop(k, None)
+        last_elements.pop(k, None)
+        frame_maps.pop(k, None)
+        benchmark_pages.pop(id(page), None)
         raise HTTPException(status_code=404,
                             detail=f"Tab '{tab_id}' has closed. Switch to another open tab or navigate to re-open it.")
+    await _require_public_page(page)
     return page
+
+
+async def _require_public_page(page: Page) -> None:
+    """Refuse to expose a tab after any non-public top-level navigation.
+
+    This is deliberately repeated after interactions as well as before reads:
+    clicks, form submissions, history actions, and popups can all navigate
+    without going through the explicit ``/navigate`` endpoint.
+    """
+
+    fixture = benchmark_pages.get(id(page))
+    if (
+        fixture is not None
+        and fixture[0] is page
+        and page.url == fixture[2]
+    ):
+        return
+    if fixture is not None:
+        benchmark_pages.pop(id(page), None)
+    try:
+        await asyncio.to_thread(normalize_public_navigation_url, page.url)
+    except Exception as exc:
+        try:
+            await page.close()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The tab was closed because its top-level URL was not verified "
+                "public HTTP(S)."
+            ),
+        ) from exc
 
 
 async def _reconcile_pages(profile: str, page: Page):
@@ -984,6 +1112,7 @@ async def _reconcile_pages(profile: str, page: Page):
                 last_elements.pop(k, None)
                 frame_maps.pop(k, None)
                 page_events.pop(id(p), None)
+                benchmark_pages.pop(id(p), None)
                 _announced_popups.discard(k)
         except Exception:
             pass
@@ -1526,6 +1655,9 @@ async def _ensure_paintable(page: Page, tries: int = 40, delay: float = 0.5):
 async def _build_response(page: Page, profile: str, session_id: str, tab_id: str,
                           overlay: bool = True, search_text: str = "",
                           role_filter: str = "") -> Dict[str, Any]:
+    # An interaction/history action can navigate without calling /navigate.
+    # Recheck before any DOM extraction, screenshot, or visible text is exposed.
+    await _require_public_page(page)
     # Reliably surface any tab the site just opened, and prune any that closed,
     # before we report open_tabs — so popup handling never races an async event.
     await _reconcile_pages(profile, page)
@@ -1659,6 +1791,24 @@ class ProfileRequest(BaseModel):
     profile: str = DEFAULT_PROFILE
 
 
+class SessionRequest(BaseModel):
+    session_id: str = "default"
+    profile: str = DEFAULT_PROFILE
+
+
+class BenchmarkFixtureRequest(BaseModel):
+    """Closed operator fixture selector; deliberately no URL/HTML fields."""
+
+    session_id: str
+    tab_id: str = "benchmark"
+    profile: str
+    fixture_id: str
+    operation: str = "seed"
+
+    class Config:
+        extra = "forbid"
+
+
 class InteractRequest(BaseModel):
     session_id: str = "default"
     tab_id: str = "default"
@@ -1787,7 +1937,13 @@ async def _pwerror_handler(request: Request, exc: PWError):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "auth_required": True, "api_version": BROWSER_API_VERSION}
+    return {
+        "status": "ok",
+        "auth_required": True,
+        "api_version": BROWSER_API_VERSION,
+        "service_id": BROWSER_SERVICE_ID,
+        "benchmark_fixture_api": "immutable-v2",
+    }
 
 
 @app.get("/ping")
@@ -1795,26 +1951,171 @@ async def ping():
     return {"status": "pong", "auth_required": True, "version": BROWSER_API_VERSION}
 
 
-# Schemes that are complete as-is (no host to prepend). "javascript" is
-# deliberately excluded — we never navigate to javascript: URLs.
-_ABSOLUTE_SCHEMES = ("data", "about", "blob", "file", "chrome", "view-source", "ftp")
+@app.post("/benchmark_fixture")
+async def benchmark_fixture(req: BenchmarkFixtureRequest):
+    """Seed, reopen, or verify one immutable page without network access.
 
+    This authenticated service endpoint is intentionally absent from Aeon's MCP
+    tool catalog.  Callers choose only a reviewed fixture ID and an isolated
+    benchmark identity; they cannot supply content, script, URL, or path data.
+    """
 
-def _normalize_url(raw: str) -> str:
-    """Turn user input into a navigable URL. Prepends https:// ONLY when there is
-    no scheme — correctly leaving http(s)://, data:, about:, file:, etc. alone, and
-    NOT mistaking a host:port ('example.com:8080') for a scheme."""
-    u = (raw or "").strip()
-    if "://" in u:
-        return u
-    head = u.split(":", 1)[0].lower() if ":" in u else ""
-    if head in _ABSOLUTE_SCHEMES:
-        return u
-    return "https://" + u
+    definition = validate_benchmark_fixture_request(
+        req.session_id,
+        req.tab_id,
+        req.profile,
+        req.fixture_id,
+        req.operation,
+    )
+    if definition is None:
+        raise HTTPException(status_code=400, detail="Invalid benchmark fixture request")
+
+    profile = _safe_profile(req.profile)
+    key = _key(profile, req.session_id, req.tab_id)
+    expected_url = benchmark_fixture_page_url(req.fixture_id, req.session_id)
+    if req.fixture_id != "session-v1":
+        expected_url = "about:blank"
+    if req.operation in {"reopen", "verify", "cleanup"}:
+        page = pages.get(key)
+        if (
+            page is None
+            or page.is_closed()
+            or benchmark_pages.get(id(page))
+            != (page, req.fixture_id, expected_url)
+            or page.url != expected_url
+        ):
+            return {
+                "status": {
+                    "reopen": "reopened",
+                    "verify": "verified",
+                    "cleanup": "cleaned",
+                }[req.operation],
+                "fixture_id": req.fixture_id,
+                "passed": False,
+            }
+        if req.operation == "cleanup":
+            try:
+                await page.evaluate(
+                    "localStorage.removeItem('aeon-benchmark-session-v1:' + "
+                    "new URL(location.href).searchParams.get('session'))"
+                )
+                cleaned = True
+            except PWError:
+                cleaned = False
+            return {
+                "status": "cleaned",
+                "fixture_id": req.fixture_id,
+                "passed": cleaned,
+            }
+        if req.operation == "reopen":
+            try:
+                signed_in = await page.evaluate(
+                    "localStorage.getItem('aeon-benchmark-session-v1:' + "
+                    "new URL(location.href).searchParams.get('session')) === "
+                    "'authenticated'"
+                )
+            except PWError:
+                signed_in = False
+            if signed_in is not True:
+                return {
+                    "status": "reopened",
+                    "fixture_id": req.fixture_id,
+                    "passed": False,
+                }
+            pages.pop(key, None)
+            last_elements.pop(key, None)
+            frame_maps.pop(key, None)
+            benchmark_pages.pop(id(page), None)
+            page_events.pop(id(page), None)
+            reopened = None
+            try:
+                await page.close()
+                context = await _ensure_browser(profile)
+                reopened = await context.new_page()
+                _setup_page(reopened)
+                pages[key] = reopened
+                benchmark_pages[id(reopened)] = (
+                    reopened,
+                    req.fixture_id,
+                    expected_url,
+                )
+                seeded = await seed_benchmark_fixture_page(
+                    reopened,
+                    req.fixture_id,
+                    session_id=req.session_id,
+                    reset_session=False,
+                )
+                if not seeded:
+                    raise RuntimeError("session fixture did not reopen")
+            except Exception:
+                pages.pop(key, None)
+                if reopened is not None:
+                    benchmark_pages.pop(id(reopened), None)
+                    try:
+                        await reopened.close()
+                    except Exception:
+                        pass
+                return {
+                    "status": "reopened",
+                    "fixture_id": req.fixture_id,
+                    "passed": False,
+                }
+            return {
+                "status": "reopened",
+                "fixture_id": req.fixture_id,
+                "passed": True,
+            }
+        try:
+            passed = await verify_benchmark_fixture_page(page, req.fixture_id)
+        except PWError:
+            passed = False
+        return {
+            "status": "verified",
+            "fixture_id": req.fixture_id,
+            "passed": passed,
+        }
+
+    existing = pages.pop(key, None)
+    last_elements.pop(key, None)
+    frame_maps.pop(key, None)
+    if existing is not None:
+        benchmark_pages.pop(id(existing), None)
+        page_events.pop(id(existing), None)
+        try:
+            await existing.close()
+        except PWError:
+            pass
+    context = await _ensure_browser(profile)
+    page = await context.new_page()
+    _setup_page(page)
+    pages[key] = page
+    benchmark_pages[id(page)] = (page, req.fixture_id, expected_url)
+    try:
+        await seed_benchmark_fixture_page(
+            page,
+            req.fixture_id,
+            session_id=req.session_id,
+            reset_session=req.fixture_id == "session-v1",
+        )
+    except Exception:
+        pages.pop(key, None)
+        benchmark_pages.pop(id(page), None)
+        try:
+            await page.close()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Benchmark fixture could not be seeded")
+    return {"status": "seeded", "fixture_id": req.fixture_id}
 
 
 @app.post("/navigate")
 async def navigate(req: NavigateRequest):
+    try:
+        # Reject file/data/chrome/FTP, credentials, private/literal addresses,
+        # and mixed public/private DNS before a browser context or page exists.
+        url = await asyncio.to_thread(normalize_public_navigation_url, req.url)
+    except BrowserMediaSafetyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     profile = _safe_profile(req.profile)
     ctx = await _ensure_browser(profile)
     k = _key(profile, req.session_id, req.tab_id)
@@ -1826,7 +2127,9 @@ async def navigate(req: NavigateRequest):
         _setup_page(page)
         pages[k] = page
     page = pages[k]
-    url = _normalize_url(req.url)
+    # Explicit navigation permanently removes the set_content exception before
+    # any URL is resolved or loaded.
+    benchmark_pages.pop(id(page), None)
     # One retry on a TRANSIENT network error (timeouts, resets) — like a person
     # who reloads a page that failed to load. Deterministic errors (bad host, SSL,
     # blocked) are returned immediately; retrying them would just waste time.
@@ -1847,6 +2150,23 @@ async def navigate(req: NavigateRequest):
             break
     if last_err is not None:
         return {"status": "error", "msg": f"Navigation to {url} failed: {last_err}"}
+    try:
+        # Route interception checks each redirect target before Chrome connects;
+        # revalidate the committed top-level URL before exposing page content.
+        await asyncio.to_thread(
+            normalize_public_navigation_url,
+            page.url,
+        )
+    except BrowserMediaSafetyError:
+        try:
+            await page.close()
+        finally:
+            pages.pop(k, None)
+            benchmark_pages.pop(id(page), None)
+        return {
+            "status": "error",
+            "msg": "Navigation was refused because the final page was not public HTTP(S).",
+        }
     await _settle_nav(page)
     return await _build_response(page, profile, req.session_id, req.tab_id, overlay=req.overlay)
 
@@ -1901,7 +2221,7 @@ def _resolve_target(profile: str, session_id: str, tab_id: str,
 @app.post("/interact")
 async def interact(req: InteractRequest):
     profile = _safe_profile(req.profile)
-    ctx = await _ensure_browser(profile)
+    await _ensure_browser(profile)
     page = await _get_page(profile, req.session_id, req.tab_id)
     a = (req.action or "").strip().lower()
     # 'select'/'choose' are common phrasings for choosing a dropdown option; accept
@@ -1971,24 +2291,42 @@ async def interact(req: InteractRequest):
             return response
         if a == "read_text":
             # PDFs render in Chrome's viewer plugin, so their text is NOT in the
-            # DOM. Fetch the bytes through the browser context (same cookies/proxy)
-            # and save them so the agent can parse the file with a PDF tool.
+            # DOM. Stream through the bounded public-media transport with the
+            # browser's cookies and explicit proxy, then save for local parsing.
             if page.url.lower().split("?")[0].split("#")[0].endswith(".pdf"):
+                temporary = None
                 try:
-                    resp = await page.context.request.get(page.url)
-                    body = await resp.body()
-                    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                    name = (page.url.split("/")[-1].split("?")[0].split("#")[0] or "document.pdf")
+                    temporary, content_type, size = await _fetch_to_private_file(
+                        page,
+                        page.url.split("#", 1)[0],
+                        DOWNLOAD_DIR,
+                        max_bytes=MAX_PDF_DOWNLOAD_BYTES,
+                    )
+                    if content_type and content_type.lower().split(";", 1)[0].strip() not in {
+                        "application/pdf",
+                        "application/octet-stream",
+                        "binary/octet-stream",
+                    }:
+                        raise BrowserMediaSafetyError(
+                            "PDF URL returned a non-PDF content type"
+                        )
+                    name = _unique_name("document", ".pdf")
                     dest = os.path.join(DOWNLOAD_DIR, name)
-                    with open(dest, "wb") as f:
-                        f.write(body)
+                    os.replace(temporary, dest)
+                    temporary = None
                     host = dest.replace("/profiles", "~/.aeon/browser_profiles", 1)
                     return {"text": (f"This page is a PDF; its text is not in the page DOM. Saved the "
-                                     f"PDF ({len(body):,} bytes) to {host}. Parse it with a PDF tool via "
+                                     f"PDF ({size:,} bytes) to {host}. Parse it with a PDF tool via "
                                      f"run_command (e.g. `pdftotext {host} -` or a Python PDF library).")}
                 except Exception as e:
                     return {"text": (f"This page is a PDF and could not be auto-saved ({e}). "
                                      f"Download it and parse with a PDF tool.")}
+                finally:
+                    if temporary:
+                        try:
+                            os.remove(temporary)
+                        except FileNotFoundError:
+                            pass
             # Clean main-content text (readability). Try the main document AND any
             # iframes (docs/readers/embeds often put the real article in a frame),
             # and return the richest result so embedded content isn't missed.
@@ -2454,7 +2792,9 @@ async def extract_page(req: ExtractRequest):
 # its own enumeration: stamp every media node with data-aeon-media=<id>, hand the
 # agent the list, and let it pick one by id. Then download the ORIGINAL bytes when
 # a real URL exists (best), else fall back to re-rendering pixels — for images an
-# element screenshot, for video yt-dlp then a screen recording.
+# element screenshot, and for video a screen recording. Page-level media
+# downloaders are intentionally excluded because their internal redirect and
+# resolver behavior cannot be bound to the validated public destination IP.
 _ENUM_MEDIA_JS = r"""
 () => {
   const out = [];
@@ -2476,13 +2816,18 @@ _ENUM_MEDIA_JS = r"""
     });
     id++;
   };
-  document.querySelectorAll('img').forEach(el => add(el, 'img', el.currentSrc || el.src, el.naturalWidth, el.naturalHeight));
-  document.querySelectorAll('video').forEach(el => add(el, 'video', el.currentSrc || el.src || '', el.videoWidth, el.videoHeight));
-  document.querySelectorAll('canvas').forEach(el => add(el, 'canvas', '', el.width, el.height));
-  // CSS background images (hero banners, some ads), bounded so a huge DOM stays cheap.
-  const all = document.querySelectorAll('body *');
-  for (let i = 0; i < all.length && out.length < 60; i++) {
-    const el = all[i];
+  const direct = document.querySelectorAll('img,video,canvas');
+  for (let i = 0; i < direct.length && out.length < 80; i++) {
+    const el = direct[i], tag = el.tagName.toLowerCase();
+    if (tag === 'img') add(el, 'img', el.currentSrc || el.src, el.naturalWidth, el.naturalHeight);
+    else if (tag === 'video') add(el, 'video', el.currentSrc || el.src || '', el.videoWidth, el.videoHeight);
+    else add(el, 'canvas', '', el.width, el.height);
+  }
+  // CSS background images (hero banners, some ads). A TreeWalker avoids first
+  // allocating an unbounded full-DOM NodeList and caps the inspected nodes.
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+  let el, inspected = 0;
+  while ((el = walker.nextNode()) && inspected++ < 2000 && out.length < 80) {
     const bg = getComputedStyle(el).backgroundImage;
     if (bg && bg.indexOf('url(') === 0) {
       const m = bg.match(/url\(["']?(.*?)["']?\)/);
@@ -2497,7 +2842,7 @@ _VIDEO_EXTS = (".mp4", ".webm", ".mov", ".m4v", ".mkv")
 
 
 def _unique_name(prefix: str, ext: str) -> str:
-    return f"{prefix}_{os.getpid()}_{int(time.time() * 1000)}{ext}"
+    return f"{prefix}_{os.getpid()}_{uuid.uuid4().hex}{ext}"
 
 
 def _ext_from(src: str, content_type: str, default: str) -> str:
@@ -2512,35 +2857,122 @@ def _ext_from(src: str, content_type: str, default: str) -> str:
     return ct_map.get(ct, default)
 
 
-async def _fetch_bytes(page: Page, src: str):
-    """Download a media URL THROUGH the page's own context (its cookies/proxy), so
-    auth-gated assets work. Returns (bytes, content_type) or (None, None)."""
+def _configured_media_proxy() -> str:
+    """Permit direct media streaming only on the locally pinned transport."""
+
+    raw = str(os.environ.get("AEON_BROWSER_PROXY") or "").strip()
+    if raw:
+        raise BrowserMediaSafetyError(
+            "direct media capture is disabled with an upstream browser proxy"
+        )
+    return ""
+
+
+def _safe_header_value(value: str, *, limit: int) -> str:
+    rendered = str(value or "")[:limit]
+    if "\r" in rendered or "\n" in rendered:
+        return ""
+    return rendered
+
+
+async def _media_request_headers(page: Page, src: str) -> dict[str, str]:
+    """Copy only bounded browser identity/cookies into the streaming request."""
+
+    headers = {
+        "Accept": "*/*",
+        "Referer": _safe_header_value(page.url, limit=8192),
+    }
     try:
-        resp = await page.context.request.get(src, timeout=45000)
-        if not resp.ok:
-            return None, None
-        body = await resp.body()
-        ct = ""
-        try:
-            ct = (await resp.header_value("content-type")) or ""
-        except Exception:
-            pass
-        return (body or None), ct
+        user_agent = await page.evaluate("() => navigator.userAgent")
     except Exception:
-        return None, None
+        user_agent = ""
+    user_agent = _safe_header_value(user_agent, limit=1024)
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    try:
+        cookies = await page.context.cookies([src])
+    except Exception:
+        cookies = []
+    pairs = []
+    for cookie in cookies[:128]:
+        if not isinstance(cookie, dict):
+            continue
+        name = _safe_header_value(cookie.get("name", ""), limit=256)
+        value = _safe_header_value(cookie.get("value", ""), limit=4096)
+        if name and all(character not in name for character in "=; "):
+            pair = f"{name}={value}"
+            if sum(len(existing) + 2 for existing in pairs) + len(pair) > 16384:
+                break
+            pairs.append(pair)
+    cookie_header = "; ".join(pairs)
+    if 0 < len(cookie_header) <= 16384:
+        headers["Cookie"] = cookie_header
+    return headers
+
+
+async def _fetch_to_private_file(
+    page: Page,
+    src: str,
+    out_dir: str,
+    *,
+    max_bytes: int,
+) -> tuple[str, str, int]:
+    """Stream one public URL into a unique private temporary output file."""
+
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    temporary = os.path.join(out_dir, _unique_name(".capture-part", ".tmp"))
+    headers = await _media_request_headers(page, src)
+    try:
+        content_type, size = await asyncio.to_thread(
+            bounded_download,
+            src,
+            temporary,
+            max_bytes=max_bytes,
+            timeout=45,
+            headers=headers,
+            proxy_url=_configured_media_proxy(),
+        )
+        return temporary, content_type, size
+    except BaseException:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 async def _capture_image(page: Page, entry: dict, out_dir: str) -> Dict[str, Any]:
     src = entry.get("src") or ""
     prefix = "capture_img"
     # 1. Original bytes when a real URL exists — the actual file, full quality.
-    if src.startswith("http"):
-        body, ct = await _fetch_bytes(page, src)
-        if body:
-            dest = os.path.join(out_dir, _unique_name(prefix, _ext_from(src, ct, ".jpg")))
-            with open(dest, "wb") as f:
-                f.write(body)
-            return {"filename": os.path.basename(dest), "method": "downloaded original image bytes"}
+    if src.lower().startswith(("http://", "https://")):
+        temporary = None
+        try:
+            temporary, ct, size = await _fetch_to_private_file(
+                page, src, out_dir, max_bytes=MAX_IMAGE_DOWNLOAD_BYTES
+            )
+            if not ct.lower().startswith("image/"):
+                raise BrowserMediaSafetyError(
+                    "image URL returned a non-image content type"
+                )
+            dest = os.path.join(
+                out_dir,
+                _unique_name(prefix, _ext_from(src, ct, ".jpg")),
+            )
+            os.replace(temporary, dest)
+            temporary = None
+            return {
+                "filename": os.path.basename(dest),
+                "method": f"streamed original image bytes ({size:,} bytes)",
+            }
+        except Exception:
+            pass
+        finally:
+            if temporary:
+                try:
+                    os.remove(temporary)
+                except FileNotFoundError:
+                    pass
     # 2. Fallback: re-render the exact node's pixels (canvas / blob: / data: / CSS bg,
     #    or a fetch that failed). Always works because it screenshots what's on screen.
     dest = os.path.join(out_dir, _unique_name(prefix, ".png"))
@@ -2551,53 +2983,70 @@ async def _capture_image(page: Page, entry: dict, out_dir: str) -> Dict[str, Any
 
 
 async def _run(cmd: list, timeout: int) -> tuple:
-    """Run a subprocess without blocking the event loop; return (rc, stderr_tail)."""
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    try:
-        _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return proc.returncode, (err or b"").decode("utf-8", "ignore")[-400:]
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        return 124, f"timed out after {timeout}s"
+    """Run one CPU helper with bounded output and exact group cleanup."""
+
+    return await run_cpu_helper(
+        cmd,
+        timeout=timeout,
+        environment=os.environ,
+    )
 
 
 async def _capture_video(page: Page, entry: dict, out_dir: str, duration_s: int) -> Dict[str, Any]:
     src = entry.get("src") or ""
     prefix = "capture_vid"
     # 1. Direct video file URL -> download the original bytes.
-    if src.startswith("http") and any(src.split("?")[0].lower().endswith(e) for e in _VIDEO_EXTS):
-        body, ct = await _fetch_bytes(page, src)
-        if body:
-            dest = os.path.join(out_dir, _unique_name(prefix, _ext_from(src, ct, ".mp4")))
-            with open(dest, "wb") as f:
-                f.write(body)
-            return {"filename": os.path.basename(dest), "method": "downloaded original video file"}
-    # 2. yt-dlp on the PAGE url — handles HLS/DASH/blob players, YouTube, most embeds.
-    stem = _unique_name(prefix, "")
-    rc, err = await _run(
-        ["yt-dlp", "--no-playlist", "--no-warnings", "-f", "mp4/best",
-         "-o", os.path.join(out_dir, stem + ".%(ext)s"), page.url],
-        timeout=max(60, duration_s * 6))
-    hits = [f for f in os.listdir(out_dir) if f.startswith(stem)]
-    if rc == 0 and hits:
-        return {"filename": hits[0], "method": "downloaded via yt-dlp (page media stream)"}
-    # 3. Last resort: screen-record the live Xvfb display while the video plays.
+    if src.lower().startswith(("http://", "https://")) and any(
+        src.split("?", 1)[0].lower().endswith(extension)
+        for extension in _VIDEO_EXTS
+    ):
+        temporary = None
+        try:
+            temporary, ct, size = await _fetch_to_private_file(
+                page, src, out_dir, max_bytes=MAX_VIDEO_DOWNLOAD_BYTES
+            )
+            if ct and not (
+                ct.lower().startswith("video/")
+                or ct.lower().split(";", 1)[0].strip()
+                in {"application/octet-stream", "binary/octet-stream"}
+            ):
+                raise BrowserMediaSafetyError(
+                    "video URL returned a non-video content type"
+                )
+            dest = os.path.join(
+                out_dir,
+                _unique_name(prefix, _ext_from(src, ct, ".mp4")),
+            )
+            os.replace(temporary, dest)
+            temporary = None
+            return {
+                "filename": os.path.basename(dest),
+                "method": f"streamed original video file ({size:,} bytes)",
+            }
+        except Exception:
+            pass
+        finally:
+            if temporary:
+                try:
+                    os.remove(temporary)
+                except FileNotFoundError:
+                    pass
+    # 2. Screen-record the already-loaded public page. Unlike a page-level media
+    # downloader, this does not create a second redirect/DNS execution path.
     dest = os.path.join(out_dir, _unique_name(prefix, ".mp4"))
     display = os.environ.get("DISPLAY", ":99")
     rc, err = await _run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "x11grab", "-draw_mouse", "0",
+        ["/usr/bin/ffmpeg", "-y", "-loglevel", "error", "-f", "x11grab", "-draw_mouse", "0",
          "-video_size", f"{SCREEN_W}x{SCREEN_H}", "-framerate", "24", "-i", display,
          "-t", str(max(1, min(int(duration_s), 60))), "-pix_fmt", "yuv420p", dest],
         timeout=max(30, int(duration_s) + 20))
     if rc == 0 and os.path.exists(dest) and os.path.getsize(dest) > 0:
         return {"filename": os.path.basename(dest),
                 "method": f"screen recording of the page for {duration_s}s (not the original file)"}
-    raise HTTPException(status_code=502,
-                        detail=f"Could not download the video and the screen-recording fallback failed ({err}).")
+    raise HTTPException(
+        status_code=502,
+        detail=f"Could not capture the video; the screen-recording fallback failed ({err}).",
+    )
 
 
 @app.post("/capture_media")
@@ -2682,8 +3131,40 @@ async def close_tab(req: TabRequest):
         last_elements.pop(target, None)
         frame_maps.pop(target, None)
         page_events.pop(id(pg), None)
+        benchmark_pages.pop(id(pg), None)
         _announced_popups.discard(target)
     return {"status": "success", "remaining_tabs": len(_tabs_for(profile, req.session_id))}
+
+
+@app.post("/close_session")
+async def close_session(req: SessionRequest):
+    """Close only pages owned by one authenticated profile/session pair.
+
+    The persistent browser context and its container remain operator-owned and
+    available to other Aeon sessions.  Popups are included only after this
+    session explicitly adopted them, because unadopted popups have no exact
+    session owner.
+    """
+    profile = _safe_profile(req.profile)
+    prefix = f"{profile}::{req.session_id}::"
+    targets = [key for key in pages if key.startswith(prefix)]
+    closed = 0
+    for key in targets:
+        page = pages.pop(key, None)
+        last_elements.pop(key, None)
+        frame_maps.pop(key, None)
+        _announced_popups.discard(key)
+        if page is None:
+            continue
+        page_events.pop(id(page), None)
+        dialog_policies.pop(id(page), None)
+        benchmark_pages.pop(id(page), None)
+        try:
+            await page.close()
+        except Exception:
+            pass
+        closed += 1
+    return {"status": "closed", "profile": profile, "closed_tabs": closed}
 
 
 @app.post("/release_profile")
@@ -2702,14 +3183,10 @@ async def release_profile(req: ProfileRequest):
             await ctx.close()
         except Exception:
             pass
-    # Delete the on-disk profile dir so ephemeral sub-agent profiles don't pile
-    # up. Safe: the context is closed, and only NON-default profiles reach here.
-    try:
-        import shutil
-        shutil.rmtree(_profile_dir(profile), ignore_errors=True)
-    except Exception:
-        pass
-    return {"status": "released", "profile": profile}
+    # A sanitized name is not a storage-ownership receipt. Preserve the profile
+    # directory for an exact operator cleanup workflow instead of recursively
+    # deleting a potentially pre-existing or uniquely valuable directory.
+    return {"status": "released", "profile": profile, "storage": "retained"}
 
 
 @app.on_event("shutdown")

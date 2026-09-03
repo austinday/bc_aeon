@@ -31,6 +31,8 @@ TOP_LEVEL_TOOLS = {
     'list_mcp_tools', 'call_mcp_tool',
     'github_repositories', 'github_status', 'github_commit',
     'github_push', 'github_verify_remote',
+    'huggingface_account', 'huggingface_publish_model',
+    'huggingface_verify_publication',
     'expand_tool_category', 'collapse_tool_category',
     'activate_skill', 'deactivate_skill', 'create_skill', 'read_skill', 'delete_skill',
     'remember_skill_knowledge', 'list_skill_knowledge', 'read_skill_knowledge',

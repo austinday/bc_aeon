@@ -22,7 +22,7 @@ from pathlib import Path
 from .store import RemoteStore
 
 
-MAX_INSTRUCTION_BYTES = 64 * 1024
+MAX_INSTRUCTION_BYTES = 512 * 1024
 MAX_NAME_CHARS = 80
 MAX_LABEL_CHARS = 80
 MAX_SOURCE_REF_CHARS = 1024

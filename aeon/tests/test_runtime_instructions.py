@@ -150,7 +150,10 @@ class TestRuntimeInstructionMaterialization(RuntimeInstructionFixture):
             layers = load_runtime_instructions()
         self.assertTrue(layers.is_empty)
         self.assertEqual(layers.agent_kind, "aeon")
-        self.assertEqual(format_runtime_instruction_layers(layers), "")
+        self.assertIn(
+            "MANDATORY FLEET COMPUTE SAFETY",
+            format_runtime_instruction_layers(layers),
+        )
 
     def test_expected_instance_identity_prevents_cross_instance_assignment(self):
         path = materialize_runtime_instructions(_snapshot(), self.instance_dir)
@@ -274,7 +277,18 @@ class TestAeonWorkerRuntimeInstructions(RuntimeInstructionFixture):
             self.assertIn(profile, prompt)
             self.assertIn(local, prompt)
             self.assertLess(prompt.index(profile), prompt.index(local))
-            self.assertLess(prompt.index(local), prompt.index("\n**OBJECTIVE**\nObjective"))
+
+        # The live protocol sends the exact objective as a role=user message;
+        # keeping it out of the system prefix prevents instruction duplication
+        # and preserves prefix-cache reuse.  The legacy compatibility builder
+        # still embeds it for callers that explicitly use that old path.
+        request_marker = "\n**EXACT USER REQUEST**\nObjective"
+        self.assertNotIn(request_marker, system_prompt)
+        self.assertIn(request_marker, compatibility_prompt)
+        self.assertLess(
+            compatibility_prompt.index(local),
+            compatibility_prompt.index(request_marker),
+        )
 
     def test_prompt_build_reloads_updates_and_configured_corruption_is_fatal(self):
         path = materialize_runtime_instructions(

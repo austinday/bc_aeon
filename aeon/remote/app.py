@@ -69,6 +69,7 @@ class TerminalBody(BaseModel):
     # "Terminal N" labels. A custom legacy label remains accepted.
     name: str | None = Field(default=None, min_length=1, max_length=64)
     workspace: str = Field(min_length=1, max_length=4096)
+    project_id: str | None = Field(default=None, pattern=r"^pr-[0-9a-f]{32}$")
     host_id: Literal[
         "192.168.0.177",
         "192.168.0.178",
@@ -101,6 +102,51 @@ class AgentSettingsBody(BaseModel):
     kind: Literal["aeon", "codex", "claude", "grok"]
     model: str = Field(max_length=160)
     effort: str = Field(max_length=32)
+    harness: str | None = Field(default=None, max_length=64)
+
+
+class ContinuousModeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    goal: str = Field(default="", max_length=20_000)
+
+
+class AgentSkillBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1, max_length=64 * 1024)
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class DeleteAgentSkillBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    confirmation: str = Field(min_length=1, max_length=200)
+
+
+class AgentSkillTransferSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_path: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}/[A-Za-z0-9][A-Za-z0-9_-]{0,79}$"
+    )
+    revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class AgentSkillTransferBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_instance_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    skills: list[AgentSkillTransferSelection] = Field(min_length=1, max_length=64)
+    include_knowledge: bool = True
+
+
+class ForkConversationBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(pattern=r"^msg-[A-Za-z0-9_-]{32}$")
 
 
 class ConfirmationBody(BaseModel):
@@ -190,7 +236,7 @@ def create_app(
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         response.headers["Permissions-Policy"] = (
-            "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+            "camera=(), microphone=(self), geolocation=(), payment=(), usb=()"
         )
         response.headers["Cache-Control"] = "no-store"
         response.headers.setdefault("Content-Security-Policy", (
@@ -374,6 +420,7 @@ def create_app(
                 name=body.name,
                 workspace=body.workspace,
                 host_id=body.host_id,
+                project_id=body.project_id,
                 actor=session["username"],
                 client_ip=_client_ip(request),
             )
@@ -444,6 +491,41 @@ def create_app(
         except InstanceError as exc:
             translate_instance_error(exc)
 
+    @app.post("/api/instances/{instance_id}/fork")
+    def fork_instance_conversation(
+        instance_id: str,
+        body: ForkConversationBody,
+        request: Request,
+        session=Depends(protected),
+    ):
+        try:
+            fork = manager.fork_agent_chat(
+                instance_id,
+                body.message_id,
+                actor=session["username"],
+                client_ip=_client_ip(request),
+            )
+        except InstanceError as exc:
+            translate_instance_error(exc)
+        return {"instance": fork}
+
+    @app.post("/api/instances/{instance_id}/close-fork")
+    def close_instance_conversation_fork(
+        instance_id: str,
+        request: Request,
+        body: EmptyActionBody | None = None,
+        session=Depends(protected),
+    ):
+        try:
+            manager.close_agent_chat_fork(
+                instance_id,
+                actor=session["username"],
+                client_ip=_client_ip(request),
+            )
+        except InstanceError as exc:
+            translate_instance_error(exc)
+        return {"closed": True}
+
     @app.put("/api/instances/{instance_id}/agent-settings")
     def update_agent_settings(
         instance_id: str,
@@ -457,6 +539,105 @@ def create_app(
                 kind=body.kind,
                 model=body.model,
                 effort=body.effort,
+                actor=session["username"],
+                harness=body.harness,
+                client_ip=_client_ip(request),
+            )
+        except InstanceError as exc:
+            translate_instance_error(exc)
+
+    @app.get("/api/instances/{instance_id}/skills")
+    def agent_created_skills(instance_id: str, session=Depends(current_session)):
+        try:
+            return manager.get_private_skills(instance_id)
+        except InstanceError as exc:
+            translate_instance_error(exc)
+
+    @app.put("/api/instances/{instance_id}/skills/{category}/{skill_name}")
+    def update_agent_created_skill(
+        instance_id: str,
+        category: str,
+        skill_name: str,
+        body: AgentSkillBody,
+        request: Request,
+        session=Depends(protected),
+    ):
+        try:
+            return manager.update_private_skill(
+                instance_id,
+                category=category,
+                skill_name=skill_name,
+                content=body.content,
+                expected_revision=body.expected_revision,
+                actor=session["username"],
+                client_ip=_client_ip(request),
+            )
+        except InstanceError as exc:
+            translate_instance_error(exc)
+
+    @app.delete("/api/instances/{instance_id}/skills/{category}/{skill_name}")
+    def delete_agent_created_skill(
+        instance_id: str,
+        category: str,
+        skill_name: str,
+        body: DeleteAgentSkillBody,
+        request: Request,
+        session=Depends(protected),
+    ):
+        try:
+            return manager.delete_private_skill(
+                instance_id,
+                category=category,
+                skill_name=skill_name,
+                expected_revision=body.expected_revision,
+                confirmation=body.confirmation,
+                actor=session["username"],
+                client_ip=_client_ip(request),
+            )
+        except InstanceError as exc:
+            translate_instance_error(exc)
+
+    @app.post("/api/instances/{instance_id}/skills/transfer")
+    def transfer_agent_created_skills(
+        instance_id: str,
+        body: AgentSkillTransferBody,
+        request: Request,
+        session=Depends(protected),
+    ):
+        try:
+            return manager.transfer_private_skills(
+                instance_id,
+                source_instance_id=body.source_instance_id,
+                selections=[item.model_dump() for item in body.skills],
+                include_knowledge=body.include_knowledge,
+                actor=session["username"],
+                client_ip=_client_ip(request),
+            )
+        except InstanceError as exc:
+            translate_instance_error(exc)
+
+    @app.get("/api/instances/{instance_id}/continuous-mode")
+    def continuous_mode(
+        instance_id: str,
+        session=Depends(current_session),
+    ):
+        try:
+            return manager.get_continuous_mode(instance_id)
+        except InstanceError as exc:
+            translate_instance_error(exc)
+
+    @app.put("/api/instances/{instance_id}/continuous-mode")
+    def update_continuous_mode(
+        instance_id: str,
+        body: ContinuousModeBody,
+        request: Request,
+        session=Depends(protected),
+    ):
+        try:
+            return manager.update_continuous_mode(
+                instance_id,
+                enabled=body.enabled,
+                goal=body.goal,
                 actor=session["username"],
                 client_ip=_client_ip(request),
             )
@@ -472,6 +653,23 @@ def create_app(
     ):
         try:
             value = manager.end_agent(
+                instance_id,
+                actor=session["username"],
+                client_ip=_client_ip(request),
+            )
+        except InstanceError as exc:
+            translate_instance_error(exc)
+        return {"instance": value}
+
+    @app.post("/api/instances/{instance_id}/fresh-context")
+    def fresh_agent_context(
+        instance_id: str,
+        request: Request,
+        body: EmptyActionBody | None = None,
+        session=Depends(protected),
+    ):
+        try:
+            value = manager.fresh_restart_agent(
                 instance_id,
                 actor=session["username"],
                 client_ip=_client_ip(request),
@@ -529,6 +727,24 @@ def create_app(
         except InstanceError as exc:
             translate_instance_error(exc)
         return {"instance": value}
+
+    @app.post("/api/instances/{instance_id}/kill")
+    def kill_instance(
+        instance_id: str,
+        body: ConfirmationBody,
+        request: Request,
+        session=Depends(protected),
+    ):
+        try:
+            manager.kill_instance(
+                instance_id,
+                confirmation=body.confirmation,
+                actor=session["username"],
+                client_ip=_client_ip(request),
+            )
+        except InstanceError as exc:
+            translate_instance_error(exc)
+        return {"deleted": True}
 
     @app.delete("/api/instances/{instance_id}")
     def delete_instance(

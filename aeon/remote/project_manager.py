@@ -1,9 +1,9 @@
-"""Durable, lazy lifecycle metadata for Nexus's Project Manager tab.
+"""Durable, lazy lifecycle metadata for Nexus's main orchestrator.
 
-The Project Manager is *always present* as a registry row.  Its base mode is a
-plain shell rooted at /home/aday; an authenticated user can run Aeon (or a
-native provider agent) in that same logical tab and later return to the shell.
-Materializing the row itself never starts tmux, a model, or a coordinator lease.
+The main orchestrator is *always present* as a registry row. Its base mode is a
+plain shell rooted at ``/home/aday``; the authenticated Nexus chat starts Aeon in
+that same logical instance as needed. Materializing the row itself never starts
+tmux, a model, or a coordinator lease.
 
 This module intentionally depends on a tiny store protocol (``get_instance``
 and ``create_instance``) so provisioning can be unit-tested without touching a
@@ -25,14 +25,15 @@ PROJECT_MANAGER_INSTANCE_ID = uuid.uuid5(
     uuid.NAMESPACE_URL,
     "https://nexus.bananacoconut.com/instances/project-manager",
 ).hex
-PROJECT_MANAGER_NAME = "Project Manager"
+PROJECT_MANAGER_NAME = "Main orchestrator"
 PROJECT_MANAGER_TMUX_NAME = f"aeon-project-manager-{PROJECT_MANAGER_INSTANCE_ID[:12]}"
 PROJECT_MANAGER_WORKSPACE = "/home/aday"
 PROJECT_MANAGER_LAUNCH_ORIGIN = "system"
 PROJECT_MANAGER_CREATED_BY = "nexus"
 PROJECT_MANAGER_OBJECTIVE = (
-    "Act as the persistent project manager for this orchestrator. Coordinate work "
-    "carefully across the user's projects and preserve renter-first compute policy."
+    "Act as the persistent project manager for Nexus, Aeon, and Fleet Compute. "
+    "Coordinate work carefully across the user's projects and preserve renter-first "
+    "compute policy."
 )
 
 
@@ -69,7 +70,7 @@ def build_project_manager_record(
 
     ``status=idle`` and ``desired_state=stopped`` are deliberate: a tab can be
     durable and visible without keeping local inference, tmux, or a GPU lease
-    warm.  The model name is metadata for a later explicit resume only.
+        warm. The model name is metadata for a later explicit chat activation only.
     """
 
     created_at = time.time() if now is None else float(now)

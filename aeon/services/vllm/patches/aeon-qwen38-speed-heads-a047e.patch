@@ -1,0 +1,156 @@
+Aeon exact Qwen3.8 speed-head support for vLLM 0ecc28479.
+
+This adds mixed-precision embedding plumbing and a hash-bound checkpoint-side
+MTP draft vocabulary.  Draft logits outside the 40,960-row shortlist are
+negative infinity.  The target model still scores and verifies all 248,320
+tokens, so this changes proposal cost/acceptance but not speculative-decoding
+correctness.
+
+The embedding plumbing is adapted from syv-ai/qwen38-27b-rtx3090 commit
+2738b38fdd40d455b4cdbc35d7763f0d47203af0 (MIT).  Validation and safetensors
+loading are Aeon-specific.
+
+The DFlash2 layer-construction fix restores the upstream extension point from
+vLLM PR #52816 that PR #52560 accidentally reverted.  It is the minimal fix
+tracked by upstream issue #53428 and PRs #53435/#53449.
+
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -377,6 +377,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
+ 
+ @support_torch_compile
+ class DFlashQwen3Model(nn.Module):
++    decoder_layer_cls = DFlashQwen3DecoderLayer
++
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_substr={
+             "midlayer.": "layers.0.",
+@@ -439,7 +441,7 @@ class DFlashQwen3Model(nn.Module):
+ 
+         self.layers = nn.ModuleList(
+             [
+-                DFlashQwen3DecoderLayer(
++                self.decoder_layer_cls(
+                     current_vllm_config,
+                     config=self.config,
+                     layer_idx=layer_idx,
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -245,6 +245,8 @@ class Qwen3_5Model(nn.Module):
+         self.embed_tokens = VocabParallelEmbedding(
+             self.vocab_size,
+             config.hidden_size,
++            quant_config=self.quant_config,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
+         )
+ 
+         def get_layer(prefix: str):
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -84,8 +84,50 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         self.embed_tokens = VocabParallelEmbedding(
+             self.vocab_size,
+             config.hidden_size,
++            quant_config=vllm_config.quant_config,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
+         )
+ 
++        # Aeon speed variant: score a checkpoint-provided INT8 draft-only
++        # vocabulary instead of the full target head on every chained MTP step.
++        # Target verification remains full-vocabulary and distribution preserving.
++        import os as _os
++
++        from safetensors.torch import load_file as _safe_load_file
++
++        self.draft_lm_head = None
++        self.draft_vocab_ids = None
++        _ids_path = _os.path.join(
++            model_config.model, "mtp_draft_vocab_ids.safetensors"
++        )
++        if (
++            _os.path.exists(_ids_path)
++            and _os.environ.get("MTP_DRAFT_VOCAB", "1") != "0"
++        ):
++            _payload = _safe_load_file(_ids_path, device="cpu")
++            _ids = _payload.get("ids")
++            if (
++                not isinstance(_ids, torch.Tensor)
++                or _ids.dtype != torch.int64
++                or _ids.ndim != 1
++                or _ids.numel() != 40960
++                or int(_ids[0]) < 0
++                or int(_ids[-1]) >= config.vocab_size
++                or not bool(torch.all(_ids[1:] > _ids[:-1]))
++            ):
++                raise ValueError("Aeon MTP draft vocabulary identity is malformed")
++            self.draft_vocab_ids = _ids.contiguous()
++            self.draft_lm_head = ParallelLMHead(
++                int(_ids.numel()),
++                config.hidden_size,
++                quant_config=vllm_config.quant_config,
++                prefix=maybe_prefix(prefix, "draft_lm_head"),
++            )
++            logger.info(
++                "Aeon speed patch: MTP drafter uses a %d-token output head",
++                int(_ids.numel()),
++            )
++
+         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
+         # missing from hf_quant_config.json exclude_modules. Force unquantized.
+         # Ref: https://github.com/vllm-project/vllm/pull/38650
+@@ -253,6 +295,11 @@ class Qwen3_5MTP(nn.Module, SupportsPP):
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.draft_logits_processor = (
++            LogitsProcessor(int(self.model.draft_vocab_ids.numel()))
++            if self.model.draft_lm_head is not None
++            else None
++        )
+ 
+     def embed_input_ids(
+         self,
+@@ -299,11 +346,43 @@ class Qwen3_5MTP(nn.Module, SupportsPP):
+         hidden_states: torch.Tensor,
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor | None:
++        if self.draft_logits_processor is not None:
++            draft_logits = self.draft_logits_processor(
++                self.model.draft_lm_head, hidden_states
++            )
++            if draft_logits is None:
++                return None
++            ids = self.model.draft_vocab_ids
++            if ids.device != draft_logits.device:
++                ids = ids.to(draft_logits.device)
++                self.model.draft_vocab_ids = ids
++            logits = draft_logits.new_full(
++                (draft_logits.shape[0], self.config.vocab_size), float("-inf")
++            )
++            logits.index_copy_(1, ids, draft_logits)
++            return logits
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
++    def get_top_tokens(
++        self,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor:
++        if self.draft_logits_processor is None:
++            return super().get_top_tokens(hidden_states)
++        top = self.draft_logits_processor.get_top_tokens(
++            self.model.draft_lm_head, hidden_states
++        )
++        ids = self.model.draft_vocab_ids
++        if ids.device != top.device:
++            ids = ids.to(top.device)
++            self.model.draft_vocab_ids = ids
++        return ids[top]
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         def remap_weight_names(weights):
+             for name, weight in weights:
++                if "draft_lm_head" in name and self.model.draft_lm_head is None:
++                    continue
+                 if name.startswith("mtp."):
+                     name = name.replace("mtp.", "model.")
+                 elif any(key in name for key in ["embed_tokens", "lm_head"]):

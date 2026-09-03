@@ -1,7 +1,62 @@
+import math
 import os
+import stat
+import warnings
+
 from PIL import Image
+
 from .base import BaseTool
 from ..core.paths import resolve_output_dir
+
+
+# ``Image.open`` is lazy, but ``convert``/``resize`` materialize the complete
+# decoded raster in Aeon's process.  Keep those allocations explicitly bounded;
+# Pillow's much larger process-global decompression-bomb default is not a
+# resource contract for this tool.
+MAX_BASE_IMAGE_BYTES = 64 * 1024 * 1024
+MAX_OVERLAY_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_BASE_PIXELS = 36_000_000
+MAX_OVERLAY_PIXELS = 16_000_000
+MAX_RESIZED_OVERLAY_PIXELS = 20_000_000
+MAX_IMAGE_DIMENSION = 16_384
+MAX_DECODED_RGBA_BYTES = 256 * 1024 * 1024
+
+
+class _CompositeLimitError(ValueError):
+    """Raised before an unbounded image decode or resize is attempted."""
+
+
+def _regular_file_size(path: str, *, label: str, max_bytes: int) -> int:
+    try:
+        file_stat = os.stat(path)
+    except OSError as exc:
+        raise _CompositeLimitError(f"could not inspect {label}: {exc}") from exc
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise _CompositeLimitError(f"{label} must be a regular file")
+    if file_stat.st_size <= 0:
+        raise _CompositeLimitError(f"{label} is empty")
+    if file_stat.st_size > max_bytes:
+        raise _CompositeLimitError(
+            f"{label} is {file_stat.st_size:,} bytes; limit is {max_bytes:,} bytes"
+        )
+    return int(file_stat.st_size)
+
+
+def _validated_dimensions(image: Image.Image, *, label: str, max_pixels: int) -> tuple[int, int]:
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        raise _CompositeLimitError(f"{label} has invalid dimensions {width}x{height}")
+    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+        raise _CompositeLimitError(
+            f"{label} dimensions {width}x{height} exceed the "
+            f"{MAX_IMAGE_DIMENSION:,}-pixel side limit"
+        )
+    pixels = width * height
+    if pixels > max_pixels:
+        raise _CompositeLimitError(
+            f"{label} has {pixels:,} pixels; limit is {max_pixels:,} pixels"
+        )
+    return width, height
 
 
 class CompositeImageTool(BaseTool):
@@ -76,24 +131,77 @@ class CompositeImageTool(BaseTool):
             return f"Error: overlay image not found at {ov_abs}"
 
         try:
-            base = Image.open(base_abs).convert("RGBA")
-            overlay = Image.open(ov_abs).convert("RGBA")
-
-            # Resize overlay: scale <=1 is a fraction of base width; >1 is a pixel width.
+            _regular_file_size(
+                base_abs, label="base image", max_bytes=MAX_BASE_IMAGE_BYTES
+            )
+            _regular_file_size(
+                ov_abs, label="overlay image", max_bytes=MAX_OVERLAY_IMAGE_BYTES
+            )
             scale = self._num(scale, 0.2)
-            if scale <= 0:
+            if not math.isfinite(scale) or scale <= 0:
                 scale = 0.2
-            target_w = max(1, int(base.width * scale)) if scale <= 1.0 else min(int(scale), base.width)
-            target_h = max(1, round(overlay.height * (target_w / overlay.width)))
+
+            # Pillow only reads headers at ``open``.  Validate both source rasters
+            # and the planned resize/peak allocation before either ``convert``
+            # materializes pixel data.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(base_abs) as base_source, Image.open(ov_abs) as overlay_source:
+                    base_w, base_h = _validated_dimensions(
+                        base_source, label="base image", max_pixels=MAX_BASE_PIXELS
+                    )
+                    overlay_w, overlay_h = _validated_dimensions(
+                        overlay_source,
+                        label="overlay image",
+                        max_pixels=MAX_OVERLAY_PIXELS,
+                    )
+
+                    # Resize overlay: scale <=1 is a fraction of base width; >1
+                    # is a pixel width.
+                    target_w = (
+                        max(1, int(base_w * scale))
+                        if scale <= 1.0
+                        else min(int(scale), base_w)
+                    )
+                    target_h = max(1, round(overlay_h * (target_w / overlay_w)))
+                    if target_w > MAX_IMAGE_DIMENSION or target_h > MAX_IMAGE_DIMENSION:
+                        raise _CompositeLimitError(
+                            f"resized overlay dimensions {target_w}x{target_h} exceed the "
+                            f"{MAX_IMAGE_DIMENSION:,}-pixel side limit"
+                        )
+                    resized_pixels = target_w * target_h
+                    if resized_pixels > MAX_RESIZED_OVERLAY_PIXELS:
+                        raise _CompositeLimitError(
+                            f"resized overlay has {resized_pixels:,} pixels; limit is "
+                            f"{MAX_RESIZED_OVERLAY_PIXELS:,} pixels"
+                        )
+                    peak_decoded_bytes = (
+                        base_w * base_h + overlay_w * overlay_h + resized_pixels
+                    ) * 4
+                    if peak_decoded_bytes > MAX_DECODED_RGBA_BYTES:
+                        raise _CompositeLimitError(
+                            f"compositing requires at least {peak_decoded_bytes:,} decoded "
+                            f"RGBA bytes; limit is {MAX_DECODED_RGBA_BYTES:,} bytes"
+                        )
+
+                    base = base_source.convert("RGBA")
+                    overlay = overlay_source.convert("RGBA")
+
             overlay = overlay.resize((target_w, target_h), Image.LANCZOS)
 
             # Opacity (scales the existing alpha channel, preserving transparency shape).
-            opacity = max(0.0, min(1.0, self._num(opacity, 1.0)))
+            opacity = self._num(opacity, 1.0)
+            if not math.isfinite(opacity):
+                opacity = 1.0
+            opacity = max(0.0, min(1.0, opacity))
             if opacity < 1.0:
                 faded = overlay.split()[3].point(lambda a: int(a * opacity))
                 overlay.putalpha(faded)
 
-            m = int(self._num(margin, max(4, int(base.width * 0.03))))
+            margin_value = self._num(margin, max(4, int(base.width * 0.03)))
+            if not math.isfinite(margin_value):
+                margin_value = max(4, int(base.width * 0.03))
+            m = int(margin_value)
             x, y = self._position(position, base.size, overlay.size, m)
             base.alpha_composite(overlay, (x, y))
 
@@ -104,6 +212,10 @@ class CompositeImageTool(BaseTool):
                 base.convert("RGB").save(out, quality=95)
             else:
                 base.save(out)
+        except _CompositeLimitError as e:
+            return f"Error: refusing unsafe image composite: {e}"
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning) as e:
+            return f"Error: refusing unsafe image composite: {e}"
         except Exception as e:
             return self.format_error_message(e, "compositing the images")
 

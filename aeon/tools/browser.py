@@ -648,6 +648,13 @@ def ensure_browser_running():
 
 
 def _session_id():
+    # OpenCode's stdio MCP bridge is intentionally restarted at a turn
+    # boundary, while the parent Aeon supervisor and browser identity remain
+    # stable.  Accept only its server-authored opaque identity; ordinary Aeon
+    # sessions retain the historical PID scope.
+    supplied = os.environ.get("AEON_BROWSER_SESSION_ID", "").strip()
+    if supplied and re.fullmatch(r"oc-[0-9a-f]{32}", supplied):
+        return supplied
     return str(os.getpid())
 
 

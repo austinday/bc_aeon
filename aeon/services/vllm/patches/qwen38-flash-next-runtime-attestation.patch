@@ -1,0 +1,27 @@
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -566,6 +566,11 @@
+             self.model_runner._setup_ple_offload(
+                 self.parallel_config._ple_offload_ipc_path
+             )
++        if os.environ.get("AEON_ENGINE_ATTESTATION") == "1":
++            from vllm.qwen38_flash_next_attestation import emit_gpu_fragment
++
++            emit_gpu_fragment(self)
++
+ 
+         if self.vllm_config.weight_transfer_config is not None:
+             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -295,6 +295,10 @@
+             # READY means that the process can immediately serve requests. Wait
+             # for every DP/TP worker to register before notifying the parent.
+             runner.accept_registrations(pull_socket, num_workers)
++            from vllm.qwen38_flash_next_attestation import emit_ple_fragment
++
++            emit_ple_fragment(runner)
++
+             ready_writer.send(
+                 {
+                     "status": PleOffloadWorker.READY_STR,

@@ -1,33 +1,48 @@
-# CODING SKILL: Root-Cause Debugging Protocol
-# Triggered when a bug, crash, failing test, or unexpected output must be fixed.
-# Goal: fix the ROOT CAUSE, not the symptom, and prove the fix with execution.
+# CODING SKILL: Evidence-led root-cause debugging
+# Use when a reproducible or observable failure must be explained and fixed without looping on guesses.
 
-1. REPRODUCE FIRST:
-- Before changing anything, run the failing case and capture the EXACT error (full traceback, exit code, or wrong output). Memorize the reproduction command.
-- If you cannot reproduce it, you cannot fix it. Establish a deterministic repro before proceeding.
+## When to use
 
-2. ISOLATE:
-- Identify the smallest unit (function, module, command) that exhibits the failure.
-- Form 3-5 concrete hypotheses for the root cause. Write each one down.
-- For each hypothesis, design a quick, targeted probe (a print, an assertion, a one-off script in scripts/debug/) that will confirm or refute it. Do NOT guess-and-edit the main code.
+Use for crashes, failing tests, installation or import failures, incorrect output,
+API failures, and data or numerical errors. Skip it for general code review when no
+specific failure or violated expectation exists.
 
-3. CONFIRM THE ROOT CAUSE:
-- Run the probes. Rank hypotheses by the evidence. Select the single most-likely root cause.
-- State explicitly WHY this is the cause and what mechanism produces the observed symptom.
+## Preconditions
 
-4. FIX MINIMALLY:
-- Apply the smallest change that addresses the root cause. Avoid unrelated refactors.
-- Before editing, check upstream callers and downstream consumers of the code you are changing for breakage.
+- Record the expected behavior, actual behavior, exact error or strongest available
+  evidence, and the environment in which it occurred.
+- Inspect applicable instructions and current workspace state before changing it.
+- Confirm that the request authorizes a fix; diagnosis alone remains read-only.
 
-5. PROVE IT:
-- Re-run the ORIGINAL reproduction command. Confirm the error is gone.
-- Run any adjacent tests to confirm you did not introduce a regression.
-- Clean up temporary debug scripts from scripts/debug/.
+## Procedure
 
-6. ANTI-LOOP:
-- If the same fix attempt fails twice, your root-cause hypothesis is wrong. Stop. Return to step 2 and form new hypotheses. Do not re-run the same failing edit expecting a different result.
+1. Reproduce the smallest useful failure when practical. If it is intermittent or
+   cannot be safely reproduced, preserve logs, inputs, traces, and timing evidence
+   rather than declaring it unfixable.
+2. Locate the first point where observed state diverges from expected state. Form
+   only the few hypotheses supported by that evidence, then choose the cheapest
+   probe that distinguishes among them.
+3. Check the relevant boundary before editing:
+   - Environment/dependency: executable and interpreter, import path, installed and
+     expected versions, resolver or compiler error, and runtime/build mismatch.
+   - HTTP/API: status, response body, headers and content type; distinguish request,
+     authentication, rate-limit, server, transport, TLS, and browser-CORS failures.
+   - Data/numerical: shapes, dtypes, ranges, missing/non-finite values, counts before
+     and after transforms, index or join cardinality, and the first corrupt record.
+4. Apply the smallest change that addresses the demonstrated mechanism. Inspect
+   direct callers and consumers when the changed contract could propagate.
+5. Re-run the original reproduction or strongest equivalent check, then run nearby
+   regression tests in proportion to the change.
 
-7. KNOW THE ERROR-CLASS PLAYBOOKS (this method still applies; these add concrete common-cause checklists):
-- Setup / import / version / build / CUDA / Docker "won't run" -> troubleshooting/environment_and_dependencies.
-- HTTP / API / network / auth / CORS failures -> troubleshooting/http_and_api_errors.
-- Shape / dtype / NaN-inf / encoding / silent-data-loss -> troubleshooting/data_and_numerical_errors.
+## Verification
+
+- Show that the original symptom is gone under the same relevant conditions.
+- Verify the causal mechanism, not merely a different exit code or hidden symptom.
+- Inspect fresh output and record any nondeterminism or environment not exercised.
+
+## Stop or adapt
+
+Do not repeat a failed probe or fix unless a named precondition changed. When evidence
+contradicts the current hypothesis or this playbook's assumptions, discard that path,
+deactivate or adapt the skill, and choose a materially different diagnostic. Report a
+truthful blocker when the necessary evidence or authorization is unavailable.

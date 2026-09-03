@@ -223,16 +223,16 @@ class LLMClient:
         self.model = config['model']            # catalog/display name: logging, llama.cpp self-heal lookup
         self.api_model = configured_api_model  # id sent to the server (vLLM served name)
         self.context_limit = config.get('context_limit', 128000)
-        # An agent decision should be a concise action envelope, not a second
-        # long-form document.  The previous 16K ceiling let one confused turn
-        # occupy the local model for minutes and multiplied that cost during
-        # candidate search.  Keep an operator escape hatch for unusually large
-        # file-write envelopes, but use a safer production default.
+        # Reasoning tokens share the completion allowance with the structured
+        # action envelope. Qwen can legitimately deliberate for much longer than
+        # the old 8K default before it reaches that envelope, so reserve 32K for
+        # one generation. The worker subtracts this entire amount from its prompt
+        # budget, keeping the combined request inside the served context window.
         self.max_turn_tokens = _bounded_int(
             config.get("max_turn_tokens", os.environ.get("AEON_MAX_TURN_TOKENS")),
-            default=8192,
+            default=32768,
             minimum=2048,
-            maximum=16384,
+            maximum=32768,
         )
         self.max_verifier_tokens = _bounded_int(
             config.get(
@@ -266,18 +266,25 @@ class LLMClient:
                 "max_decision_completion_tokens",
                 os.environ.get("AEON_MAX_DECISION_COMPLETION_TOKENS"),
             ),
-            default=12288,
-            minimum=4096,
-            maximum=32768,
+            # Local inference has no metered-token cost. Leave one complete
+            # 32K recovery generation after a 32K primary truncation while
+            # retaining a finite liveness backstop for a malformed model loop.
+            default=65536,
+            minimum=8192,
+            maximum=131072,
         )
         self.max_decision_wall_seconds = _bounded_float(
             config.get(
                 "max_decision_wall_seconds",
                 os.environ.get("AEON_MAX_DECISION_WALL_SECONDS"),
             ),
-            default=90.0,
+            # A token ceiling is not useful if a much shorter wall deadline
+            # always fires first. Thirty minutes covers two 32K generations at
+            # the qualified runtime's expected decode rates while remaining a
+            # finite, interruptible liveness guard.
+            default=1800.0,
             minimum=15.0,
-            maximum=180.0,
+            maximum=3600.0,
         )
         # Non-decision model calls are production work too: ThinkTool, web
         # summaries, skill routing, state integration and media prompt
@@ -353,6 +360,7 @@ class LLMClient:
         *,
         max_model_calls: Optional[int] = None,
         max_completion_tokens: Optional[int] = None,
+        max_wall_seconds: Optional[float] = None,
     ) -> DecisionGenerationBudget:
         return DecisionGenerationBudget(
             max_model_calls=(
@@ -363,9 +371,13 @@ class LLMClient:
             max_completion_tokens=(
                 max_completion_tokens
                 if max_completion_tokens is not None
-                else getattr(self, "max_decision_completion_tokens", 12288)
+                else getattr(self, "max_decision_completion_tokens", 65536)
             ),
-            max_wall_seconds=getattr(self, "max_decision_wall_seconds", 90.0),
+            max_wall_seconds=(
+                max_wall_seconds
+                if max_wall_seconds is not None
+                else getattr(self, "max_decision_wall_seconds", 1800.0)
+            ),
         )
 
     @staticmethod
@@ -393,7 +405,10 @@ class LLMClient:
             self._expected_local_path_prefix = f"{base_path}/" if base_path else "/"
             return openai.OpenAI(
                 base_url=endpoint,
-                api_key='no-key-needed',
+                # Fleet endpoints retain the historical local placeholder.
+                # The OpenCode bridge supplies a per-process random bearer so
+                # its loopback gateway is not an unauthenticated local API.
+                api_key=str(config.get("api_key") or "no-key-needed"),
                 http_client=httpx.Client(
                     trust_env=False,
                     follow_redirects=False,
@@ -594,8 +609,12 @@ class LLMClient:
         value = str(effort or default).strip().lower()
         return value if value in {"low", "medium", "xhigh"} else default
 
-    def _reasoning_request_kwargs(self, effort: str = "medium",
-                                  preserve_thinking: bool = True) -> Dict:
+    def _reasoning_request_kwargs(
+        self,
+        effort: str = "medium",
+        preserve_thinking: bool = True,
+        enable_thinking: bool = True,
+    ) -> Dict:
         """Qwen3.8-native thinking controls and recommended sampling extras.
 
         ``reasoning_effort`` is a top-level Chat Completions field. Template
@@ -613,16 +632,27 @@ class LLMClient:
                 "min_p": 0.0,
                 "repetition_penalty": 1.0,
                 "chat_template_kwargs": {
-                    "enable_thinking": True,
-                    "preserve_thinking": bool(preserve_thinking),
+                    "enable_thinking": bool(enable_thinking),
+                    "preserve_thinking": bool(preserve_thinking and enable_thinking),
                 },
             },
         }
 
-    def _merge_reasoning_kwargs(self, base: Optional[Dict], effort: str) -> Dict:
+    def _merge_reasoning_kwargs(
+        self,
+        base: Optional[Dict],
+        effort: str,
+        *,
+        preserve_thinking: bool = True,
+        enable_thinking: bool = True,
+    ) -> Dict:
         """Merge Qwen thinking controls without losing guided/schema extras."""
         merged = dict(base or {})
-        reasoning = self._reasoning_request_kwargs(effort, preserve_thinking=True)
+        reasoning = self._reasoning_request_kwargs(
+            effort,
+            preserve_thinking=preserve_thinking,
+            enable_thinking=enable_thinking,
+        )
         base_extra = dict(merged.get("extra_body") or {})
         base_extra.update(reasoning.pop("extra_body", {}))
         merged.update(reasoning)
@@ -1056,7 +1086,7 @@ class LLMClient:
         try:
             reservation = budget.reserve(
                 phase=f"missing-block recovery ({missing_key})",
-                requested_tokens=min(getattr(self, "max_turn_tokens", 8192), 4096),
+                requested_tokens=min(getattr(self, "max_turn_tokens", 32768), 4096),
                 minimum_useful_tokens=256,
             )
             resp = self.utility_client.chat.completions.create(
@@ -1462,7 +1492,8 @@ class LLMClient:
                                    candidate_directive: Optional[str] = None,
                                    *,
                                    _decision_budget: Optional[DecisionGenerationBudget] = None,
-                                   _max_output_tokens: Optional[int] = None) -> str:
+                                   _max_output_tokens: Optional[int] = None,
+                                   _disable_thinking: bool = False) -> str:
         """Get combined reasoning and action from the Primary Agent (Strong Model).
 
         When ``images`` (file paths) are supplied — e.g. the current browser
@@ -1507,7 +1538,7 @@ class LLMClient:
             if isinstance(_max_output_tokens, int)
             and not isinstance(_max_output_tokens, bool)
             and _max_output_tokens > 0
-            else getattr(self, "max_turn_tokens", 8192)
+            else getattr(self, "max_turn_tokens", 32768)
         )
 
         # Preserve the caller's typed conversation. Candidate and retry guidance
@@ -1577,15 +1608,13 @@ class LLMClient:
                 # becomes a dead path. Degrades per _downgrade_structured_mode if
                 # this server can't do it.
                 structured_kwargs = self._structured_request_kwargs()
-                # A retry is itself failure recovery, so it automatically gets
-                # maximum reasoning even if the original simple turn was low or
-                # medium.  This avoids saving milliseconds only to repeat a bad
-                # plan several times.
-                attempt_effort = (
-                    "xhigh" if completed_generation_attempts > 0 else requested_effort
-                )
+                attempt_effort = requested_effort
                 sampling_kwargs = self._merge_reasoning_kwargs(
-                    structured_kwargs or {"extra_body": {}}, attempt_effort)
+                    structured_kwargs or {"extra_body": {}},
+                    attempt_effort,
+                    preserve_thinking=not _disable_thinking,
+                    enable_thinking=not _disable_thinking,
+                )
                 # NOTE: no frequency_penalty here, deliberately. It accumulates on
                 # repeated tokens — and JSON's structural tokens ('"', ',', '}')
                 # are the most-repeated tokens in a long response. Production logs
@@ -2309,7 +2338,7 @@ class LLMClient:
             decision_budget.max_completion_tokens - verifier_reserve,
         )
         candidate_token_cap = min(
-            getattr(self, "max_turn_tokens", 8192),
+            getattr(self, "max_turn_tokens", 32768),
             candidate_pool // count,
         )
         if candidate_token_cap < 256:
@@ -2325,6 +2354,7 @@ class LLMClient:
         )
         valid = []
         failures = []
+        last_budget_error = None
         for index in range(count):
             try:
                 raw = self.get_primary_agent_response(
@@ -2361,19 +2391,34 @@ class LLMClient:
                     "proposal_index": index,
                 })
             except DecisionGenerationBudgetExceeded as exc:
-                if not valid:
-                    raise
+                last_budget_error = exc
                 failures.append(
-                    f"candidate {index + 1}: budget exhausted after a valid proposal: {exc}"
+                    f"candidate {index + 1}: generation budget exhausted: {exc}"
                 )
                 self.logger.warning("Selective local-search %s", failures[-1])
-                break
+                # A single candidate can hit its per-proposal length ceiling while
+                # the aggregate decision budget still has room for the independent
+                # fallback candidate.  Do not abandon that remaining evidence path.
+                # Once a valid proposal exists, preserve it for deterministic
+                # verification/fallback instead of risking the reserve it needs.
+                if valid:
+                    break
+                if (
+                    decision_budget.model_calls_started
+                    < decision_budget.max_model_calls
+                    and decision_budget.remaining_completion_tokens >= 256
+                    and decision_budget.remaining_wall_seconds > 0
+                ):
+                    continue
+                raise
             except Exception as exc:
                 failures.append(f"candidate {index + 1}: {type(exc).__name__}: {exc}")
                 self.logger.warning("Selective local-search %s", failures[-1])
 
         if not valid:
             self.last_local_search = {"requested": count, "valid": 0, "failures": failures}
+            if last_budget_error is not None:
+                raise last_budget_error
             raise RuntimeError("All selective local-search candidates failed: " + "; ".join(failures))
 
         selected, reason = self._verify_primary_candidates(

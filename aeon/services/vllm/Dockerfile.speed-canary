@@ -1,0 +1,57 @@
+# Experimental Qwen3.8 speed canary.  This image is deliberately separate from
+# the release-bound aeon_vllm image so a failed kernel/runtime experiment cannot
+# replace the known-good production artifact.
+#
+# The wheel URL is content-addressed by the exact upstream vLLM commit.  That
+# revision contains both the fused CUDA GDN/MTP decode kernel (PR #51674) and
+# native DFlash2 support (PR #52816).
+FROM nvidia/cuda:13.0.1-base-ubuntu24.04
+
+LABEL com.bc_aeon.component="qwen38-speed-canary" \
+      com.bc_aeon.vllm-commit="0ecc284790e5403f74b899524ef82ecb69f83cb3"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VLLM_NO_USAGE_STATS=1 \
+    DO_NOT_TRACK=1 \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-dev python3.12-venv python-is-python3 \
+      cuda-nvcc-13-0 cuda-cudart-dev-13-0 libcurand-dev-13-0 \
+      build-essential ca-certificates curl git ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG VLLM_COMMIT=0ecc284790e5403f74b899524ef82ecb69f83cb3
+ARG VLLM_WHEEL=vllm-0.26.1rc1.dev1141%2Bg0ecc28479-cp38-abi3-manylinux_2_28_x86_64.whl
+RUN python3.12 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip \
+    && /opt/venv/bin/pip install \
+      "https://wheels.vllm.ai/${VLLM_COMMIT}/${VLLM_WHEEL}" \
+      "qwen-vl-utils==0.0.14" \
+      "accelerate==1.14.0"
+
+# Fail the build if the pinned binary wheel does not actually contain the two
+# capabilities this canary exists to measure.
+RUN python3.12 - <<'PY'
+from importlib.metadata import distribution, version
+from pathlib import Path
+
+dist = distribution("vllm")
+root = Path(dist.locate_file("vllm"))
+gdn = (root / "model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py").read_text()
+dflash2 = (root / "model_executor/models/qwen3_dflash2.py").read_text()
+binary_extensions = tuple(root.glob("_C*.so"))
+installed = version("vllm")
+assert "0ecc28479" in installed, installed
+assert "fused_gdn_decode_post_conv_mtp" in gdn
+assert "class DFlash2Qwen3ForCausalLM" in dflash2
+assert "attention_conv" in dflash2
+assert binary_extensions, "vLLM wheel has no compiled CUDA extension"
+print("speed canary vLLM:", installed, binary_extensions)
+PY
+
+EXPOSE 8000
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
