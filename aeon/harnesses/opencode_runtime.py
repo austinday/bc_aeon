@@ -54,6 +54,7 @@ from .opencode_completion import (
 from .opencode_config import (
     DEFAULT_OPENCODE_STEPS,
     MAX_OPENCODE_STEPS,
+    SHARED_RUNTIME_LAYOUT_VERSION,
     OpenCodeConfigError,
     _atomic_private_bytes,
     _private_directory,
@@ -99,25 +100,32 @@ def _state_root() -> Path:
         if path.is_absolute():
             return _private_directory(path.parent / "opencode")
     configured = os.environ.get("AEON_STATE_DIR", "").strip()
-    root = Path(configured).expanduser() if configured else Path.home() / ".aeon" / "state"
-    workspace_id = __import__("hashlib").sha256(
-        str(Path.cwd().resolve(strict=True)).encode("utf-8")
-    ).hexdigest()[:20]
+    root = (
+        Path(configured).expanduser() if configured else Path.home() / ".aeon" / "state"
+    )
+    workspace_id = (
+        __import__("hashlib")
+        .sha256(str(Path.cwd().resolve(strict=True)).encode("utf-8"))
+        .hexdigest()[:20]
+    )
     # A direct CLI process has no transcript-owned instance directory.  Give it
     # the same process-stable identity used by Worker/presence so two Aeon
     # processes in one workspace never share authority, config, session, or
     # browser-tab files.  Managed Nexus instances already take the transcript
     # branch above and retain restart-stable state there.
-    instance_id = validate_remote_instance_id(
-        os.environ.get("AEON_REMOTE_INSTANCE_ID")
-    ) or process_instance_id()
+    instance_id = (
+        validate_remote_instance_id(os.environ.get("AEON_REMOTE_INSTANCE_ID"))
+        or process_instance_id()
+    )
     return _private_directory(root / "opencode" / workspace_id / instance_id)
 
 
 def _load_session_id(root: Path) -> str | None:
     path = root / SESSION_FILE
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        )
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -268,6 +276,7 @@ class OpenCodeTurnRunner:
         max_steps: int,
         resume: bool,
         browser_profile: str = "default",
+        shared_runtime_root: Path | None = None,
     ) -> None:
         workspace = Path.cwd().resolve(strict=True)
         exact_root = root.resolve(strict=True)
@@ -281,6 +290,23 @@ class OpenCodeTurnRunner:
             )
         self.binary = binary
         self.root = exact_root
+        shared_candidate = shared_runtime_root or (
+            binary.expanduser().absolute().parent
+            / f"runtime-v{SHARED_RUNTIME_LAYOUT_VERSION}"
+        )
+        shared_root = shared_candidate.expanduser().absolute()
+        if (
+            shared_root == workspace
+            or shared_root.is_relative_to(workspace)
+            or workspace.is_relative_to(shared_root)
+            or shared_root == exact_root
+            or shared_root.is_relative_to(exact_root)
+            or exact_root.is_relative_to(shared_root)
+        ):
+            raise OpenCodeRuntimeError(
+                "OpenCode shared runtime must be disjoint from workspace and session state"
+            )
+        self.shared_runtime_root = shared_root
         self.proxy = proxy
         self.logical_model = logical_model
         self.max_steps = max_steps
@@ -321,6 +347,7 @@ class OpenCodeTurnRunner:
         environment = isolated_environment(
             os.environ,
             directory=self.root,
+            shared_runtime_directory=self.shared_runtime_root,
             config_path=config,
             authority_path=authority,
             base_url=self.proxy.base_url,
@@ -387,7 +414,11 @@ class OpenCodeTurnRunner:
             env=environment,
             start_new_session=True,
         )
-        assert child.stdin is not None and child.stdout is not None and child.stderr is not None
+        assert (
+            child.stdin is not None
+            and child.stdout is not None
+            and child.stderr is not None
+        )
         try:
             child.stdin.write(prompt.encode("utf-8"))
             child.stdin.close()
@@ -465,7 +496,9 @@ class OpenCodeTurnRunner:
                     self.session_id = event_session
                     _save_session_id(self.root, event_session)
                 elif event_session != self.session_id:
-                    raise OpenCodeRuntimeError("OpenCode event changed session identity")
+                    raise OpenCodeRuntimeError(
+                        "OpenCode event changed session identity"
+                    )
             event_type = event.get("type")
             part = event.get("part") if isinstance(event.get("part"), dict) else {}
             if event_type == "text":
@@ -633,7 +666,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.model != AEON_DEFAULT_MODEL_NAME:
-        print("The OpenCode harness accepts only the reviewed Aeon logical model.", file=sys.stderr)
+        print(
+            "The OpenCode harness accepts only the reviewed Aeon logical model.",
+            file=sys.stderr,
+        )
         return 2
     if not 1 <= args.max_iterations <= MAX_OPENCODE_STEPS:
         print(
@@ -646,9 +682,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     os.environ[CHAT_WRITER_PID_ENV] = str(os.getpid())
-    if not _BROWSER_SESSION_RE.fullmatch(
-        os.environ.get("AEON_BROWSER_SESSION_ID", "")
-    ):
+    if not _BROWSER_SESSION_RE.fullmatch(os.environ.get("AEON_BROWSER_SESSION_ID", "")):
         os.environ["AEON_BROWSER_SESSION_ID"] = f"oc-{uuid.uuid4().hex}"
     presence: Presence | None = None
     fleet: BrokerServiceSession | None = None
@@ -660,10 +694,10 @@ def main(argv: list[str] | None = None) -> int:
         binary = resolve_opencode_binary()
         root = _state_root()
         presence = Presence(cwd=os.getcwd())
-        presence.update(phase="startup", model=args.model, intent="Starting OpenCode harness")
-        fleet = BrokerServiceSession(
-            consumer=f"aeon-opencode/{process_instance_id()}"
+        presence.update(
+            phase="startup", model=args.model, intent="Starting OpenCode harness"
         )
+        fleet = BrokerServiceSession(consumer=f"aeon-opencode/{process_instance_id()}")
         print("[SESSION] Requesting local Qwen through Fleet Compute...", flush=True)
         endpoint = fleet.start()
         wire_model = __import__(
@@ -685,7 +719,9 @@ def main(argv: list[str] | None = None) -> int:
             resume=args.resume_unfinished,
             browser_profile=args.browser_profile,
         )
-        presence.update(phase="completed", intent="Ready for a message", model=args.model)
+        presence.update(
+            phase="completed", intent="Ready for a message", model=args.model
+        )
         print(f"Aeon Ready (OpenCode {binary.name}; {args.model})", flush=True)
 
         next_prompt = str(args.start or "").strip()
@@ -713,7 +749,9 @@ def main(argv: list[str] | None = None) -> int:
             if next_prompt.lower() == "/clear":
                 runner.clear()
                 clear_chat_messages_from_environment()
-                message = "OpenCode context cleared. The next message starts a fresh session."
+                message = (
+                    "OpenCode context cleared. The next message starts a fresh session."
+                )
                 append_assistant_message_from_environment(message)
                 print(message, flush=True)
                 next_prompt = ""
@@ -803,7 +841,10 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         if presence is not None:
             presence.mark_error(exc)
-        print(f"Aeon OpenCode startup failed: {sanitize_summary(type(exc).__name__ + ': ' + str(exc))}", file=sys.stderr)
+        print(
+            f"Aeon OpenCode startup failed: {sanitize_summary(type(exc).__name__ + ': ' + str(exc))}",
+            file=sys.stderr,
+        )
         exit_code = 1
     finally:
         _close_browser_session(args.browser_profile)

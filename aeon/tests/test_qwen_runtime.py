@@ -2132,6 +2132,10 @@ print(json.dumps([
             self.assertIn("32768", command)
             self.assertEqual(command.count("--no-enable-log-requests"), 1)
             self.assertNotIn("--disable-log-requests", command)
+            self.assertEqual(command.count("--enable-auto-tool-choice"), 1)
+            self.assertEqual(command.count("--tool-call-parser"), 1)
+            tool_parser_index = command.index("--tool-call-parser")
+            self.assertEqual(command[tool_parser_index + 1], "qwen3_coder")
             mutations = {
                 "AEON_GPU_MEM_UTIL": "0.9",
                 "AEON_MAX_NUM_SEQS": "2",

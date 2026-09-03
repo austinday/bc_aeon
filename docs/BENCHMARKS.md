@@ -114,7 +114,10 @@ is reported separately and excluded only when the broker proves the wait.
 
 Summaries expose:
 
-- `total_wall_ms`, `total_active_wall_ms`, and `total_compute_wait_ms`;
+- `end_to_end_wall_ms` for the durable claim-to-terminal run boundary, plus
+  per-case aggregates `total_wall_ms`, `total_active_wall_ms`, and
+  `total_compute_wait_ms`; this keeps orchestration overhead and Fleet wait
+  visible without treating either as active-time scoring work;
 - `model_turn_count`, `model_call_count`, and `tool_call_count`;
 - cumulative provider-reported input (`prompt_tokens`), output
   (`completion_tokens`), and total (`context_tokens`) tokens, plus the maximum
@@ -147,6 +150,10 @@ case, repetition, random nonce, file identity, monotonic sequence, operation,
 status, and bounded effect facts. Raw sensitive arguments are not retained.
 Malformed, missing, duplicate, reordered, replayed, cross-case, or tampered
 streams fail closed.
+
+The final private evidence digest also binds the run's terminal status,
+allowlisted error code, and sanitized summary. A database/evidence mismatch is
+not comparable and its evidence-only case details are withheld.
 
 The hidden Fleet fixture has stable opaque job and checkpoint generations. Its
 driver controls queued and preempted transitions, independently verifies useful
@@ -259,12 +266,20 @@ from model-facing workspaces. Readback verifies evidence ownership, size, shape,
 run identity, and SHA-256 before returning cases. Failed verification returns no
 untrusted cases.
 
+Each OpenCode case still has an independent data database, lock state, discovery
+home, authority, and resume identity. Immutable OpenCode config/cache scaffolding
+is reused from the exact pinned binary's validated read-only `runtime-v1`
+directory. The scaffold contains no JavaScript plugins or dependency tree, so a
+matrix does not multiply `node_modules` by cases or repetitions. Mutable case
+state and retained benchmark evidence are never placed in that shared tree.
+
 Workers bind their exact owner PID and kernel start time in the private database.
 Reconciliation marks a vanished exact worker `failed/worker_lost`; an
-unregistered queued worker receives a bounded startup grace. Process identity is
-never exposed through Nexus. Cancellation targets only the proven run-owned
-process tree and revalidates PIDs before signaling. It never searches or kills by
-process name.
+unregistered queued worker receives a bounded startup grace beginning when its
+launch is requested, so time spent durably `pending` behind another matrix child
+does not consume that grace. Process identity is never exposed through Nexus.
+Cancellation targets only the proven run-owned process tree and revalidates PIDs
+before signaling. It never searches or kills by process name.
 
 Provenance binds catalog and canonical benchmark versions, request,
 runner/executor protocols, exact combination, evidence digest, and content-bound

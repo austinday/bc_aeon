@@ -6,6 +6,7 @@ import io
 import json
 import os
 import signal
+import stat
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +43,20 @@ from aeon.tools.command_fleet_guard import (
 )
 from aeon.tools.file_io import StrReplaceTool
 from aeon.tools.system import RunCommandTool
+
+
+@pytest.fixture(autouse=True)
+def _restore_test_runtime_write_modes(tmp_path: Path):
+    """Let pytest remove test-only trees that intentionally model mode 0500."""
+
+    yield
+    for path in tuple(tmp_path.rglob("*")):
+        try:
+            metadata = path.lstat()
+            if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                path.chmod(0o700)
+        except OSError:
+            pass
 
 
 class _LLM:
@@ -419,12 +434,17 @@ def test_active_run_command_is_receipt_stopped_on_process_cleanup(
     process = _FakeProcess()
     receipt = object()
     launched = threading.Event()
+    return_handle = threading.Event()
     stopped: list[object] = []
     finalized: list[object] = []
     boundary = SimpleNamespace(cwd=str(tmp_path))
 
-    monkeypatch.setattr("aeon.tools.system.guard_fleet_shell_command", lambda value: value)
-    monkeypatch.setattr("aeon.tools.system.resolve_command_cwd", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(
+        "aeon.tools.system.guard_fleet_shell_command", lambda value: value
+    )
+    monkeypatch.setattr(
+        "aeon.tools.system.resolve_command_cwd", lambda *_args, **_kwargs: tmp_path
+    )
     monkeypatch.setattr(
         "aeon.tools.system.prepare_fleet_shell_boundary",
         lambda **_kwargs: (boundary, {}),
@@ -435,6 +455,7 @@ def test_active_run_command_is_receipt_stopped_on_process_cleanup(
         assert callable(callback)
         callback(receipt)
         launched.set()
+        assert return_handle.wait(timeout=5)
         return SimpleNamespace(
             process=process,
             receipt=receipt,
@@ -458,7 +479,10 @@ def test_active_run_command_is_receipt_stopped_on_process_cleanup(
     thread.start()
     assert launched.wait(timeout=2)
 
-    assert cancel_process_resources() == []
+    try:
+        assert cancel_process_resources() == []
+    finally:
+        return_handle.set()
     thread.join(timeout=2)
 
     assert not thread.is_alive()

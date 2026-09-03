@@ -40,8 +40,10 @@ from aeon.benchmarks.catalog import (
 from aeon.core.benchmark_receipt import (
     CAPABILITY_RECEIPT_KEY_ENV,
     CAPABILITY_RECEIPT_PATH_ENV,
+    begin_model_call,
     decode_capability_receipts,
     emit_fleet_wait_capability_receipt,
+    finish_model_call,
 )
 from aeon.benchmarks.protocol import (
     executor_source_sha256,
@@ -116,11 +118,22 @@ def test_catalog_is_immutable_complete_json_safe_and_hashed() -> None:
     }
     assert catalog["scoring"]["overall_field"] == "overall_score"
     assert catalog["scoring"]["quality_field"] == "quality_score"
+    assert (
+        catalog["scoring"]["efficiency"]["basis"]
+        == "whole_run_total_active_wall_ms"
+    )
+    assert catalog["scoring"]["efficiency"]["fleet_wait_excluded"] is True
     assert catalog["scoring"]["observable_metrics"]["token_fields"] == [
         "prompt_tokens",
         "peak_prompt_tokens",
         "context_tokens",
         "completion_tokens",
+    ]
+    assert catalog["scoring"]["observable_metrics"]["total_time_fields"] == [
+        "end_to_end_wall_ms",
+        "total_wall_ms",
+        "total_active_wall_ms",
+        "total_compute_wait_ms",
     ]
     assert [axis["field"] for axis in catalog["scoring"]["pareto_axes"]] == [
         "quality_score",
@@ -328,6 +341,7 @@ def test_runner_executes_deterministic_specs_and_publishes_sanitized_evidence(
     assert summary["median_active_wall_ms"] == pytest.approx(20.0)
     assert summary["median_compute_wait_ms"] == pytest.approx(5.0)
     assert summary["total_wall_ms"] == pytest.approx(25.0 * case_count)
+    assert summary["end_to_end_wall_ms"] >= 0.0
     assert summary["total_active_wall_ms"] == pytest.approx(20.0 * case_count)
     assert summary["total_compute_wait_ms"] == pytest.approx(5.0 * case_count)
     assert summary["stuck_rate"] == pytest.approx(0.0)
@@ -361,6 +375,9 @@ def test_runner_executes_deterministic_specs_and_publishes_sanitized_evidence(
     assert provenance["tool_source_sha256"] == TOOL_SOURCE_SHA256
     assert re.fullmatch(r"[0-9a-f]{64}", provenance["evidence_sha256"])
     evidence_payload = json.loads(evidence.read_text(encoding="utf-8"))
+    assert evidence_payload["status"] == "succeeded"
+    assert evidence_payload["error_code"] is None
+    assert evidence_payload["summary"] == summary
     assert evidence_payload["executor_protocol_version"] == EXECUTOR_PROTOCOL_VERSION
     assert evidence_payload["executor_protocol_sha256"] == EXECUTOR_PROTOCOL_SHA256
     assert evidence_payload["runner_source_sha256"] == RUNNER_SOURCE_SHA256
@@ -424,7 +441,190 @@ def test_missing_real_executor_fails_instead_of_manufacturing_passes(tmp_path: P
     assert all(case["status"] != "passed" for case in finished["cases"])
 
 
-def test_executor_exception_preserves_measured_case_time(tmp_path: Path) -> None:
+def test_unrecovered_authenticated_model_transport_failure_invalidates_run(
+    tmp_path: Path,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+
+    def failed_transport(
+        _argv, _cwd, environment, _timeout, _cancel, _compute_state_changed
+    ):
+        with patch.dict(os.environ, environment, clear=True):
+            handle = begin_model_call("opencode_proxy")
+            assert handle is not None
+            assert finish_model_call(handle, outcome="transport_error")
+        # Even a zero exit and answer-shaped output cannot turn a signed
+        # provider failure into comparable model-quality evidence.
+        return ProcessResult("exited", 0, b"BENCH_SMOKE_DIRECT_7Q2", 3.0)
+
+    with FleetHarnessExecutor(
+        service,
+        str(queued["id"]),
+        process_runner=failed_transport,
+        readiness_checker=lambda _harness: {"supported": True, "reason": ""},
+        browser_fixture_client=lambda _fixture, _operation: False,
+    ) as executor:
+        finished = run_benchmark(
+            service,
+            str(queued["id"]),
+            executor=executor,
+        )
+
+    assert finished["status"] == "failed"
+    assert finished["error_code"] == "executor_unavailable"
+    assert finished["summary"] == {}
+    assert len(finished["cases"]) == 1
+    assert finished["cases"][0]["status"] == "failed"
+    assert float(finished["cases"][0]["wall_ms"]) > 0
+
+
+def test_recovered_model_transport_retry_remains_comparable(tmp_path: Path) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+
+    def recovered_transport(
+        _argv, _cwd, environment, _timeout, _cancel, _compute_state_changed
+    ):
+        with patch.dict(os.environ, environment, clear=True):
+            first = begin_model_call("opencode_proxy")
+            assert first is not None
+            assert finish_model_call(first, outcome="http_error")
+            second = begin_model_call("opencode_proxy")
+            assert second is not None
+            assert finish_model_call(
+                second,
+                outcome="succeeded",
+                prompt_tokens=5,
+                completion_tokens=1,
+                total_tokens=6,
+            )
+        return ProcessResult("exited", 0, b"BENCH_SMOKE_DIRECT_7Q2", 3.0)
+
+    scenario = next(
+        item
+        for item in SUITES["comprehensive"].cases
+        if item.case_id == "smoke.direct"
+    )
+    with FleetHarnessExecutor(
+        service,
+        str(queued["id"]),
+        process_runner=recovered_transport,
+        readiness_checker=lambda _harness: {"supported": True, "reason": ""},
+        browser_fixture_client=lambda _fixture, _operation: False,
+    ) as executor:
+        result = executor.execute(
+            ExecutionRequest(
+                run_id=str(queued["id"]),
+                suite_id="comprehensive",
+                scenario=scenario,
+                repetition=1,
+                harness_id="opencode",
+                model_id="local/qwen",
+                tool_profile_id="fleet-local",
+                timeout_seconds=scenario.timeout_seconds,
+            )
+        )
+
+    assert result["status"] == "passed"
+    assert result["model_call_count"] == 2
+    # The recovered call is valid behavioral evidence, while token totals stay
+    # unknown because the failed first attempt may also have consumed tokens.
+    assert result["prompt_tokens"] is None
+
+
+def test_later_model_transport_failure_after_success_invalidates_run(
+    tmp_path: Path,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+
+    def terminal_transport_failure(
+        _argv, _cwd, environment, _timeout, _cancel, _compute_state_changed
+    ):
+        with patch.dict(os.environ, environment, clear=True):
+            first = begin_model_call("opencode_proxy")
+            assert first is not None
+            assert finish_model_call(
+                first,
+                outcome="succeeded",
+                prompt_tokens=5,
+                completion_tokens=1,
+                total_tokens=6,
+            )
+            second = begin_model_call("opencode_proxy")
+            assert second is not None
+            assert finish_model_call(second, outcome="transport_error")
+        return ProcessResult("exited", 0, b"BENCH_SMOKE_DIRECT_7Q2", 3.0)
+
+    with FleetHarnessExecutor(
+        service,
+        str(queued["id"]),
+        process_runner=terminal_transport_failure,
+        readiness_checker=lambda _harness: {"supported": True, "reason": ""},
+        browser_fixture_client=lambda _fixture, _operation: False,
+    ) as executor:
+        finished = run_benchmark(
+            service,
+            str(queued["id"]),
+            executor=executor,
+        )
+
+    assert finished["status"] == "failed"
+    assert finished["error_code"] == "executor_unavailable"
+    assert finished["summary"] == {}
+    assert len(finished["cases"]) == 1
+
+
+@pytest.mark.parametrize("outcome", ["http_error", "cancelled", "failed"])
+def test_ambiguous_model_call_failure_remains_behavioral_evidence(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+
+    def ambiguous_failure(
+        _argv, _cwd, environment, _timeout, _cancel, _compute_state_changed
+    ):
+        with patch.dict(os.environ, environment, clear=True):
+            handle = begin_model_call("opencode_proxy")
+            assert handle is not None
+            assert finish_model_call(handle, outcome=outcome)
+        return ProcessResult("exited", 1, b"", 3.0)
+
+    scenario = next(
+        item
+        for item in SUITES["comprehensive"].cases
+        if item.case_id == "smoke.direct"
+    )
+    with FleetHarnessExecutor(
+        service,
+        str(queued["id"]),
+        process_runner=ambiguous_failure,
+        readiness_checker=lambda _harness: {"supported": True, "reason": ""},
+        browser_fixture_client=lambda _fixture, _operation: False,
+    ) as executor:
+        result = executor.execute(
+            ExecutionRequest(
+                run_id=str(queued["id"]),
+                suite_id="comprehensive",
+                scenario=scenario,
+                repetition=1,
+                harness_id="opencode",
+                model_id="local/qwen",
+                tool_profile_id="fleet-local",
+                timeout_seconds=scenario.timeout_seconds,
+            )
+        )
+
+    assert result["status"] == "failed"
+    assert result["score"] == 0.0
+
+
+def test_executor_exception_is_noncomparable_and_preserves_measured_case_time(
+    tmp_path: Path,
+) -> None:
     service, _launches = _service(tmp_path)
     queued = service.submit(_request())
 
@@ -434,11 +634,34 @@ def test_executor_exception_preserves_measured_case_time(tmp_path: Path) -> None
             raise RuntimeError("synthetic model failure")
 
     finished = run_benchmark(service, str(queued["id"]), executor=DelayedFailure())
-    assert finished["status"] == "succeeded"
-    assert len(finished["cases"]) == len(SUITES["comprehensive"].cases)
-    assert all(float(case["wall_ms"]) > 0 for case in finished["cases"])
-    assert finished["summary"]["total_wall_ms"] > 0
-    assert finished["summary"]["total_active_wall_ms"] > 0
+    assert finished["status"] == "failed"
+    assert finished["error_code"] == "executor_unavailable"
+    assert finished["summary"] == {}
+    assert len(finished["cases"]) == 1
+    assert float(finished["cases"][0]["wall_ms"]) > 0
+
+
+def test_executor_prepare_exception_is_noncomparable_runner_failure(
+    tmp_path: Path,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+
+    class BrokenPreparation:
+        def prepare(self, _request):
+            raise OSError("synthetic preparation failure")
+
+        def execute(self, _request):
+            raise AssertionError("execute must not run after failed preparation")
+
+    finished = run_benchmark(
+        service, str(queued["id"]), executor=BrokenPreparation()
+    )
+    assert finished["status"] == "failed"
+    assert finished["error_code"] == "runner_failed"
+    assert finished["summary"] == {}
+    assert len(finished["cases"]) == 1
+    assert finished["cases"][0]["status"] == "failed"
 
 
 def test_cancel_is_idempotent_and_running_cancel_preserves_partial_evidence(
@@ -488,6 +711,251 @@ def test_evidence_tamper_fails_closed_without_returning_untrusted_cases(
     assert "secret" not in json.dumps(readback)
 
 
+def test_evidence_terminal_binding_rejects_database_status_drift(tmp_path: Path) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    finished = run_benchmark(
+        service, str(queued["id"]), executor=_PassingExecutor()
+    )
+    assert finished["evidence_verified"] is True
+
+    with sqlite3.connect(service.database_path) as connection:
+        connection.execute(
+            "UPDATE benchmark_runs SET status = 'failed', error_code = 'runner_failed' "
+            "WHERE id = ?",
+            (finished["id"],),
+        )
+
+    readback = service.get_run(str(finished["id"]))
+    assert readback["status"] == "failed"
+    assert readback["error_code"] == "runner_failed"
+    assert readback["evidence_verified"] is False
+    assert readback["cases"] == []
+
+
+def test_evidence_terminal_binding_rejects_database_error_code_drift(
+    tmp_path: Path,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    finished = run_benchmark(service, str(queued["id"]))
+    assert finished["status"] == "failed"
+    assert finished["error_code"] == "executor_unavailable"
+    assert finished["evidence_verified"] is True
+
+    with sqlite3.connect(service.database_path) as connection:
+        connection.execute(
+            "UPDATE benchmark_runs SET error_code = 'executor_stuck' WHERE id = ?",
+            (finished["id"],),
+        )
+
+    readback = service.get_run(str(finished["id"]))
+    assert readback["status"] == "failed"
+    assert readback["error_code"] == "executor_stuck"
+    assert readback["evidence_verified"] is False
+    assert readback["cases"] == []
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "suite_sha256",
+        "runner_protocol_sha256",
+        "executor_protocol_sha256",
+        "runner_source_sha256",
+        "harness_source_sha256",
+        "tool_source_sha256",
+        "combination_sha256",
+    ],
+)
+def test_evidence_provenance_binding_rejects_database_drift(
+    tmp_path: Path,
+    column: str,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    finished = run_benchmark(
+        service, str(queued["id"]), executor=_PassingExecutor()
+    )
+    assert finished["evidence_verified"] is True
+
+    with sqlite3.connect(service.database_path) as connection:
+        connection.execute(
+            f"UPDATE benchmark_runs SET {column} = ? WHERE id = ?",
+            ("0" * 64, finished["id"]),
+        )
+
+    readback = service.get_run(str(finished["id"]))
+    assert readback["evidence_verified"] is False
+    assert readback["cases"] == []
+
+
+def test_evidence_summary_binding_rejects_database_drift_and_comparison(
+    tmp_path: Path,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    finished = run_benchmark(
+        service, str(queued["id"]), executor=_PassingExecutor()
+    )
+    assert finished["evidence_verified"] is True
+
+    with sqlite3.connect(service.database_path) as connection:
+        connection.execute(
+            "UPDATE benchmark_runs SET summary_json = ? WHERE id = ?",
+            ('{"overall_score":0}', finished["id"]),
+        )
+
+    readback = service.get_run(str(finished["id"]))
+    assert readback["summary"] == {"overall_score": 0}
+    assert readback["evidence_verified"] is False
+    assert readback["cases"] == []
+    with patch.object(
+        executor_module,
+        "runtime_execution_status",
+        return_value={"supported": True, "reason": ""},
+    ):
+        comparison = service.comparison()
+    entry = next(
+        item
+        for item in comparison["combinations"]
+        if item["combination"]["harness_id"] == "opencode"
+    )
+    assert entry["state"] == "missing"
+    assert entry["run"] is None
+    assert entry["evidence_verified"] is False
+
+
+def test_evidence_nonfinite_summary_fails_closed_after_valid_digest(
+    tmp_path: Path,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    finished = run_benchmark(
+        service, str(queued["id"]), executor=_PassingExecutor()
+    )
+    evidence_path = service.evidence_root / str(finished["id"]) / "results.json"
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    payload["summary"]["overall_score"] = float("nan")
+    malformed = (
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    evidence_path.write_bytes(malformed)
+    evidence_path.chmod(0o600)
+    with sqlite3.connect(service.database_path) as connection:
+        connection.execute(
+            "UPDATE benchmark_runs SET evidence_sha256 = ? WHERE id = ?",
+            (hashlib.sha256(malformed).hexdigest(), finished["id"]),
+        )
+
+    readback = service.get_run(str(finished["id"]))
+    assert readback["evidence_verified"] is False
+    assert readback["cases"] == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["label", "score", "private_field", "duplicate", "case_count"],
+)
+def test_evidence_case_semantics_fail_closed_after_valid_digest(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    finished = run_benchmark(
+        service, str(queued["id"]), executor=_PassingExecutor()
+    )
+    evidence_path = service.evidence_root / str(finished["id"]) / "results.json"
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if mutation == "label":
+        payload["cases"][0]["label"] = "mutated label"
+    elif mutation == "score":
+        payload["cases"][0]["score"] = 999
+    elif mutation == "private_field":
+        payload["cases"][0]["private_prompt"] = "must not escape"
+    elif mutation == "duplicate":
+        payload["cases"].append(dict(payload["cases"][0]))
+    else:
+        payload["summary"]["case_count"] += 1
+    mutated = (
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    evidence_path.write_bytes(mutated)
+    evidence_path.chmod(0o600)
+    with sqlite3.connect(service.database_path) as connection:
+        if mutation == "case_count":
+            connection.execute(
+                "UPDATE benchmark_runs SET summary_json = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        payload["summary"],
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    finished["id"],
+                ),
+            )
+        connection.execute(
+            "UPDATE benchmark_runs SET evidence_sha256 = ? WHERE id = ?",
+            (hashlib.sha256(mutated).hexdigest(), finished["id"]),
+        )
+
+    readback = service.get_run(str(finished["id"]))
+    assert readback["evidence_verified"] is False
+    assert readback["cases"] == []
+    assert "must not escape" not in json.dumps(readback)
+
+
+def test_terminal_evidence_uses_one_finished_at_for_durable_run_wall_and_error(
+    tmp_path: Path,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    assert service._claim_run(str(queued["id"])) is not None
+    with sqlite3.connect(service.database_path) as connection:
+        connection.execute(
+            "UPDATE benchmark_runs SET started_at = ? WHERE id = ?",
+            (100.0, queued["id"]),
+        )
+
+    with patch.object(service_module.time, "time", return_value=104.25):
+        finished = service._finish_run(
+            str(queued["id"]),
+            status_value="failed",
+            summary={
+                "total_wall_ms": 1250.0,
+                "end_to_end_wall_ms": 999_999.0,
+            },
+            cases=[],
+            error_code="RAW_UNTRUSTED_ERROR",
+        )
+
+    assert finished["status"] == "failed"
+    assert finished["finished_at"] == pytest.approx(104.25)
+    assert finished["error_code"] == "runner_failed"
+    assert finished["summary"]["total_wall_ms"] == pytest.approx(1250.0)
+    assert finished["summary"]["end_to_end_wall_ms"] == pytest.approx(4250.0)
+    evidence = json.loads(
+        (
+            service.evidence_root / str(finished["id"]) / "results.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert evidence["status"] == "failed"
+    assert evidence["error_code"] == "runner_failed"
+    assert evidence["summary"] == finished["summary"]
+    assert "RAW_UNTRUSTED_ERROR" not in json.dumps(evidence)
+
+
 def test_failed_evidence_publish_retains_owned_staging_for_manual_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -520,7 +988,7 @@ def test_database_v1_migrates_worker_and_executor_identity_columns(tmp_path: Pat
         connection.execute("PRAGMA user_version = 1")
     reopened = BenchmarkService(service.root, launcher=lambda _argv: None)
     with sqlite3.connect(reopened.database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(benchmark_runs)").fetchall()
@@ -529,6 +997,7 @@ def test_database_v1_migrates_worker_and_executor_identity_columns(tmp_path: Pat
         "worker_pid",
         "worker_starttime",
         "worker_registered_at",
+        "worker_launch_requested_at",
         "executor_protocol_version",
         "executor_protocol_sha256",
         "runner_source_sha256",
@@ -568,6 +1037,29 @@ def test_database_v3_migration_marks_old_source_provenance_unbound(
     assert finished["error_code"] == "runner_failed"
 
 
+def test_database_v5_migrates_worker_launch_grace_baseline(tmp_path: Path) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    with sqlite3.connect(service.database_path) as connection:
+        connection.execute(
+            "ALTER TABLE benchmark_runs DROP COLUMN worker_launch_requested_at"
+        )
+        connection.execute("PRAGMA user_version = 5")
+
+    reopened = BenchmarkService(service.root, launcher=lambda _argv: None)
+    with sqlite3.connect(reopened.database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        row = connection.execute(
+            "SELECT created_at, worker_launch_requested_at "
+            "FROM benchmark_runs WHERE id = ?",
+            (queued["id"],),
+        ).fetchone()
+
+    assert version == 6
+    assert row is not None
+    assert row[1] == pytest.approx(row[0])
+
+
 def test_stale_worker_identity_is_reconciled_without_exposing_pid(tmp_path: Path) -> None:
     service, _launches = _service(tmp_path)
     queued = service.submit(_request())
@@ -594,7 +1086,9 @@ def test_unregistered_stale_queue_is_truthfully_failed(tmp_path: Path) -> None:
     queued = service.submit(_request())
     with sqlite3.connect(service.database_path) as connection:
         connection.execute(
-            "UPDATE benchmark_runs SET created_at = 0 WHERE id = ?", (queued["id"],)
+            "UPDATE benchmark_runs SET created_at = 0, "
+            "worker_launch_requested_at = 0 WHERE id = ?",
+            (queued["id"],),
         )
     reconciled = service.list_runs()["runs"][0]
     assert reconciled["status"] == "failed"

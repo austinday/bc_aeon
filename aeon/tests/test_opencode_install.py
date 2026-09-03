@@ -46,7 +46,7 @@ def _fake_archive(
     archive_path = directory / "opencode-linux-x64.tar.gz"
     script = (
         "#!/bin/sh\n"
-        "if [ \"$1\" = \"--version\" ]; then\n"
+        'if [ "$1" = "--version" ]; then\n'
         f"  printf '%s\\n' '{version}'\n"
         "  exit 0\n"
         "fi\n"
@@ -154,6 +154,20 @@ def test_version_probe_uses_minimal_non_secret_environment(
     assert environment["OPENCODE_DISABLE_MODELS_FETCH"] == "true"
     assert environment["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
     assert environment["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "true"
+    probe_root = Path(environment["HOME"]).parent
+    assert not probe_root.exists()
+    assert environment["OPENCODE_CONFIG_DIR"] == str(probe_root / "config" / "opencode")
+    assert environment["OPENCODE_TEST_HOME"] == str(probe_root / "home")
+    for name in (
+        "HOME",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_STATE_HOME",
+    ):
+        assert Path(environment[name]).is_relative_to(probe_root)
     for name in (
         "OPENAI_API_KEY",
         "GPU_AGENT_CLAIM_ID",
@@ -161,6 +175,7 @@ def test_version_probe_uses_minimal_non_secret_environment(
         "OPENCODE_CONFIG",
     ):
         assert name not in environment
+
     def failed_run(*_args, **_kwargs):
         return SimpleNamespace(
             returncode=2,
@@ -168,9 +183,7 @@ def test_version_probe_uses_minimal_non_secret_environment(
             stderr="token=must-not-leak",
         )
 
-    monkeypatch.setattr(
-        "aeon.harnesses.opencode_install.subprocess.run", failed_run
-    )
+    monkeypatch.setattr("aeon.harnesses.opencode_install.subprocess.run", failed_run)
     with pytest.raises(OpenCodeInstallError) as failure:
         _probe_version(tmp_path / "opencode")
     assert "must-not-leak" not in str(failure.value)
@@ -190,7 +203,9 @@ def test_resolver_never_falls_back_to_path(tmp_path: Path, monkeypatch) -> None:
 def test_home_must_be_absolute_and_environment_is_supported(tmp_path: Path) -> None:
     with pytest.raises(OpenCodeInstallError, match="absolute"):
         resolve_opencode_home("relative/opencode")
-    assert resolve_opencode_home(environ={"AEON_OPENCODE_HOME": str(tmp_path)}) == tmp_path
+    assert (
+        resolve_opencode_home(environ={"AEON_OPENCODE_HOME": str(tmp_path)}) == tmp_path
+    )
 
 
 def test_install_is_private_atomic_idempotent_and_resolvable(tmp_path: Path) -> None:
@@ -248,17 +263,13 @@ def test_wrong_platform_is_rejected_before_creating_home(tmp_path: Path) -> None
             machine="arm64",
         )
     assert not home.exists()
-    status = opencode_status(
-        home, artifact=artifact, system="Darwin", machine="arm64"
-    )
+    status = opencode_status(home, artifact=artifact, system="Darwin", machine="arm64")
     assert status["state"] == "unsupported"
 
 
 def test_digest_mismatch_never_publishes_a_version(tmp_path: Path) -> None:
     archive, artifact = _fake_archive(tmp_path)
-    bad_artifact = HarnessArtifact(
-        **{**artifact.__dict__, "archive_sha256": "0" * 64}
-    )
+    bad_artifact = HarnessArtifact(**{**artifact.__dict__, "archive_sha256": "0" * 64})
     home = tmp_path / "opencode"
     with pytest.raises(OpenCodeInstallError, match="digest"):
         install_opencode(
@@ -347,7 +358,9 @@ def test_archive_symlink_member_is_rejected_without_escape(tmp_path: Path) -> No
     assert not opencode_binary_path(home, artifact=artifact).parent.exists()
 
 
-def test_status_rejects_tamper_permissions_hardlinks_and_symlinks(tmp_path: Path) -> None:
+def test_status_rejects_tamper_permissions_hardlinks_and_symlinks(
+    tmp_path: Path,
+) -> None:
     archive, artifact = _fake_archive(tmp_path)
 
     def fresh(name: str) -> Path:
@@ -364,9 +377,12 @@ def test_status_rejects_tamper_permissions_hardlinks_and_symlinks(tmp_path: Path
     tampered = fresh("tampered")
     binary = opencode_binary_path(tampered, artifact=artifact)
     binary.write_bytes(binary.read_bytes() + b"# changed\n")
-    assert opencode_status(
-        tampered, artifact=artifact, system="Linux", machine="x86_64"
-    )["state"] == "invalid"
+    assert (
+        opencode_status(tampered, artifact=artifact, system="Linux", machine="x86_64")[
+            "state"
+        ]
+        == "invalid"
+    )
 
     permissive = fresh("permissive")
     opencode_binary_path(permissive, artifact=artifact).chmod(0o755)

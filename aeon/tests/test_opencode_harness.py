@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,12 +17,28 @@ from aeon.core.model_identity import AEON_DEFAULT_MODEL_NAME
 from aeon.harnesses.launch import build_harness_argv
 from aeon.harnesses.model_proxy import FleetModelProxy
 from aeon.harnesses.opencode_config import (
+    OpenCodeConfigError,
     _atomic_private_bytes,
     isolated_environment,
     materialize_authority,
     materialize_config,
+    materialize_shared_runtime,
 )
 from aeon.harnesses.opencode_runtime import OpenCodeTurnRunner, _state_root
+
+
+@pytest.fixture(autouse=True)
+def _restore_test_runtime_write_modes(tmp_path: Path):
+    """Let pytest remove test-only trees that intentionally model mode 0500."""
+
+    yield
+    for path in tuple(tmp_path.rglob("*")):
+        try:
+            metadata = path.lstat()
+            if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                path.chmod(0o700)
+        except OSError:
+            pass
 
 
 def test_harness_launch_is_fixed_and_modular() -> None:
@@ -41,9 +58,12 @@ def test_harness_launch_is_fixed_and_modular() -> None:
         "--start",
         "inspect",
     ]
-    assert build_harness_argv(
-        "/usr/bin/python3", "legacy-aeon", AEON_DEFAULT_MODEL_NAME
-    )[2] == "aeon.main"
+    assert (
+        build_harness_argv("/usr/bin/python3", "legacy-aeon", AEON_DEFAULT_MODEL_NAME)[
+            2
+        ]
+        == "aeon.main"
+    )
     with pytest.raises(ValueError):
         build_harness_argv("/usr/bin/python3", "invented", AEON_DEFAULT_MODEL_NAME)
 
@@ -65,6 +85,16 @@ def test_isolated_config_disables_bypass_tools(tmp_path: Path) -> None:
     assert config["share"] == "disabled"
     assert config["agent"]["aeon"]["steps"] == 7
     assert config["mcp"]["aeon"]["type"] == "local"
+    assert config["mcp"]["aeon"]["environment"] == {
+        "XDG_CACHE_HOME": str(tmp_path / "tool-runtime" / "cache"),
+        "XDG_CONFIG_HOME": str(tmp_path / "tool-runtime" / "config"),
+        "XDG_DATA_HOME": str(tmp_path / "tool-runtime" / "data"),
+        "XDG_STATE_HOME": str(tmp_path / "tool-runtime" / "state"),
+    }
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o700
+        for path in (tmp_path / "tool-runtime").iterdir()
+    )
     for name in (
         "bash",
         "read",
@@ -110,6 +140,7 @@ def test_isolated_config_disables_bypass_tools(tmp_path: Path) -> None:
             "OPENCODE_SERVER_PASSWORD": "must-not-leak",
         },
         directory=tmp_path,
+        shared_runtime_directory=tmp_path / "shared-runtime",
         config_path=config_path,
         authority_path=authority,
         base_url="http://127.0.0.1:19001/v1",
@@ -138,8 +169,61 @@ def test_isolated_config_disables_bypass_tools(tmp_path: Path) -> None:
     ):
         assert name not in environment
     assert environment["OPENCODE_CONFIG"] == str(config_path)
+    shared = tmp_path / "shared-runtime"
+    assert environment["OPENCODE_CONFIG_DIR"] == str(shared / "config" / "opencode")
+    assert environment["XDG_CONFIG_HOME"] == str(shared / "config")
+    assert environment["XDG_CACHE_HOME"] == str(shared / "cache")
+    assert environment["XDG_DATA_HOME"] == str(tmp_path / "data")
+    assert environment["XDG_STATE_HOME"] == str(tmp_path / "state")
+    assert environment["OPENCODE_TEST_HOME"] == str(tmp_path / "home")
     assert environment["CUDA_VISIBLE_DEVICES"] == "void"
     assert environment["NO_PROXY"] == "127.0.0.1,localhost"
+
+
+def test_shared_runtime_is_bounded_read_only_and_rejects_contamination(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime-v1"
+
+    first = materialize_shared_runtime(root)
+    second = materialize_shared_runtime(root)
+
+    assert first == second
+    assert first.config_home == root / "config"
+    assert first.cache_home == root / "cache"
+    assert len(list(root.rglob("*"))) == 7
+    assert not list(root.rglob("node_modules"))
+    for directory in (
+        root / "config",
+        root / "config" / "opencode",
+        root / "cache",
+        root / "cache" / "opencode",
+        root / "cache" / "opencode" / "bin",
+    ):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o500
+
+    cache_bin = root / "cache" / "opencode" / "bin"
+    cache_bin.chmod(0o700)
+    (cache_bin / "unexpected").write_text("not trusted\n", encoding="utf-8")
+    cache_bin.chmod(0o500)
+    with pytest.raises(OpenCodeConfigError, match="unexpected content"):
+        materialize_shared_runtime(root)
+
+
+def test_shared_runtime_first_materialization_is_serialized(tmp_path: Path) -> None:
+    root = tmp_path / "runtime-v1"
+    barrier = threading.Barrier(8)
+
+    def create(_index: int):
+        barrier.wait()
+        return materialize_shared_runtime(root)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        layouts = list(pool.map(create, range(8)))
+
+    assert len({layout.root for layout in layouts}) == 1
+    assert len(list(root.rglob("*"))) == 7
+    assert not list(root.rglob("node_modules"))
 
 
 def test_turn_runner_propagates_browser_profile_and_stable_worker_identity(
@@ -319,9 +403,7 @@ def test_fresh_mcp_process_restores_reviewed_worker_memory(
     monkeypatch.setenv("AEON_OPENCODE_PROXY_URL", "http://127.0.0.1:19001/v1")
     monkeypatch.setenv("AEON_OPENCODE_PROXY_TOKEN", "test-token")
     monkeypatch.setenv("AEON_OPENCODE_LOGICAL_MODEL", AEON_DEFAULT_MODEL_NAME)
-    monkeypatch.setenv(
-        "AEON_OPENCODE_WIRE_MODEL", "Qwen3.8-27B-ARA-NVFP4-MTP"
-    )
+    monkeypatch.setenv("AEON_OPENCODE_WIRE_MODEL", "Qwen3.8-27B-ARA-NVFP4-MTP")
     monkeypatch.setenv("AEON_OPENCODE_INSTANCE_ID", "d" * 32)
 
     authority = materialize_authority(bridge, "Remember a project fact")
@@ -363,36 +445,42 @@ def test_console_front_door_defaults_to_opencode_and_preserves_legacy_choice(
     opencode_calls: list[list[str]] = []
     legacy_calls: list[list[str]] = []
     adoption_calls: list[tuple[list[str], str]] = []
-    monkeypatch.setattr(opencode_runtime, "main", lambda argv: opencode_calls.append(argv) or 0)
-    monkeypatch.setattr(legacy_runtime, "cli", lambda argv: legacy_calls.append(argv) or 0)
+    monkeypatch.setattr(
+        opencode_runtime, "main", lambda argv: opencode_calls.append(argv) or 0
+    )
+    monkeypatch.setattr(
+        legacy_runtime, "cli", lambda argv: legacy_calls.append(argv) or 0
+    )
     monkeypatch.setattr(
         legacy_runtime,
         "_auto_adopt_tmux",
-        lambda _options, *, cli_args, harness: adoption_calls.append(
-            (list(cli_args), harness)
-        )
-        or False,
+        lambda _options, *, cli_args, harness: (
+            adoption_calls.append((list(cli_args), harness)) or False
+        ),
     )
 
     assert console_cli.main(["-n", "--start", "inspect"]) == 0
-    assert opencode_calls == [[
-        "--model",
-        AEON_DEFAULT_MODEL_NAME,
-        "--start",
-        "inspect",
-        "--non-interactive",
-    ]]
+    assert opencode_calls == [
+        [
+            "--model",
+            AEON_DEFAULT_MODEL_NAME,
+            "--start",
+            "inspect",
+            "--non-interactive",
+        ]
+    ]
     assert legacy_calls == []
     assert adoption_calls == [(opencode_calls[0], "opencode")]
 
-    assert console_cli.main(
-        ["--harness", "legacy-aeon", "-n", "--start", "inspect"]
-    ) == 0
+    assert (
+        console_cli.main(["--harness", "legacy-aeon", "-n", "--start", "inspect"]) == 0
+    )
     assert legacy_calls == [["-n", "--start", "inspect"]]
 
-    assert console_cli.main(
-        ["--harness=legacy-aeon", "-n", "--start", "inspect again"]
-    ) == 0
+    assert (
+        console_cli.main(["--harness=legacy-aeon", "-n", "--start", "inspect again"])
+        == 0
+    )
     assert legacy_calls[-1] == ["-n", "--start", "inspect again"]
 
 
@@ -455,12 +543,30 @@ def test_model_proxy_authenticates_guards_and_rewrites_model() -> None:
         accepted = requests.post(
             proxy.base_url + "/chat/completions",
             headers={"Authorization": f"Bearer {proxy.token}"},
-            json={"model": "model-controlled-value", "messages": []},
+            json={
+                "model": "model-controlled-value",
+                "messages": [],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "aeon_test_tool",
+                            "description": "Exercise native local tool routing.",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "tool_choice": "auto",
+            },
             timeout=5,
         )
         assert accepted.status_code == 200
         assert fleet.guards == 1
         assert _UpstreamHandler.requests[-1]["model"] == "Qwen3.8-27B-ARA-NVFP4-MTP"
+        assert _UpstreamHandler.requests[-1]["tool_choice"] == "auto"
+        assert _UpstreamHandler.requests[-1]["tools"][0]["function"]["name"] == (
+            "aeon_test_tool"
+        )
     finally:
         proxy.close()
         upstream.shutdown()

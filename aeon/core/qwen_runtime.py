@@ -1961,6 +1961,14 @@ def _planner_contract(
         str(context),
         "--no-enable-log-requests",
         "--disable-uvicorn-access-log",
+        # OpenCode uses the OpenAI-compatible native tool contract.  Keep tool
+        # parsing on the serving boundary so streamed XML emitted by this
+        # release's Qwen chat template becomes typed ``tool_calls`` rather than
+        # model prose.  The parser name is release-bound alongside the existing
+        # qwen3 reasoning parser and is already exercised by the vLLM canary.
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "qwen3_coder",
         "--reasoning-parser",
         "qwen3",
         "--structured-outputs-config.enable_in_reasoning=False",
@@ -3379,9 +3387,28 @@ _WARMUP_TURN_FAILURE_CODES = frozenset(
         "internal",
     }
 )
+_WARMUP_NATIVE_TOOL_FAILURE_CODES = frozenset(
+    {
+        "http_timeout",
+        "http_request",
+        "http_status",
+        "response_size",
+        "response_json",
+        "completion_count",
+        "completion_content",
+        "finish_reason",
+        "tool_call_count",
+        "tool_call_type",
+        "tool_call_name",
+        "tool_call_arguments",
+        "tool_call_payload",
+        "internal",
+    }
+)
 _WARMUP_FAILURE_CODES_BY_STAGE = {
     "preflight": frozenset({"staged_imports", "internal"}),
     "text": _WARMUP_TURN_FAILURE_CODES,
+    "tool_choice": _WARMUP_NATIVE_TOOL_FAILURE_CODES,
     "vision": _WARMUP_TURN_FAILURE_CODES,
     "runner": frozenset(
         {

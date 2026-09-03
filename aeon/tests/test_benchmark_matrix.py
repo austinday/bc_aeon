@@ -199,6 +199,33 @@ def test_terminal_child_advances_global_queue_across_batches(tmp_path: Path) -> 
     assert service.get_batch(str(second["id"]))["items"][0]["status"] == "queued"
 
 
+def test_long_pending_child_gets_fresh_worker_registration_grace(
+    tmp_path: Path,
+) -> None:
+    service, launches = _service(tmp_path)
+    with patch.object(executor_module, "runtime_execution_status", _runtime_status):
+        batch = service.submit_matrix(_matrix_request("9", missing_only=False))
+
+    first_run_id, second_run_id = (str(item) for item in batch["run_ids"])
+    assert [item["status"] for item in batch["items"]] == ["queued", "pending"]
+
+    # The second combination can legitimately wait longer than the worker
+    # registration grace while the first combination runs. Its creation time
+    # must not become the grace baseline when it is finally launched.
+    with sqlite3.connect(service.database_path) as connection:
+        connection.execute(
+            "UPDATE benchmark_runs SET created_at = 0 WHERE id = ?",
+            (second_run_id,),
+        )
+
+    service._mark_failed(first_run_id, error_code="launcher_failed")
+
+    assert len(launches) == 2
+    resumed = service.get_run(second_run_id)
+    assert resumed["status"] == "queued"
+    assert "error_code" not in resumed
+
+
 def test_concurrent_run_all_missing_commits_one_child_set_and_one_launch(
     tmp_path: Path,
 ) -> None:
@@ -298,7 +325,8 @@ def test_run_all_missing_replaces_a_stale_unregistered_active_row(
     with sqlite3.connect(service.database_path) as connection:
         connection.execute(
             "UPDATE benchmark_runs SET status = ?, cancel_requested = ?, "
-            "created_at = 0, worker_pid = NULL, worker_starttime = NULL WHERE id = ?",
+            "created_at = 0, worker_pid = NULL, worker_starttime = NULL, "
+            "worker_launch_requested_at = 0 WHERE id = ?",
             (status_value, cancel_requested, stale["id"]),
         )
 

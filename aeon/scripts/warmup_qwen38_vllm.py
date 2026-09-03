@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Warm the Qwen3.8 kernels and verify one real structured Aeon turn."""
+"""Warm Qwen3.8 and verify structured, vision, and native auto-tool turns."""
 from __future__ import annotations
 
 import argparse
@@ -26,6 +26,12 @@ MARKER = "AEON_RUNTIME_WARM"
 REASON = "Verified runtime warmup marker AEON_RUNTIME_WARM"
 TOOL_NAME = "task_complete"
 CANONICAL_TURN_MAX_BYTES = 512
+NATIVE_TOOL_NAME = "aeon_runtime_capability_probe"
+NATIVE_TOOL_PROBE_ID = "AEON_NATIVE_TOOL_READY"
+NATIVE_TOOL_ORDINAL = 7
+NATIVE_TOOL_MAX_TOKENS = 256
+NATIVE_TOOL_MAX_RESPONSE_BYTES = 64 * 1024
+NATIVE_TOOL_MAX_ARGUMENT_BYTES = 512
 
 
 def _expected_turn() -> dict:
@@ -73,9 +79,28 @@ _TURN_FAILURE_CODES = frozenset(
         "internal",
     }
 )
+_NATIVE_TOOL_FAILURE_CODES = frozenset(
+    {
+        "http_timeout",
+        "http_request",
+        "http_status",
+        "response_size",
+        "response_json",
+        "completion_count",
+        "completion_content",
+        "finish_reason",
+        "tool_call_count",
+        "tool_call_type",
+        "tool_call_name",
+        "tool_call_arguments",
+        "tool_call_payload",
+        "internal",
+    }
+)
 FAILURE_CODES_BY_STAGE = {
     "preflight": frozenset({"staged_imports", "internal"}),
     "text": _TURN_FAILURE_CODES,
+    "tool_choice": _NATIVE_TOOL_FAILURE_CODES,
     "vision": _TURN_FAILURE_CODES,
     # The caller uses this one code when the wrapper/interpreter did not return
     # a valid diagnostic. The warmup process itself never emits this stage.
@@ -316,6 +341,194 @@ def warm(base_url: str, model: str, *, include_image: bool = False) -> dict:
     return usage if isinstance(usage, dict) else {}
 
 
+def _bounded_response_json(response, *, stage: str) -> dict:
+    """Read one streamed response without retaining an unbounded server body."""
+
+    try:
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise WarmupFailure(
+                stage, "http_status", "native tool probe HTTP status failed"
+            ) from exc
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            if not isinstance(chunk, bytes):
+                raise WarmupFailure(
+                    stage, "response_json", "native tool probe response was malformed"
+                )
+            size += len(chunk)
+            if size > NATIVE_TOOL_MAX_RESPONSE_BYTES:
+                raise WarmupFailure(
+                    stage, "response_size", "native tool probe response exceeded its bound"
+                )
+            chunks.append(chunk)
+    except requests.RequestException as exc:
+        raise WarmupFailure(
+            stage, "http_request", "native tool probe response read failed"
+        ) from exc
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+    try:
+        body = json.loads(b"".join(chunks))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise WarmupFailure(
+            stage, "response_json", "native tool probe response was not JSON"
+        ) from exc
+    if not isinstance(body, dict):
+        raise WarmupFailure(
+            stage, "response_json", "native tool probe response was not an object"
+        )
+    return body
+
+
+def warm_native_tool(base_url: str, model: str) -> dict:
+    """Require vLLM's native auto-tool parser to produce one typed call."""
+
+    stage = "tool_choice"
+    expected_arguments = {
+        "probe_id": NATIVE_TOOL_PROBE_ID,
+        "ordinal": NATIVE_TOOL_ORDINAL,
+        "ready": True,
+    }
+    try:
+        response = requests.post(
+            base_url.rstrip("/") + "/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Use the provided function exactly as requested. "
+                            "Do not answer with prose."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Call {NATIVE_TOOL_NAME} exactly once with probe_id "
+                            f"{NATIVE_TOOL_PROBE_ID}, ordinal {NATIVE_TOOL_ORDINAL}, "
+                            "and ready true."
+                        ),
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": NATIVE_TOOL_NAME,
+                            "description": "Prove native typed tool-call readiness.",
+                            "parameters": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "probe_id": {"type": "string"},
+                                    "ordinal": {"type": "integer"},
+                                    "ready": {"type": "boolean"},
+                                },
+                                "required": ["probe_id", "ordinal", "ready"],
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": "auto",
+                "parallel_tool_calls": False,
+                "temperature": 0.0,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "seed": 1701,
+                "max_tokens": NATIVE_TOOL_MAX_TOKENS,
+            },
+            timeout=(15, 60),
+            allow_redirects=False,
+            proxies={"http": "", "https": ""},
+            stream=True,
+        )
+    except requests.Timeout as exc:
+        raise WarmupFailure(
+            stage, "http_timeout", "native tool probe request timed out"
+        ) from exc
+    except requests.RequestException as exc:
+        raise WarmupFailure(
+            stage, "http_request", "native tool probe request failed"
+        ) from exc
+    body = _bounded_response_json(response, stage=stage)
+    choices = body.get("choices") or []
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise WarmupFailure(
+            stage, "completion_count", "native tool probe returned no unique completion"
+        )
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise WarmupFailure(
+            stage, "completion_content", "native tool probe completion was malformed"
+        )
+    if choice.get("finish_reason") != "tool_calls":
+        raise WarmupFailure(
+            stage, "finish_reason", "native tool probe did not finish with a tool call"
+        )
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise WarmupFailure(
+            stage, "completion_content", "native tool probe message was malformed"
+        )
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list) or len(tool_calls) != 1:
+        raise WarmupFailure(
+            stage, "tool_call_count", "native tool probe returned no unique tool call"
+        )
+    tool_call = tool_calls[0]
+    if not isinstance(tool_call, dict) or tool_call.get("type") != "function":
+        raise WarmupFailure(
+            stage, "tool_call_type", "native tool probe returned the wrong call type"
+        )
+    function = tool_call.get("function")
+    if not isinstance(function, dict) or function.get("name") != NATIVE_TOOL_NAME:
+        raise WarmupFailure(
+            stage, "tool_call_name", "native tool probe returned the wrong function"
+        )
+    arguments = function.get("arguments")
+    try:
+        arguments_size = (
+            len(arguments.encode("utf-8")) if isinstance(arguments, str) else None
+        )
+    except UnicodeError:
+        arguments_size = None
+    if (
+        not arguments
+        or arguments_size is None
+        or arguments_size > NATIVE_TOOL_MAX_ARGUMENT_BYTES
+    ):
+        raise WarmupFailure(
+            stage, "tool_call_arguments", "native tool probe arguments were malformed"
+        )
+    try:
+        parsed = json.loads(arguments)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise WarmupFailure(
+            stage, "tool_call_arguments", "native tool probe arguments were not JSON"
+        ) from exc
+    if (
+        not isinstance(parsed, dict)
+        or set(parsed) != set(expected_arguments)
+        or not isinstance(parsed.get("probe_id"), str)
+        or type(parsed.get("ordinal")) is not int
+        or type(parsed.get("ready")) is not bool
+        or parsed != expected_arguments
+    ):
+        raise WarmupFailure(
+            stage, "tool_call_payload", "native tool probe arguments were not exact"
+        )
+    usage = body.get("usage") or {}
+    return usage if isinstance(usage, dict) else {}
+
+
 def _completion_tokens(usage: dict) -> int:
     value = usage.get("completion_tokens")
     if type(value) is not int or not 0 <= value <= 10_000_000:
@@ -334,6 +547,8 @@ def main(argv=None) -> int:
         _assert_staged_imports()
         stage = "text"
         text_usage = warm(args.base_url, args.model)
+        stage = "tool_choice"
+        tool_usage = warm_native_tool(args.base_url, args.model)
         stage = "vision"
         vision_usage = warm(args.base_url, args.model, include_image=True)
     except WarmupFailure as exc:
@@ -345,6 +560,7 @@ def main(argv=None) -> int:
     print(
         "QWEN38_WARMUP_OK "
         f"text_completion_tokens={_completion_tokens(text_usage)} "
+        f"tool_completion_tokens={_completion_tokens(tool_usage)} "
         f"vision_completion_tokens={_completion_tokens(vision_usage)}"
     )
     return 0

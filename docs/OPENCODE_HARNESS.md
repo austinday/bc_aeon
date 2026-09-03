@@ -69,6 +69,21 @@ particular:
 - MCP stdout is reserved for protocol framing, while model and tool failures
   are reduced to bounded, sanitized errors.
 
+OpenCode's mutable data, SQLite database, lock state, discovery home, generated
+configuration, instructions, and authority remain isolated per Aeon instance
+(and per benchmark case). The pinned binary's `runtime-v1` directory supplies a
+single version-bound config/cache skeleton. Its exact allowlisted tree is locked
+during first materialization, validated before every turn, and mode `0500`; it
+contains no plugins, package manifests, or `node_modules`. Pinned OpenCode maps
+both of its otherwise-duplicated global config paths to that same directory, so
+its background JavaScript SDK installer safely treats the directory as
+non-writable. This avoids copying roughly 126 MB and thousands of immutable
+dependency files into every isolated case without sharing session or memory
+state. The Aeon MCP child receives separate writable, instance-private XDG
+directories, so local tools and bounded children do not inherit the read-only
+OpenCode cache. Unexpected content or changed ownership/modes fails closed; it
+is never adopted or automatically deleted.
+
 Pinned OpenCode cannot import a top-level JSON-Schema `oneOf`; one such schema
 would otherwise hide the entire MCP catalog. The bridge flattens only unions of
 closed object branches for transport, preserving every property constraint and

@@ -22,13 +22,28 @@ from aeon.tests.test_qwen_runtime import durable_runtime_state
 
 
 class WarmupProcessDiagnosticsTests(unittest.TestCase):
-    def _run_main(self, side_effect):
+    @staticmethod
+    def _native_response(body):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        response.iter_content.return_value = [payload[:11], payload[11:]]
+        return response
+
+    def _run_main(self, side_effect, *, native_side_effect=None):
+        if native_side_effect is None:
+            native_side_effect = [{"completion_tokens": 3}]
         output = io.StringIO()
         errors = io.StringIO()
         with tempfile.TemporaryFile(mode="w+b") as failure:
             with (
                 patch.object(warmup, "_assert_staged_imports", return_value=None),
                 patch.object(warmup, "warm", side_effect=side_effect),
+                patch.object(
+                    warmup,
+                    "warm_native_tool",
+                    side_effect=native_side_effect,
+                ),
                 contextlib.redirect_stdout(output),
                 contextlib.redirect_stderr(errors),
             ):
@@ -92,6 +107,215 @@ class WarmupProcessDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual((raised.exception.stage, raised.exception.code), ("text", "http_timeout"))
         self.assertNotIn("RAW_TRANSPORT_DETAIL", str(raised.exception))
+
+    def test_blank_structured_content_has_a_stable_failure_not_a_type_error(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": ""}}],
+        }
+        with patch.object(warmup.requests, "post", return_value=response):
+            with self.assertRaises(warmup.WarmupFailure) as raised:
+                warmup.warm("http://localhost:1", "qwen")
+
+        self.assertEqual(
+            (raised.exception.stage, raised.exception.code),
+            ("text", "completion_content"),
+        )
+
+    def test_native_auto_tool_probe_sends_exact_contract_and_parses_typed_call(self):
+        expected_arguments = {
+            "probe_id": warmup.NATIVE_TOOL_PROBE_ID,
+            "ordinal": warmup.NATIVE_TOOL_ORDINAL,
+            "ready": True,
+        }
+        response = self._native_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_probe",
+                                    "type": "function",
+                                    "function": {
+                                        "name": warmup.NATIVE_TOOL_NAME,
+                                        "arguments": json.dumps(expected_arguments),
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"completion_tokens": 9},
+            }
+        )
+        with patch.object(
+            warmup.requests, "post", return_value=response
+        ) as post:
+            usage = warmup.warm_native_tool("http://localhost:1/", "qwen")
+
+        self.assertEqual(usage, {"completion_tokens": 9})
+        post.assert_called_once()
+        call = post.call_args
+        self.assertEqual(call.args, ("http://localhost:1/v1/chat/completions",))
+        self.assertEqual(call.kwargs["timeout"], (15, 60))
+        self.assertIs(call.kwargs["stream"], True)
+        request = call.kwargs["json"]
+        self.assertEqual(request["model"], "qwen")
+        self.assertEqual(request["tool_choice"], "auto")
+        self.assertIs(request["parallel_tool_calls"], False)
+        self.assertEqual(request["max_tokens"], warmup.NATIVE_TOOL_MAX_TOKENS)
+        self.assertEqual(request["tools"][0]["type"], "function")
+        function = request["tools"][0]["function"]
+        self.assertEqual(function["name"], warmup.NATIVE_TOOL_NAME)
+        self.assertEqual(
+            function["parameters"]["required"],
+            ["probe_id", "ordinal", "ready"],
+        )
+        self.assertIs(function["parameters"]["additionalProperties"], False)
+        response.close.assert_called_once_with()
+
+    def test_native_tool_probe_rejects_wrong_shape_name_and_argument_types(self):
+        exact_arguments = {
+            "probe_id": warmup.NATIVE_TOOL_PROBE_ID,
+            "ordinal": warmup.NATIVE_TOOL_ORDINAL,
+            "ready": True,
+        }
+
+        def body(*, finish_reason="tool_calls", tool_calls=None):
+            return {
+                "choices": [
+                    {
+                        "finish_reason": finish_reason,
+                        "message": {"tool_calls": tool_calls},
+                    }
+                ]
+            }
+
+        exact_call = {
+            "type": "function",
+            "function": {
+                "name": warmup.NATIVE_TOOL_NAME,
+                "arguments": json.dumps(exact_arguments),
+            },
+        }
+        scenarios = (
+            ({"choices": []}, "completion_count"),
+            (body(finish_reason="stop", tool_calls=[exact_call]), "finish_reason"),
+            (body(tool_calls=[]), "tool_call_count"),
+            (body(tool_calls=[{**exact_call, "type": "custom"}]), "tool_call_type"),
+            (
+                body(
+                    tool_calls=[
+                        {
+                            **exact_call,
+                            "function": {
+                                **exact_call["function"],
+                                "name": "wrong_probe",
+                            },
+                        }
+                    ]
+                ),
+                "tool_call_name",
+            ),
+            (
+                body(
+                    tool_calls=[
+                        {
+                            **exact_call,
+                            "function": {
+                                **exact_call["function"],
+                                "arguments": {"not": "json text"},
+                            },
+                        }
+                    ]
+                ),
+                "tool_call_arguments",
+            ),
+            (
+                body(
+                    tool_calls=[
+                        {
+                            **exact_call,
+                            "function": {
+                                **exact_call["function"],
+                                "arguments": json.dumps(
+                                    {**exact_arguments, "ordinal": "7"}
+                                ),
+                            },
+                        }
+                    ]
+                ),
+                "tool_call_payload",
+            ),
+        )
+        for response_body, expected_code in scenarios:
+            response = self._native_response(response_body)
+            with self.subTest(code=expected_code), patch.object(
+                warmup.requests, "post", return_value=response
+            ), self.assertRaises(warmup.WarmupFailure) as raised:
+                warmup.warm_native_tool("http://localhost:1", "qwen")
+            self.assertEqual(
+                (raised.exception.stage, raised.exception.code),
+                ("tool_choice", expected_code),
+            )
+
+    def test_native_tool_probe_bounds_response_and_sanitizes_http_failure(self):
+        oversized = Mock()
+        oversized.raise_for_status.return_value = None
+        oversized.iter_content.return_value = [
+            b"x" * (warmup.NATIVE_TOOL_MAX_RESPONSE_BYTES + 1)
+        ]
+        with patch.object(
+            warmup.requests, "post", return_value=oversized
+        ), self.assertRaises(warmup.WarmupFailure) as raised:
+            warmup.warm_native_tool("http://localhost:1", "qwen")
+        self.assertEqual(
+            (raised.exception.stage, raised.exception.code),
+            ("tool_choice", "response_size"),
+        )
+        oversized.close.assert_called_once_with()
+
+        rejected = Mock()
+        rejected.raise_for_status.side_effect = requests.HTTPError(
+            "RAW_PROVIDER_RESPONSE"
+        )
+        with patch.object(
+            warmup.requests, "post", return_value=rejected
+        ), self.assertRaises(warmup.WarmupFailure) as raised:
+            warmup.warm_native_tool("http://localhost:1", "qwen")
+        self.assertEqual(
+            (raised.exception.stage, raised.exception.code),
+            ("tool_choice", "http_status"),
+        )
+        self.assertNotIn("RAW_PROVIDER_RESPONSE", str(raised.exception))
+        rejected.close.assert_called_once_with()
+
+    def test_main_emits_sanitized_native_tool_failure_receipt(self):
+        failure = warmup.WarmupFailure(
+            "tool_choice",
+            "tool_call_payload",
+            "RAW_MODEL_TOOL_ARGUMENTS",
+        )
+        result, output, errors, receipt, _mode = self._run_main(
+            [{"completion_tokens": 1}],
+            native_side_effect=failure,
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual(output, "")
+        self.assertEqual(errors, "")
+        self.assertEqual(
+            json.loads(receipt),
+            {
+                "schema_version": 1,
+                "stage": "tool_choice",
+                "code": "tool_call_payload",
+            },
+        )
+        self.assertNotIn("RAW_MODEL_TOOL_ARGUMENTS", receipt)
 
     def test_wrong_action_has_a_stable_semantic_code(self):
         response = Mock()
@@ -258,6 +482,11 @@ class WarmupProcessDiagnosticsTests(unittest.TestCase):
                     {"completion_tokens": 20},
                 ],
             ),
+            patch.object(
+                warmup,
+                "warm_native_tool",
+                return_value={"completion_tokens": 3},
+            ),
             contextlib.redirect_stdout(output),
         ):
             result = warmup.main(
@@ -275,6 +504,7 @@ class WarmupProcessDiagnosticsTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue(),
             "QWEN38_WARMUP_OK text_completion_tokens=10 "
+            "tool_completion_tokens=3 "
             "vision_completion_tokens=20\n",
         )
 
@@ -290,6 +520,11 @@ class WarmupProcessDiagnosticsTests(unittest.TestCase):
                     {"completion_tokens": "RAW_SERVER_VALUE"},
                     {"completion_tokens": -1},
                 ],
+            ),
+            patch.object(
+                warmup,
+                "warm_native_tool",
+                return_value={"completion_tokens": "RAW_SERVER_VALUE"},
             ),
             contextlib.redirect_stdout(output),
         ):
@@ -308,6 +543,7 @@ class WarmupProcessDiagnosticsTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue(),
             "QWEN38_WARMUP_OK text_completion_tokens=0 "
+            "tool_completion_tokens=0 "
             "vision_completion_tokens=0\n",
         )
         self.assertNotIn("RAW_", output.getvalue())
@@ -436,6 +672,11 @@ class RuntimeWarmupReceiptTests(unittest.TestCase):
                 self._failure("vision", "turn_action"),
             ),
             (
+                "native_tool",
+                self._failure("tool_choice", "tool_call_payload"),
+                self._failure("tool_choice", "tool_call_payload"),
+            ),
+            (
                 "malformed",
                 b"RAW_MODEL_OUTPUT_AND_RESPONSE_BODY",
                 self._failure("runner", "invalid_diagnostic"),
@@ -494,6 +735,7 @@ class RuntimeWarmupReceiptTests(unittest.TestCase):
                         command_runner=runner,
                     )
                 saved = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["phase"], "launching")
                 self.assertEqual(saved["warmup_failure"], expected)
                 serialized = json.dumps(saved) + str(raised.exception)
                 self.assertNotIn("RAW_", serialized)

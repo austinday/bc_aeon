@@ -25,8 +25,8 @@ from .protocol import (
 
 
 BENCHMARK_SCHEMA_VERSION = 1
-BENCHMARK_CATALOG_VERSION = "2026-09-03.4"
-RUNNER_PROTOCOL_VERSION = "7"
+BENCHMARK_CATALOG_VERSION = "2026-09-03.5"
+RUNNER_PROTOCOL_VERSION = "9"
 # ``suite_id`` remains in durable rows and requests so existing records and API
 # clients keep a stable shape.  There is now exactly one benchmark a user can
 # start, however, and callers may omit the field entirely.
@@ -638,6 +638,7 @@ RUNNER_PROTOCOL_SHA256 = _canonical_sha256(
             "quality_score",
             "component_scores",
             "total_wall_ms",
+            "end_to_end_wall_ms",
             "total_active_wall_ms",
             "total_compute_wait_ms",
             "model_turn_count",
@@ -712,6 +713,7 @@ def public_catalog() -> dict[str, object]:
             },
             "observable_metrics": {
                 "total_time_fields": [
+                    "end_to_end_wall_ms",
                     "total_wall_ms",
                     "total_active_wall_ms",
                     "total_compute_wait_ms",

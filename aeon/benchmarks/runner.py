@@ -740,6 +740,25 @@ def run_benchmark(
                         cases=cases,
                         error_code="executor_unavailable",
                     )
+                # Executor implementations report ordinary model/harness
+                # behavior as a result mapping. An unexpected exception means
+                # no trustworthy behavioral observation was produced, so keep
+                # one timed diagnostic case but publish no comparable score.
+                cases.append(
+                    _safe_case_result(
+                        scenario,
+                        repetition,
+                        raw,
+                        measured_wall_ms=measured,
+                    )
+                )
+                return service._finish_run(
+                    run_id,
+                    status_value="failed",
+                    summary={},
+                    cases=cases,
+                    error_code="executor_unavailable",
+                )
             except ExecutionCancelled:
                 return service._finish_run(
                     run_id,
@@ -773,8 +792,21 @@ def run_benchmark(
                     error_code="executor_unavailable",
                 )
             except Exception:
-                raw = {"status": "failed", "score": 0.0}
-                measured = 0.0
+                cases.append(
+                    _safe_case_result(
+                        scenario,
+                        repetition,
+                        {"status": "failed", "score": 0.0},
+                        measured_wall_ms=0.0,
+                    )
+                )
+                return service._finish_run(
+                    run_id,
+                    status_value="failed",
+                    summary={},
+                    cases=cases,
+                    error_code="runner_failed",
+                )
             safe = _safe_case_result(
                 scenario,
                 repetition,

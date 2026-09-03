@@ -44,7 +44,7 @@ from .catalog import (
 FLEET_LOW_PRIORITY = "/home/aday/bin/fleet-low-priority"
 DATABASE_FILENAME = "benchmarks.sqlite3"
 EVIDENCE_DIRECTORY_NAME = "evidence"
-DATABASE_SCHEMA_VERSION = 5
+DATABASE_SCHEMA_VERSION = 6
 WORKER_START_GRACE_SECONDS = 120.0
 MAX_REPETITIONS = 20
 MAX_RUN_LIST = 500
@@ -54,6 +54,16 @@ RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
 BATCH_REQUEST_ID_RE = re.compile(r"^bm-[0-9a-f]{32}$")
 BATCH_ID_RE = re.compile(r"^batch-[0-9a-f]{32}$")
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+TERMINAL_ERROR_CODES = frozenset(
+    {
+        "launcher_failed",
+        "executor_unavailable",
+        "executor_stuck",
+        "harness_unavailable",
+        "runner_failed",
+        "worker_lost",
+    }
+)
 ACTIVE_STATUSES = frozenset(
     {"pending", "queued", "waiting_for_compute", "starting", "running", "cancelling"}
 )
@@ -351,7 +361,7 @@ class BenchmarkService:
     def _initialize_database(self) -> None:
         with self._lock, self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, 1, 2, 3, 4, DATABASE_SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, 4, 5, DATABASE_SCHEMA_VERSION}:
                 raise BenchmarkError("benchmark database schema is unsupported")
             connection.executescript(
                 """
@@ -394,7 +404,8 @@ class BenchmarkService:
                     evidence_sha256 TEXT,
                     worker_pid INTEGER,
                     worker_starttime INTEGER,
-                    worker_registered_at REAL
+                    worker_registered_at REAL,
+                    worker_launch_requested_at REAL
                 );
                 CREATE INDEX IF NOT EXISTS benchmark_runs_created
                     ON benchmark_runs(created_at DESC, id DESC);
@@ -465,6 +476,32 @@ class BenchmarkService:
                         tool_source_sha256 = COALESCE(tool_source_sha256, ?)
                     """,
                     ("0" * 64, "0" * 64, "0" * 64),
+                )
+                connection.execute("COMMIT")
+            if version in {1, 2, 3, 4, 5}:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(benchmark_runs)"
+                    ).fetchall()
+                }
+                connection.execute("BEGIN IMMEDIATE")
+                if "worker_launch_requested_at" not in columns:
+                    connection.execute(
+                        "ALTER TABLE benchmark_runs "
+                        "ADD COLUMN worker_launch_requested_at REAL"
+                    )
+                # Preserve truthful stale-worker behavior for old queued rows.
+                # Pending matrix children have never had a launch request and
+                # must receive a fresh timestamp only when they are promoted.
+                connection.execute(
+                    """
+                    UPDATE benchmark_runs
+                    SET worker_launch_requested_at =
+                        COALESCE(worker_registered_at, started_at, created_at)
+                    WHERE status != 'pending'
+                      AND worker_launch_requested_at IS NULL
+                    """
                 )
                 connection.execute("COMMIT")
             connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
@@ -589,6 +626,7 @@ class BenchmarkService:
             "case_count",
             "passed_cases",
             "total_wall_ms",
+            "end_to_end_wall_ms",
             "total_active_wall_ms",
             "total_compute_wait_ms",
             "model_turn_count",
@@ -816,11 +854,85 @@ class BenchmarkService:
             ):
                 return None
             payload = json.loads(payload_bytes)
-        except (BenchmarkError, OSError, UnicodeError, json.JSONDecodeError):
+        except (
+            BenchmarkError,
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+        ):
             return None
-        if not isinstance(payload, dict) or payload.get("run_id") != row["id"]:
+        try:
+            expected_summary = self._safe_summary(json.loads(row["summary_json"]))
+        except (TypeError, json.JSONDecodeError, RecursionError):
             return None
-        return payload
+        if not isinstance(payload, dict):
+            return None
+        payload_summary = payload.get("summary")
+        payload_cases = payload.get("cases")
+        if not isinstance(payload_summary, dict) or not isinstance(payload_cases, list):
+            return None
+        try:
+            summaries_match = (
+                self._safe_summary(payload_summary) == expected_summary
+                and _canonical_json(payload_summary) == _canonical_json(expected_summary)
+            )
+            safe_cases = self._safe_cases(
+                payload_cases,
+                suite_id=str(row["suite_id"]),
+                repetitions=int(row["repetitions"]),
+            )
+            cases_match = _canonical_json(payload_cases) == _canonical_json(safe_cases)
+        except (BenchmarkError, TypeError, ValueError, UnicodeError, RecursionError):
+            return None
+        suite = SUITES.get(str(row["suite_id"]))
+        if suite is None:
+            return None
+        expected_order = [
+            (scenario.case_id, repetition)
+            for repetition in range(1, int(row["repetitions"]) + 1)
+            for scenario in suite.cases
+        ]
+        actual_order = [
+            (str(item["case_id"]), int(item["repetition"])) for item in safe_cases
+        ]
+        summary_case_count = expected_summary.get("case_count")
+        expected_error_code = (
+            str(row["error_code"]) if isinstance(row["error_code"], str) else None
+        )
+        expected_evidence_fields = {
+            "schema_version": BENCHMARK_SCHEMA_VERSION,
+            "run_id": row["id"],
+            "suite_id": row["suite_id"],
+            "suite_version": row["suite_version"],
+            "suite_sha256": row["suite_sha256"],
+            "runner_protocol_version": row["runner_protocol_version"],
+            "runner_protocol_sha256": row["runner_protocol_sha256"],
+            "executor_protocol_version": row["executor_protocol_version"],
+            "executor_protocol_sha256": row["executor_protocol_sha256"],
+            "runner_source_sha256": row["runner_source_sha256"],
+            "harness_source_sha256": row["harness_source_sha256"],
+            "tool_source_sha256": row["tool_source_sha256"],
+            "combination_sha256": row["combination_sha256"],
+        }
+        if (
+            any(
+                payload.get(field) != expected
+                for field, expected in expected_evidence_fields.items()
+            )
+            or payload.get("status") != row["status"]
+            or payload.get("error_code") != expected_error_code
+            or not summaries_match
+            or not cases_match
+            or actual_order != expected_order[: len(actual_order)]
+            or (row["status"] == "succeeded" and len(actual_order) != len(expected_order))
+            or (
+                summary_case_count is not None
+                and summary_case_count != len(actual_order)
+            )
+        ):
+            return None
+        return {**payload, "cases": safe_cases}
 
     def _public_run(self, row: sqlite3.Row, *, include_cases: bool) -> dict[str, object]:
         try:
@@ -927,7 +1039,8 @@ class BenchmarkService:
             rows = connection.execute(
                 """
                 SELECT id, status, created_at, cancel_requested,
-                       worker_pid, worker_starttime
+                       worker_pid, worker_starttime,
+                       worker_launch_requested_at
                 FROM benchmark_runs
                 WHERE status IN ('queued', 'waiting_for_compute', 'starting',
                                  'running', 'cancelling')
@@ -945,8 +1058,15 @@ class BenchmarkService:
                     # running/waiting/cancelling row that suppresses Run all
                     # missing forever.  Keep the same grace that protects a
                     # genuinely new queued child while it starts and registers.
+                    launch_requested_at = row["worker_launch_requested_at"]
+                    grace_started_at = (
+                        float(launch_requested_at)
+                        if isinstance(launch_requested_at, (int, float))
+                        and math.isfinite(float(launch_requested_at))
+                        else float(row["created_at"])
+                    )
                     stale = (
-                        observed_at - float(row["created_at"])
+                        observed_at - grace_started_at
                         >= WORKER_START_GRACE_SECONDS
                     )
                 if not stale:
@@ -1014,8 +1134,22 @@ class BenchmarkService:
         status_value: str,
         created_at: float,
     ) -> None:
-        columns = ["id", "status", "created_at", "summary_json", "cancel_requested"]
-        values: list[object] = [run_id, status_value, created_at, "{}", 0]
+        columns = [
+            "id",
+            "status",
+            "created_at",
+            "summary_json",
+            "cancel_requested",
+            "worker_launch_requested_at",
+        ]
+        values: list[object] = [
+            run_id,
+            status_value,
+            created_at,
+            "{}",
+            0,
+            created_at if status_value == "queued" else None,
+        ]
         for key in (
             "request_id",
             "suite_id",
@@ -1670,12 +1804,14 @@ class BenchmarkService:
             ).fetchone()
             if pending is not None:
                 run_id = str(pending["id"])
+                launch_requested_at = time.time()
                 connection.execute(
                     """
-                    UPDATE benchmark_runs SET status = 'queued'
+                    UPDATE benchmark_runs
+                    SET status = 'queued', worker_launch_requested_at = ?
                     WHERE id = ? AND status = 'pending'
                     """,
-                    (run_id,),
+                    (launch_requested_at, run_id),
                 )
             connection.execute("COMMIT")
         if run_id is None:
@@ -1869,41 +2005,72 @@ class BenchmarkService:
         if status_value not in TERMINAL_STATUSES:
             raise BenchmarkError("invalid terminal benchmark status")
         safe_summary = self._safe_summary(summary)
-        with self._lock, self._connect() as connection:
-            row = self._fetch_row(connection, normalized)
-        safe_cases = self._safe_cases(
-            cases,
-            suite_id=str(row["suite_id"]),
-            repetitions=int(row["repetitions"]),
-        )
-        evidence = {
-            "schema_version": BENCHMARK_SCHEMA_VERSION,
-            "run_id": normalized,
-            "suite_id": row["suite_id"],
-            "suite_version": row["suite_version"],
-            "suite_sha256": row["suite_sha256"],
-            "runner_protocol_version": row["runner_protocol_version"],
-            "runner_protocol_sha256": row["runner_protocol_sha256"],
-            "executor_protocol_version": row["executor_protocol_version"],
-            "executor_protocol_sha256": row["executor_protocol_sha256"],
-            "runner_source_sha256": row["runner_source_sha256"],
-            "harness_source_sha256": row["harness_source_sha256"],
-            "tool_source_sha256": row["tool_source_sha256"],
-            "combination_sha256": row["combination_sha256"],
-            "summary": safe_summary,
-            "cases": safe_cases,
-        }
-        run_directory = self.evidence_root / normalized
-        _path, evidence_sha256 = _atomic_private_json(
-            run_directory, "results.json", evidence
-        )
+        # This clock is service-authored from the durable run timestamps. Never
+        # accept an executor/runner-supplied value for the same public field.
+        safe_summary.pop("end_to_end_wall_ms", None)
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            current = self._fetch_row(connection, normalized)
+            row = self._fetch_row(connection, normalized)
             final_status = (
                 "cancelled"
-                if honor_cancel_requested and current["cancel_requested"]
+                if honor_cancel_requested and row["cancel_requested"]
                 else status_value
+            )
+            if final_status == "failed":
+                safe_error_code = (
+                    error_code
+                    if isinstance(error_code, str)
+                    and error_code in TERMINAL_ERROR_CODES
+                    else "runner_failed"
+                )
+            else:
+                safe_error_code = None
+            finished_at = time.time()
+            started_at = row["started_at"]
+            if (
+                safe_summary
+                and not isinstance(started_at, bool)
+                and isinstance(started_at, (int, float))
+                and math.isfinite(float(started_at))
+                and math.isfinite(float(finished_at))
+            ):
+                # This is the durable run boundary (claim -> terminal decision),
+                # including orchestration overhead and Fleet wait. Per-case
+                # total_wall_ms remains unchanged, while compute wait stays
+                # separately observable and excluded from efficiency scoring.
+                safe_summary = {
+                    **safe_summary,
+                    "end_to_end_wall_ms": max(
+                        0.0, (float(finished_at) - float(started_at)) * 1000.0
+                    ),
+                }
+            safe_cases = self._safe_cases(
+                cases,
+                suite_id=str(row["suite_id"]),
+                repetitions=int(row["repetitions"]),
+            )
+            evidence = {
+                "schema_version": BENCHMARK_SCHEMA_VERSION,
+                "run_id": normalized,
+                "status": final_status,
+                "error_code": safe_error_code,
+                "suite_id": row["suite_id"],
+                "suite_version": row["suite_version"],
+                "suite_sha256": row["suite_sha256"],
+                "runner_protocol_version": row["runner_protocol_version"],
+                "runner_protocol_sha256": row["runner_protocol_sha256"],
+                "executor_protocol_version": row["executor_protocol_version"],
+                "executor_protocol_sha256": row["executor_protocol_sha256"],
+                "runner_source_sha256": row["runner_source_sha256"],
+                "harness_source_sha256": row["harness_source_sha256"],
+                "tool_source_sha256": row["tool_source_sha256"],
+                "combination_sha256": row["combination_sha256"],
+                "summary": safe_summary,
+                "cases": safe_cases,
+            }
+            run_directory = self.evidence_root / normalized
+            _path, evidence_sha256 = _atomic_private_json(
+                run_directory, "results.json", evidence
             )
             connection.execute(
                 """
@@ -1914,9 +2081,9 @@ class BenchmarkService:
                 """,
                 (
                     final_status,
-                    time.time(),
+                    finished_at,
                     _canonical_json(safe_summary).decode("ascii").strip(),
-                    error_code if final_status == "failed" else None,
+                    safe_error_code,
                     evidence_sha256,
                     normalized,
                 ),
@@ -1928,14 +2095,11 @@ class BenchmarkService:
         return result
 
     def _mark_failed(self, run_id: str, *, error_code: str) -> None:
-        safe_code = error_code if error_code in {
-            "launcher_failed",
-            "executor_unavailable",
-            "executor_stuck",
-            "harness_unavailable",
-            "runner_failed",
-            "worker_lost",
-        } else "runner_failed"
+        safe_code = (
+            error_code
+            if isinstance(error_code, str) and error_code in TERMINAL_ERROR_CODES
+            else "runner_failed"
+        )
         with self._lock, self._connect() as connection:
             connection.execute(
                 """

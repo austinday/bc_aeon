@@ -80,6 +80,13 @@ BENCHMARK_BROWSER_PROFILE = "benchmark-000000000000"
 CONTEXT_PRESSURE_TURN_BYTES = 32_000
 _HARNESS_IDS = frozenset({"opencode", "legacy-aeon"})
 _MODEL_LOGICAL_NAMES = {DEFAULT_MODEL_ID: AEON_DEFAULT_MODEL_NAME}
+# Only this receipt outcome is unambiguous infrastructure evidence. HTTP 4xx
+# can be caused by the harness itself (for example context overflow or an
+# invalid tool schema), while generic failure/cancellation can also be local
+# lifecycle behavior. Those must remain benchmarkable combination failures.
+# Fleet readiness separately proves the exact server/tool contract before a
+# runtime is published, including the native ``tool_choice=auto`` probe.
+_MODEL_TRANSPORT_FAILURE_OUTCOMES = frozenset({"transport_error"})
 _SAFE_HARNESS_ENVIRONMENT = frozenset(
     {
         "AEON_COMPUTE_BACKEND",
@@ -917,7 +924,35 @@ class FleetHarnessExecutor:
         )
         if result.state == "cancelled":
             raise ExecutionCancelled()
+        if self._model_transport_unavailable(result):
+            # An authenticated transport failure is not evidence about model
+            # quality. A later successful retry recovers it and keeps the full
+            # wall-time/call cost; ambiguous HTTP/harness failures stay scored.
+            raise ExecutorUnavailable(
+                "selected harness model transport became unavailable"
+            )
         return result
+
+    @staticmethod
+    def _model_transport_unavailable(result: ProcessResult) -> bool:
+        expected_sources = frozenset(result.model_call_sources)
+        if not expected_sources:
+            return False
+        finished = tuple(
+            item
+            for item in result.capability_receipts
+            if isinstance(item, ModelCallReceipt)
+            and item.phase == "finished"
+            and item.source in expected_sources
+        )
+        if not finished:
+            return False
+        # A multi-step harness can complete one model turn and then lose the
+        # provider on the next turn.  Only a later success recovers a failed
+        # attempt; an earlier success must not mask the terminal transport
+        # failure and turn infrastructure breakage into a model-quality score.
+        latest = max(finished, key=lambda item: item.call_sequence)
+        return latest.outcome in _MODEL_TRANSPORT_FAILURE_OUTCOMES
 
     def _browser_fixture_outcome(
         self, fixture_id: str, operation: str

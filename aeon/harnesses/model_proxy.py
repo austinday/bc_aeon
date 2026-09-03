@@ -26,6 +26,22 @@ from aeon.core.model_identity import wire_model_for_runtime_profiles
 MAX_REQUEST_BYTES = 48 * 1024 * 1024
 MAX_ERROR_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024 * 1024
+
+
+class _DownstreamClientError(RuntimeError):
+    """The benchmarked harness stopped accepting the model response."""
+
+
+def _write_downstream_chunk(stream: Any, chunk: bytes) -> None:
+    """Forward one chunk while preserving its downstream failure origin."""
+
+    try:
+        stream.write(chunk)
+        stream.flush()
+    except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as exc:
+        raise _DownstreamClientError from exc
+
+
 class FleetModelProxy:
     """Hold no allocation itself; gate HTTP through an existing broker session.
 
@@ -315,20 +331,28 @@ class FleetModelProxy:
                             model_call_outcome = "failed"
                             self._json_error(502, "Fleet model response exceeded its size limit")
                             return
-                    self.send_response(response.status)
-                    upstream_type = str(
-                        response.getheader("content-type", "application/json")
-                    ).lower()
-                    content_type = (
-                        "text/event-stream"
-                        if upstream_type.startswith("text/event-stream")
-                        else "application/json"
-                    )
-                    usage_capture = ResponseUsageCapture(content_type)
-                    self.send_header("Content-Type", content_type[:200])
-                    self.send_header("Cache-Control", "no-store")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
+                    try:
+                        self.send_response(response.status)
+                        upstream_type = str(
+                            response.getheader("content-type", "application/json")
+                        ).lower()
+                        content_type = (
+                            "text/event-stream"
+                            if upstream_type.startswith("text/event-stream")
+                            else "application/json"
+                        )
+                        usage_capture = ResponseUsageCapture(content_type)
+                        self.send_header("Content-Type", content_type[:200])
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                    except (
+                        BrokenPipeError,
+                        ConnectionResetError,
+                        TimeoutError,
+                        OSError,
+                    ) as exc:
+                        raise _DownstreamClientError from exc
                     downstream_started = True
                     sent = 0
                     response_complete = False
@@ -342,8 +366,7 @@ class FleetModelProxy:
                             break
                         forwarded = chunk[:remaining]
                         usage_capture.feed(forwarded)
-                        self.wfile.write(forwarded)
-                        self.wfile.flush()
+                        _write_downstream_chunk(self.wfile, forwarded)
                         sent += len(forwarded)
                         if len(forwarded) != len(chunk):
                             break
@@ -354,6 +377,13 @@ class FleetModelProxy:
                         model_call_outcome = "http_error"
                     else:
                         model_call_outcome = "failed"
+                    self.close_connection = True
+                except _DownstreamClientError:
+                    # The upstream model may be healthy even though the tested
+                    # harness crashed or abandoned its stream. Keep that as a
+                    # scored harness/model failure, never an infrastructure
+                    # exclusion.
+                    model_call_outcome = "failed"
                     self.close_connection = True
                 except (
                     BrokenPipeError,

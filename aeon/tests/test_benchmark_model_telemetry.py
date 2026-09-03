@@ -369,6 +369,51 @@ def test_opencode_proxy_counts_generation_errors_and_excludes_health_gets(
     }
 
 
+def test_opencode_proxy_scores_downstream_harness_disconnect_as_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    path, key, expected = _trace_environment(monkeypatch, tmp_path)
+    _ProxyUpstream.statuses = [200]
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyUpstream)
+    upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    upstream_thread.start()
+    proxy = FleetModelProxy(
+        _FleetSession(f"http://127.0.0.1:{upstream.server_port}/v1")
+    )
+    proxy.start()
+    session = requests.Session()
+    session.trust_env = False
+
+    def abandon_response(_stream, _chunk: bytes) -> None:
+        raise model_proxy_module._DownstreamClientError
+
+    monkeypatch.setattr(
+        model_proxy_module, "_write_downstream_chunk", abandon_response
+    )
+    try:
+        response = session.post(
+            proxy.base_url + "/chat/completions",
+            headers={"Authorization": f"Bearer {proxy.token}"},
+            json={"model": "ignored", "messages": []},
+            stream=True,
+            timeout=5,
+        )
+        response.close()
+    finally:
+        session.close()
+        proxy.close()
+        upstream.shutdown()
+        upstream.server_close()
+        upstream_thread.join(timeout=2)
+
+    finished = [
+        item
+        for item in _decode(path, key, expected)
+        if isinstance(item, ModelCallReceipt) and item.phase == "finished"
+    ]
+    assert [item.outcome for item in finished] == ["failed"]
+
+
 class _ProxySSEUpstream(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
 

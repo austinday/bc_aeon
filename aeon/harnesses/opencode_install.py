@@ -37,7 +37,9 @@ DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 VERSION_PROBE_TIMEOUT_SECONDS = 10.0
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-_VERSION_LINE_RE = re.compile(r"^(?:opencode(?:\s+version)?\s+)?v?(\d+\.\d+\.\d+)$", re.I)
+_VERSION_LINE_RE = re.compile(
+    r"^(?:opencode(?:\s+version)?\s+)?v?(\d+\.\d+\.\d+)$", re.I
+)
 _ALLOWED_DOWNLOAD_HOSTS = frozenset(
     {
         "github.com",
@@ -153,7 +155,9 @@ def _regular_owner_file(path: Path, *, executable: bool) -> os.stat_result:
         raise OpenCodeInstallError(f"refusing non-private file: {path.name}")
     if executable:
         if not mode & stat.S_IXUSR:
-            raise OpenCodeInstallError(f"OpenCode binary is not owner-executable: {path.name}")
+            raise OpenCodeInstallError(
+                f"OpenCode binary is not owner-executable: {path.name}"
+            )
     elif mode & 0o111:
         raise OpenCodeInstallError(f"refusing executable metadata file: {path.name}")
     return metadata
@@ -163,11 +167,15 @@ def _private_directory(path: Path) -> os.stat_result:
     try:
         metadata = path.lstat()
     except FileNotFoundError as exc:
-        raise OpenCodeInstallError(f"required directory is missing: {path.name}") from exc
+        raise OpenCodeInstallError(
+            f"required directory is missing: {path.name}"
+        ) from exc
     if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise OpenCodeInstallError(f"refusing non-directory or symlink: {path.name}")
     if metadata.st_uid != os.geteuid():
-        raise OpenCodeInstallError(f"refusing directory not owned by this user: {path.name}")
+        raise OpenCodeInstallError(
+            f"refusing directory not owned by this user: {path.name}"
+        )
     if stat.S_IMODE(metadata.st_mode) & 0o077:
         raise OpenCodeInstallError(f"refusing non-private directory: {path.name}")
     return metadata
@@ -228,34 +236,49 @@ def _probe_version(
     # ``aeon doctor`` calls this probe.  Even a digest-pinned binary has no need
     # to receive API keys, service credentials, loader hooks, Fleet authority,
     # or caller-supplied OpenCode configuration merely to print its version.
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key in _VERSION_PROBE_ENVIRONMENT
-        and isinstance(value, str)
-        and "\x00" not in value
-    }
-    environment.setdefault("HOME", str(Path.home()))
-    environment.setdefault("PATH", os.defpath)
-    environment.update(
-        {
-            "OPENCODE_DISABLE_AUTOUPDATE": "true",
-            "OPENCODE_DISABLE_MODELS_FETCH": "true",
-            "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
-            "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
-        }
-    )
     try:
-        completed = subprocess.run(
-            [os.fspath(binary), "--version"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=environment,
-        )
+        # Pinned OpenCode initializes all XDG directories before dispatching
+        # even ``--version``.  Route that unavoidable probe activity into one
+        # exact temporary home so read-only status never touches real user
+        # config/data/cache/state or the process-global /tmp/opencode path.
+        with tempfile.TemporaryDirectory(prefix="aeon-opencode-version-") as temporary:
+            probe_root = Path(temporary)
+            probe_root.chmod(0o700)
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key in _VERSION_PROBE_ENVIRONMENT
+                and isinstance(value, str)
+                and "\x00" not in value
+            }
+            environment.setdefault("PATH", os.defpath)
+            environment.update(
+                {
+                    "HOME": str(probe_root / "home"),
+                    "TMPDIR": str(probe_root / "tmp"),
+                    "XDG_CACHE_HOME": str(probe_root / "cache"),
+                    "XDG_CONFIG_HOME": str(probe_root / "config"),
+                    "XDG_DATA_HOME": str(probe_root / "data"),
+                    "XDG_RUNTIME_DIR": str(probe_root / "runtime"),
+                    "XDG_STATE_HOME": str(probe_root / "state"),
+                    "OPENCODE_CONFIG_DIR": str(probe_root / "config" / "opencode"),
+                    "OPENCODE_TEST_HOME": str(probe_root / "home"),
+                    "OPENCODE_DISABLE_AUTOUPDATE": "true",
+                    "OPENCODE_DISABLE_MODELS_FETCH": "true",
+                    "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
+                    "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
+                }
+            )
+            completed = subprocess.run(
+                [os.fspath(binary), "--version"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=environment,
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         raise OpenCodeInstallError("OpenCode version probe failed") from exc
     if completed.returncode != 0:
@@ -290,7 +313,9 @@ def _inspect_opencode_status(
         )
     binary = opencode_binary_path(root, artifact=artifact)
     detected_system = platform.system() if system is None else system
-    detected_machine = platform.machine().lower() if machine is None else machine.lower()
+    detected_machine = (
+        platform.machine().lower() if machine is None else machine.lower()
+    )
     if detected_system != artifact.system or detected_machine not in artifact.machines:
         return OpenCodeStatus(
             state="unsupported",
@@ -419,7 +444,9 @@ def _copy_verified_local_archive(
     try:
         source_fd = os.open(source_path, source_flags)
     except OSError as exc:
-        raise OpenCodeInstallError("OpenCode archive could not be opened safely") from exc
+        raise OpenCodeInstallError(
+            "OpenCode archive could not be opened safely"
+        ) from exc
     destination_fd = -1
     try:
         source_metadata = os.fstat(source_fd)
@@ -439,9 +466,10 @@ def _copy_verified_local_archive(
         destination_fd = os.open(destination, destination_flags, 0o600)
         size = 0
         digest = hashlib.sha256()
-        with os.fdopen(source_fd, "rb") as source, os.fdopen(
-            destination_fd, "wb"
-        ) as target:
+        with (
+            os.fdopen(source_fd, "rb") as source,
+            os.fdopen(destination_fd, "wb") as target,
+        ):
             source_fd = -1
             destination_fd = -1
             while True:
@@ -450,7 +478,9 @@ def _copy_verified_local_archive(
                     break
                 size += len(chunk)
                 if size > artifact.archive_size:
-                    raise OpenCodeInstallError("OpenCode archive exceeds its pinned size")
+                    raise OpenCodeInstallError(
+                        "OpenCode archive exceeds its pinned size"
+                    )
                 digest.update(chunk)
                 target.write(chunk)
             target.flush()
@@ -475,7 +505,9 @@ def _download_archive(
 ) -> Path:
     parsed = urlparse(artifact.url)
     if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
-        raise OpenCodeInstallError("OpenCode release URL is not an approved HTTPS origin")
+        raise OpenCodeInstallError(
+            "OpenCode release URL is not an approved HTTPS origin"
+        )
     request = urllib.request.Request(
         artifact.url,
         headers={"User-Agent": "Aeon-OpenCode-Installer/1"},
@@ -492,7 +524,10 @@ def _download_archive(
             with opener(request, timeout=60) as response:
                 final_url = getattr(response, "url", artifact.url)
                 final = urlparse(final_url)
-                if final.scheme != "https" or final.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
+                if (
+                    final.scheme != "https"
+                    or final.hostname not in _ALLOWED_DOWNLOAD_HOSTS
+                ):
                     raise OpenCodeInstallError(
                         "OpenCode download redirected to an unapproved origin"
                     )
@@ -502,7 +537,9 @@ def _download_archive(
                         break
                     size += len(chunk)
                     if size > MAX_ARCHIVE_BYTES or size > artifact.archive_size:
-                        raise OpenCodeInstallError("OpenCode archive exceeds its pinned size")
+                        raise OpenCodeInstallError(
+                            "OpenCode archive exceeds its pinned size"
+                        )
                     digest.update(chunk)
                     target.write(chunk)
             target.flush()
@@ -517,14 +554,18 @@ def _download_archive(
     return destination
 
 
-def _archive_binary_member(archive: tarfile.TarFile, artifact: HarnessArtifact) -> tarfile.TarInfo:
+def _archive_binary_member(
+    archive: tarfile.TarFile, artifact: HarnessArtifact
+) -> tarfile.TarInfo:
     candidates = []
     for member in archive.getmembers():
         normalized = member.name.removeprefix("./")
         if normalized == artifact.executable_name:
             candidates.append(member)
     if len(candidates) != 1:
-        raise OpenCodeInstallError("OpenCode archive does not contain exactly one binary")
+        raise OpenCodeInstallError(
+            "OpenCode archive does not contain exactly one binary"
+        )
     member = candidates[0]
     if (
         not member.isreg()
@@ -536,7 +577,9 @@ def _archive_binary_member(archive: tarfile.TarFile, artifact: HarnessArtifact) 
     return member
 
 
-def _extract_binary(archive_path: Path, destination: Path, artifact: HarnessArtifact) -> None:
+def _extract_binary(
+    archive_path: Path, destination: Path, artifact: HarnessArtifact
+) -> None:
     try:
         with tarfile.open(archive_path, mode="r:gz") as archive:
             member = _archive_binary_member(archive, artifact)
@@ -563,9 +606,9 @@ def _extract_binary(archive_path: Path, destination: Path, artifact: HarnessArti
 
 
 def _write_receipt(path: Path, payload: Mapping[str, object]) -> None:
-    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
-        "utf-8"
-    )
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -605,7 +648,9 @@ def install_opencode(
     """Install one verified artifact, atomically and without PATH mutation."""
 
     detected_system = platform.system() if system is None else system
-    detected_machine = platform.machine().lower() if machine is None else machine.lower()
+    detected_machine = (
+        platform.machine().lower() if machine is None else machine.lower()
+    )
     if detected_system != artifact.system or detected_machine not in artifact.machines:
         raise OpenCodeInstallError(
             "OpenCode installation is supported only on Linux x86-64"
@@ -634,7 +679,9 @@ def install_opencode(
     published = False
     try:
         if archive_path is None:
-            archive = _download_archive(stage / artifact.archive_name, artifact, opener=opener)
+            archive = _download_archive(
+                stage / artifact.archive_name, artifact, opener=opener
+            )
         else:
             archive = _copy_verified_local_archive(
                 Path(archive_path), stage / artifact.archive_name, artifact

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-EXECUTOR_PROTOCOL_VERSION = "8"
+EXECUTOR_PROTOCOL_VERSION = "9"
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _EXECUTOR_SOURCES = (
     _PACKAGE_ROOT / "benchmarks" / "executor.py",
