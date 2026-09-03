@@ -110,6 +110,17 @@ class BrowserMediaDownloadTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             browser_util.BENCHMARK_FIXTURES["other"] = "caller html"
 
+        self.assertEqual(
+            browser_util.benchmark_fixture_internal_failure("session-v1", "reopen"),
+            {
+                "status": "error",
+                "fixture_id": "session-v1",
+                "operation": "reopen",
+                "failure_kind": "fixture_internal",
+                "passed": False,
+            },
+        )
+
     def test_benchmark_page_helpers_use_only_catalog_content_and_predicates(self):
         class FakePage:
             def __init__(self):

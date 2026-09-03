@@ -1974,19 +1974,24 @@ class AdmissionIdentityTests(unittest.TestCase):
             "aeon/core/action_schema.py",
             "aeon/core/compute_profile.py",
             "aeon/core/deploy_planner.py",
+            "aeon/core/fleet_hosts.py",
             "aeon/core/gpu.py",
             "aeon/core/gpu_queue.py",
             "aeon/core/model_catalog.py",
             "aeon/core/mtp_tuning.py",
+            "aeon/core/qwen_artifact_cache.py",
             "aeon/core/qwen_capabilities.py",
+            "aeon/core/qwen_fleet_runtime.py",
             "aeon/core/qwen_runtime.py",
             "aeon/core/sampling.py",
+            "aeon/core/utils/io.py",
             "aeon/core/data/qwen38_mtp_selection.json",
             "aeon/core/data/qwen38_rtx5000_178_128k_release_receipt.json",
             "aeon/core/data/qwen38_rtx5000_128k_release_receipt.json",
             "aeon/core/data/qwen_runtime_capabilities.json",
             "aeon/scripts/vllm_uuid_sitecustomize.py",
             "aeon/scripts/warmup_qwen38_vllm.py",
+            "aeon/scripts/qwen_remote_worker.py",
         }
         self.assertTrue(required.issubset(set(runtime.SOURCE_FILES)))
         with tempfile.TemporaryDirectory() as temp:
@@ -2019,6 +2024,21 @@ class AdmissionIdentityTests(unittest.TestCase):
                 runtime._source_identity(root, base / "unused-run").manifest_sha256,
                 before.manifest_sha256,
             )
+
+    def test_packaged_source_manifest_exactly_matches_current_closure(self):
+        package_root = Path(runtime.__file__).resolve().parents[2]
+        generated = b"".join(
+            hashlib.sha256((package_root / relative).read_bytes())
+            .hexdigest()
+            .encode("ascii")
+            + b"  "
+            + relative.encode("utf-8")
+            + b"\n"
+            for relative in runtime.SOURCE_FILES
+        )
+        self.assertEqual(
+            (package_root / runtime.SOURCE_MANIFEST_FILE).read_bytes(), generated
+        )
 
     def test_staged_warmup_dependency_mutation_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -8,11 +8,12 @@ import statistics
 import threading
 import time
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Mapping, NoReturn, Protocol
 
 from .catalog import (
     BENCHMARK_CATALOG_SHA256,
     BENCHMARK_CATALOG_VERSION,
+    COMPONENTS,
     EXECUTOR_PROTOCOL_SHA256,
     EXECUTOR_PROTOCOL_VERSION,
     HARNESS_SOURCE_SHA256,
@@ -42,6 +43,33 @@ class ExecutionCancelled(RuntimeError):
 
 class ExecutorUnresolved(RuntimeError):
     """A supposedly cancellable executor did not prove that it stopped."""
+
+
+class ExecutorInvocationFailure(RuntimeError):
+    """An executor call failed after starting, with its measured time retained."""
+
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        wall_ms: float,
+        compute_wait_ms: float,
+    ) -> None:
+        super().__init__("benchmark executor invocation failed")
+        self.error = error
+        self.wall_ms = max(0.0, float(wall_ms))
+        self.compute_wait_ms = min(
+            self.wall_ms, max(0.0, float(compute_wait_ms))
+        )
+
+    def case_result(self) -> dict[str, object]:
+        return {
+            "status": "failed",
+            "score": 0.0,
+            "wall_ms": self.wall_ms,
+            "active_wall_ms": max(0.0, self.wall_ms - self.compute_wait_ms),
+            "compute_wait_ms": self.compute_wait_ms,
+        }
 
 
 @dataclass(frozen=True)
@@ -117,6 +145,7 @@ def _safe_case_result(
         "case_id": scenario.case_id,
         "label": scenario.label,
         "category": scenario.category,
+        "component_id": scenario.component_id,
         "repetition": repetition,
         "status": status,
         "score": score,
@@ -143,6 +172,57 @@ def _safe_case_result(
             "stuck": "case_stuck",
             "unsupported": "case_unsupported",
         }.get(str(status), "case_failed")
+    for field in ("model_turn_count", "model_call_count", "tool_call_count"):
+        value = mapping.get(field)
+        if (
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 1_000_000
+        ):
+            result[field] = None
+        else:
+            result[field] = value
+    for field in (
+        "prompt_tokens",
+        "peak_prompt_tokens",
+        "context_tokens",
+        "completion_tokens",
+    ):
+        value = mapping.get(field)
+        if (
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 1_000_000_000
+        ):
+            result[field] = None
+        else:
+            result[field] = value
+    for field in (
+        "context_pressure_bytes",
+        "context_pressure_turns",
+        "highest_verified_context_pressure_bytes",
+        "duplicate_submission_count",
+        "max_parallelism",
+    ):
+        value = mapping.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000_000:
+            result[field] = value
+    for field in (
+        "fleet_compute_judgment_score",
+        "preemption_recovery_score",
+        "useful_wait_work_score",
+        "checkpoint_reacquire_score",
+        "integration_score",
+    ):
+        value = _bounded_number(mapping.get(field), low=0.0, high=100.0)
+        if value is not None:
+            result[field] = value
+    for field in ("useful_overlap_ratio", "idle_wait_ratio"):
+        value = _bounded_number(mapping.get(field), low=0.0, high=1.0)
+        if value is not None:
+            result[field] = value
     return result
 
 
@@ -154,8 +234,8 @@ def summarize_cases(
     cases: list[Mapping[str, object]],
     *,
     planned_cases: int,
-) -> dict[str, float | int]:
-    scores = [float(item["score"]) for item in cases]
+    scenarios: tuple[ScenarioSpec, ...] = (),
+) -> dict[str, object]:
     wall = [float(item["wall_ms"]) for item in cases]
     active_wall = [float(item["active_wall_ms"]) for item in cases]
     compute_wait = [float(item["compute_wait_ms"]) for item in cases]
@@ -170,9 +250,126 @@ def summarize_cases(
     ]
     vision = [float(item["vision_score"]) for item in cases if "vision_score" in item]
     denominator = max(1, planned_cases)
-    return {
-        "score": statistics.fmean(scores) if scores else 0.0,
-        "completion_rate": sum(passed) / denominator,
+    scenario_by_id = {scenario.case_id: scenario for scenario in scenarios}
+    repetitions = max(
+        1,
+        planned_cases // len(scenarios) if scenarios else 1,
+    )
+    component_scores: dict[str, float] = {}
+    for component in COMPONENTS:
+        if component.component_id == "reliability_efficiency":
+            continue
+        component_scenarios = tuple(
+            scenario
+            for scenario in scenarios
+            if scenario.component_id == component.component_id
+        )
+        planned_weight = repetitions * sum(
+            scenario.case_weight for scenario in component_scenarios
+        )
+        earned = sum(
+            float(item.get("score", 0.0))
+            * scenario_by_id[str(item.get("case_id"))].case_weight
+            for item in cases
+            if str(item.get("case_id")) in scenario_by_id
+            and scenario_by_id[str(item.get("case_id"))].component_id
+            == component.component_id
+        )
+        component_scores[component.component_id] = (
+            100.0 * earned / planned_weight if planned_weight > 0 else 0.0
+        )
+
+    total_deadline_ms = repetitions * sum(
+        scenario.timeout_seconds * 1000.0 for scenario in scenarios
+    )
+    total_target_ms = repetitions * sum(
+        scenario.target_active_seconds * 1000.0 for scenario in scenarios
+    )
+    charged_active_ms = 0.0
+    observed = {
+        (str(item.get("case_id")), int(item.get("repetition", 0))): item
+        for item in cases
+        if isinstance(item.get("repetition"), int)
+    }
+    for repetition in range(1, repetitions + 1):
+        for scenario in scenarios:
+            item = observed.get((scenario.case_id, repetition))
+            if item is None or item.get("status") in {"timeout", "stuck"}:
+                charged_active_ms += scenario.timeout_seconds * 1000.0
+            else:
+                charged_active_ms += min(
+                    scenario.timeout_seconds * 1000.0,
+                    max(0.0, float(item.get("active_wall_ms", 0.0))),
+                )
+    efficiency_denominator = total_deadline_ms - total_target_ms
+    if efficiency_denominator <= 0:
+        efficiency = 0.0
+    else:
+        efficiency = max(
+            0.0,
+            min(
+                1.0,
+                (total_deadline_ms - charged_active_ms) / efficiency_denominator,
+            ),
+        )
+    completion_rate = sum(passed) / denominator
+    reliability_efficiency = 100.0 * (0.5 * completion_rate + 0.5 * efficiency)
+    component_scores["reliability_efficiency"] = reliability_efficiency
+    weights = {component.component_id: component.weight for component in COMPONENTS}
+    quality_weight = sum(
+        weight
+        for component_id, weight in weights.items()
+        if component_id != "reliability_efficiency"
+    )
+    quality_score = (
+        sum(
+            component_scores.get(component_id, 0.0) * weight
+            for component_id, weight in weights.items()
+            if component_id != "reliability_efficiency"
+        )
+        / quality_weight
+        if quality_weight
+        else 0.0
+    )
+    overall_score = sum(
+        component_scores.get(component_id, 0.0) * weight
+        for component_id, weight in weights.items()
+    )
+
+    def complete_sum(field: str) -> int | None:
+        values = [item.get(field) for item in cases]
+        if len(values) != planned_cases or any(
+            isinstance(value, bool) or not isinstance(value, int) for value in values
+        ):
+            return None
+        return sum(int(value) for value in values)
+
+    def complete_max(field: str) -> int | None:
+        values = [item.get(field) for item in cases]
+        if len(values) != planned_cases or any(
+            isinstance(value, bool) or not isinstance(value, int) for value in values
+        ):
+            return None
+        return max((int(value) for value in values), default=0)
+
+    def numeric_values(field: str) -> list[float]:
+        return [
+            float(item[field])
+            for item in cases
+            if isinstance(item.get(field), (int, float))
+            and not isinstance(item.get(field), bool)
+        ]
+
+    total_wall_ms = sum(wall)
+    total_active_wall_ms = sum(active_wall)
+    total_compute_wait_ms = sum(compute_wait)
+    summary: dict[str, object] = {
+        "overall_score": overall_score,
+        "quality_score": quality_score,
+        "component_scores": component_scores,
+        # Legacy normalized alias retained for existing clients.
+        "score": overall_score / 100.0,
+        "completion_rate": completion_rate,
         "median_wall_ms": statistics.median(wall) if wall else 0.0,
         "median_active_wall_ms": (
             statistics.median(active_wall) if active_wall else 0.0
@@ -187,7 +384,44 @@ def summarize_cases(
         "vision_score": statistics.fmean(vision) if vision else 0.0,
         "case_count": len(cases),
         "passed_cases": sum(passed),
+        "total_wall_ms": total_wall_ms,
+        "total_active_wall_ms": total_active_wall_ms,
+        "total_compute_wait_ms": total_compute_wait_ms,
+        "model_turn_count": complete_sum("model_turn_count"),
+        "model_call_count": complete_sum("model_call_count"),
+        "tool_call_count": complete_sum("tool_call_count"),
+        "prompt_tokens": complete_sum("prompt_tokens"),
+        "peak_prompt_tokens": complete_max("peak_prompt_tokens"),
+        "context_tokens": complete_sum("context_tokens"),
+        "completion_tokens": complete_sum("completion_tokens"),
+        "token_metrics_complete": (
+            complete_sum("prompt_tokens") is not None
+            and complete_max("peak_prompt_tokens") is not None
+            and complete_sum("context_tokens") is not None
+            and complete_sum("completion_tokens") is not None
+        ),
+        "context_pressure_bytes": sum(numeric_values("context_pressure_bytes")),
+        "context_pressure_turns": sum(numeric_values("context_pressure_turns")),
+        "highest_verified_context_pressure_bytes": max(
+            numeric_values("highest_verified_context_pressure_bytes"), default=0.0
+        ),
+        "duplicate_submission_count": sum(
+            numeric_values("duplicate_submission_count")
+        ),
+        "max_parallelism": max(numeric_values("max_parallelism"), default=0.0),
     }
+    for field in (
+        "fleet_compute_judgment_score",
+        "preemption_recovery_score",
+        "useful_wait_work_score",
+        "checkpoint_reacquire_score",
+        "useful_overlap_ratio",
+        "idle_wait_ratio",
+        "integration_score",
+    ):
+        values = numeric_values(field)
+        summary[field] = statistics.fmean(values) if values else None
+    return summary
 
 
 def _request_executor_cancel(
@@ -243,10 +477,38 @@ def _execute_with_deadline(
     previously_paused = False
     paused_elapsed = 0.0
     cancelled = False
+
+    def timed_failure(error: Exception) -> ExecutorInvocationFailure:
+        finished = time.monotonic()
+        measured = max(0.0, (finished - started) * 1000.0)
+        accounted_pause = paused_elapsed
+        if previously_paused:
+            accounted_pause += max(0.0, finished - last_tick)
+        return ExecutorInvocationFailure(
+            error,
+            wall_ms=measured,
+            compute_wait_ms=min(measured, accounted_pause * 1000.0),
+        )
+
+    def abort_for_supervisor_error(error: Exception) -> NoReturn:
+        cooperative = _request_executor_cancel(executor, request)
+        worker.join(
+            timeout=EXECUTOR_CANCEL_GRACE_SECONDS if cooperative else 0.05
+        )
+        classified: Exception = (
+            ExecutorUnavailable("benchmark supervision became unavailable")
+            if not worker.is_alive()
+            else ExecutorUnresolved()
+        )
+        raise timed_failure(classified) from error
+
     while worker.is_alive():
         now = time.monotonic()
         deadline_paused = getattr(executor, "deadline_paused", None)
-        paused = callable(deadline_paused) and deadline_paused(request) is True
+        try:
+            paused = callable(deadline_paused) and deadline_paused(request) is True
+        except Exception as exc:
+            abort_for_supervisor_error(exc)
         # Do not charge the polling interval in which a pause transition was
         # observed. That interval can contain an arbitrary amount of proven
         # Fleet wait and cannot be split safely from this supervising thread.
@@ -257,7 +519,11 @@ def _execute_with_deadline(
             remaining_budget -= elapsed
         last_tick = now
         previously_paused = paused
-        if service._cancel_requested(request.run_id):
+        try:
+            cancel_requested = service._cancel_requested(request.run_id)
+        except Exception as exc:
+            abort_for_supervisor_error(exc)
+        if cancel_requested:
             # An executor may atomically finish its case and request that the
             # remaining cases be cancelled. Preserve that completed evidence.
             worker.join(timeout=0.05)
@@ -269,7 +535,8 @@ def _execute_with_deadline(
                 timeout=EXECUTOR_CANCEL_GRACE_SECONDS if cooperative else 0.05
             )
             if worker.is_alive():
-                raise ExecutorUnresolved()
+                unresolved = ExecutorUnresolved()
+                raise timed_failure(unresolved) from unresolved
             break
         if remaining_budget <= 0:
             cooperative = _request_executor_cancel(executor, request)
@@ -294,7 +561,14 @@ def _execute_with_deadline(
     finished = time.monotonic()
     final_elapsed = max(0.0, finished - last_tick)
     final_pause = getattr(executor, "deadline_paused", None)
-    if previously_paused or (callable(final_pause) and final_pause(request) is True):
+    try:
+        finally_paused = callable(final_pause) and final_pause(request) is True
+    except Exception as exc:
+        unavailable = ExecutorUnavailable(
+            "benchmark supervision became unavailable"
+        )
+        raise timed_failure(unavailable) from exc
+    if previously_paused or finally_paused:
         paused_elapsed += final_elapsed
     measured = (finished - started) * 1000.0
     if cancelled:
@@ -322,6 +596,13 @@ def _execute_with_deadline(
             timed.setdefault("active_wall_ms", max(0.0, measured - wait_ms))
             return timed, measured, False
         return value, measured, False
+    if isinstance(value, Exception):
+        wait_ms = min(measured, max(0.0, paused_elapsed * 1000.0))
+        raise ExecutorInvocationFailure(
+            value,
+            wall_ms=measured,
+            compute_wait_ms=wait_ms,
+        ) from value
     if isinstance(value, BaseException):
         raise value
     return ({"status": "failed", "score": 0.0}, measured, False)
@@ -376,7 +657,9 @@ def run_benchmark(
     for repetition in range(1, repetitions + 1):
         for scenario in suite.cases:
             if service._cancel_requested(run_id):
-                summary = summarize_cases(cases, planned_cases=planned)
+                summary = summarize_cases(
+                    cases, planned_cases=planned, scenarios=suite.cases
+                )
                 return service._finish_run(
                     run_id,
                     status_value="cancelled",
@@ -401,14 +684,69 @@ def run_benchmark(
                     return service._finish_run(
                         run_id,
                         status_value="cancelled",
-                        summary=summarize_cases(cases, planned_cases=planned),
+                        summary=summarize_cases(
+                            cases, planned_cases=planned, scenarios=suite.cases
+                        ),
                         cases=cases,
+                    )
+            except ExecutorInvocationFailure as failure:
+                original = failure.error
+                if isinstance(original, ExecutionCancelled):
+                    return service._finish_run(
+                        run_id,
+                        status_value="cancelled",
+                        summary=summarize_cases(
+                            cases, planned_cases=planned, scenarios=suite.cases
+                        ),
+                        cases=cases,
+                    )
+                if isinstance(original, ExecutorUnresolved):
+                    raw = failure.case_result()
+                    raw["status"] = "stuck"
+                    cases.append(
+                        _safe_case_result(
+                            scenario,
+                            repetition,
+                            raw,
+                            measured_wall_ms=failure.wall_ms,
+                        )
+                    )
+                    return service._finish_run(
+                        run_id,
+                        status_value="failed",
+                        # The process did not prove termination, so this is
+                        # diagnostic evidence rather than a comparable model
+                        # score even when cancellation triggered the check.
+                        summary={},
+                        cases=cases,
+                        error_code="executor_stuck",
+                        honor_cancel_requested=False,
+                    )
+                raw = failure.case_result()
+                measured = failure.wall_ms
+                if isinstance(original, ExecutorUnavailable):
+                    cases.append(
+                        _safe_case_result(
+                            scenario,
+                            repetition,
+                            raw,
+                            measured_wall_ms=measured,
+                        )
+                    )
+                    return service._finish_run(
+                        run_id,
+                        status_value="failed",
+                        summary={},
+                        cases=cases,
+                        error_code="executor_unavailable",
                     )
             except ExecutionCancelled:
                 return service._finish_run(
                     run_id,
                     status_value="cancelled",
-                    summary=summarize_cases(cases, planned_cases=planned),
+                    summary=summarize_cases(
+                        cases, planned_cases=planned, scenarios=suite.cases
+                    ),
                     cases=cases,
                 )
             except ExecutorUnresolved:
@@ -427,7 +765,10 @@ def run_benchmark(
                 return service._finish_run(
                     run_id,
                     status_value="failed",
-                    summary=summarize_cases(cases, planned_cases=planned),
+                    # Harness/fixture readiness is infrastructure validity,
+                    # not agent behavior.  Preserve the sanitized diagnostic
+                    # case but publish no comparable score.
+                    summary={},
                     cases=cases,
                     error_code="executor_unavailable",
                 )
@@ -445,14 +786,18 @@ def run_benchmark(
                 return service._finish_run(
                     run_id,
                     status_value="failed",
-                    summary=summarize_cases(cases, planned_cases=planned),
+                    summary=summarize_cases(
+                        cases, planned_cases=planned, scenarios=suite.cases
+                    ),
                     cases=cases,
                     error_code="executor_stuck",
                 )
     return service._finish_run(
         run_id,
         status_value="succeeded",
-        summary=summarize_cases(cases, planned_cases=planned),
+        summary=summarize_cases(
+            cases, planned_cases=planned, scenarios=suite.cases
+        ),
         cases=cases,
     )
 
@@ -461,6 +806,7 @@ __all__ = (
     "CASE_STATUSES",
     "ExecutionRequest",
     "ExecutionCancelled",
+    "ExecutorInvocationFailure",
     "ExecutorUnresolved",
     "ExecutorUnavailable",
     "HarnessExecutor",

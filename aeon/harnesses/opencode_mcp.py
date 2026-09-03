@@ -43,6 +43,7 @@ _LOCAL_HTTP = {
 # Keep the catalog task-oriented. OpenCode prefixes these with ``aeon_``.
 EXPOSED_TOOLS = frozenset(
     {
+        "benchmark_workflow",
         "open_file",
         "close_file",
         "write_file",
@@ -433,12 +434,12 @@ def create_server() -> Server:
 
     @server.call_tool(validate_input=True)
     async def call_tool(name: str, arguments: dict | None) -> types.CallToolResult:
+        parameters = arguments if isinstance(arguments, dict) else {}
         if name not in tools_by_name or name not in worker._active_tool_names():
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text="Tool is unavailable for this request")],
                 isError=True,
             )
-        parameters = arguments if isinstance(arguments, dict) else {}
         async with call_lock:
             def execute() -> tuple[Any, list[str]]:
                 # Tool implementations sometimes print diagnostics. Keep them

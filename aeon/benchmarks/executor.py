@@ -8,6 +8,7 @@ through Fleet Compute; this layer never selects a host, GPU, claim, or endpoint.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import re
@@ -37,7 +38,26 @@ from aeon.core.benchmark_receipt import (
     CAPABILITY_RECEIPT_PATH_ENV,
     MAX_CAPABILITY_RECEIPT_BYTES,
     FleetWaitCapabilityReceipt,
+    ModelCallReceipt,
+    ScenarioEffectReceipt,
+    ToolCallReceipt,
+    TRACE_CASE_ID_ENV,
+    TRACE_NONCE_ENV,
+    TRACE_REPETITION_ENV,
+    TRACE_RUN_ID_ENV,
     decode_capability_receipts,
+    tool_arguments_sha256,
+)
+from aeon.core.benchmark_model_telemetry import summarize_model_calls
+from aeon.core.benchmark_simulator import (
+    SCENARIO_CAPABILITY_ENV,
+    SCENARIO_TOOL_NAME,
+    ScenarioCapability,
+    ScenarioInfrastructureError,
+    decode_scenario_capability,
+    mint_scenario_capability,
+    score_scenario_effects,
+    simulator_preflight,
 )
 from .runner import (
     ExecutionCancelled,
@@ -57,6 +77,7 @@ TERMINATION_GRACE_SECONDS = 5.0
 EXECUTOR_CLOSE_GRACE_SECONDS = 12.0
 BROWSER_FIXTURE_TIMEOUT_SECONDS = 8.0
 BENCHMARK_BROWSER_PROFILE = "benchmark-000000000000"
+CONTEXT_PRESSURE_TURN_BYTES = 32_000
 _HARNESS_IDS = frozenset({"opencode", "legacy-aeon"})
 _MODEL_LOGICAL_NAMES = {DEFAULT_MODEL_ID: AEON_DEFAULT_MODEL_NAME}
 _SAFE_HARNESS_ENVIRONMENT = frozenset(
@@ -85,7 +106,15 @@ class ProcessResult:
     # ``wall_ms`` remains the total end-to-end duration for API compatibility.
     wall_ms: float
     compute_wait_ms: float = 0.0
-    capability_receipts: tuple[FleetWaitCapabilityReceipt, ...] = ()
+    capability_receipts: tuple[
+        FleetWaitCapabilityReceipt
+        | ToolCallReceipt
+        | ScenarioEffectReceipt
+        | ModelCallReceipt,
+        ...,
+    ] = ()
+    scenario_capability: ScenarioCapability | None = None
+    model_call_sources: tuple[str, ...] = ()
 
     @property
     def active_wall_ms(self) -> float:
@@ -105,6 +134,32 @@ ProcessRunner = Callable[
 ]
 ReadinessChecker = Callable[[str | None], Mapping[str, object]]
 BrowserFixtureClient = Callable[[str, str], bool]
+
+
+@dataclass(frozen=True)
+class _FixtureOperationResult:
+    """Separate a reachable negative verification from broken fixture I/O."""
+
+    responded: bool
+    passed: bool
+
+
+def _context_pressure_filler(serial: int, size: int) -> str:
+    """Build deterministic token-dense noise without embedding hidden facts."""
+
+    if serial < 1 or not 1 <= size < 40_000:
+        raise ValueError("context-pressure filler bounds are invalid")
+    blocks: list[str] = []
+    length = 0
+    counter = 0
+    while length < size:
+        block = hashlib.sha256(
+            f"aeon-context-pressure-v1:{serial}:{counter}".encode("ascii")
+        ).hexdigest()
+        blocks.extend((block, "\n"))
+        length += len(block) + 1
+        counter += 1
+    return "".join(blocks)[:size]
 
 
 def _safe_wrapper() -> bool:
@@ -165,6 +220,12 @@ class _CapabilityReceiptTarget:
     key: str
     device: int
     inode: int
+    run_id: str
+    case_id: str
+    repetition: int
+    trace_nonce: str
+    scenario_capability_raw: str = ""
+    scenario_capability: ScenarioCapability | None = None
 
 
 def _process_identity(pid: int) -> _ProcessIdentity | None:
@@ -525,6 +586,8 @@ class FleetHarnessExecutor:
             raise ExecutorUnavailable("benchmark harness state root is unsafe")
         self.harness_state = state_root / run_id
         self.harness_state.mkdir(mode=0o700)
+        self._receipt_root = self.harness_state / "benchmark-evidence"
+        self._receipt_root.mkdir(mode=0o700)
         harness_state_metadata = self.harness_state.lstat()
         if (
             not stat.S_ISDIR(harness_state_metadata.st_mode)
@@ -617,6 +680,17 @@ class FleetHarnessExecutor:
         environment.update(
             {
                 "AEON_COMPUTE_BACKEND": "broker",
+                # Every harness turn is a new OS process. Bind all turns for
+                # one case/repetition to the same validated identity so
+                # resume=True can recover its session, while preventing state
+                # or memory from leaking into another scored case.
+                "AEON_REMOTE_INSTANCE_ID": hashlib.sha256(
+                    (
+                        "aeon-benchmark-case-v1\0"
+                        f"{request.run_id}\0{request.scenario.case_id}\0"
+                        f"{request.repetition}"
+                    ).encode("utf-8")
+                ).hexdigest()[:32],
                 # OpenCode requires its supervisor/config/session state to be
                 # disjoint from the model-facing workspace. Legacy Aeon accepts
                 # the same per-run private sibling root.
@@ -641,12 +715,20 @@ class FleetHarnessExecutor:
         if receipt_target is not None:
             environment[CAPABILITY_RECEIPT_PATH_ENV] = str(receipt_target.path)
             environment[CAPABILITY_RECEIPT_KEY_ENV] = receipt_target.key
+            environment[TRACE_RUN_ID_ENV] = receipt_target.run_id
+            environment[TRACE_CASE_ID_ENV] = receipt_target.case_id
+            environment[TRACE_REPETITION_ENV] = str(receipt_target.repetition)
+            environment[TRACE_NONCE_ENV] = receipt_target.trace_nonce
+            if receipt_target.scenario_capability_raw:
+                environment[SCENARIO_CAPABILITY_ENV] = (
+                    receipt_target.scenario_capability_raw
+                )
         return environment
 
     def _new_capability_receipt_target(
         self, request: ExecutionRequest
     ) -> _CapabilityReceiptTarget:
-        root = self.workspace / "results"
+        root = self._receipt_root
         label = re.sub(r"[^a-z0-9]+", "-", request.scenario.case_id.casefold()).strip("-")
         path = root / (
             f".{label}-r{request.repetition}-{secrets.token_hex(12)}.receipt"
@@ -664,17 +746,59 @@ class FleetHarnessExecutor:
             metadata = os.fstat(descriptor)
         finally:
             os.close(descriptor)
+        key = secrets.token_hex(32)
+        trace_nonce = secrets.token_hex(32)
+        raw_capability = mint_scenario_capability(
+            run_id=request.run_id,
+            case_id=request.scenario.case_id,
+            repetition=request.repetition,
+            trace_nonce=trace_nonce,
+            receipt_path=path,
+            receipt_device=metadata.st_dev,
+            receipt_inode=metadata.st_ino,
+            receipt_key=key,
+        )
+        expected_environment = {
+            CAPABILITY_RECEIPT_PATH_ENV: str(path),
+            TRACE_RUN_ID_ENV: request.run_id,
+            TRACE_CASE_ID_ENV: request.scenario.case_id,
+            TRACE_REPETITION_ENV: str(request.repetition),
+            TRACE_NONCE_ENV: trace_nonce,
+        }
+        parsed_capability = (
+            decode_scenario_capability(
+                raw_capability,
+                key,
+                environment=expected_environment,
+            )
+            if raw_capability is not None
+            else None
+        )
+        if raw_capability is not None and parsed_capability is None:
+            raise ExecutorUnavailable("benchmark scenario capability is invalid")
         return _CapabilityReceiptTarget(
             path=path,
-            key=secrets.token_hex(32),
+            key=key,
             device=metadata.st_dev,
             inode=metadata.st_ino,
+            run_id=request.run_id,
+            case_id=request.scenario.case_id,
+            repetition=request.repetition,
+            trace_nonce=trace_nonce,
+            scenario_capability_raw=raw_capability or "",
+            scenario_capability=parsed_capability,
         )
 
     @staticmethod
     def _read_capability_receipts(
         target: _CapabilityReceiptTarget,
-    ) -> tuple[FleetWaitCapabilityReceipt, ...]:
+    ) -> tuple[
+        FleetWaitCapabilityReceipt
+        | ToolCallReceipt
+        | ScenarioEffectReceipt
+        | ModelCallReceipt,
+        ...,
+    ]:
         descriptor: int | None = None
         try:
             descriptor = os.open(
@@ -700,7 +824,14 @@ class FleetHarnessExecutor:
                 os.close(descriptor)
         if len(payload) != metadata.st_size:
             return ()
-        return decode_capability_receipts(payload, key=target.key)
+        return decode_capability_receipts(
+            payload,
+            key=target.key,
+            run_id=target.run_id,
+            case_id=target.case_id,
+            repetition=target.repetition,
+            trace_nonce=target.trace_nonce,
+        )
 
     def _command(
         self,
@@ -771,27 +902,34 @@ class FleetHarnessExecutor:
             self._compute_state_changed,
         )
         observed_receipts = self._read_capability_receipts(receipt_target)
-        if observed_receipts:
-            result = replace(
-                result,
-                capability_receipts=(
-                    *result.capability_receipts,
-                    *observed_receipts,
-                ),
-            )
+        result = replace(
+            result,
+            capability_receipts=(
+                *result.capability_receipts,
+                *observed_receipts,
+            ),
+            scenario_capability=receipt_target.scenario_capability,
+            model_call_sources=(
+                ("opencode_proxy",)
+                if request.harness_id == "opencode"
+                else ("aeon_task_model",)
+            ),
+        )
         if result.state == "cancelled":
             raise ExecutionCancelled()
         return result
 
-    def _browser_fixture(self, fixture_id: str, operation: str) -> bool:
+    def _browser_fixture_outcome(
+        self, fixture_id: str, operation: str
+    ) -> _FixtureOperationResult:
         """Seed/verify only the authenticated service's closed fixture catalog."""
 
         if fixture_id not in {"observe-v1", "form-v1", "session-v1", "vision-v1"}:
-            return False
+            return _FixtureOperationResult(False, False)
         if operation not in {"seed", "reopen", "verify", "cleanup"}:
-            return False
+            return _FixtureOperationResult(False, False)
         if operation in {"reopen", "cleanup"} and fixture_id != "session-v1":
-            return False
+            return _FixtureOperationResult(False, False)
         try:
             from aeon.tools.browser import (
                 BROWSER_API_URL,
@@ -819,44 +957,85 @@ class FleetHarnessExecutor:
                 allow_redirects=False,
                 proxies={"http": "", "https": ""},
             )
-            if response.status_code != 200:
+            status_code = response.status_code
+            try:
+                document = response.json()
+            finally:
                 response.close()
-                return False
-            document = response.json()
-            response.close()
+            if status_code != 200:
+                return _FixtureOperationResult(False, False)
         except Exception:
-            return False
+            return _FixtureOperationResult(False, False)
         if not isinstance(document, Mapping) or document.get("fixture_id") != fixture_id:
-            return False
+            return _FixtureOperationResult(False, False)
+        if document.get("failure_kind") == "fixture_internal":
+            # Defense in depth for mixed-version services: fixture mechanics
+            # never become a model-quality zero, even if an old proxy rewrites
+            # the intended 503 status to 200.
+            return _FixtureOperationResult(False, False)
         if operation == "seed":
-            return document.get("status") == "seeded"
+            return _FixtureOperationResult(
+                True, document.get("status") == "seeded"
+            )
         if operation == "reopen":
-            return (
+            return _FixtureOperationResult(
+                True,
                 document.get("status") == "reopened"
-                and document.get("passed") is True
+                and document.get("passed") is True,
             )
         if operation == "cleanup":
-            return (
+            return _FixtureOperationResult(
+                True,
                 document.get("status") == "cleaned"
-                and document.get("passed") is True
+                and document.get("passed") is True,
             )
-        return document.get("status") == "verified" and document.get("passed") is True
+        return _FixtureOperationResult(
+            True,
+            document.get("status") == "verified" and document.get("passed") is True,
+        )
 
-    def _fixture_operation(self, fixture_id: str, operation: str) -> bool:
+    def _browser_fixture(self, fixture_id: str, operation: str) -> bool:
+        """Compatibility bool view used by direct fixture diagnostics."""
+
+        return self._browser_fixture_outcome(fixture_id, operation).passed
+
+    def _fixture_outcome(
+        self, fixture_id: str, operation: str
+    ) -> _FixtureOperationResult:
         client = self._fixture_client
         if client is not None:
             try:
-                succeeded = client(fixture_id, operation) is True
+                outcome = _FixtureOperationResult(
+                    True, client(fixture_id, operation) is True
+                )
             except Exception:
-                return False
+                outcome = _FixtureOperationResult(False, False)
         else:
-            succeeded = self._browser_fixture(fixture_id, operation)
-        if succeeded and fixture_id == "session-v1":
+            outcome = self._browser_fixture_outcome(fixture_id, operation)
+        if outcome.passed and fixture_id == "session-v1":
             if operation == "seed":
                 self._session_fixture_seeded = True
             elif operation == "cleanup":
                 self._session_fixture_seeded = False
-        return succeeded
+        return outcome
+
+    def _fixture_operation(self, fixture_id: str, operation: str) -> bool:
+        return self._fixture_outcome(fixture_id, operation).passed
+
+    def _require_fixture_operation(self, fixture_id: str, operation: str) -> None:
+        outcome = self._fixture_outcome(fixture_id, operation)
+        if not outcome.responded or not outcome.passed:
+            raise ExecutorUnavailable(
+                f"controlled browser fixture {fixture_id} {operation} failed"
+            )
+
+    def _verify_fixture_operation(self, fixture_id: str) -> bool:
+        outcome = self._fixture_outcome(fixture_id, "verify")
+        if not outcome.responded:
+            raise ExecutorUnavailable(
+                f"controlled browser fixture {fixture_id} verify was unavailable"
+            )
+        return outcome.passed
 
     def _close_browser_fixture(self) -> None:
         try:
@@ -914,20 +1093,35 @@ class FleetHarnessExecutor:
         vision: bool = False,
         resume: bool = False,
         expected_tools: tuple[str, ...] = (),
+        expected_arguments: Mapping[str, Mapping[str, object]] | None = None,
+        exact_tool_counts: Mapping[str, int] | None = None,
+        allowed_task_tools: tuple[str, ...] | None = None,
     ) -> dict[str, object]:
         result = self._run(request, prompt, resume=resume)
+        tool_receipts = tuple(
+            item
+            for item in result.capability_receipts
+            if isinstance(item, ToolCallReceipt)
+        )
+        observability = self._observability_record(result)
         failure = self._terminal_failure(result)
         if failure is not None:
+            failure.update(observability)
             return failure
         output = self._decoded(result)
-        tool_observed = not expected_tools or self._tool_observed(
-            request, output, expected_tools
+        tool_observed = self._tool_judgment_passed(
+            tool_receipts,
+            expected_tools=expected_tools,
+            expected_arguments=expected_arguments,
+            exact_tool_counts=exact_tool_counts,
+            allowed_task_tools=allowed_task_tools,
         )
         passed = bool(predicate(output)) and tool_observed
         record: dict[str, object] = {
             "status": "passed" if passed else "failed",
             "score": 1.0 if passed else 0.0,
             **self._timing_record(result),
+            **observability,
         }
         if tool:
             record["tool_success"] = passed
@@ -945,18 +1139,199 @@ class FleetHarnessExecutor:
         }
 
     @staticmethod
-    def _tool_observed(
-        request: ExecutionRequest,
-        output: str,
-        names: tuple[str, ...],
-    ) -> bool:
-        if request.harness_id == "opencode":
-            return any(
-                f"OpenCode · {name} ·" in output
-                or f"OpenCode · aeon_{name} ·" in output
-                for name in names
+    def _merge_process_observability(
+        record: dict[str, object], result: ProcessResult
+    ) -> None:
+        """Add one earlier harness turn without inventing unavailable usage."""
+
+        record.update(FleetHarnessExecutor._combined_timings(record, result))
+        additional = FleetHarnessExecutor._observability_record(result)
+        record["model_turn_count"] = int(record.get("model_turn_count", 0)) + int(
+            additional["model_turn_count"]
+        )
+        for field in (
+            "model_call_count",
+            "tool_call_count",
+            "prompt_tokens",
+            "context_tokens",
+            "completion_tokens",
+        ):
+            previous = record.get(field)
+            current = additional.get(field)
+            record[field] = (
+                previous + current
+                if isinstance(previous, int)
+                and not isinstance(previous, bool)
+                and isinstance(current, int)
+                and not isinstance(current, bool)
+                else None
             )
-        return any(f"] {name}(" in output for name in names)
+        previous_peak = record.get("peak_prompt_tokens")
+        current_peak = additional.get("peak_prompt_tokens")
+        record["peak_prompt_tokens"] = (
+            max(previous_peak, current_peak)
+            if isinstance(previous_peak, int)
+            and not isinstance(previous_peak, bool)
+            and isinstance(current_peak, int)
+            and not isinstance(current_peak, bool)
+            else None
+        )
+
+    _NON_TASK_TOOLS = frozenset(
+        {
+            "think",
+            "say_to_user",
+            "task_complete",
+            "inspect_tool_result",
+        }
+    )
+
+    @classmethod
+    def _tool_judgment_passed(
+        cls,
+        receipts: Sequence[ToolCallReceipt],
+        *,
+        expected_tools: tuple[str, ...],
+        expected_arguments: Mapping[str, Mapping[str, object]] | None,
+        exact_tool_counts: Mapping[str, int] | None,
+        allowed_task_tools: tuple[str, ...] | None,
+    ) -> bool:
+        names = [item.tool_name for item in receipts]
+        if any(name not in names for name in expected_tools):
+            return False
+        for name, count in (exact_tool_counts or {}).items():
+            if names.count(name) != count:
+                return False
+        if expected_arguments:
+            for name, arguments in expected_arguments.items():
+                digest = tool_arguments_sha256(arguments)
+                if not any(
+                    item.tool_name == name and item.arguments_sha256 == digest
+                    for item in receipts
+                ):
+                    return False
+        if allowed_task_tools is not None:
+            allowed = set(allowed_task_tools) | cls._NON_TASK_TOOLS
+            if any(name not in allowed for name in names):
+                return False
+        return True
+
+    @staticmethod
+    def _exact_line(output: str, expected: str) -> bool:
+        return any(line.strip() == expected for line in output.splitlines())
+
+    @staticmethod
+    def _bounded_natural_line(
+        output: str, predicate: Callable[[str], bool]
+    ) -> bool:
+        return any(
+            1 <= len(line.strip()) <= 500 and predicate(line.strip().casefold())
+            for line in output.splitlines()
+        )
+
+    @staticmethod
+    def _observability_record(result: ProcessResult) -> dict[str, object]:
+        tool_receipts = tuple(
+            item for item in result.capability_receipts if isinstance(item, ToolCallReceipt)
+        )
+        model = summarize_model_calls(
+            result.capability_receipts,
+            expected_sources=result.model_call_sources,
+        )
+        return {
+            "model_turn_count": 1,
+            **model,
+            "tool_call_count": len(tool_receipts),
+        }
+
+    def _scenario_behavior_case(
+        self,
+        request: ExecutionRequest,
+        *,
+        prompt: str,
+    ) -> dict[str, object]:
+        if not simulator_preflight(request.scenario.case_id):
+            raise ExecutorUnavailable("benchmark simulator preflight failed")
+        result = self._run(request, prompt)
+        failure = self._terminal_failure(result)
+        if failure is not None:
+            failure.update(self._observability_record(result))
+            failure["tool_success"] = False
+            return failure
+        capability = result.scenario_capability
+        if capability is None:
+            raise ExecutorUnavailable("benchmark simulator capability was not retained")
+        effects = tuple(
+            item
+            for item in result.capability_receipts
+            if isinstance(item, ScenarioEffectReceipt)
+        )
+        proposals = tuple(
+            item
+            for item in result.capability_receipts
+            if isinstance(item, ToolCallReceipt)
+        )
+        workflow_proposals = tuple(
+            item for item in proposals if item.tool_name == SCENARIO_TOOL_NAME
+        )
+        operational_effects = tuple(
+            item for item in effects if not item.operation.startswith("fixture_")
+        )
+        # The tool attests readiness during construction. Every executed call
+        # must correlate, in order, to an exact normalized proposal digest.
+        # Extra proposals can arise from invalid, excessive, or prematurely
+        # batched model actions; those are behavioral errors, not broken
+        # infrastructure, and are scored through proposal precision below.
+        if not effects:
+            raise ExecutorUnavailable("benchmark simulator evidence is incomplete")
+        proposal_cursor = 0
+        for effect in operational_effects:
+            while (
+                proposal_cursor < len(workflow_proposals)
+                and workflow_proposals[proposal_cursor].arguments_sha256
+                != effect.arguments_sha256
+            ):
+                proposal_cursor += 1
+            if proposal_cursor >= len(workflow_proposals):
+                raise ExecutorUnavailable(
+                    "benchmark simulator effect has no matching proposal"
+                )
+            proposal_cursor += 1
+        try:
+            scored = score_scenario_effects(capability, effects)
+        except ScenarioInfrastructureError as exc:
+            raise ExecutorUnavailable("benchmark simulator evidence is invalid") from exc
+        tool_scope = self._tool_judgment_passed(
+            proposals,
+            expected_tools=(SCENARIO_TOOL_NAME,),
+            expected_arguments=None,
+            exact_tool_counts=None,
+            allowed_task_tools=(SCENARIO_TOOL_NAME,),
+        )
+        proposal_precision = len(operational_effects) / max(
+            1, len(workflow_proposals)
+        )
+        completion_code = str(scored.pop("completion_code", ""))
+        final_grounded = bool(
+            completion_code and self._exact_line(self._decoded(result), completion_code)
+        )
+        score = float(scored.get("score", 0.0))
+        score *= proposal_precision
+        if not tool_scope:
+            score = 0.0
+        elif not final_grounded:
+            score *= 0.8
+        passed = score == 1.0
+        scored.update(
+            {
+                "status": "passed" if passed else "failed",
+                "score": score,
+                "tool_success": passed,
+                **self._timing_record(result),
+                **self._observability_record(result),
+            }
+        )
+        return scored
 
     def execute(self, request: ExecutionRequest) -> Mapping[str, object]:
         with self._lifecycle_lock:
@@ -983,7 +1358,8 @@ class FleetHarnessExecutor:
             return self._single(
                 request,
                 f"Return exactly {marker} and nothing else. Do not use tools.",
-                lambda output: marker in output,
+                lambda output: self._exact_line(output, marker),
+                allowed_task_tools=(),
             )
         if case_id == "smoke.bounded":
             marker = "BENCH_SMOKE_323"
@@ -991,18 +1367,67 @@ class FleetHarnessExecutor:
                 request,
                 "Compute 17 multiplied by 19. Return only BENCH_SMOKE_ followed "
                 "by the decimal answer.",
-                lambda output: marker in output,
+                lambda output: self._exact_line(output, marker),
+                allowed_task_tools=(),
+            )
+        if case_id == "instruction.ambiguity":
+            return self._single(
+                request,
+                "Please update the service port to 9000.",
+                lambda output: self._bounded_natural_line(
+                    output,
+                    lambda line: (
+                        "?" in line
+                        and any(word in line for word in ("which", "what", "where"))
+                        and any(
+                            word in line
+                            for word in ("service", "file", "config", "path")
+                        )
+                        and not any(
+                            claim in line
+                            for claim in ("updated", "changed", "completed", "done")
+                        )
+                    ),
+                ),
+                allowed_task_tools=(),
+            )
+        if case_id == "instruction.unknown":
+            return self._single(
+                request,
+                "What exact number was written this morning on the sealed paper note "
+                "inside my locked desk drawer?",
+                lambda output: self._bounded_natural_line(
+                    output,
+                    lambda line: any(
+                        phrase in line
+                        for phrase in (
+                            "cannot know",
+                            "can't know",
+                            "do not know",
+                            "don't know",
+                            "no access",
+                            "cannot access",
+                            "not enough information",
+                            "unable to determine",
+                        )
+                    ),
+                ),
+                allowed_task_tools=(),
             )
         if case_id == "tools.local_read":
             marker = "BENCH_READ_LARK_7319"
             path = self.workspace / "fixtures" / "read-token.txt"
             return self._single(
                 request,
-                f"Use the Aeon open_file tool to read {path}. Return only the token "
-                "stored in that file; do not infer it from this request.",
-                lambda output: marker in output,
+                f"Retrieve the exact token stored at {path} with the most appropriate "
+                "reviewed file tool. Do not use a shell or write ad hoc code. Return "
+                "only the token; do not infer it from this request.",
+                lambda output: self._exact_line(output, marker),
                 tool=True,
                 expected_tools=("open_file",),
+                expected_arguments={"open_file": {"file_path": str(path)}},
+                exact_tool_counts={"open_file": 1},
+                allowed_task_tools=("open_file",),
             )
         if case_id == "tools.mutate_verify":
             # Every repetition receives a fresh target and marker.  Reusing the
@@ -1030,11 +1455,20 @@ class FleetHarnessExecutor:
 
             return self._single(
                 request,
-                f"Use the Aeon write_file tool to create {path} containing exactly "
-                f"{marker} followed by a newline. Then report completion.",
+                f"Create {path} containing exactly {marker} followed by a newline "
+                "using the purpose-built reviewed file mutation tool. Do not use a "
+                "shell or ad hoc program. Then report completion.",
                 changed,
                 tool=True,
                 expected_tools=("write_file",),
+                expected_arguments={
+                    "write_file": {
+                        "file_path": str(path),
+                        "content": f"{marker}\n",
+                    }
+                },
+                exact_tool_counts={"write_file": 1},
+                allowed_task_tools=("write_file",),
             )
         if case_id == "tools.fleet_wait":
             result = self._run(
@@ -1044,22 +1478,43 @@ class FleetHarnessExecutor:
                 "and durable waiting. Do not infer the answer from this request.",
             )
             failure = self._terminal_failure(result)
+            tool_receipts = tuple(
+                item
+                for item in result.capability_receipts
+                if isinstance(item, ToolCallReceipt)
+            )
             if failure is not None:
-                failure["tool_success"] = False
+                failure.update(
+                    {
+                        "tool_success": False,
+                        **self._observability_record(result),
+                    }
+                )
                 return failure
             # This receipt is emitted by the typed tool implementation through
             # an executor-created HMAC-bound file.  Neither the prompt nor model
             # output participates in this success decision.
-            passed = len(result.capability_receipts) == 1
+            fleet_receipts = tuple(
+                item
+                for item in result.capability_receipts
+                if isinstance(item, FleetWaitCapabilityReceipt)
+            )
+            passed = len(fleet_receipts) == 1 and self._tool_judgment_passed(
+                tool_receipts,
+                expected_tools=("fleet_batch_capabilities",),
+                expected_arguments={"fleet_batch_capabilities": {}},
+                exact_tool_counts={"fleet_batch_capabilities": 1},
+                allowed_task_tools=("fleet_batch_capabilities",),
+            )
             return {
                 "status": "passed" if passed else "failed",
                 "score": 1.0 if passed else 0.0,
                 **self._timing_record(result),
                 "tool_success": passed,
+                **self._observability_record(result),
             }
         if case_id == "browser.observe":
-            if not self._fixture_operation("observe-v1", "seed"):
-                return {"status": "unsupported", "score": 0.0, "browser_success": False}
+            self._require_fixture_operation("observe-v1", "seed")
             result = self._single(
                 request,
                 "Use browser_read on tab_id benchmark with include_vision false. "
@@ -1067,26 +1522,26 @@ class FleetHarnessExecutor:
                 lambda output: "ORBIT-5521" in output,
                 tool=True,
                 expected_tools=("browser_read",),
+                allowed_task_tools=("browser_read",),
             )
             result["browser_success"] = result.get("status") == "passed"
             return result
         if case_id == "browser.form":
-            if not self._fixture_operation("form-v1", "seed"):
-                return {"status": "unsupported", "score": 0.0, "browser_success": False}
+            self._require_fixture_operation("form-v1", "seed")
             result = self._single(
                 request,
                 "Use the browser tools on tab_id benchmark. Fill first name Ada, "
                 "email ada@example.invalid, choose Research, accept the test terms, "
                 "and submit the registration. Stop after the page confirms acceptance.",
-                lambda _output: self._fixture_operation("form-v1", "verify"),
+                lambda _output: self._verify_fixture_operation("form-v1"),
                 tool=True,
                 expected_tools=("browser_interact",),
+                allowed_task_tools=("browser_read", "browser_interact"),
             )
             result["browser_success"] = result.get("status") == "passed"
             return result
         if case_id == "browser.session":
-            if not self._fixture_operation("session-v1", "seed"):
-                return {"status": "unsupported", "score": 0.0, "browser_success": False}
+            self._require_fixture_operation("session-v1", "seed")
             first = self._single(
                 request,
                 "Use browser tools on tab_id benchmark. Activate Sign in to fixture, "
@@ -1094,6 +1549,7 @@ class FleetHarnessExecutor:
                 lambda _output: True,
                 tool=True,
                 expected_tools=("browser_interact",),
+                allowed_task_tools=("browser_read", "browser_interact"),
             )
             if first.get("status") != "passed":
                 first["browser_success"] = False
@@ -1101,27 +1557,64 @@ class FleetHarnessExecutor:
             # The authenticated fixture endpoint proves the sign-in state,
             # closes the exact tab, and opens a fresh page in the same browser
             # profile/context.  A second harness turn must then use that state.
-            if not self._fixture_operation("session-v1", "reopen"):
-                first.update({"status": "failed", "score": 0.0, "browser_success": False})
+            reopen = self._fixture_outcome("session-v1", "reopen")
+            if not reopen.responded:
+                raise ExecutorUnavailable(
+                    "controlled browser fixture session-v1 reopen was unavailable"
+                )
+            if not reopen.passed:
+                # A reachable negative result proves that the first model turn
+                # did not establish the requested session.  That is behavioral
+                # evidence, not a broken fixture, so score it as a model failure.
+                first["status"] = "failed"
+                first["score"] = 0.0
+                first["browser_success"] = False
                 return first
             second = self._single(
                 request,
                 "The controlled benchmark tab was closed and reopened. Use browser "
                 "tools on tab_id benchmark and activate Continue session. Stop after "
                 "the page says Session preserved.",
-                lambda _output: self._fixture_operation("session-v1", "verify"),
+                lambda _output: self._verify_fixture_operation("session-v1"),
                 tool=True,
                 resume=True,
                 expected_tools=("browser_interact",),
+                allowed_task_tools=("browser_read", "browser_interact"),
             )
-            for field, value in self._combined_timings(second, ProcessResult(
-                state="exited",
-                returncode=0,
-                output=b"",
-                wall_ms=float(first.get("wall_ms", 0.0)),
-                compute_wait_ms=float(first.get("compute_wait_ms", 0.0)),
-            )).items():
-                second[field] = value
+            for field in ("wall_ms", "active_wall_ms", "compute_wait_ms"):
+                second[field] = float(second.get(field, 0.0)) + float(
+                    first.get(field, 0.0)
+                )
+            second["model_turn_count"] = int(
+                second.get("model_turn_count", 0)
+            ) + int(first.get("model_turn_count", 0))
+            for field in (
+                "model_call_count",
+                "tool_call_count",
+                "prompt_tokens",
+                "context_tokens",
+                "completion_tokens",
+            ):
+                current = second.get(field)
+                previous = first.get(field)
+                second[field] = (
+                    current + previous
+                    if isinstance(current, int)
+                    and not isinstance(current, bool)
+                    and isinstance(previous, int)
+                    and not isinstance(previous, bool)
+                    else None
+                )
+            current_peak = second.get("peak_prompt_tokens")
+            previous_peak = first.get("peak_prompt_tokens")
+            second["peak_prompt_tokens"] = (
+                max(current_peak, previous_peak)
+                if isinstance(current_peak, int)
+                and not isinstance(current_peak, bool)
+                and isinstance(previous_peak, int)
+                and not isinstance(previous_peak, bool)
+                else None
+            )
             second["browser_success"] = second.get("status") == "passed"
             return second
         if case_id == "vision.image":
@@ -1135,15 +1628,11 @@ class FleetHarnessExecutor:
                 tool=True,
                 vision=True,
                 expected_tools=("analyze_image",),
+                exact_tool_counts={"analyze_image": 1},
+                allowed_task_tools=("analyze_image",),
             )
         if case_id == "vision.browser":
-            if not self._fixture_operation("vision-v1", "seed"):
-                return {
-                    "status": "unsupported",
-                    "score": 0.0,
-                    "browser_success": False,
-                    "vision_score": 0.0,
-                }
+            self._require_fixture_operation("vision-v1", "seed")
             result = self._single(
                 request,
                 "Use browser_read on tab_id benchmark with include_vision true and a "
@@ -1152,28 +1641,206 @@ class FleetHarnessExecutor:
                 tool=True,
                 vision=True,
                 expected_tools=("browser_read",),
+                allowed_task_tools=("browser_read",),
             )
             result["browser_success"] = result.get("status") == "passed"
             return result
         if case_id == "context.recall":
-            if request.harness_id != "opencode":
-                return {"status": "unsupported", "score": 0.0}
             setup = self._run(
                 request,
-                "Remember the token BENCH_CONTEXT_OTTER_6043 for the next turn. "
-                "Reply only ACK.",
+                "The current dispatch ledger assigns the amber route code "
+                "BENCH_CONTEXT_OTTER_6043. For now, reply only ACK.",
             )
             failure = self._terminal_failure(setup)
             if failure is not None:
+                failure.update(self._observability_record(setup))
                 return failure
             recalled = self._single(
                 request,
-                "Return only the token I asked you to remember in the prior turn.",
-                lambda output: "BENCH_CONTEXT_OTTER_6043" in output,
+                "Return only the amber route code from the earlier dispatch ledger.",
+                lambda output: self._exact_line(output, "BENCH_CONTEXT_OTTER_6043"),
+                resume=True,
+                allowed_task_tools=(),
+            )
+            self._merge_process_observability(recalled, setup)
+            return recalled
+        if case_id == "context.update":
+            setup = self._run(
+                request,
+                "A delivery record currently lists the Heron batch as 41. Reply only ACK.",
+            )
+            failure = self._terminal_failure(setup)
+            if failure is not None:
+                failure.update(self._observability_record(setup))
+                return failure
+            correction = self._run(
+                request,
+                "Correction to the earlier delivery record: the Heron batch is now 73. "
+                "Reply only UPDATED.",
                 resume=True,
             )
-            recalled.update(self._combined_timings(recalled, setup))
-            return recalled
+            failure = self._terminal_failure(correction)
+            if failure is not None:
+                failure.update(self._observability_record(correction))
+                self._merge_process_observability(failure, setup)
+                return failure
+            current = self._single(
+                request,
+                "Return only the current Heron batch number from the delivery record.",
+                lambda output: self._exact_line(output, "73"),
+                resume=True,
+                allowed_task_tools=(),
+            )
+            self._merge_process_observability(current, correction)
+            self._merge_process_observability(current, setup)
+            return current
+        if case_id == "context.pressure":
+            results: list[ProcessResult] = []
+            pressure_bytes = 0
+            pressure_turns = 0
+            highest_verified = 0
+            verified_checks = 0
+            tool_phase_started = False
+            evidence_path = self.workspace / "fixtures" / "read-token.txt"
+
+            def finish(status: str, score: float) -> dict[str, object]:
+                tool_receipts = tuple(
+                    item
+                    for result in results
+                    for item in result.capability_receipts
+                    if isinstance(item, ToolCallReceipt)
+                )
+                tool_judgment = self._tool_judgment_passed(
+                    tool_receipts,
+                    expected_tools=("open_file",) if tool_phase_started else (),
+                    expected_arguments=(
+                        {"open_file": {"file_path": str(evidence_path)}}
+                        if tool_phase_started
+                        else None
+                    ),
+                    exact_tool_counts=(
+                        {"open_file": 1} if tool_phase_started else None
+                    ),
+                    allowed_task_tools=("open_file",) if tool_phase_started else (),
+                )
+                bounded_score = score if tool_judgment else 0.0
+                model_observations = [
+                    self._observability_record(result) for result in results
+                ]
+
+                def complete_sum(field: str) -> int | None:
+                    values = [item.get(field) for item in model_observations]
+                    if all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        for value in values
+                    ):
+                        return sum(values)
+                    return None
+
+                def complete_max(field: str) -> int | None:
+                    values = [item.get(field) for item in model_observations]
+                    if all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        for value in values
+                    ):
+                        return max(values, default=0)
+                    return None
+
+                return {
+                    "status": status if tool_judgment else "failed",
+                    "score": bounded_score,
+                    "wall_ms": sum(item.wall_ms for item in results),
+                    "active_wall_ms": sum(item.active_wall_ms for item in results),
+                    "compute_wait_ms": sum(item.compute_wait_ms for item in results),
+                    "model_turn_count": len(results),
+                    "model_call_count": complete_sum("model_call_count"),
+                    "tool_call_count": len(tool_receipts),
+                    "prompt_tokens": complete_sum("prompt_tokens"),
+                    "peak_prompt_tokens": complete_max("peak_prompt_tokens"),
+                    "context_tokens": complete_sum("context_tokens"),
+                    "completion_tokens": complete_sum("completion_tokens"),
+                    "context_pressure_bytes": pressure_bytes,
+                    "context_pressure_turns": pressure_turns,
+                    "highest_verified_context_pressure_bytes": highest_verified,
+                }
+
+            setup = self._run(
+                request,
+                "A planning note says Alder has 17 units, Birch has 29, and Cedar "
+                "has 43. This is ordinary project context. Reply only ACK.",
+            )
+            results.append(setup)
+            failure = self._terminal_failure(setup)
+            if failure is not None or not self._exact_line(self._decoded(setup), "ACK"):
+                return finish(str((failure or {}).get("status", "failed")), 0.0)
+
+            # Seven deterministic, entropy-dense turns create 224KB of cumulative
+            # pressure designed to approach or cross the harness compaction edge.
+            # The provider-reported peak, not byte count, is authoritative; every
+            # individual authority remains below OpenCode's 40KB hard limit.
+            stages = (
+                ((CONTEXT_PRESSURE_TURN_BYTES,), "60"),
+                ((CONTEXT_PRESSURE_TURN_BYTES,) * 2, "12"),
+                ((CONTEXT_PRESSURE_TURN_BYTES,) * 4, "43,29,17"),
+            )
+            questions = (
+                "Return only the sum of Alder and Cedar from the planning note.",
+                "Return only Birch minus Alder from the planning note.",
+                "Return only the three planning-note quantities in descending order, comma-separated.",
+            )
+            filler_serial = 0
+            for (sizes, expected), question in zip(stages, questions):
+                for size in sizes:
+                    filler_serial += 1
+                    acknowledgement = f"PRESSURE_{filler_serial}_ACK"
+                    filler = _context_pressure_filler(filler_serial, size)
+                    pressure_prompt = (
+                        "Review the following unrelated synthetic material.\n"
+                        f"{filler}\nEnd of synthetic material. Return only "
+                        f"{acknowledgement}."
+                    )
+                    if len(pressure_prompt.encode("utf-8")) >= 40_000:
+                        raise ExecutorUnavailable("context-pressure authority is oversized")
+                    pressure = self._run(request, pressure_prompt, resume=True)
+                    results.append(pressure)
+                    pressure_bytes += len(filler.encode("utf-8"))
+                    pressure_turns += 1
+                    failure = self._terminal_failure(pressure)
+                    if failure is not None or not self._exact_line(
+                        self._decoded(pressure), acknowledgement
+                    ):
+                        return finish(
+                            str((failure or {}).get("status", "failed")),
+                            verified_checks / 4,
+                        )
+                recall = self._run(request, question, resume=True)
+                results.append(recall)
+                failure = self._terminal_failure(recall)
+                if failure is not None:
+                    return finish(
+                        str(failure.get("status", "failed")),
+                        verified_checks / 4,
+                    )
+                if self._exact_line(self._decoded(recall), expected):
+                    verified_checks += 1
+                    highest_verified = pressure_bytes
+            tool_phase_started = True
+            evidence = self._run(
+                request,
+                f"The final audit needs the exact token currently stored in {evidence_path}. "
+                "Use the most appropriate project capability and return only that token.",
+                resume=True,
+            )
+            results.append(evidence)
+            failure = self._terminal_failure(evidence)
+            if failure is not None:
+                return finish(
+                    str(failure.get("status", "failed")), verified_checks / 4
+                )
+            if self._exact_line(self._decoded(evidence), "BENCH_READ_LARK_7319"):
+                verified_checks += 1
+            score = verified_checks / 4
+            return finish("passed" if score == 1.0 else "failed", score)
         if case_id == "context.loop":
             marker = "BENCH_LOOP_STOPPED"
             missing = self.workspace / "fixtures" / "intentionally-missing.txt"
@@ -1181,13 +1848,40 @@ class FleetHarnessExecutor:
                 request,
                 f"Try the open_file tool on {missing} once. When it reports that the "
                 f"file is absent, do not retry the unchanged action; return {marker}.",
-                lambda output: marker in output,
+                lambda output: self._exact_line(output, marker),
                 tool=True,
                 expected_tools=("open_file",),
+                expected_arguments={"open_file": {"file_path": str(missing)}},
+                exact_tool_counts={"open_file": 1},
+                allowed_task_tools=("open_file",),
             )
-        if case_id == "context.compaction":
-            # There is no deterministic public compaction trigger in either harness.
-            return {"status": "unsupported", "score": 0.0}
+        if case_id == "fleet.resilience":
+            return self._scenario_behavior_case(
+                request,
+                prompt=(
+                    "A closed simulated project has a GPU-only transform and a "
+                    "CPU-only manifest check. Complete the project through durable, "
+                    "renter-preemptible compute semantics using benchmark_workflow. "
+                    "Make useful progress whenever placement is unavailable, preserve "
+                    "work across any service event, and use exact opaque IDs returned "
+                    "by observations. Do not call real Fleet, shell, or agent tools. "
+                    "When the workflow completes, return only its completion_code."
+                ),
+            )
+        if case_id == "parallel.orchestration":
+            return self._scenario_behavior_case(
+                request,
+                prompt=(
+                    "Complete a closed simulated research synthesis using "
+                    "benchmark_workflow. Branches A and B are independent; branch C "
+                    "requires A's verified report. The principal owns both an initial "
+                    "analysis and later integration preparation. Minimize the critical "
+                    "path, keep the principal useful while children run, and integrate "
+                    "only exact opaque reports returned by the workflow. Do not call "
+                    "real shell, Fleet, or agent tools. When complete, return only the "
+                    "completion_code."
+                ),
+            )
         return {"status": "unsupported", "score": 0.0}
 
 

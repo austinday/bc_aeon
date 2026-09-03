@@ -13,6 +13,12 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from aeon.core.benchmark_model_telemetry import ResponseUsageCapture
+from aeon.core.benchmark_receipt import (
+    begin_model_call,
+    benchmark_trace_requested,
+    finish_model_call,
+)
 from aeon.core.fleet_backend import FleetBackendError, validate_loopback_endpoint
 from aeon.core.model_identity import wire_model_for_runtime_profiles
 
@@ -235,15 +241,41 @@ class FleetModelProxy:
                 except (FleetBackendError, ValueError, RuntimeError):
                     self._json_error(503, "Fleet model is not ready")
                     return
+                if benchmark_trace_requested() and document.get("stream") is True:
+                    raw_stream_options = document.get("stream_options")
+                    if raw_stream_options is None:
+                        stream_options: dict[str, object] = {}
+                    elif isinstance(raw_stream_options, dict):
+                        stream_options = dict(raw_stream_options)
+                    else:
+                        self._json_error(400, "Model stream_options must be an object")
+                        return
+                    # The reviewed local vLLM endpoint supports per-request final
+                    # usage. This benchmark-only request mutation makes exact token
+                    # evidence available without altering ordinary OpenCode runs.
+                    stream_options["include_usage"] = True
+                    document["stream_options"] = stream_options
                 document["model"] = model
                 body = json.dumps(document, separators=(",", ":")).encode("utf-8")
+                if len(body) > MAX_REQUEST_BYTES:
+                    self._json_error(
+                        413, "Local model request exceeds its size limit after routing"
+                    )
+                    return
                 connection: http.client.HTTPConnection | None = None
                 response: http.client.HTTPResponse | None = None
                 upstream_socket: socket.socket | None = None
                 downstream_started = False
+                model_call = None
+                model_call_outcome = "transport_error"
+                model_call_usage = None
                 try:
                     connection, route = owner._upstream_connection(endpoint)
                     owner._track_connection(connection)
+                    # Only POSTs that reach the reviewed generation transport are
+                    # counted. GET /models readiness and the pre-proxy vision
+                    # self-test never cross this boundary.
+                    model_call = begin_model_call("opencode_proxy")
                     connection.request(
                         "POST",
                         route,
@@ -263,6 +295,7 @@ class FleetModelProxy:
                     owner._track_response(response)
                     upstream_socket.settimeout(600)
                     if 300 <= response.status < 400:
+                        model_call_outcome = "http_error"
                         self._json_error(502, "Fleet model attempted a redirect")
                         return
                     response_limit = (
@@ -275,9 +308,11 @@ class FleetModelProxy:
                         try:
                             declared_length = int(content_length)
                         except ValueError:
+                            model_call_outcome = "failed"
                             self._json_error(502, "Fleet model returned invalid framing")
                             return
                         if not 0 <= declared_length <= response_limit:
+                            model_call_outcome = "failed"
                             self._json_error(502, "Fleet model response exceeded its size limit")
                             return
                     self.send_response(response.status)
@@ -289,23 +324,36 @@ class FleetModelProxy:
                         if upstream_type.startswith("text/event-stream")
                         else "application/json"
                     )
+                    usage_capture = ResponseUsageCapture(content_type)
                     self.send_header("Content-Type", content_type[:200])
                     self.send_header("Cache-Control", "no-store")
                     self.send_header("Connection", "close")
                     self.end_headers()
                     downstream_started = True
                     sent = 0
+                    response_complete = False
                     while True:
                         chunk = response.read(64 * 1024)
                         if not chunk:
+                            response_complete = True
                             break
                         remaining = response_limit - sent
                         if remaining <= 0:
                             break
-                        chunk = chunk[:remaining]
-                        self.wfile.write(chunk)
+                        forwarded = chunk[:remaining]
+                        usage_capture.feed(forwarded)
+                        self.wfile.write(forwarded)
                         self.wfile.flush()
-                        sent += len(chunk)
+                        sent += len(forwarded)
+                        if len(forwarded) != len(chunk):
+                            break
+                    if 200 <= response.status < 300 and response_complete:
+                        model_call_outcome = "succeeded"
+                        model_call_usage = usage_capture.finish()
+                    elif response.status >= 400:
+                        model_call_outcome = "http_error"
+                    else:
+                        model_call_outcome = "failed"
                     self.close_connection = True
                 except (
                     BrokenPipeError,
@@ -322,6 +370,25 @@ class FleetModelProxy:
                         except (BrokenPipeError, ConnectionResetError, OSError):
                             self.close_connection = True
                 finally:
+                    finish_model_call(
+                        model_call,
+                        outcome=model_call_outcome,
+                        prompt_tokens=(
+                            model_call_usage.prompt_tokens
+                            if model_call_usage is not None
+                            else None
+                        ),
+                        completion_tokens=(
+                            model_call_usage.completion_tokens
+                            if model_call_usage is not None
+                            else None
+                        ),
+                        total_tokens=(
+                            model_call_usage.total_tokens
+                            if model_call_usage is not None
+                            else None
+                        ),
+                    )
                     owner._untrack_upstream(connection, response, upstream_socket)
                     if response is not None:
                         response.close()

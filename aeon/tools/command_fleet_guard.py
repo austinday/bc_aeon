@@ -806,6 +806,7 @@ def _protected_environment_name(name: str) -> bool:
         or upper.startswith("NVIDIA_")
         or upper.startswith("FLEET_")
         or upper.startswith("AEON_FLEET_")
+        or upper.startswith("AEON_BENCHMARK_")
         or (upper.startswith("SLURM_") and "GPU" in upper)
         or (
             upper.startswith(("AEON_", "GPU_", "QWEN_"))

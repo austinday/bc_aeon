@@ -11,7 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from aeon.harnesses.catalog import OPENCODE_VERSION, public_harness_catalog
 
@@ -25,9 +25,12 @@ from .protocol import (
 
 
 BENCHMARK_SCHEMA_VERSION = 1
-BENCHMARK_CATALOG_VERSION = "2026-09-02.7"
-RUNNER_PROTOCOL_VERSION = "5"
-DEFAULT_SUITE_ID = "smoke"
+BENCHMARK_CATALOG_VERSION = "2026-09-03.4"
+RUNNER_PROTOCOL_VERSION = "7"
+# ``suite_id`` remains in durable rows and requests so existing records and API
+# clients keep a stable shape.  There is now exactly one benchmark a user can
+# start, however, and callers may omit the field entirely.
+DEFAULT_SUITE_ID = "comprehensive"
 DEFAULT_MODEL_ID = "local/qwen"
 DEFAULT_TOOL_PROFILE_ID = "fleet-local"
 
@@ -49,6 +52,9 @@ class ScenarioSpec:
     category: str
     timeout_seconds: int
     required_capabilities: tuple[str, ...] = ()
+    component_id: str = "instruction_following"
+    case_weight: float = 1.0
+    target_active_seconds: int = 30
 
     def provenance_record(self) -> dict[str, object]:
         return {
@@ -57,6 +63,9 @@ class ScenarioSpec:
             "category": self.category,
             "timeout_seconds": self.timeout_seconds,
             "required_capabilities": list(self.required_capabilities),
+            "component_id": self.component_id,
+            "case_weight": self.case_weight,
+            "target_active_seconds": self.target_active_seconds,
         }
 
 
@@ -68,6 +77,7 @@ class SuiteSpec:
     version: str
     cases: tuple[ScenarioSpec, ...]
     default_tool_profile_id: str = DEFAULT_TOOL_PROFILE_ID
+    accepts_new_submissions: bool = False
 
     @property
     def required_capabilities(self) -> tuple[str, ...]:
@@ -93,9 +103,26 @@ class SuiteSpec:
                 "description": self.description,
                 "version": self.version,
                 "default_tool_profile_id": self.default_tool_profile_id,
+                "accepts_new_submissions": self.accepts_new_submissions,
                 "cases": [case.provenance_record() for case in self.cases],
             }
         )
+
+
+@dataclass(frozen=True)
+class ComponentSpec:
+    component_id: str
+    label: str
+    description: str
+    weight: float
+
+    def public_record(self) -> dict[str, object]:
+        return {
+            "id": self.component_id,
+            "label": self.label,
+            "description": self.description,
+            "weight": self.weight,
+        }
 
 
 @dataclass(frozen=True)
@@ -165,52 +192,232 @@ class CombinationSpec:
         }
 
 
+COMPONENTS: tuple[ComponentSpec, ...] = (
+    ComponentSpec(
+        "instruction_following",
+        "Instruction following",
+        "Follows exact output and constraint instructions without unnecessary actions.",
+        0.20,
+    ),
+    ComponentSpec(
+        "memory_context",
+        "Memory and context",
+        "Retains, updates, and applies information across bounded turns.",
+        0.20,
+    ),
+    ComponentSpec(
+        "tool_judgment",
+        "Tool-call judgment",
+        "Chooses the right reviewed tool, supplies task-relevant inputs, and avoids redundant calls.",
+        0.20,
+    ),
+    ComponentSpec(
+        "web_vision",
+        "Web and visual reasoning",
+        "Selects browser or vision capabilities when needed and grounds actions in observations.",
+        0.10,
+    ),
+    ComponentSpec(
+        "fleet_resilience",
+        "Fleet resilience",
+        "Uses durable demand, useful wait work, checkpoints, and same-job recovery without polling or warm reservation.",
+        0.10,
+    ),
+    ComponentSpec(
+        "parallel_execution",
+        "Parallel orchestration",
+        "Schedules independent and dependent work with useful principal overlap and verifies integrated results.",
+        0.10,
+    ),
+    ComponentSpec(
+        "reliability_efficiency",
+        "Reliability and efficiency",
+        "Completes cases without stalls while using a bounded amount of active execution time.",
+        0.10,
+    ),
+)
+COMPONENT_WEIGHTS: Mapping[str, float] = MappingProxyType(
+    {component.component_id: component.weight for component in COMPONENTS}
+)
+
+
 _SMOKE_CASES = (
-    ScenarioSpec("smoke.direct", "Direct completion", "smoke", 45),
-    ScenarioSpec("smoke.bounded", "Bounded completion", "smoke", 60),
+    ScenarioSpec(
+        "smoke.direct",
+        "Follow an exact no-tool response instruction",
+        "instruction",
+        45,
+        component_id="instruction_following",
+        target_active_seconds=15,
+    ),
+    ScenarioSpec(
+        "smoke.bounded",
+        "Follow a bounded reasoning-and-format instruction",
+        "instruction",
+        60,
+        component_id="instruction_following",
+        target_active_seconds=20,
+    ),
+    ScenarioSpec(
+        "instruction.ambiguity",
+        "Ask for missing mutation details without acting",
+        "instruction",
+        60,
+        component_id="instruction_following",
+        target_active_seconds=20,
+    ),
+    ScenarioSpec(
+        "instruction.unknown",
+        "Report an unknowable value without fabrication",
+        "instruction",
+        60,
+        component_id="instruction_following",
+        target_active_seconds=20,
+    ),
 )
 _TOOL_CASES = (
     ScenarioSpec(
-        "tools.local_read", "Select and read a local artifact", "tools", 90, ("local-tools",)
+        "tools.local_read",
+        "Choose the local read tool when evidence is required",
+        "tool_judgment",
+        90,
+        ("local-tools",),
+        "tool_judgment",
+        1.0,
+        35,
     ),
     ScenarioSpec(
         "tools.mutate_verify",
-        "Perform and verify a sandboxed mutation",
-        "tools",
+        "Choose the mutation tool with exact task inputs",
+        "tool_judgment",
         120,
         ("local-tools",),
+        "tool_judgment",
+        1.0,
+        45,
     ),
     ScenarioSpec(
         "tools.fleet_wait",
-        "Respect durable Fleet wait semantics",
-        "tools",
+        "Choose the Fleet capability tool exactly once",
+        "tool_judgment",
         120,
         ("fleet-tools",),
+        "tool_judgment",
+        1.0,
+        35,
+    ),
+    ScenarioSpec(
+        "context.loop",
+        "Stop after one unchanged failed tool call",
+        "tool_judgment",
+        180,
+        ("local-tools",),
+        "tool_judgment",
+        1.0,
+        45,
     ),
 )
 _BROWSER_CASES = (
     ScenarioSpec(
-        "browser.observe", "Observe a controlled dynamic page", "browser", 120, ("browser",)
+        "browser.observe",
+        "Choose browser observation for page-only evidence",
+        "web_vision",
+        120,
+        ("browser",),
+        "web_vision",
+        1.0,
+        50,
     ),
     ScenarioSpec(
-        "browser.form", "Complete a controlled multi-field form", "browser", 180, ("browser",)
+        "browser.form",
+        "Translate instructions into a grounded browser workflow",
+        "web_vision",
+        180,
+        ("browser",),
+        "web_vision",
+        1.0,
+        75,
     ),
     ScenarioSpec(
-        "browser.session", "Preserve a controlled authenticated session", "browser", 180, ("browser",)
+        "browser.session",
+        "Use remembered browser state across turns",
+        "memory_context",
+        180,
+        ("browser",),
+        "memory_context",
+        1.0,
+        100,
     ),
 )
 _VISION_CASES = (
     ScenarioSpec(
-        "vision.image", "Ground an answer in a fixture image", "vision", 120, ("vision",)
+        "vision.image",
+        "Choose visual inspection and ground the answer",
+        "web_vision",
+        120,
+        ("vision",),
+        "web_vision",
+        1.0,
+        55,
     ),
     ScenarioSpec(
-        "vision.browser", "Ground browser action in a screenshot", "vision", 150, ("browser", "vision")
+        "vision.browser",
+        "Choose screenshot-aware browser reasoning",
+        "web_vision",
+        150,
+        ("browser", "vision"),
+        "web_vision",
+        1.0,
+        65,
     ),
 )
 _CONTEXT_CASES = (
-    ScenarioSpec("context.recall", "Recall an early bounded fact", "context", 180),
-    ScenarioSpec("context.compaction", "Recover after context compaction", "context", 240),
-    ScenarioSpec("context.loop", "Avoid repeating an unchanged failed action", "context", 180),
+    ScenarioSpec(
+        "context.recall",
+        "Recall information across bounded turns",
+        "memory_context",
+        180,
+        component_id="memory_context",
+        target_active_seconds=80,
+    ),
+    ScenarioSpec(
+        "context.update",
+        "Prefer a later correction over stale context",
+        "memory_context",
+        240,
+        component_id="memory_context",
+        target_active_seconds=110,
+    ),
+    ScenarioSpec(
+        "context.pressure",
+        "Retain and transform implicit facts under bounded context pressure",
+        "memory_context",
+        600,
+        component_id="memory_context",
+        target_active_seconds=300,
+    ),
+)
+_ORCHESTRATION_CASES = (
+    ScenarioSpec(
+        "fleet.resilience",
+        "Preserve useful progress through queued and preempted compute",
+        "fleet_resilience",
+        180,
+        ("local-tools",),
+        "fleet_resilience",
+        1.0,
+        65,
+    ),
+    ScenarioSpec(
+        "parallel.orchestration",
+        "Orchestrate useful parallel work with a dependent branch",
+        "parallel_execution",
+        180,
+        ("local-tools",),
+        "parallel_execution",
+        1.0,
+        65,
+    ),
 )
 _COMPREHENSIVE_CASES = (
     *_SMOKE_CASES,
@@ -218,6 +425,7 @@ _COMPREHENSIVE_CASES = (
     *_BROWSER_CASES,
     *_VISION_CASES,
     *_CONTEXT_CASES,
+    *_ORCHESTRATION_CASES,
 )
 
 SUITES: Mapping[str, SuiteSpec] = MappingProxyType(
@@ -226,45 +434,46 @@ SUITES: Mapping[str, SuiteSpec] = MappingProxyType(
         for suite in (
             SuiteSpec(
                 "smoke",
-                "Smoke",
-                "Fast completion and lifecycle checks.",
+                "Legacy smoke",
+                "Historical partial benchmark; retained only to read old records.",
                 "1",
                 _SMOKE_CASES,
             ),
             SuiteSpec(
                 "tools",
-                "Local and Fleet tools",
-                "Selection, validation, mutation, and Fleet-wait behavior.",
+                "Legacy tools",
+                "Historical partial benchmark; retained only to read old records.",
                 "2",
-                _TOOL_CASES,
+                _TOOL_CASES[:3],
             ),
             SuiteSpec(
                 "browser",
-                "Browser workflows",
-                "Controlled observation, form, and session workflows.",
+                "Legacy browser",
+                "Historical partial benchmark; retained only to read old records.",
                 "2",
                 _BROWSER_CASES,
             ),
             SuiteSpec(
                 "vision",
-                "Vision",
-                "Image and browser-screenshot grounding.",
+                "Legacy vision",
+                "Historical partial benchmark; retained only to read old records.",
                 "1",
                 _VISION_CASES,
             ),
             SuiteSpec(
                 "context",
-                "Context durability",
-                "Recall, compaction recovery, and loop avoidance.",
-                "1",
+                "Legacy context",
+                "Historical partial benchmark; retained only to read old records.",
+                "2",
                 _CONTEXT_CASES,
             ),
             SuiteSpec(
                 "comprehensive",
-                "Comprehensive",
-                "All deterministic benchmark scenarios.",
-                "2",
+                "Agent capability benchmark",
+                "One complete behavioral evaluation of instruction following, memory, tool judgment, web and visual reasoning, reliability, and efficiency.",
+                "5",
                 _COMPREHENSIVE_CASES,
+                accepts_new_submissions=True,
             ),
         )
     }
@@ -329,6 +538,36 @@ def combination_for(
     return None
 
 
+def valid_combinations(
+    *,
+    harness_ids: Iterable[str] | None = None,
+    model_ids: Iterable[str] | None = None,
+    tool_profile_ids: Iterable[str] | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Enumerate reviewed rows without manufacturing a Cartesian product.
+
+    Nexus uses this primitive for each ``All`` selector.  Filters intersect the
+    explicit allowlist, so a future model/tool addition cannot create an invalid
+    harness combination merely because its ID appears in another selector.
+    """
+
+    selected_harnesses = None if harness_ids is None else frozenset(harness_ids)
+    selected_models = None if model_ids is None else frozenset(model_ids)
+    selected_tools = (
+        None if tool_profile_ids is None else frozenset(tool_profile_ids)
+    )
+    return tuple(
+        item.public_record()
+        for item in COMBINATIONS
+        if (selected_harnesses is None or item.harness_id in selected_harnesses)
+        and (selected_models is None or item.model_id in selected_models)
+        and (
+            selected_tools is None
+            or item.tool_profile_id in selected_tools
+        )
+    )
+
+
 def combination_sha256(combination: Mapping[str, object]) -> str:
     return _canonical_sha256(
         {
@@ -366,6 +605,7 @@ def _catalog_provenance() -> dict[str, object]:
         "models": [item.public_record() for item in MODELS],
         "tool_profiles": [item.public_record() for item in TOOL_PROFILES],
         "combinations": [item.public_record() for item in COMBINATIONS],
+        "components": [item.public_record() for item in COMPONENTS],
     }
 
 
@@ -393,9 +633,41 @@ RUNNER_PROTOCOL_SHA256 = _canonical_sha256(
             "browser_success",
             "vision_score",
             "error_code",
+            "component_id",
+            "overall_score",
+            "quality_score",
+            "component_scores",
+            "total_wall_ms",
+            "total_active_wall_ms",
+            "total_compute_wait_ms",
+            "model_turn_count",
+            "model_call_count",
+            "tool_call_count",
+            "prompt_tokens",
+            "peak_prompt_tokens",
+            "context_tokens",
+            "completion_tokens",
+            "context_pressure_bytes",
+            "context_pressure_turns",
+            "highest_verified_context_pressure_bytes",
         ],
     }
 )
+
+
+def _suite_public_record(suite: SuiteSpec) -> dict[str, object]:
+    return {
+        "id": suite.suite_id,
+        "label": suite.label,
+        "description": suite.description,
+        "version": suite.version,
+        "sha256": suite.sha256,
+        "case_count": len(suite.cases),
+        "categories": sorted({case.category for case in suite.cases}),
+        "required_capabilities": list(suite.required_capabilities),
+        "default_tool_profile_id": suite.default_tool_profile_id,
+        "default": suite.suite_id == DEFAULT_SUITE_ID,
+    }
 
 
 def public_catalog() -> dict[str, object]:
@@ -406,21 +678,8 @@ def public_catalog() -> dict[str, object]:
         record = dict(item)
         record["version"] = HARNESS_VERSIONS[str(record["id"])]
         harnesses.append(record)
-    suites = [
-        {
-            "id": suite.suite_id,
-            "label": suite.label,
-            "description": suite.description,
-            "version": suite.version,
-            "sha256": suite.sha256,
-            "case_count": len(suite.cases),
-            "categories": sorted({case.category for case in suite.cases}),
-            "required_capabilities": list(suite.required_capabilities),
-            "default_tool_profile_id": suite.default_tool_profile_id,
-            "default": suite.suite_id == DEFAULT_SUITE_ID,
-        }
-        for suite in SUITES.values()
-    ]
+    benchmark = _suite_public_record(SUITES[DEFAULT_SUITE_ID])
+    components = [item.public_record() for item in COMPONENTS]
     return {
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "catalog_version": BENCHMARK_CATALOG_VERSION,
@@ -432,7 +691,62 @@ def public_catalog() -> dict[str, object]:
         "runner_source_sha256": RUNNER_SOURCE_SHA256,
         "harness_source_sha256": HARNESS_SOURCE_SHA256,
         "tool_source_sha256": TOOL_SOURCE_SHA256,
-        "suites": suites,
+        # ``suites`` and ``default_suite_id`` are compatibility fields.  The
+        # single record is also exposed with domain language so new clients do
+        # not need to present a suite selector.
+        "default_suite_id": DEFAULT_SUITE_ID,
+        "benchmark": dict(benchmark),
+        "suites": [dict(benchmark)],
+        "scoring": {
+            "overall_field": "overall_score",
+            "scale_min": 0,
+            "scale_max": 100,
+            "higher_is_better": True,
+            "components": components,
+            "quality_field": "quality_score",
+            "efficiency": {
+                "basis": "whole_run_total_active_wall_ms",
+                "fleet_wait_excluded": True,
+                "missing_or_stuck_charged_as_deadline": True,
+                "targets_are_case_bound": True,
+            },
+            "observable_metrics": {
+                "total_time_fields": [
+                    "total_wall_ms",
+                    "total_active_wall_ms",
+                    "total_compute_wait_ms",
+                ],
+                "count_fields": [
+                    "model_turn_count",
+                    "model_call_count",
+                    "tool_call_count",
+                ],
+                "token_fields": [
+                    "prompt_tokens",
+                    "peak_prompt_tokens",
+                    "context_tokens",
+                    "completion_tokens",
+                ],
+                "unknown_value": None,
+            },
+            "pareto_axes": [
+                {
+                    "field": "quality_score",
+                    "label": "Behavioral quality",
+                    "direction": "maximize",
+                },
+                {
+                    "field": "total_active_wall_ms",
+                    "label": "Total active time to verified completion",
+                    "direction": "minimize",
+                },
+            ],
+        },
+        "selection": {
+            "all_value": "all",
+            "enumerate_from": "combinations",
+            "cartesian_product_allowed": False,
+        },
         "harnesses": harnesses,
         "models": [item.public_record() for item in MODELS],
         "tool_profiles": [item.public_record() for item in TOOL_PROFILES],
@@ -445,6 +759,8 @@ __all__ = (
     "BENCHMARK_CATALOG_VERSION",
     "BENCHMARK_SCHEMA_VERSION",
     "COMBINATIONS",
+    "COMPONENTS",
+    "COMPONENT_WEIGHTS",
     "DEFAULT_MODEL_ID",
     "DEFAULT_SUITE_ID",
     "DEFAULT_TOOL_PROFILE_ID",
@@ -462,9 +778,11 @@ __all__ = (
     "TOOL_SOURCE_SHA256",
     "ToolProfileSpec",
     "CombinationSpec",
+    "ComponentSpec",
     "ScenarioSpec",
     "SuiteSpec",
     "combination_for",
     "combination_sha256",
     "public_catalog",
+    "valid_combinations",
 )

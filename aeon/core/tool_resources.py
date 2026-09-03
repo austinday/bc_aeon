@@ -41,6 +41,7 @@ _LOCAL_CPU_TOOLS = frozenset(
         "activate_skill",
         "blackboard_post",
         "blackboard_read",
+        "benchmark_workflow",
         "close_file",
         "collapse_skills_category",
         "collapse_tool_category",

@@ -48,7 +48,7 @@ PRINCIPAL_ONLY_ENV_KEYS = frozenset(
 # inheriting even the path to a principal's receipt/key file would collapse that
 # authority boundary.
 _PRINCIPAL_ONLY_ENV_PREFIXES = (
-    "AEON_BENCHMARK_GPU_CAPABILITY_",
+    "AEON_BENCHMARK_",
     "AEON_OPENCODE_",
 )
 

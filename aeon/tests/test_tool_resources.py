@@ -75,12 +75,12 @@ class ToolResourceManifestTests(unittest.TestCase):
         self.assertEqual(len(tools), len(names))
         self.assertEqual(len(names), 82)
         self.assertIn("integrate_sub_agent_changes", names)
-        # The mutually exclusive public-sibling handoff capability is loaded
-        # only under a launch-bound collaborator identity, never in the Project
-        # Manager inventory exercised here.
+        # These capability-gated tools are declared in the resource manifest
+        # but are absent unless their exact launch-bound identity is active.
         self.assertEqual(
             names,
-            declared_tool_names() - {"send_collaborator_handoff"},
+            declared_tool_names()
+            - {"benchmark_workflow", "send_collaborator_handoff"},
         )
         for tool in tools:
             self.assertEqual(tool.resource_policy, tool_resource_policy(tool.name))

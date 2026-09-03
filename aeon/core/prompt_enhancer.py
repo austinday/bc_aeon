@@ -153,7 +153,13 @@ def enhance_prompt(llm_client, raw: str, media_type: str = "image",
         if callable(limiter)
         else {"max_tokens": 2048, "timeout": 45.0}
     )
-    resp = llm_client.client.chat.completions.create(
+    task_create = getattr(llm_client, "task_completion_create", None)
+    create = (
+        (lambda **kwargs: task_create(use_utility=True, **kwargs))
+        if callable(task_create)
+        else llm_client.client.chat.completions.create
+    )
+    resp = create(
         # Send the served model id (api_model), the same id the main agent loop
         # uses -- the display name ('model') 404s against vLLM's served name.
         model=llm_client.api_model,

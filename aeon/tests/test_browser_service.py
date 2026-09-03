@@ -263,6 +263,23 @@ class BrowserServiceTests(unittest.TestCase):
         self.assertIn('"service_id": BROWSER_SERVICE_ID', server_source)
         self.assertIn("AEON_BROWSER_SERVICE_ID", server_source)
 
+    def test_benchmark_fixture_internal_errors_are_503_not_behavioral_misses(self):
+        server_source = (service.SOURCE_ROOT / "server.py").read_text(encoding="utf-8")
+        endpoint_source = server_source.split(
+            '@app.post("/benchmark_fixture")', 1
+        )[1].split('@app.post("/navigate")', 1)[0]
+
+        self.assertIn("status_code=503", server_source)
+        self.assertIn("benchmark_fixture_internal_failure", server_source)
+        # State mismatches remain reachable 200/false model outcomes, while all
+        # browser-engine/setup exception paths use the infrastructure response.
+        self.assertIn('"passed": False', endpoint_source)
+        self.assertGreaterEqual(
+            endpoint_source.count("return _benchmark_fixture_internal_response(req)"),
+            7,
+        )
+        self.assertNotIn("except PWError:\n            passed = False", endpoint_source)
+
     def test_docker_client_is_fixed_local_and_low_priority(self):
         completed = subprocess.CompletedProcess([], 0, "[]", "")
         with patch.object(

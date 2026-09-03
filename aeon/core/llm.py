@@ -3,6 +3,7 @@ import io
 import base64
 import time
 import math
+import hmac
 import openai
 import httpx
 import pathlib
@@ -17,6 +18,8 @@ sys.setrecursionlimit(2000)
 from .system_info import get_runtime_info
 from .logger import get_logger
 from .utils import estimate_tokens
+from .benchmark_model_telemetry import UsageAccumulator, authoritative_token_usage
+from .benchmark_receipt import begin_model_call, finish_model_call
 from .model_catalog import VISION_MODEL_NAME, VISION_MODEL_NAMES
 from .fleet_backend import FleetBackendError, validate_loopback_endpoint
 from .sampling import (
@@ -35,6 +38,99 @@ from .prompts import (
 # ANSI Colors for debug printing
 C_YELLOW = '\033[93m'
 C_RESET = '\033[0m'
+
+
+def _finish_task_model_call(handle, *, outcome: str, response=None) -> None:
+    """Publish content-free benchmark telemetry; never affect normal inference."""
+
+    usage = authoritative_token_usage(getattr(response, "usage", None))
+    finish_model_call(
+        handle,
+        outcome=outcome,
+        prompt_tokens=usage.prompt_tokens if usage is not None else None,
+        completion_tokens=usage.completion_tokens if usage is not None else None,
+        total_tokens=usage.total_tokens if usage is not None else None,
+    )
+
+
+def _primary_model_error_outcome(error: BaseException) -> str:
+    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        return "cancelled"
+    if isinstance(error, openai.APIStatusError):
+        return "http_error"
+    if isinstance(
+        error,
+        (openai.APIConnectionError, openai.APITimeoutError, ConnectionError, TimeoutError),
+    ):
+        return "transport_error"
+    return "failed"
+
+
+class _BenchmarkModelStream:
+    """Preserve the SDK stream interface while bracketing its actual lifetime."""
+
+    def __init__(self, stream, handle) -> None:
+        self._stream = stream
+        self._iterator = iter(stream)
+        self._handle = handle
+        self._usage = UsageAccumulator()
+        self._finished = False
+        self._exhausted = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            chunk = next(self._iterator)
+        except StopIteration:
+            self._exhausted = True
+            self._finish("succeeded")
+            raise
+        except BaseException as exc:
+            self._finish(_primary_model_error_outcome(exc))
+            raise
+        self._usage.observe(getattr(chunk, "usage", None))
+        return chunk
+
+    def _finish(self, outcome: str) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        usage = self._usage.result if outcome == "succeeded" else None
+        finish_model_call(
+            self._handle,
+            outcome=outcome,
+            prompt_tokens=usage.prompt_tokens if usage is not None else None,
+            completion_tokens=usage.completion_tokens if usage is not None else None,
+            total_tokens=usage.total_tokens if usage is not None else None,
+        )
+
+    def close(self) -> None:
+        try:
+            close = getattr(self._stream, "close", None)
+            if callable(close):
+                close()
+        finally:
+            self._finish("cancelled")
+
+    def __enter__(self):
+        enter = getattr(self._stream, "__enter__", None)
+        if callable(enter):
+            enter()
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        exit_method = getattr(self._stream, "__exit__", None)
+        result = None
+        try:
+            if callable(exit_method):
+                result = exit_method(kind, value, traceback)
+        finally:
+            self._finish(
+                "succeeded" if kind is None and self._exhausted else "cancelled"
+            )
+        return result
 
 
 def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
@@ -219,6 +315,24 @@ class LLMClient:
                 f"Expected one reviewed vLLM wire model: {sorted(VISION_MODEL_NAMES)}.")
 
         self.provider = config['provider']
+        proxy_url = os.environ.get("AEON_OPENCODE_PROXY_URL", "")
+        proxy_token = os.environ.get("AEON_OPENCODE_PROXY_TOKEN", "")
+        configured_url = str(config.get("base_url") or "")
+        configured_token = str(config.get("api_key") or "")
+        try:
+            proxy_matches = bool(
+                proxy_url
+                and proxy_token
+                and validate_loopback_endpoint(configured_url)
+                == validate_loopback_endpoint(proxy_url)
+                and hmac.compare_digest(configured_token, proxy_token)
+            )
+        except (TypeError, ValueError):
+            proxy_matches = False
+        # The proxy is the sole telemetry boundary for OpenCode, including MCP
+        # tool calls routed back through it. Recording here as well would count
+        # one upstream generation twice.
+        self._benchmark_telemetry_via_opencode_proxy = proxy_matches
         self.client = self._create_client(config)
         self.model = config['model']            # catalog/display name: logging, llama.cpp self-heal lookup
         self.api_model = configured_api_model  # id sent to the server (vLLM served name)
@@ -354,6 +468,36 @@ class LLMClient:
         # count, selected index, grounded verifier reason), never a hidden chain of
         # thought and never sent to an external service.
         self.last_local_search: Dict = {}
+
+    def task_completion_create(self, *, use_utility: bool = False, **kwargs):
+        """Create one task-attributable local generation with benchmark evidence.
+
+        This covers primary decisions, retries, verification, skill routing,
+        compaction, resume integration, and model-backed tools. Readiness/vision
+        probes live outside :class:`LLMClient` and are intentionally excluded.
+        """
+
+        transport = self.utility_client if use_utility else self.client
+        handle = (
+            None
+            if getattr(self, "_benchmark_telemetry_via_opencode_proxy", False)
+            else begin_model_call("aeon_task_model")
+        )
+        try:
+            response = transport.chat.completions.create(**kwargs)
+        except BaseException as exc:
+            _finish_task_model_call(
+                handle, outcome=_primary_model_error_outcome(exc)
+            )
+            raise
+        if kwargs.get("stream") is True:
+            return (
+                _BenchmarkModelStream(response, handle)
+                if handle is not None
+                else response
+            )
+        _finish_task_model_call(handle, outcome="succeeded", response=response)
+        return response
 
     def _new_decision_generation_budget(
         self,
@@ -785,7 +929,8 @@ class LLMClient:
                 "Respond with ONLY a valid JSON object, no prose, no markdown fences:\n"
                 '{\"skill\": \"<category>/<skill_name>\" or null, \"reason\": \"<one sentence>\"}'
             )
-            resp = self.utility_client.chat.completions.create(
+            resp = self.task_completion_create(
+                use_utility=True,
                 model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=QWEN_CONTROL_TEMPERATURE,
@@ -1089,7 +1234,8 @@ class LLMClient:
                 requested_tokens=min(getattr(self, "max_turn_tokens", 32768), 4096),
                 minimum_useful_tokens=256,
             )
-            resp = self.utility_client.chat.completions.create(
+            resp = self.task_completion_create(
+                use_utility=True,
                 model=self.utility_model,
                 messages=[{"role": "user", "content": recovery_prompt}],
                 temperature=QWEN_CONTROL_TEMPERATURE,
@@ -1226,7 +1372,8 @@ class LLMClient:
             minimum_useful_tokens=256,
         )
         try:
-            resp = self.utility_client.chat.completions.create(
+            resp = self.task_completion_create(
+                use_utility=True,
                 model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=QWEN_CONTROL_TEMPERATURE,
@@ -1644,7 +1791,7 @@ class LLMClient:
                     # Stream the response to accurately measure TTFT vs pure
                     # generation time. Both max_tokens and timeout are derived
                     # from the shared decision budget, never caller multiplication.
-                    resp_stream = self.client.chat.completions.create(
+                    resp_stream = self.task_completion_create(
                         model=self.api_model,
                         messages=req_messages,
                         temperature=QWEN_CONTROL_TEMPERATURE,
@@ -2249,7 +2396,7 @@ class LLMClient:
                 requested_tokens=verifier_cap,
                 minimum_useful_tokens=256,
             )
-            response = self.client.chat.completions.create(
+            response = self.task_completion_create(
                 model=self.api_model,
                 messages=verifier_messages,
                 temperature=QWEN_CONTROL_TEMPERATURE,
@@ -2460,7 +2607,8 @@ class LLMClient:
         """Compress a long action log down to ~25% of its size using the utility model."""
         prompt = COMPRESS_ACTION_LOG_PROMPT.format(log=log_text)
         try:
-            resp = self.utility_client.chat.completions.create(
+            resp = self.task_completion_create(
+                use_utility=True,
                 model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=QWEN_CONTROL_TEMPERATURE,
@@ -2489,7 +2637,8 @@ class LLMClient:
             # or taking ownership of that subsystem's prompt.
             prompt = COMPRESS_MEMORIES_PROMPT.replace("{memories}", memories_text)
         try:
-            resp = self.utility_client.chat.completions.create(
+            resp = self.task_completion_create(
+                use_utility=True,
                 model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
@@ -2518,7 +2667,7 @@ class LLMClient:
         interruptions are rare and the decision is high-stakes."""
         prompt = ANALYZE_INTERRUPTION_PROMPT.format(obj=obj, plan=plan, progress=progress, inp=inp)
         try:
-            resp = self.client.chat.completions.create(
+            resp = self.task_completion_create(
                 model=self.api_model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
@@ -2554,7 +2703,7 @@ class LLMClient:
             prev_objective=prev_objective, prev_plan=prev_plan,
             progress=progress, new_instruction=new_instruction)
         try:
-            resp = self.client.chat.completions.create(
+            resp = self.task_completion_create(
                 model=self.api_model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
@@ -2580,7 +2729,7 @@ class LLMClient:
     def reason(self, prompt: str) -> str:
         """General reasoning/thinking call (uses primary/strong model)."""
         try:
-            resp = self.client.chat.completions.create(
+            resp = self.task_completion_create(
                 model=self.api_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=QWEN_CONTROL_TEMPERATURE,
@@ -2628,7 +2777,7 @@ class LLMClient:
             + "\n</CANDIDATE_EXTERNAL_PROMPT>"
         )
         try:
-            resp = self.client.chat.completions.create(
+            resp = self.task_completion_create(
                 model=self.api_model,
                 messages=[{"role": "user", "content": review_prompt}],
                 # This security decision remains deterministic and fail-closed;
@@ -2664,7 +2813,8 @@ class LLMClient:
         """Summarize text in context of a query."""
         prompt = SUMMARIZE_TEXT_PROMPT.format(query=query, text=text)
         try:
-            resp = self.utility_client.chat.completions.create(
+            resp = self.task_completion_create(
+                use_utility=True,
                 model=self.utility_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=QWEN_CONTROL_TEMPERATURE,

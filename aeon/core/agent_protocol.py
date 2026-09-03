@@ -1324,6 +1324,7 @@ _AGENT_STATE_TOOLS = frozenset(
 )
 _CONTROL_TOOLS = frozenset(
     {
+        "benchmark_workflow",
         "think",
         "say_to_user",
         "get_user_input",

@@ -56,10 +56,10 @@ from patchright.async_api import async_playwright, Page, BrowserContext, Error a
 # runs `uvicorn server:app` from /app where both files sit side by side.
 from human_motion import mouse_path, scroll_ticks, type_delays, idle_drift_target
 from browser_util import (
-    bearer_is_authorized, benchmark_fixture_page_url, is_destructive_dialog,
-    parse_proxy, primary_locale, read_auth_token, seed_benchmark_fixture_page,
-    validate_benchmark_fixture_request, valid_timezone,
-    verify_benchmark_fixture_page,
+    bearer_is_authorized, benchmark_fixture_internal_failure,
+    benchmark_fixture_page_url, is_destructive_dialog, parse_proxy,
+    primary_locale, read_auth_token, seed_benchmark_fixture_page,
+    validate_benchmark_fixture_request, valid_timezone, verify_benchmark_fixture_page,
 )
 from media_safety import (
     BrowserMediaSafetyError,
@@ -1942,13 +1942,22 @@ async def health():
         "auth_required": True,
         "api_version": BROWSER_API_VERSION,
         "service_id": BROWSER_SERVICE_ID,
-        "benchmark_fixture_api": "immutable-v2",
+        "benchmark_fixture_api": "immutable-v3",
     }
 
 
 @app.get("/ping")
 async def ping():
     return {"status": "pong", "auth_required": True, "version": BROWSER_API_VERSION}
+
+
+def _benchmark_fixture_internal_response(req: BenchmarkFixtureRequest) -> JSONResponse:
+    """Fail a benchmark run without leaking browser-engine exception details."""
+
+    return JSONResponse(
+        status_code=503,
+        content=benchmark_fixture_internal_failure(req.fixture_id, req.operation),
+    )
 
 
 @app.post("/benchmark_fixture")
@@ -1977,13 +1986,17 @@ async def benchmark_fixture(req: BenchmarkFixtureRequest):
         expected_url = "about:blank"
     if req.operation in {"reopen", "verify", "cleanup"}:
         page = pages.get(key)
-        if (
-            page is None
-            or page.is_closed()
-            or benchmark_pages.get(id(page))
-            != (page, req.fixture_id, expected_url)
-            or page.url != expected_url
-        ):
+        try:
+            page_matches = (
+                page is not None
+                and not page.is_closed()
+                and benchmark_pages.get(id(page))
+                == (page, req.fixture_id, expected_url)
+                and page.url == expected_url
+            )
+        except Exception:
+            return _benchmark_fixture_internal_response(req)
+        if not page_matches:
             return {
                 "status": {
                     "reopen": "reopened",
@@ -1999,13 +2012,12 @@ async def benchmark_fixture(req: BenchmarkFixtureRequest):
                     "localStorage.removeItem('aeon-benchmark-session-v1:' + "
                     "new URL(location.href).searchParams.get('session'))"
                 )
-                cleaned = True
-            except PWError:
-                cleaned = False
+            except Exception:
+                return _benchmark_fixture_internal_response(req)
             return {
                 "status": "cleaned",
                 "fixture_id": req.fixture_id,
-                "passed": cleaned,
+                "passed": True,
             }
         if req.operation == "reopen":
             try:
@@ -2014,8 +2026,8 @@ async def benchmark_fixture(req: BenchmarkFixtureRequest):
                     "new URL(location.href).searchParams.get('session')) === "
                     "'authenticated'"
                 )
-            except PWError:
-                signed_in = False
+            except Exception:
+                return _benchmark_fixture_internal_response(req)
             if signed_in is not True:
                 return {
                     "status": "reopened",
@@ -2051,15 +2063,12 @@ async def benchmark_fixture(req: BenchmarkFixtureRequest):
                 pages.pop(key, None)
                 if reopened is not None:
                     benchmark_pages.pop(id(reopened), None)
+                    page_events.pop(id(reopened), None)
                     try:
                         await reopened.close()
                     except Exception:
                         pass
-                return {
-                    "status": "reopened",
-                    "fixture_id": req.fixture_id,
-                    "passed": False,
-                }
+                return _benchmark_fixture_internal_response(req)
             return {
                 "status": "reopened",
                 "fixture_id": req.fixture_id,
@@ -2067,8 +2076,8 @@ async def benchmark_fixture(req: BenchmarkFixtureRequest):
             }
         try:
             passed = await verify_benchmark_fixture_page(page, req.fixture_id)
-        except PWError:
-            passed = False
+        except Exception:
+            return _benchmark_fixture_internal_response(req)
         return {
             "status": "verified",
             "fixture_id": req.fixture_id,
@@ -2083,28 +2092,33 @@ async def benchmark_fixture(req: BenchmarkFixtureRequest):
         page_events.pop(id(existing), None)
         try:
             await existing.close()
-        except PWError:
-            pass
-    context = await _ensure_browser(profile)
-    page = await context.new_page()
-    _setup_page(page)
-    pages[key] = page
-    benchmark_pages[id(page)] = (page, req.fixture_id, expected_url)
+        except Exception:
+            return _benchmark_fixture_internal_response(req)
+    page = None
     try:
-        await seed_benchmark_fixture_page(
+        context = await _ensure_browser(profile)
+        page = await context.new_page()
+        _setup_page(page)
+        pages[key] = page
+        benchmark_pages[id(page)] = (page, req.fixture_id, expected_url)
+        seeded = await seed_benchmark_fixture_page(
             page,
             req.fixture_id,
             session_id=req.session_id,
             reset_session=req.fixture_id == "session-v1",
         )
+        if not seeded:
+            raise RuntimeError("fixture catalog seed failed")
     except Exception:
         pages.pop(key, None)
-        benchmark_pages.pop(id(page), None)
-        try:
-            await page.close()
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail="Benchmark fixture could not be seeded")
+        if page is not None:
+            benchmark_pages.pop(id(page), None)
+            page_events.pop(id(page), None)
+            try:
+                await page.close()
+            except Exception:
+                pass
+        return _benchmark_fixture_internal_response(req)
     return {"status": "seeded", "fixture_id": req.fixture_id}
 
 

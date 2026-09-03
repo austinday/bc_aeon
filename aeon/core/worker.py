@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Any, Callable, Optional
 
 from .llm import DecisionGenerationBudget, DecisionGenerationBudgetExceeded, LLMClient
+from .benchmark_receipt import emit_tool_call_receipt
 from .durable_agent_guard import (
     DurableAgentTurnGuard,
     INTENT_CAPABILITY,
@@ -643,6 +644,24 @@ class Worker:
             # This check precedes categories and request-mode policy. A malformed
             # contract or expanded category can never widen a public sibling.
             return {"send_collaborator_handoff"}.intersection(self.tools)
+
+        # A signed benchmark scenario is a closed simulator, not permission to
+        # expose ordinary host, Fleet, browser, or delegation capabilities. This
+        # exact-case clamp also prevents a model from substituting a real shell
+        # or real sub-agent call for the synthetic behavior being measured.
+        from aeon.core.benchmark_simulator import (
+            SCENARIO_CAPABILITY_ENV,
+            SCENARIO_TOOL_NAME,
+            load_scenario_capability,
+        )
+
+        if os.environ.get(SCENARIO_CAPABILITY_ENV):
+            capability = load_scenario_capability()
+            return (
+                {SCENARIO_TOOL_NAME}.intersection(self.tools)
+                if capability is not None
+                else set()
+            )
 
         durable_guard = getattr(self, "_durable_agent_guard", None)
         if durable_guard is not None and durable_guard.project_manager:
@@ -5203,6 +5222,13 @@ do not infer that omitted context proves success."""
         self._tool_result_inspection_remaining = TOOL_RESULT_INSPECTION_TURN_CHARS
         self._tool_result_inspection_seen.clear()
         proposed = self._normalize_actions(turn.get("actions") or [])
+        for proposed_action in proposed:
+            proposed_name = str(proposed_action.get("tool_name") or "").strip()
+            proposed_parameters = proposed_action.get("parameters")
+            emit_tool_call_receipt(
+                proposed_name,
+                proposed_parameters if isinstance(proposed_parameters, dict) else {},
+            )
         # Keep the full proposal in history. Every model-proposed call receives a
         # typed receipt, including calls beyond the bounded execution batch.
         turn["actions"] = proposed

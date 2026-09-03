@@ -15,12 +15,14 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-EXECUTOR_PROTOCOL_VERSION = "4"
+EXECUTOR_PROTOCOL_VERSION = "8"
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _EXECUTOR_SOURCES = (
     _PACKAGE_ROOT / "benchmarks" / "executor.py",
     _PACKAGE_ROOT / "benchmarks" / "catalog.py",
+    _PACKAGE_ROOT / "core" / "benchmark_model_telemetry.py",
     _PACKAGE_ROOT / "core" / "benchmark_receipt.py",
+    _PACKAGE_ROOT / "core" / "benchmark_simulator.py",
 )
 _RUNNER_SOURCES = (
     _PACKAGE_ROOT / "benchmarks" / "runner.py",
@@ -30,12 +32,16 @@ _RUNNER_SOURCES = (
 _HARNESS_SOURCES = (
     _PACKAGE_ROOT / "cli.py",
     _PACKAGE_ROOT / "main.py",
+    _PACKAGE_ROOT / "core" / "benchmark_model_telemetry.py",
+    _PACKAGE_ROOT / "core" / "llm.py",
+    _PACKAGE_ROOT / "core" / "prompt_enhancer.py",
     *sorted((_PACKAGE_ROOT / "harnesses").glob("*.py")),
 )
 _TOOL_SOURCES = (
     _PACKAGE_ROOT / "core" / "action_schema.py",
     _PACKAGE_ROOT / "core" / "agent_protocol.py",
     _PACKAGE_ROOT / "core" / "benchmark_receipt.py",
+    _PACKAGE_ROOT / "core" / "benchmark_simulator.py",
     _PACKAGE_ROOT / "core" / "fleet_backend.py",
     _PACKAGE_ROOT / "core" / "tool_resources.py",
     _PACKAGE_ROOT / "core" / "worker.py",

@@ -94,6 +94,20 @@ def validate_benchmark_fixture_request(
     return benchmark_fixture_definition(fixture_id)
 
 
+def benchmark_fixture_internal_failure(
+    fixture_id: str, operation: str
+) -> dict[str, object]:
+    """Return the stable, non-sensitive payload for fixture infrastructure errors."""
+
+    return {
+        "status": "error",
+        "fixture_id": fixture_id,
+        "operation": operation,
+        "failure_kind": "fixture_internal",
+        "passed": False,
+    }
+
+
 def benchmark_fixture_page_url(fixture_id: str, session_id: str) -> str:
     """Return the one route-intercepted origin used for session persistence."""
 

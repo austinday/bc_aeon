@@ -31,7 +31,6 @@ def _parser() -> argparse.ArgumentParser:
     cancel.add_argument("run_id")
     submit = commands.add_parser("submit")
     submit.add_argument("--request-id", default=None)
-    submit.add_argument("--suite", required=True)
     submit.add_argument("--harness", required=True)
     submit.add_argument("--model", required=True)
     submit.add_argument("--tool-profile", default=None)
@@ -58,7 +57,6 @@ def main(
         else:
             request = {
                 "request_id": args.request_id or f"br-{uuid.uuid4().hex}",
-                "suite_id": args.suite,
                 "harness_id": args.harness,
                 "model_id": args.model,
                 "repetitions": args.repetitions,

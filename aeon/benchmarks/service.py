@@ -32,25 +32,30 @@ from .catalog import (
     SUITES,
     TOOL_PROFILES,
     TOOL_SOURCE_SHA256,
+    COMPONENTS,
+    DEFAULT_SUITE_ID,
     combination_for,
     combination_sha256,
     public_catalog,
+    valid_combinations,
 )
 
 
 FLEET_LOW_PRIORITY = "/home/aday/bin/fleet-low-priority"
 DATABASE_FILENAME = "benchmarks.sqlite3"
 EVIDENCE_DIRECTORY_NAME = "evidence"
-DATABASE_SCHEMA_VERSION = 4
+DATABASE_SCHEMA_VERSION = 5
 WORKER_START_GRACE_SECONDS = 120.0
 MAX_REPETITIONS = 20
 MAX_RUN_LIST = 500
 MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
 REQUEST_ID_RE = re.compile(r"^br-[0-9a-f]{32}$")
 RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
+BATCH_REQUEST_ID_RE = re.compile(r"^bm-[0-9a-f]{32}$")
+BATCH_ID_RE = re.compile(r"^batch-[0-9a-f]{32}$")
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 ACTIVE_STATUSES = frozenset(
-    {"queued", "waiting_for_compute", "starting", "running", "cancelling"}
+    {"pending", "queued", "waiting_for_compute", "starting", "running", "cancelling"}
 )
 _SUBMIT_KEYS = frozenset(
     {
@@ -62,6 +67,19 @@ _SUBMIT_KEYS = frozenset(
         "repetitions",
     }
 )
+_MATRIX_KEYS = frozenset(
+    {
+        "request_id",
+        "suite_id",
+        "harness_id",
+        "model_id",
+        "tool_profile_id",
+        "repetitions",
+        "missing_only",
+    }
+)
+MAX_MATRIX_COMBINATIONS = 64
+MAX_MATRIX_PLANNED_CASES = 4096
 _SAFE_ENVIRONMENT = frozenset(
     {
         "AEON_COMPUTE_BACKEND",
@@ -82,6 +100,10 @@ _SAFE_ENVIRONMENT = frozenset(
 
 class BenchmarkError(RuntimeError):
     """Benchmark state or execution could not be handled safely."""
+
+
+class BenchmarkExecutionUnavailable(BenchmarkError):
+    """A fresh request cannot run with the currently available harnesses."""
 
 
 def _canonical_json(value: object) -> bytes:
@@ -307,6 +329,10 @@ class BenchmarkService:
         self._launcher = default_launcher if launcher is None else launcher
         self._lock = threading.RLock()
         self._initialize_database()
+        # A matrix is a durable queue, not a browser-session loop.  Reconcile
+        # exact dead workers and atomically claim one pending matrix child on
+        # service construction so a restart cannot strand the batch.
+        self._reconcile_stale_runs()
 
     def _connect(self) -> sqlite3.Connection:
         _private_regular_file(self.database_path)
@@ -325,7 +351,7 @@ class BenchmarkService:
     def _initialize_database(self) -> None:
         with self._lock, self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, 1, 2, 3, DATABASE_SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, 4, DATABASE_SCHEMA_VERSION}:
                 raise BenchmarkError("benchmark database schema is unsupported")
             connection.executescript(
                 """
@@ -372,6 +398,31 @@ class BenchmarkService:
                 );
                 CREATE INDEX IF NOT EXISTS benchmark_runs_created
                     ON benchmark_runs(created_at DESC, id DESC);
+                CREATE TABLE IF NOT EXISTS benchmark_batches (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    request_id TEXT UNIQUE NOT NULL,
+                    created_at REAL NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    catalog_version TEXT NOT NULL,
+                    catalog_sha256 TEXT NOT NULL,
+                    missing_only INTEGER NOT NULL,
+                    repetitions INTEGER NOT NULL,
+                    harness_selection TEXT NOT NULL,
+                    model_selection TEXT NOT NULL,
+                    tool_profile_selection TEXT NOT NULL,
+                    selected_count INTEGER NOT NULL,
+                    created_count INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS benchmark_batch_runs (
+                    batch_id TEXT NOT NULL REFERENCES benchmark_batches(id),
+                    ordinal INTEGER NOT NULL,
+                    combination_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL REFERENCES benchmark_runs(id),
+                    created_child INTEGER NOT NULL,
+                    PRIMARY KEY (batch_id, ordinal)
+                );
+                CREATE INDEX IF NOT EXISTS benchmark_batch_runs_run
+                    ON benchmark_batch_runs(run_id, batch_id);
                 COMMIT;
                 """
             )
@@ -435,7 +486,14 @@ class BenchmarkService:
         request_id = self._string(request.get("request_id"), field="request ID")
         if not REQUEST_ID_RE.fullmatch(request_id):
             raise ValueError("invalid benchmark request ID")
-        suite_id = self._string(request.get("suite_id"), field="suite")
+        suite_value = request.get("suite_id")
+        suite_id = (
+            DEFAULT_SUITE_ID
+            if suite_value is None
+            else self._string(suite_value, field="suite")
+        )
+        if suite_id != DEFAULT_SUITE_ID:
+            raise ValueError("partial benchmark suites cannot be submitted")
         harness_id = self._string(request.get("harness_id"), field="harness")
         model_id = self._string(request.get("model_id"), field="model")
         suite = SUITES.get(suite_id)
@@ -512,11 +570,13 @@ class BenchmarkService:
         return value
 
     @staticmethod
-    def _safe_summary(value: object) -> dict[str, float | int]:
+    def _safe_summary(value: object) -> dict[str, object]:
         if not isinstance(value, Mapping):
             return {}
         allowed = {
             "score",
+            "overall_score",
+            "quality_score",
             "completion_rate",
             "median_wall_ms",
             "median_active_wall_ms",
@@ -528,10 +588,53 @@ class BenchmarkService:
             "vision_score",
             "case_count",
             "passed_cases",
+            "total_wall_ms",
+            "total_active_wall_ms",
+            "total_compute_wait_ms",
+            "model_turn_count",
+            "model_call_count",
+            "tool_call_count",
+            "prompt_tokens",
+            "peak_prompt_tokens",
+            "context_tokens",
+            "completion_tokens",
+            "context_pressure_bytes",
+            "context_pressure_turns",
+            "highest_verified_context_pressure_bytes",
+            "fleet_compute_judgment_score",
+            "preemption_recovery_score",
+            "useful_wait_work_score",
+            "checkpoint_reacquire_score",
+            "duplicate_submission_count",
+            "useful_overlap_ratio",
+            "idle_wait_ratio",
+            "max_parallelism",
+            "integration_score",
         }
-        result: dict[str, float | int] = {}
+        nullable = {
+            "model_turn_count",
+            "model_call_count",
+            "tool_call_count",
+            "prompt_tokens",
+            "peak_prompt_tokens",
+            "context_tokens",
+            "completion_tokens",
+            "fleet_compute_judgment_score",
+            "preemption_recovery_score",
+            "useful_wait_work_score",
+            "checkpoint_reacquire_score",
+            "useful_overlap_ratio",
+            "idle_wait_ratio",
+            "integration_score",
+        }
+        result: dict[str, object] = {}
         for key in allowed:
+            if key not in value:
+                continue
             item = value.get(key)
+            if item is None and key in nullable:
+                result[key] = None
+                continue
             if (
                 isinstance(item, bool)
                 or not isinstance(item, (int, float))
@@ -539,6 +642,23 @@ class BenchmarkService:
             ):
                 continue
             result[key] = item
+        component_value = value.get("component_scores")
+        if isinstance(component_value, Mapping):
+            known = {component.component_id for component in COMPONENTS}
+            components: dict[str, float] = {}
+            for key, item in component_value.items():
+                if (
+                    key in known
+                    and not isinstance(item, bool)
+                    and isinstance(item, (int, float))
+                    and math.isfinite(float(item))
+                    and 0.0 <= float(item) <= 100.0
+                ):
+                    components[str(key)] = float(item)
+            result["component_scores"] = components
+        token_complete = value.get("token_metrics_complete")
+        if isinstance(token_complete, bool):
+            result["token_metrics_complete"] = token_complete
         return result
 
     @staticmethod
@@ -605,6 +725,7 @@ class BenchmarkService:
                 "case_id": case_id,
                 "label": scenario.label,
                 "category": scenario.category,
+                "component_id": scenario.component_id,
                 "repetition": repetition,
                 "status": status_value,
                 "score": float(score),
@@ -630,6 +751,55 @@ class BenchmarkService:
                     "stuck": "case_stuck",
                     "unsupported": "case_unsupported",
                 }.get(str(status_value), "case_failed")
+            for field in (
+                "model_turn_count",
+                "model_call_count",
+                "tool_call_count",
+                "prompt_tokens",
+                "peak_prompt_tokens",
+                "context_tokens",
+                "completion_tokens",
+            ):
+                metric = item.get(field)
+                if metric is None:
+                    record[field] = None
+                elif (
+                    isinstance(metric, int)
+                    and not isinstance(metric, bool)
+                    and 0 <= metric <= 1_000_000_000
+                ):
+                    record[field] = metric
+            for field in (
+                "context_pressure_bytes",
+                "context_pressure_turns",
+                "highest_verified_context_pressure_bytes",
+                "duplicate_submission_count",
+                "max_parallelism",
+            ):
+                metric = item.get(field)
+                if (
+                    isinstance(metric, int)
+                    and not isinstance(metric, bool)
+                    and 0 <= metric <= 1_000_000_000
+                ):
+                    record[field] = metric
+            for field, high in (
+                ("fleet_compute_judgment_score", 100.0),
+                ("preemption_recovery_score", 100.0),
+                ("useful_wait_work_score", 100.0),
+                ("checkpoint_reacquire_score", 100.0),
+                ("useful_overlap_ratio", 1.0),
+                ("idle_wait_ratio", 1.0),
+                ("integration_score", 100.0),
+            ):
+                metric = item.get(field)
+                if (
+                    not isinstance(metric, bool)
+                    and isinstance(metric, (int, float))
+                    and math.isfinite(float(metric))
+                    and 0.0 <= float(metric) <= high
+                ):
+                    record[field] = float(metric)
             results.append(record)
         return results
 
@@ -751,6 +921,7 @@ class BenchmarkService:
         """Truthfully terminalize active rows whose exact worker disappeared."""
 
         observed_at = time.time() if now is None else float(now)
+        stale_run_ids: list[str] = []
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
@@ -768,13 +939,19 @@ class BenchmarkService:
                 if isinstance(pid, int) and isinstance(starttime, int):
                     stale = _owned_process_starttime(pid) != starttime
                 else:
+                    # Every launched active state must eventually bind the
+                    # worker's exact PID/start time.  Older schema rows and a
+                    # crash between state transitions can otherwise leave a
+                    # running/waiting/cancelling row that suppresses Run all
+                    # missing forever.  Keep the same grace that protects a
+                    # genuinely new queued child while it starts and registers.
                     stale = (
-                        str(row["status"]) == "queued"
-                        and observed_at - float(row["created_at"])
+                        observed_at - float(row["created_at"])
                         >= WORKER_START_GRACE_SECONDS
                     )
                 if not stale:
                     continue
+                stale_run_ids.append(str(row["id"]))
                 cancelled = bool(row["cancel_requested"])
                 connection.execute(
                     """
@@ -790,6 +967,13 @@ class BenchmarkService:
                     ),
                 )
             connection.execute("COMMIT")
+        for stale_run_id in stale_run_ids:
+            self._advance_batches_for_run(stale_run_id)
+        # This is also the restart/reconciliation kick for a matrix committed
+        # before its first launcher invocation.  The claim is a transactional
+        # pending -> queued transition, so concurrent service instances cannot
+        # launch the same child twice.
+        self._launch_next_matrix_child()
 
     def list_runs(self, *, limit: int = 100) -> dict[str, object]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_RUN_LIST:
@@ -821,18 +1005,17 @@ class BenchmarkService:
             run_id,
         ]
 
-    def submit(self, request: Mapping[str, object]) -> dict[str, object]:
-        normalized = self._normalize_request(request)
-        if self._launcher is default_launcher:
-            from .executor import runtime_execution_status
-
-            execution = runtime_execution_status(str(normalized["harness_id"]))
-            if execution.get("supported") is not True:
-                raise BenchmarkError("benchmark execution is unavailable")
-        run_id = f"run-{uuid.uuid4().hex}"
-        created_at = time.time()
+    @staticmethod
+    def _insert_normalized_run(
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        normalized: Mapping[str, object],
+        status_value: str,
+        created_at: float,
+    ) -> None:
         columns = ["id", "status", "created_at", "summary_json", "cancel_requested"]
-        values: list[object] = [run_id, "queued", created_at, "{}", 0]
+        values: list[object] = [run_id, status_value, created_at, "{}", 0]
         for key in (
             "request_id",
             "suite_id",
@@ -864,6 +1047,18 @@ class BenchmarkService:
             columns.append(key)
             values.append(normalized[key])
         placeholders = ",".join("?" for _ in columns)
+        connection.execute(
+            f"INSERT INTO benchmark_runs ({','.join(columns)}) VALUES ({placeholders})",
+            values,
+        )
+
+    def submit(self, request: Mapping[str, object]) -> dict[str, object]:
+        replay = self._existing_submission_replay(request)
+        if replay is not None:
+            return replay
+        normalized = self._normalize_request(request)
+        run_id = f"run-{uuid.uuid4().hex}"
+        created_at = time.time()
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             duplicate = connection.execute(
@@ -881,9 +1076,26 @@ class BenchmarkService:
                     )
                 return self._public_run(duplicate, include_cases=False)
             try:
-                connection.execute(
-                    f"INSERT INTO benchmark_runs ({','.join(columns)}) VALUES ({placeholders})",
-                    values,
+                # Availability is intentionally checked only after the
+                # transaction's authoritative duplicate lookup. A retry racing
+                # the original commit must replay that row even if the harness
+                # becomes unavailable between the two requests.
+                if self._launcher is default_launcher:
+                    from .executor import runtime_execution_status
+
+                    execution = runtime_execution_status(
+                        str(normalized["harness_id"])
+                    )
+                    if execution.get("supported") is not True:
+                        raise BenchmarkExecutionUnavailable(
+                            "benchmark execution is unavailable"
+                        )
+                self._insert_normalized_run(
+                    connection,
+                    run_id=run_id,
+                    normalized=normalized,
+                    status_value="queued",
+                    created_at=created_at,
                 )
                 connection.execute("COMMIT")
             except Exception:
@@ -894,6 +1106,645 @@ class BenchmarkService:
         except Exception:
             self._mark_failed(run_id, error_code="launcher_failed")
         return self.get_run(run_id)
+
+    def _existing_submission_replay(
+        self, request: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        """Return an exact old/new idempotent replay before new-suite validation.
+
+        This preserves lost-response retries from clients that submitted a now
+        historical partial suite.  It never creates another partial run and it
+        compares only the original caller-controlled fields; provenance remains
+        whatever was durably bound when that row was created.
+        """
+
+        if not isinstance(request, Mapping):
+            raise TypeError("benchmark request must be a mapping")
+        if set(request) - _SUBMIT_KEYS:
+            raise ValueError("benchmark request contains unsupported fields")
+        request_id = self._string(request.get("request_id"), field="request ID")
+        if not REQUEST_ID_RE.fullmatch(request_id):
+            raise ValueError("invalid benchmark request ID")
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM benchmark_runs WHERE request_id = ?", (request_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        supplied_suite = request.get("suite_id")
+        if supplied_suite is None:
+            # Omission has always meant the one current benchmark; it must not
+            # accidentally replay an old partial run with a reused ID.
+            if row["suite_id"] != DEFAULT_SUITE_ID:
+                raise ValueError(
+                    "benchmark request ID is already bound to a different request"
+                )
+        elif supplied_suite != row["suite_id"]:
+            raise ValueError(
+                "benchmark request ID is already bound to a different request"
+            )
+        supplied_tool = request.get("tool_profile_id")
+        comparisons = {
+            "harness_id": request.get("harness_id"),
+            "model_id": request.get("model_id"),
+            "tool_profile_id": (
+                row["tool_profile_id"] if supplied_tool is None else supplied_tool
+            ),
+            "repetitions": request.get("repetitions", 1),
+        }
+        if any(row[key] != value for key, value in comparisons.items()):
+            raise ValueError(
+                "benchmark request ID is already bound to a different request"
+            )
+        return self._public_run(row, include_cases=False)
+
+    @staticmethod
+    def _matrix_selector(value: object, *, field: str) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 128
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+        ):
+            raise ValueError(f"invalid benchmark matrix {field}")
+        return value
+
+    def _normalize_matrix_client_request(
+        self, request: Mapping[str, object]
+    ) -> tuple[dict[str, object], str]:
+        if not isinstance(request, Mapping):
+            raise TypeError("benchmark matrix request must be a mapping")
+        if set(request) - _MATRIX_KEYS:
+            raise ValueError("benchmark matrix request contains unsupported fields")
+        request_id = self._string(request.get("request_id"), field="matrix request ID")
+        if BATCH_REQUEST_ID_RE.fullmatch(request_id) is None:
+            raise ValueError("invalid benchmark matrix request ID")
+        suite_value = request.get("suite_id")
+        if suite_value is not None and suite_value != DEFAULT_SUITE_ID:
+            raise ValueError("partial benchmark suites cannot be submitted")
+        repetitions = request.get("repetitions", 1)
+        if (
+            isinstance(repetitions, bool)
+            or not isinstance(repetitions, int)
+            or not 1 <= repetitions <= MAX_REPETITIONS
+        ):
+            raise ValueError("benchmark repetitions must be between 1 and 20")
+        missing_only = request.get("missing_only", True)
+        if not isinstance(missing_only, bool):
+            raise ValueError("benchmark matrix missing_only must be boolean")
+        normalized: dict[str, object] = {
+            "request_id": request_id,
+            "suite_id": DEFAULT_SUITE_ID,
+            "harness_id": self._matrix_selector(
+                request.get("harness_id", "all"), field="harness"
+            ),
+            "model_id": self._matrix_selector(
+                request.get("model_id", "all"), field="model"
+            ),
+            "tool_profile_id": self._matrix_selector(
+                request.get("tool_profile_id", "all"), field="tool profile"
+            ),
+            "repetitions": repetitions,
+            "missing_only": missing_only,
+        }
+        return normalized, _sha256(_canonical_json(normalized))
+
+    @staticmethod
+    def _batch_id(value: object) -> str:
+        if not isinstance(value, str) or BATCH_ID_RE.fullmatch(value) is None:
+            raise KeyError("invalid benchmark batch ID")
+        return value
+
+    def _current_run_for_combination(
+        self,
+        connection: sqlite3.Connection,
+        combination: Mapping[str, object],
+        *,
+        repetitions: int,
+    ) -> sqlite3.Row | None:
+        rows = connection.execute(
+            """
+            SELECT * FROM benchmark_runs
+            WHERE suite_id = ? AND harness_id = ? AND model_id = ?
+              AND tool_profile_id = ? AND repetitions = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (
+                DEFAULT_SUITE_ID,
+                combination["harness_id"],
+                combination["model_id"],
+                combination["tool_profile_id"],
+                repetitions,
+            ),
+        ).fetchall()
+        eligible: list[sqlite3.Row] = []
+        for row in rows:
+            if not self._row_has_current_provenance(row, combination):
+                continue
+            eligible.append(row)
+        active = next(
+            (row for row in eligible if str(row["status"]) in ACTIVE_STATUSES),
+            None,
+        )
+        if active is not None:
+            return active
+        return next(
+            (
+                row
+                for row in eligible
+                if row["status"] == "succeeded"
+                and self._evidence_payload(row) is not None
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _row_has_current_provenance(
+        row: Mapping[str, object], combination: Mapping[str, object]
+    ) -> bool:
+        suite = SUITES[DEFAULT_SUITE_ID]
+        return (
+            row["suite_id"] == DEFAULT_SUITE_ID
+            and row["suite_version"] == suite.version
+            and row["suite_sha256"] == suite.sha256
+            and row["catalog_version"] == BENCHMARK_CATALOG_VERSION
+            and row["catalog_sha256"] == BENCHMARK_CATALOG_SHA256
+            and row["runner_protocol_version"] == RUNNER_PROTOCOL_VERSION
+            and row["runner_protocol_sha256"] == RUNNER_PROTOCOL_SHA256
+            and row["executor_protocol_version"] == EXECUTOR_PROTOCOL_VERSION
+            and row["executor_protocol_sha256"] == EXECUTOR_PROTOCOL_SHA256
+            and row["runner_source_sha256"] == RUNNER_SOURCE_SHA256
+            and row["harness_source_sha256"] == HARNESS_SOURCE_SHA256
+            and row["tool_source_sha256"] == TOOL_SOURCE_SHA256
+            and row["combination_sha256"] == combination_sha256(combination)
+            and all(
+                row[key] == value
+                for key, value in combination.items()
+                if key != "id"
+            )
+        )
+    def _public_batch(self, row: sqlite3.Row) -> dict[str, object]:
+        with self._lock, self._connect() as connection:
+            mappings = connection.execute(
+                """
+                SELECT m.ordinal, m.combination_id, m.created_child, r.*
+                FROM benchmark_batch_runs AS m
+                JOIN benchmark_runs AS r ON r.id = m.run_id
+                WHERE m.batch_id = ?
+                ORDER BY m.ordinal ASC
+                """,
+                (row["id"],),
+            ).fetchall()
+        runs = [self._public_run(item, include_cases=False) for item in mappings]
+        statuses = [str(item["status"]) for item in mappings]
+        if any(status in ACTIVE_STATUSES for status in statuses):
+            status_value = "active"
+        elif statuses and all(status == "succeeded" for status in statuses):
+            status_value = "succeeded"
+        elif statuses and all(status == "cancelled" for status in statuses):
+            status_value = "cancelled"
+        else:
+            status_value = "failed"
+        created_run_ids = [
+            str(item["id"]) for item in mappings if bool(item["created_child"])
+        ]
+        run_ids = [str(item["id"]) for item in mappings]
+        items = [
+            {
+                "ordinal": int(item["ordinal"]),
+                "combination_id": str(item["combination_id"]),
+                "run_id": str(item["id"]),
+                "created": bool(item["created_child"]),
+                "status": str(item["status"]),
+            }
+            for item in mappings
+        ]
+        return {
+            "schema_version": BENCHMARK_SCHEMA_VERSION,
+            "id": row["id"],
+            "request_id": row["request_id"],
+            "status": status_value,
+            "created_at": row["created_at"],
+            "catalog_version": row["catalog_version"],
+            "catalog_sha256": row["catalog_sha256"],
+            "missing_only": bool(row["missing_only"]),
+            "repetitions": row["repetitions"],
+            "harness_selection": row["harness_selection"],
+            "model_selection": row["model_selection"],
+            "tool_profile_selection": row["tool_profile_selection"],
+            "selected_count": row["selected_count"],
+            "created_count": row["created_count"],
+            "skipped_count": row["selected_count"] - row["created_count"],
+            "run_ids": run_ids,
+            "created_run_ids": created_run_ids,
+            "items": items,
+            "runs": runs,
+        }
+
+    def get_batch(self, batch_id: str) -> dict[str, object]:
+        normalized = self._batch_id(batch_id)
+        self._reconcile_stale_runs()
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM benchmark_batches WHERE id = ?", (normalized,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(normalized)
+        return self._public_batch(row)
+
+    def comparison(self, *, repetitions: int = 1) -> dict[str, object]:
+        """Return server-authoritative current coverage for every reviewed row.
+
+        A result is comparable only when every scoring/source identity matches
+        the current catalog.  A succeeded row additionally needs intact,
+        hash-verified evidence; old or corrupt results remain historical but do
+        not suppress ``Run all missing``.
+        """
+
+        if (
+            isinstance(repetitions, bool)
+            or not isinstance(repetitions, int)
+            or not 1 <= repetitions <= MAX_REPETITIONS
+        ):
+            raise ValueError("benchmark repetitions must be between 1 and 20")
+        self._reconcile_stale_runs()
+        runtime_catalog = self.catalog()
+        available_harnesses = {
+            str(item["id"])
+            for item in runtime_catalog["harnesses"]
+            if item.get("available") is True
+        }
+        entries: list[dict[str, object]] = []
+        counts = {"succeeded": 0, "active": 0, "failed": 0, "missing": 0}
+        with self._lock, self._connect() as connection:
+            for combination in valid_combinations():
+                row = self._current_run_for_combination(
+                    connection, combination, repetitions=repetitions
+                )
+                state = "missing"
+                evidence_verified = False
+                if row is not None:
+                    status_value = str(row["status"])
+                    if status_value in ACTIVE_STATUSES:
+                        state = "active"
+                    elif status_value == "succeeded":
+                        state = "succeeded"
+                        evidence_verified = True
+                if row is None:
+                    # Surface the latest current-provenance terminal failure for
+                    # diagnosis without treating it as coverage.
+                    candidates = connection.execute(
+                        """
+                        SELECT * FROM benchmark_runs
+                        WHERE suite_id = ? AND harness_id = ? AND model_id = ?
+                          AND tool_profile_id = ? AND repetitions = ?
+                          AND catalog_sha256 = ? AND suite_sha256 = ?
+                          AND runner_protocol_sha256 = ?
+                          AND executor_protocol_sha256 = ?
+                          AND combination_sha256 = ?
+                        ORDER BY created_at DESC, id DESC
+                        """,
+                        (
+                            DEFAULT_SUITE_ID,
+                            combination["harness_id"],
+                            combination["model_id"],
+                            combination["tool_profile_id"],
+                            repetitions,
+                            BENCHMARK_CATALOG_SHA256,
+                            SUITES[DEFAULT_SUITE_ID].sha256,
+                            RUNNER_PROTOCOL_SHA256,
+                            EXECUTOR_PROTOCOL_SHA256,
+                            combination_sha256(combination),
+                        ),
+                    ).fetchall()
+                    failed = next(
+                        (
+                            candidate
+                            for candidate in candidates
+                            if str(candidate["status"]) in {"failed", "cancelled"}
+                            and self._row_has_current_provenance(
+                                candidate, combination
+                            )
+                        ),
+                        None,
+                    )
+                    if failed is not None:
+                        row = failed
+                        state = "failed"
+                submission_available = (
+                    str(combination["harness_id"]) in available_harnesses
+                )
+                counts[state] += 1
+                entries.append(
+                    {
+                        "combination": dict(combination),
+                        "state": state,
+                        "submission_available": submission_available,
+                        "needs_run": submission_available
+                        and state not in {"active", "succeeded"},
+                        "evidence_verified": evidence_verified,
+                        "run": (
+                            self._public_run(row, include_cases=False)
+                            if row is not None
+                            else None
+                        ),
+                    }
+                )
+        return {
+            "schema_version": BENCHMARK_SCHEMA_VERSION,
+            "catalog_version": BENCHMARK_CATALOG_VERSION,
+            "catalog_sha256": BENCHMARK_CATALOG_SHA256,
+            "suite_id": DEFAULT_SUITE_ID,
+            "repetitions": repetitions,
+            "counts": counts,
+            "combinations": entries,
+        }
+
+    def _matrix_combinations(
+        self, client_request: Mapping[str, object]
+    ) -> tuple[dict[str, object], ...]:
+        catalog = self.catalog()
+        available_harnesses = {
+            str(item["id"])
+            for item in catalog["harnesses"]
+            if item.get("available") is True
+        }
+        if not available_harnesses:
+            raise BenchmarkExecutionUnavailable(
+                "benchmark execution is unavailable"
+            )
+        selector_specs = (
+            ("harness_id", "harnesses"),
+            ("model_id", "models"),
+            ("tool_profile_id", "tool_profiles"),
+        )
+        filters: dict[str, tuple[str, ...] | None] = {}
+        for field, catalog_field in selector_specs:
+            selected = str(client_request[field])
+            known = {str(item["id"]) for item in catalog[catalog_field]}
+            if selected == "all":
+                filters[field] = (
+                    tuple(sorted(available_harnesses))
+                    if field == "harness_id"
+                    else None
+                )
+            elif selected in known:
+                if field == "harness_id" and selected not in available_harnesses:
+                    raise BenchmarkExecutionUnavailable(
+                        "selected benchmark harness is unavailable"
+                    )
+                filters[field] = (selected,)
+            else:
+                raise ValueError(f"unknown benchmark matrix {field}")
+        combinations = valid_combinations(
+            harness_ids=filters["harness_id"],
+            model_ids=filters["model_id"],
+            tool_profile_ids=filters["tool_profile_id"],
+        )
+        if not combinations:
+            raise ValueError("benchmark matrix selects no reviewed combinations")
+        suite = SUITES[DEFAULT_SUITE_ID]
+        repetitions = int(client_request["repetitions"])
+        if (
+            len(combinations) > MAX_MATRIX_COMBINATIONS
+            or len(combinations) * len(suite.cases) * repetitions
+            > MAX_MATRIX_PLANNED_CASES
+        ):
+            raise ValueError("benchmark matrix exceeds its bounded workload")
+        return combinations
+
+    def submit_matrix(self, request: Mapping[str, object]) -> dict[str, object]:
+        # Resolve dead workers before deciding that an active row satisfies
+        # missing coverage.  Otherwise the first matrix submitted after a
+        # quiet period could bind itself to a stale queued/running row and
+        # finish failed instead of creating the replacement it requested.
+        self._reconcile_stale_runs()
+        client_request, client_sha = self._normalize_matrix_client_request(request)
+        with self._lock, self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM benchmark_batches WHERE request_id = ?",
+                (client_request["request_id"],),
+            ).fetchone()
+        if existing is not None:
+            if not hmac.compare_digest(str(existing["request_sha256"]), client_sha):
+                raise ValueError(
+                    "benchmark matrix request ID is already bound to a different request"
+                )
+            return self._public_batch(existing)
+
+        repetitions = int(client_request["repetitions"])
+        batch_id = f"batch-{uuid.uuid4().hex}"
+        created_at = time.time()
+        created_count = 0
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            duplicate = connection.execute(
+                "SELECT * FROM benchmark_batches WHERE request_id = ?",
+                (client_request["request_id"],),
+            ).fetchone()
+            if duplicate is not None:
+                connection.execute("COMMIT")
+                if not hmac.compare_digest(str(duplicate["request_sha256"]), client_sha):
+                    raise ValueError(
+                        "benchmark matrix request ID is already bound to a different request"
+                    )
+                return self._public_batch(duplicate)
+            # As with single submissions, the transaction's duplicate lookup
+            # must precede dynamic availability. This makes a concurrent
+            # lost-response retry deterministic across an availability change.
+            combinations = self._matrix_combinations(client_request)
+            connection.execute(
+                """
+                INSERT INTO benchmark_batches (
+                    id, request_id, created_at, request_sha256,
+                    catalog_version, catalog_sha256, missing_only, repetitions,
+                    harness_selection, model_selection, tool_profile_selection,
+                    selected_count, created_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    batch_id,
+                    client_request["request_id"],
+                    created_at,
+                    client_sha,
+                    BENCHMARK_CATALOG_VERSION,
+                    BENCHMARK_CATALOG_SHA256,
+                    int(bool(client_request["missing_only"])),
+                    repetitions,
+                    client_request["harness_id"],
+                    client_request["model_id"],
+                    client_request["tool_profile_id"],
+                    len(combinations),
+                ),
+            )
+            for ordinal, combination in enumerate(combinations):
+                current = (
+                    self._current_run_for_combination(
+                        connection, combination, repetitions=repetitions
+                    )
+                    if client_request["missing_only"]
+                    else None
+                )
+                created_child = current is None
+                if current is None:
+                    child_request_id = "br-" + hashlib.sha256(
+                        f"{batch_id}\0{combination['id']}".encode("utf-8")
+                    ).hexdigest()[:32]
+                    normalized = self._normalize_request(
+                        {
+                            "request_id": child_request_id,
+                            "harness_id": combination["harness_id"],
+                            "model_id": combination["model_id"],
+                            "tool_profile_id": combination["tool_profile_id"],
+                            "repetitions": repetitions,
+                        }
+                    )
+                    run_id = f"run-{uuid.uuid4().hex}"
+                    self._insert_normalized_run(
+                        connection,
+                        run_id=run_id,
+                        normalized=normalized,
+                        status_value="pending",
+                        created_at=created_at + ordinal * 1e-6,
+                    )
+                    created_count += 1
+                else:
+                    run_id = str(current["id"])
+                connection.execute(
+                    """
+                    INSERT INTO benchmark_batch_runs (
+                        batch_id, ordinal, combination_id, run_id, created_child
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        batch_id,
+                        ordinal,
+                        combination["id"],
+                        run_id,
+                        int(created_child),
+                    ),
+                )
+            connection.execute(
+                "UPDATE benchmark_batches SET created_count = ? WHERE id = ?",
+                (created_count, batch_id),
+            )
+            connection.execute("COMMIT")
+        self._launch_next_matrix_child()
+        return self.get_batch(batch_id)
+
+    def _launch_next_matrix_child(self) -> None:
+        """Launch at most one matrix-owned child globally.
+
+        Exact one-off benchmark runs are independent.  Matrix work is globally
+        serialized so two tabs or two batches cannot amplify local/Fleet demand.
+        """
+
+        run_id: str | None = None
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT 1
+                FROM benchmark_batch_runs AS m
+                JOIN benchmark_runs AS r ON r.id = m.run_id
+                WHERE m.created_child = 1
+                  AND r.status IN ('queued', 'waiting_for_compute', 'starting',
+                                   'running', 'cancelling')
+                LIMIT 1
+                """,
+            ).fetchone()
+            if active is not None:
+                connection.execute("COMMIT")
+                return
+            pending = connection.execute(
+                """
+                SELECT r.id
+                FROM benchmark_batch_runs AS m
+                JOIN benchmark_batches AS b ON b.id = m.batch_id
+                JOIN benchmark_runs AS r ON r.id = m.run_id
+                WHERE m.created_child = 1 AND r.status = 'pending'
+                ORDER BY b.created_at ASC, b.id ASC, m.ordinal ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if pending is not None:
+                run_id = str(pending["id"])
+                connection.execute(
+                    """
+                    UPDATE benchmark_runs SET status = 'queued'
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (run_id,),
+                )
+            connection.execute("COMMIT")
+        if run_id is None:
+            return
+        try:
+            self._launcher(self._worker_command(run_id))
+        except Exception:
+            self._mark_failed(run_id, error_code="launcher_failed")
+
+    def _advance_batches_for_run(self, run_id: str) -> None:
+        with self._lock, self._connect() as connection:
+            owned = connection.execute(
+                """
+                SELECT 1 FROM benchmark_batch_runs
+                WHERE run_id = ? AND created_child = 1 LIMIT 1
+                """,
+                (self._run_id(run_id),),
+            ).fetchone()
+        if owned is not None:
+            self._launch_next_matrix_child()
+
+    def cancel_batch(self, batch_id: str) -> dict[str, object]:
+        """Cancel only children created by one matrix, preserving reused runs."""
+
+        normalized = self._batch_id(batch_id)
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            batch = connection.execute(
+                "SELECT * FROM benchmark_batches WHERE id = ?", (normalized,)
+            ).fetchone()
+            if batch is None:
+                connection.execute("ROLLBACK")
+                raise KeyError(normalized)
+            rows = connection.execute(
+                """
+                SELECT r.id, r.status
+                FROM benchmark_batch_runs AS m
+                JOIN benchmark_runs AS r ON r.id = m.run_id
+                WHERE m.batch_id = ? AND m.created_child = 1
+                """,
+                (normalized,),
+            ).fetchall()
+            for row in rows:
+                status_value = str(row["status"])
+                if status_value in TERMINAL_STATUSES:
+                    continue
+                if status_value in {"pending", "queued"}:
+                    connection.execute(
+                        """
+                        UPDATE benchmark_runs
+                        SET cancel_requested = 1, status = 'cancelled',
+                            finished_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, row["id"]),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE benchmark_runs
+                        SET cancel_requested = 1, status = 'cancelling'
+                        WHERE id = ?
+                        """,
+                        (row["id"],),
+                    )
+            connection.execute("COMMIT")
+        self._launch_next_matrix_child()
+        return self.get_batch(normalized)
 
     def cancel(self, run_id: str) -> dict[str, object]:
         normalized = self._run_id(run_id)
@@ -906,7 +1757,11 @@ class BenchmarkService:
             if status_value in TERMINAL_STATUSES:
                 connection.execute("COMMIT")
                 return self._public_run(row, include_cases=True)
-            next_status = "cancelled" if status_value == "queued" else "cancelling"
+            next_status = (
+                "cancelled"
+                if status_value in {"pending", "queued"}
+                else "cancelling"
+            )
             finished_at = now if next_status == "cancelled" else None
             connection.execute(
                 """
@@ -918,7 +1773,10 @@ class BenchmarkService:
             )
             row = self._fetch_row(connection, normalized)
             connection.execute("COMMIT")
-        return self._public_run(row, include_cases=True)
+        result = self._public_run(row, include_cases=True)
+        if next_status == "cancelled":
+            self._advance_batches_for_run(normalized)
+        return result
 
     # Runner-only methods.  They accept only generated run IDs and fixed states;
     # no caller-provided prompt, endpoint, claim, or diagnostic is persisted.
@@ -1005,6 +1863,7 @@ class BenchmarkService:
         summary: Mapping[str, object],
         cases: Sequence[Mapping[str, object]],
         error_code: str | None = None,
+        honor_cancel_requested: bool = True,
     ) -> dict[str, object]:
         normalized = self._run_id(run_id)
         if status_value not in TERMINAL_STATUSES:
@@ -1041,7 +1900,11 @@ class BenchmarkService:
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = self._fetch_row(connection, normalized)
-            final_status = "cancelled" if current["cancel_requested"] else status_value
+            final_status = (
+                "cancelled"
+                if honor_cancel_requested and current["cancel_requested"]
+                else status_value
+            )
             connection.execute(
                 """
                 UPDATE benchmark_runs
@@ -1060,7 +1923,9 @@ class BenchmarkService:
             )
             final = self._fetch_row(connection, normalized)
             connection.execute("COMMIT")
-        return self._public_run(final, include_cases=True)
+        result = self._public_run(final, include_cases=True)
+        self._advance_batches_for_run(normalized)
+        return result
 
     def _mark_failed(self, run_id: str, *, error_code: str) -> None:
         safe_code = error_code if error_code in {
@@ -1080,11 +1945,13 @@ class BenchmarkService:
                 """,
                 (time.time(), safe_code, self._run_id(run_id)),
             )
+        self._advance_batches_for_run(self._run_id(run_id))
 
 
 __all__ = (
     "ACTIVE_STATUSES",
     "BenchmarkError",
+    "BenchmarkExecutionUnavailable",
     "BenchmarkService",
     "FLEET_LOW_PRIORITY",
     "REQUEST_ID_RE",

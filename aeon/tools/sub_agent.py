@@ -1649,7 +1649,13 @@ class GetSubAgentReport(BaseTool):
                 prompt += f"\nAlso answer this specific question: {specific_question}\n"
             prompt += f"\n--- RECENT LOG TAIL ---\n{log_tail}\n--- END LOG ---"
             try:
-                resp = self.llm_client.client.chat.completions.create(
+                task_create = getattr(self.llm_client, "task_completion_create", None)
+                create = (
+                    task_create
+                    if callable(task_create)
+                    else self.llm_client.client.chat.completions.create
+                )
+                resp = create(
                     model=self.llm_client.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.3,

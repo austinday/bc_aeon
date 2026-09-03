@@ -217,6 +217,7 @@ SOURCE_FILES = (
     "aeon/core/qwen_fleet_runtime.py",
     "aeon/core/qwen_runtime.py",
     "aeon/core/sampling.py",
+    "aeon/core/utils/io.py",
     "aeon/core/data/qwen38_mtp_selection.json",
     "aeon/core/data/qwen38_rtx5000_178_128k_release_receipt.json",
     "aeon/core/data/qwen38_rtx5000_128k_release_receipt.json",

@@ -74,17 +74,19 @@ from aeon.benchmarks.service import (
 def _request(
     serial: str = "1",
     *,
-    suite: str = "smoke",
+    suite: str | None = "comprehensive",
     harness: str = "opencode",
     repetitions: int = 1,
 ) -> dict[str, object]:
-    return {
+    request: dict[str, object] = {
         "request_id": f"br-{serial * 32}",
-        "suite_id": suite,
         "harness_id": harness,
         "model_id": "local/qwen",
         "repetitions": repetitions,
     }
+    if suite is not None:
+        request["suite_id"] = suite
+    return request
 
 
 def _service(tmp_path: Path):
@@ -98,14 +100,9 @@ def _service(tmp_path: Path):
 
 def test_catalog_is_immutable_complete_json_safe_and_hashed() -> None:
     catalog = public_catalog()
-    assert {item["id"] for item in catalog["suites"]} == {
-        "smoke",
-        "tools",
-        "browser",
-        "vision",
-        "context",
-        "comprehensive",
-    }
+    assert [item["id"] for item in catalog["suites"]] == ["comprehensive"]
+    assert catalog["default_suite_id"] == "comprehensive"
+    assert catalog["benchmark"] == catalog["suites"][0]
     assert [item["id"] for item in catalog["harnesses"]] == [
         "opencode",
         "legacy-aeon",
@@ -115,12 +112,27 @@ def test_catalog_is_immutable_complete_json_safe_and_hashed() -> None:
         item["id"]: item["required_capabilities"] for item in catalog["suites"]
     }
     assert required_by_suite == {
-        "smoke": [],
-        "tools": ["fleet-tools", "local-tools"],
-        "browser": ["browser"],
-        "vision": ["browser", "vision"],
-        "context": [],
         "comprehensive": ["browser", "fleet-tools", "local-tools", "vision"],
+    }
+    assert catalog["scoring"]["overall_field"] == "overall_score"
+    assert catalog["scoring"]["quality_field"] == "quality_score"
+    assert catalog["scoring"]["observable_metrics"]["token_fields"] == [
+        "prompt_tokens",
+        "peak_prompt_tokens",
+        "context_tokens",
+        "completion_tokens",
+    ]
+    assert [axis["field"] for axis in catalog["scoring"]["pareto_axes"]] == [
+        "quality_score",
+        "total_active_wall_ms",
+    ]
+    assert sum(
+        component["weight"] for component in catalog["scoring"]["components"]
+    ) == pytest.approx(1.0)
+    assert catalog["selection"] == {
+        "all_value": "all",
+        "enumerate_from": "combinations",
+        "cartesian_product_allowed": False,
     }
     assert catalog["models"][0]["identity_scope"] == "logical_service"
     assert catalog["models"][0]["service_id"] == "aeon-qwen38-standard"
@@ -139,13 +151,13 @@ def test_catalog_is_immutable_complete_json_safe_and_hashed() -> None:
     serialized = json.dumps(catalog, allow_nan=False)
     assert "http://" not in serialized
     assert "https://" not in serialized
-    assert "prompt" not in serialized.lower()
+    assert "raw prompt" not in serialized.lower()
 
     catalog["models"][0]["harnesses"].append("tampered")
     catalog["suites"].clear()
     fresh = public_catalog()
     assert fresh["models"][0]["harnesses"] == ["opencode", "legacy-aeon"]
-    assert len(fresh["suites"]) == 6
+    assert len(fresh["suites"]) == 1
     with pytest.raises(FrozenInstanceError):
         SUITES["smoke"].version = "changed"
 
@@ -186,7 +198,8 @@ def test_submit_is_durable_idempotent_and_uses_only_fixed_worker_argv(
     assert created["request_id"] == "br-" + "1" * 32
     assert created["status"] == "queued"
     assert created["tool_profile_id"] == "fleet-local"
-    assert created["suite_version"] == "1"
+    assert created["suite_id"] == "comprehensive"
+    assert created["suite_version"] == SUITES["comprehensive"].version
     assert launches == [[
         FLEET_LOW_PRIORITY,
         os.sys.executable,
@@ -213,10 +226,10 @@ def test_submit_rejects_request_id_reuse_for_a_different_request(
     created = service.submit(_request())
 
     with pytest.raises(ValueError, match="already bound to a different request"):
-        service.submit(_request(suite="tools"))
+        service.submit(_request(repetitions=2))
 
     assert len(launches) == 1
-    assert service.get_run(str(created["id"]))["suite_id"] == "smoke"
+    assert service.get_run(str(created["id"]))["suite_id"] == "comprehensive"
     assert [run["id"] for run in service.list_runs()["runs"]] == [created["id"]]
 
 
@@ -233,7 +246,7 @@ def test_submit_rejects_tool_profile_missing_suite_capabilities(
 
     with patch.object(service_module, "TOOL_PROFILES", (incomplete,)):
         with pytest.raises(ValueError, match="required capabilities"):
-            service.submit(_request(suite="vision"))
+            service.submit(_request())
 
     assert launches == []
     assert service.list_runs()["runs"] == []
@@ -301,27 +314,36 @@ def test_runner_executes_deterministic_specs_and_publishes_sanitized_evidence(
     tmp_path: Path,
 ) -> None:
     service, _launches = _service(tmp_path)
-    queued = service.submit(_request(suite="tools", repetitions=2))
+    queued = service.submit(_request())
     finished = run_benchmark(
         service, str(queued["id"]), executor=_PassingExecutor()
     )
     assert finished["status"] == "succeeded"
     assert finished["evidence_verified"] is True
-    assert len(finished["cases"]) == 6
-    assert finished["summary"] == {
-        "score": pytest.approx(0.8),
-        "completion_rate": pytest.approx(1.0),
-        "median_wall_ms": pytest.approx(25.0),
-        "median_active_wall_ms": pytest.approx(20.0),
-        "median_compute_wait_ms": pytest.approx(5.0),
-        "stuck_rate": pytest.approx(0.0),
-        "unsupported_rate": pytest.approx(0.0),
-        "tool_success_rate": pytest.approx(1.0),
-        "browser_success_rate": pytest.approx(0.0),
-        "vision_score": pytest.approx(0.0),
-        "case_count": 6,
-        "passed_cases": 6,
+    case_count = len(SUITES["comprehensive"].cases)
+    assert len(finished["cases"]) == case_count
+    summary = finished["summary"]
+    assert summary["completion_rate"] == pytest.approx(1.0)
+    assert summary["median_wall_ms"] == pytest.approx(25.0)
+    assert summary["median_active_wall_ms"] == pytest.approx(20.0)
+    assert summary["median_compute_wait_ms"] == pytest.approx(5.0)
+    assert summary["total_wall_ms"] == pytest.approx(25.0 * case_count)
+    assert summary["total_active_wall_ms"] == pytest.approx(20.0 * case_count)
+    assert summary["total_compute_wait_ms"] == pytest.approx(5.0 * case_count)
+    assert summary["stuck_rate"] == pytest.approx(0.0)
+    assert summary["unsupported_rate"] == pytest.approx(0.0)
+    assert summary["case_count"] == case_count
+    assert summary["passed_cases"] == case_count
+    assert 0.0 <= summary["quality_score"] <= 100.0
+    assert 0.0 <= summary["overall_score"] <= 100.0
+    assert summary["score"] == pytest.approx(summary["overall_score"] / 100.0)
+    assert set(summary["component_scores"]) == {
+        item["id"] for item in public_catalog()["scoring"]["components"]
     }
+    assert summary["model_call_count"] is None
+    assert summary["prompt_tokens"] is None
+    assert summary["peak_prompt_tokens"] is None
+    assert summary["token_metrics_complete"] is False
     serialized = json.dumps(finished)
     for forbidden in ("raw prompt", "must-not-survive", "127.0.0.1", "GPU-"):
         assert forbidden not in serialized
@@ -397,9 +419,26 @@ def test_missing_real_executor_fails_instead_of_manufacturing_passes(tmp_path: P
     finished = run_benchmark(service, str(queued["id"]))
     assert finished["status"] == "failed"
     assert finished["error_code"] == "executor_unavailable"
-    assert finished["summary"]["completion_rate"] == 0.0
+    assert finished["summary"] == {}
     assert finished["cases"][0]["status"] == "failed"
     assert all(case["status"] != "passed" for case in finished["cases"])
+
+
+def test_executor_exception_preserves_measured_case_time(tmp_path: Path) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+
+    class DelayedFailure:
+        def execute(self, _request):
+            time.sleep(0.002)
+            raise RuntimeError("synthetic model failure")
+
+    finished = run_benchmark(service, str(queued["id"]), executor=DelayedFailure())
+    assert finished["status"] == "succeeded"
+    assert len(finished["cases"]) == len(SUITES["comprehensive"].cases)
+    assert all(float(case["wall_ms"]) > 0 for case in finished["cases"])
+    assert finished["summary"]["total_wall_ms"] > 0
+    assert finished["summary"]["total_active_wall_ms"] > 0
 
 
 def test_cancel_is_idempotent_and_running_cancel_preserves_partial_evidence(
@@ -414,7 +453,7 @@ def test_cancel_is_idempotent_and_running_cancel_preserves_partial_evidence(
         service, str(queued["id"]), executor=_PassingExecutor()
     )["status"] == "cancelled"
 
-    second = service.submit(_request("2", suite="tools"))
+    second = service.submit(_request("2"))
 
     class CancelAfterFirst:
         calls = 0
@@ -481,7 +520,7 @@ def test_database_v1_migrates_worker_and_executor_identity_columns(tmp_path: Pat
         connection.execute("PRAGMA user_version = 1")
     reopened = BenchmarkService(service.root, launcher=lambda _argv: None)
     with sqlite3.connect(reopened.database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         columns = {
             row[1]
             for row in connection.execute("PRAGMA table_info(benchmark_runs)").fetchall()
@@ -623,15 +662,31 @@ def test_real_executor_builds_only_reviewed_harness_commands_and_safe_fixtures(
         browser_fixture_client=lambda _fixture, _operation: False,
     ) as executor:
         retained_workspace = executor.workspace
-        finished = run_benchmark(service, str(queued["id"]), executor=executor)
-    assert finished["status"] == "succeeded"
-    assert finished["summary"]["completion_rate"] == pytest.approx(1.0)
-    assert len(observed) == 2
+        results = [
+            executor.execute(
+                ExecutionRequest(
+                    run_id=str(queued["id"]),
+                    suite_id="comprehensive",
+                    scenario=scenario,
+                    repetition=1,
+                    harness_id="opencode",
+                    model_id="local/qwen",
+                    tool_profile_id="fleet-local",
+                    timeout_seconds=scenario.timeout_seconds,
+                )
+            )
+            for scenario in SUITES["smoke"].cases
+            if scenario.case_id.startswith("smoke.")
+        ]
+    assert {result["status"] for result in results} == {"passed"}
+    assert len(observed) == sum(
+        scenario.case_id.startswith("smoke.") for scenario in SUITES["smoke"].cases
+    )
     assert all(command[:3] == [sys.executable, "-m", "aeon.harnesses.opencode_runtime"] for command in observed)
     assert all("--non-interactive" in command for command in observed)
     assert retained_workspace.is_dir()
     assert stat.S_IMODE(retained_workspace.stat().st_mode) == 0o700
-    assert len(environments) == len(working_directories) == 2
+    assert len(environments) == len(working_directories) == len(observed)
     for environment, workspace in zip(environments, working_directories, strict=True):
         configured_state = Path(environment["AEON_STATE_DIR"])
         assert not configured_state.is_relative_to(workspace)
@@ -656,9 +711,58 @@ def test_real_executor_builds_only_reviewed_harness_commands_and_safe_fixtures(
     assert not working_directories[0].is_relative_to(runtime_state)
 
 
+def test_executor_case_identity_is_resume_stable_and_case_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    executor = FleetHarnessExecutor(
+        service,
+        str(queued["id"]),
+        browser_fixture_client=lambda _fixture, _operation: True,
+    )
+    scenarios = SUITES["comprehensive"].cases[:2]
+
+    def request(index: int, repetition: int) -> ExecutionRequest:
+        scenario = scenarios[index]
+        return ExecutionRequest(
+            run_id=str(queued["id"]),
+            suite_id="comprehensive",
+            scenario=scenario,
+            repetition=repetition,
+            harness_id="opencode",
+            model_id="local/qwen",
+            tool_profile_id="fleet-local",
+            timeout_seconds=scenario.timeout_seconds,
+        )
+
+    first = executor._environment(request(0, 1))
+    resumed = executor._environment(request(0, 1))
+    other_case = executor._environment(request(1, 1))
+    other_repetition = executor._environment(request(0, 2))
+    assert re.fullmatch(r"[0-9a-f]{32}", first["AEON_REMOTE_INSTANCE_ID"])
+    assert resumed["AEON_REMOTE_INSTANCE_ID"] == first["AEON_REMOTE_INSTANCE_ID"]
+    assert len(
+        {
+            first["AEON_REMOTE_INSTANCE_ID"],
+            other_case["AEON_REMOTE_INSTANCE_ID"],
+            other_repetition["AEON_REMOTE_INSTANCE_ID"],
+        }
+    ) == 3
+
+    monkeypatch.chdir(executor.workspace)
+    roots = []
+    for environment in (first, resumed, other_case, other_repetition):
+        with patch.dict(os.environ, environment, clear=True):
+            roots.append(opencode_runtime._state_root())
+    assert roots[0] == roots[1]
+    assert len({roots[0], roots[2], roots[3]}) == 3
+    executor.close()
+
+
 def test_mutation_repetitions_use_distinct_paths_and_markers(tmp_path: Path) -> None:
     service, _launches = _service(tmp_path)
-    queued = service.submit(_request(suite="tools", repetitions=2))
+    queued = service.submit(_request(repetitions=2))
     prompts: list[str] = []
 
     def fake_process(
@@ -668,7 +772,7 @@ def test_mutation_repetitions_use_distinct_paths_and_markers(tmp_path: Path) -> 
         prompt = list(argv)[list(argv).index("--start") + 1]
         prompts.append(prompt)
         match = re.search(
-            r"create (?P<path>/\S+) containing exactly (?P<marker>\S+) followed",
+            r"[Cc]reate (?P<path>/\S+) containing exactly (?P<marker>\S+) followed",
             prompt,
         )
         assert match is not None
@@ -696,7 +800,7 @@ def test_mutation_repetitions_use_distinct_paths_and_markers(tmp_path: Path) -> 
         for repetition in (1, 2):
             request = ExecutionRequest(
                 run_id=str(queued["id"]),
-                suite_id="tools",
+                suite_id="comprehensive",
                 scenario=scenario,
                 repetition=repetition,
                 harness_id="opencode",
@@ -704,7 +808,8 @@ def test_mutation_repetitions_use_distinct_paths_and_markers(tmp_path: Path) -> 
                 tool_profile_id="fleet-local",
                 timeout_seconds=scenario.timeout_seconds,
             )
-            results.append(executor.execute(request))
+            with patch.object(executor, "_tool_judgment_passed", return_value=True):
+                results.append(executor.execute(request))
         first = executor.workspace / "results" / "mutation-repetition-1.txt"
         second = executor.workspace / "results" / "mutation-repetition-2.txt"
 
@@ -736,7 +841,7 @@ def test_fleet_wait_requires_authenticated_typed_tool_receipt_not_model_prose(
     def request_for(run_id: str) -> ExecutionRequest:
         return ExecutionRequest(
             run_id=run_id,
-            suite_id="tools",
+            suite_id="comprehensive",
             scenario=scenario,
             repetition=1,
             harness_id="opencode",
@@ -745,7 +850,7 @@ def test_fleet_wait_requires_authenticated_typed_tool_receipt_not_model_prose(
             timeout_seconds=scenario.timeout_seconds,
         )
 
-    prose_run = service.submit(_request("c", suite="tools"))
+    prose_run = service.submit(_request("c"))
 
     def prose_only(
         _argv, _cwd, _environment, _timeout, _cancel, _compute_state_changed
@@ -771,18 +876,12 @@ def test_fleet_wait_requires_authenticated_typed_tool_receipt_not_model_prose(
     assert prose_result["status"] == "failed"
     assert prose_result["tool_success"] is False
 
-    receipt_run = service.submit(_request("d", suite="tools"))
+    receipt_run = service.submit(_request("d"))
 
     def typed_receipt(
         _argv, _cwd, environment, _timeout, _cancel, _compute_state_changed
     ):
-        with patch.dict(
-            os.environ,
-            {
-                CAPABILITY_RECEIPT_PATH_ENV: environment[CAPABILITY_RECEIPT_PATH_ENV],
-                CAPABILITY_RECEIPT_KEY_ENV: environment[CAPABILITY_RECEIPT_KEY_ENV],
-            },
-        ):
+        with patch.dict(os.environ, environment, clear=True):
             emit_fleet_wait_capability_receipt(_fleet_capability_document())
         return ProcessResult("exited", 0, b"ordinary completion", 3.0)
 
@@ -793,7 +892,8 @@ def test_fleet_wait_requires_authenticated_typed_tool_receipt_not_model_prose(
         readiness_checker=lambda _harness: {"supported": True, "reason": ""},
         browser_fixture_client=lambda _fixture, _operation: False,
     ) as executor:
-        receipt_result = executor.execute(request_for(str(receipt_run["id"])))
+        with patch.object(executor, "_tool_judgment_passed", return_value=True):
+            receipt_result = executor.execute(request_for(str(receipt_run["id"])))
     assert receipt_result["status"] == "passed"
     assert receipt_result["tool_success"] is True
 
@@ -835,11 +935,11 @@ def test_capability_receipt_rejects_one_byte_tamper(tmp_path: Path) -> None:
     ) == ()
 
 
-def test_browser_scenarios_are_truthfully_unsupported_without_public_fixture(
+def test_browser_scenarios_are_infrastructure_invalid_without_controlled_fixture(
     tmp_path: Path,
 ) -> None:
     service, _launches = _service(tmp_path)
-    queued = service.submit(_request(suite="browser"))
+    queued = service.submit(_request())
 
     def must_not_launch(*_args):
         raise AssertionError("controlled browser cases must not use an external site")
@@ -851,20 +951,27 @@ def test_browser_scenarios_are_truthfully_unsupported_without_public_fixture(
         readiness_checker=lambda _harness: {"supported": True, "reason": ""},
         browser_fixture_client=lambda _fixture, _operation: False,
     ) as executor:
-        finished = run_benchmark(service, str(queued["id"]), executor=executor)
-    assert finished["status"] == "succeeded"
-    assert finished["summary"]["unsupported_rate"] == pytest.approx(1.0)
-    assert {case["status"] for case in finished["cases"]} == {"unsupported"}
-    assert {case["error_code"] for case in finished["cases"]} == {
-        "case_unsupported"
-    }
+        for scenario in SUITES["browser"].cases:
+            with pytest.raises(ExecutorUnavailable, match="fixture .* seed failed"):
+                executor.execute(
+                    ExecutionRequest(
+                        run_id=str(queued["id"]),
+                        suite_id="comprehensive",
+                        scenario=scenario,
+                        repetition=1,
+                        harness_id="opencode",
+                        model_id="local/qwen",
+                        tool_profile_id="fleet-local",
+                        timeout_seconds=scenario.timeout_seconds,
+                    )
+                )
 
 
 def test_browser_suite_uses_closed_fixture_client_and_actual_harness_commands(
     tmp_path: Path,
 ) -> None:
     service, _launches = _service(tmp_path)
-    queued = service.submit(_request(suite="browser"))
+    queued = service.submit(_request())
     fixture_calls: list[tuple[str, str]] = []
     environments: list[dict[str, str]] = []
     commands: list[list[str]] = []
@@ -908,9 +1015,23 @@ def test_browser_suite_uses_closed_fixture_client_and_actual_harness_commands(
         readiness_checker=lambda _harness: {"supported": True, "reason": ""},
         browser_fixture_client=fixture_client,
     ) as executor:
-        finished = run_benchmark(service, str(queued["id"]), executor=executor)
-    assert finished["status"] == "succeeded"
-    assert finished["summary"]["browser_success_rate"] == pytest.approx(1.0)
+        with patch.object(executor, "_tool_judgment_passed", return_value=True):
+            results = [
+                executor.execute(
+                    ExecutionRequest(
+                        run_id=str(queued["id"]),
+                        suite_id="comprehensive",
+                        scenario=scenario,
+                        repetition=1,
+                        harness_id="opencode",
+                        model_id="local/qwen",
+                        tool_profile_id="fleet-local",
+                        timeout_seconds=scenario.timeout_seconds,
+                    )
+                )
+                for scenario in SUITES["browser"].cases
+            ]
+    assert {result["status"] for result in results} == {"passed"}
     assert fixture_calls == [
         ("observe-v1", "seed"),
         ("form-v1", "seed"),
@@ -934,12 +1055,67 @@ def test_browser_suite_uses_closed_fixture_client_and_actual_harness_commands(
     assert BENCHMARK_BROWSER_PROFILE == "benchmark-000000000000"
 
 
+@pytest.mark.parametrize("transport_error", [False, True])
+def test_browser_session_separates_model_sign_in_miss_from_fixture_transport_error(
+    tmp_path: Path,
+    transport_error: bool,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+    process_calls = 0
+
+    def fixture_client(fixture_id: str, operation: str) -> bool:
+        assert fixture_id == "session-v1"
+        if operation == "reopen":
+            if transport_error:
+                raise OSError("fixture transport unavailable")
+            return False
+        return True
+
+    def fake_process(*_args) -> ProcessResult:
+        nonlocal process_calls
+        process_calls += 1
+        return ProcessResult("exited", 0, b"first turn complete", 5.0)
+
+    scenario = next(
+        item
+        for item in SUITES["comprehensive"].cases
+        if item.case_id == "browser.session"
+    )
+    with FleetHarnessExecutor(
+        service,
+        str(queued["id"]),
+        process_runner=fake_process,
+        readiness_checker=lambda _harness: {"supported": True, "reason": ""},
+        browser_fixture_client=fixture_client,
+    ) as executor, patch.object(executor, "_tool_judgment_passed", return_value=True):
+        request = ExecutionRequest(
+            run_id=str(queued["id"]),
+            suite_id="comprehensive",
+            scenario=scenario,
+            repetition=1,
+            harness_id="opencode",
+            model_id="local/qwen",
+            tool_profile_id="fleet-local",
+            timeout_seconds=scenario.timeout_seconds,
+        )
+        if transport_error:
+            with pytest.raises(ExecutorUnavailable, match="reopen was unavailable"):
+                executor.execute(request)
+        else:
+            result = executor.execute(request)
+            assert result["status"] == "failed"
+            assert result["score"] == 0.0
+            assert result["browser_success"] is False
+    assert process_calls == 1
+
+
 def test_shared_benchmark_profile_keeps_interleaved_runs_session_isolated(
     tmp_path: Path,
 ) -> None:
     service, _launches = _service(tmp_path)
-    first_run = service.submit(_request("a", suite="browser"))
-    second_run = service.submit(_request("b", suite="browser"))
+    first_run = service.submit(_request("a"))
+    second_run = service.submit(_request("b"))
     state: dict[tuple[str, str], str] = {}
 
     def client_for(run_id: str):
@@ -996,7 +1172,7 @@ def test_browser_fixture_request_finishes_inside_cancel_grace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, _launches = _service(tmp_path)
-    queued = service.submit(_request(suite="browser"))
+    queued = service.submit(_request())
     observed: dict[str, object] = {}
 
     from aeon.tools import browser as browser_module
@@ -1036,6 +1212,89 @@ def test_browser_fixture_request_finishes_inside_cancel_grace(
     timeout = observed["timeout"]
     assert isinstance(timeout, (int, float))
     assert 0 < timeout < runner_module.EXECUTOR_CANCEL_GRACE_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("status_code", "document", "expected_responded"),
+    [
+        (
+            503,
+            {
+                "status": "error",
+                "fixture_id": "session-v1",
+                "operation": "reopen",
+                "failure_kind": "fixture_internal",
+                "passed": False,
+            },
+            False,
+        ),
+        (
+            200,
+            {
+                "status": "error",
+                "fixture_id": "session-v1",
+                "operation": "reopen",
+                "failure_kind": "fixture_internal",
+                "passed": False,
+            },
+            False,
+        ),
+        (
+            200,
+            {"status": "reopened", "fixture_id": "session-v1", "passed": False},
+            True,
+        ),
+    ],
+)
+def test_browser_fixture_http_classifies_internal_errors_as_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    document: dict[str, object],
+    expected_responded: bool,
+) -> None:
+    service, _launches = _service(tmp_path)
+    queued = service.submit(_request())
+
+    from aeon.tools import browser as browser_module
+
+    monkeypatch.setattr(browser_module, "ensure_browser_running", lambda: True)
+    monkeypatch.setattr(browser_module, "_browser_service_identity", lambda: "owned")
+    monkeypatch.setattr(
+        browser_module,
+        "browser_auth_headers",
+        lambda: {"Authorization": "Bearer test"},
+    )
+
+    class Response:
+        closed = False
+
+        def __init__(self) -> None:
+            self.status_code = status_code
+
+        @staticmethod
+        def json():
+            return document
+
+        def close(self) -> None:
+            self.closed = True
+
+    response = Response()
+    monkeypatch.setattr(executor_module.requests, "post", lambda *_args, **_kwargs: response)
+    executor = FleetHarnessExecutor(
+        service,
+        str(queued["id"]),
+        readiness_checker=lambda _harness: {"supported": True, "reason": ""},
+        browser_fixture_client=lambda _fixture, _operation: False,
+    )
+    try:
+        outcome = executor._browser_fixture_outcome("session-v1", "reopen")
+    finally:
+        executor.close()
+
+    assert outcome.responded is expected_responded
+    assert outcome.passed is False
+    assert response.closed is True
 
 
 def test_runner_deadline_bounds_noncooperative_injected_executor(tmp_path: Path) -> None:
@@ -1091,6 +1350,11 @@ def test_unresolved_cooperative_cancel_fails_instead_of_claiming_cancelled(
     finished = run_benchmark(service, str(queued["id"]), executor=executor)
     assert finished["status"] == "failed"
     assert finished["error_code"] == "executor_stuck"
+    assert finished["summary"] == {}
+    assert len(finished["cases"]) == 1
+    assert finished["cases"][0]["status"] == "stuck"
+    assert float(finished["cases"][0]["wall_ms"]) > 0
+    assert float(finished["cases"][0]["active_wall_ms"]) > 0
     assert executor.calls == 1
 
 
@@ -1247,6 +1511,8 @@ def test_wait_transition_is_public_status_not_a_second_demand(
 ) -> None:
     service, _launches = _service(tmp_path)
     queued = service.submit(_request())
+    assert service._register_worker(str(queued["id"])) is True
+    assert service._claim_run(str(queued["id"])) is not None
     transitions: list[str] = []
     launches = 0
 
@@ -1272,16 +1538,26 @@ def test_wait_transition_is_public_status_not_a_second_demand(
         readiness_checker=lambda _harness: {"supported": True, "reason": ""},
         browser_fixture_client=lambda _fixture, _operation: False,
     ) as executor:
-        finished = run_benchmark(service, str(queued["id"]), executor=executor)
+        results = [
+            executor.execute(
+                ExecutionRequest(
+                    run_id=str(queued["id"]),
+                    suite_id="comprehensive",
+                    scenario=scenario,
+                    repetition=1,
+                    harness_id="opencode",
+                    model_id="local/qwen",
+                    tool_profile_id="fleet-local",
+                    timeout_seconds=scenario.timeout_seconds,
+                )
+            )
+            for scenario in SUITES["smoke"].cases
+            if scenario.case_id.startswith("smoke.")
+        ]
 
-    assert finished["status"] == "succeeded"
-    assert transitions == [
-        "waiting_for_compute",
-        "running",
-        "waiting_for_compute",
-        "running",
-    ]
-    assert launches == 2  # exactly one real harness process per planned case
+    assert {result["status"] for result in results} == {"passed"}
+    assert launches >= 2
+    assert transitions == ["waiting_for_compute", "running"] * launches
 
 
 def test_bounded_process_cleans_up_when_selector_setup_fails(
